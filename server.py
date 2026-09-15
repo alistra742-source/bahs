@@ -31,13 +31,26 @@ DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
 API_KEY = os.getenv("API_KEY", "")
 # Hosted inference: the way out of CPU-only inference. A 3B model on a container short
 # of RAM spends ~20 minutes evaluating a prompt before it writes a character, and no
-# API-side change fixes that. Set INFERENCE_URL and INFERENCE_KEY to any
-# OpenAI-compatible /chat/completions endpoint (SambaNova, Groq, OpenRouter, OpenAI) and
-# jobs stream from there instead — the Ollama service is then not touched at all.
-# Unset, nothing changes: Ollama over the private network stays the default.
-INFERENCE_URL = os.getenv("INFERENCE_URL", "").strip().rstrip("/")
-INFERENCE_KEY = os.getenv("INFERENCE_KEY", "").strip()
-INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "DeepSeek-V3.1").strip()
+# API-side change fixes that. With a key present, jobs stream from an OpenAI-compatible
+# /chat/completions endpoint instead and the Ollama service is not touched at all — no
+# pull, no warm-up, no single-slot queue. Without one, Ollama stays the default.
+#
+# Hugging Face's Inference Providers router is the default endpoint, so setting the
+# token alone is enough to switch everything over. Any other compatible endpoint
+# (SambaNova, Groq, OpenRouter, OpenAI) works too: point INFERENCE_URL at it.
+HF_ROUTER = "https://router.huggingface.co/v1"
+
+def inference_key() -> str:
+    """The hosted key, under whichever name it was put in the service's variables."""
+    for name in ("INFERENCE_KEY", "HF_API", "HF_TOKEN"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+INFERENCE_KEY = inference_key()
+INFERENCE_URL = os.getenv("INFERENCE_URL", "").strip().rstrip("/") or (HF_ROUTER if INFERENCE_KEY else "")
+INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct").strip()
 HOSTED = bool(INFERENCE_URL and INFERENCE_KEY)
 
 def active_model() -> str:
@@ -47,6 +60,13 @@ def active_model() -> str:
 def endpoint() -> str:
     """Where inference actually happens, for error messages."""
     return INFERENCE_URL if HOSTED else OLLAMA
+
+def provider_label() -> str:
+    """Short name of whatever is answering, for the page's chips."""
+    if not HOSTED:
+        return "ollama"
+    host = INFERENCE_URL.split("//", 1)[-1].split("/", 1)[0]
+    return f"hosted ({host})"
 
 INDEX = Path(__file__).parent / "web" / "index.html"
 # Inference without a GPU is slow, so the defaults lean on repeated use: the weights
@@ -256,8 +276,10 @@ def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Nothing to pull or warm when a hosted endpoint does the work.
-    if not HOSTED:
+    if HOSTED:
+        # Nothing to pull or warm: the weights are somebody else's problem now.
+        print(f"[model] hosted inference at {INFERENCE_URL} using {INFERENCE_MODEL}", flush=True)
+    else:
         # On a thread so the API answers /health and / while the weights download.
         threading.Thread(target=ensure_model, daemon=True).start()
     yield
@@ -541,7 +563,7 @@ async def root():
         chip(state["database"], "postgres", "connected" if state["database"]
              else str(state.get("database_error", "not configured"))),
         chip(state["ollama"], "ollama",
-             "not used -- hosted inference" if HOSTED
+             f"not used -- {provider_label()}" if HOSTED
              else "reachable" if state["ollama"] else str(state.get("error", "unreachable"))),
         chip(state["model_ready"], "model", f"{active_model()} ready" if state["model_ready"]
              else f"{active_model()} pulling"),
@@ -661,7 +683,7 @@ async def snapshot() -> dict:
     # Always reports rather than raising, so the platform healthcheck only depends
     # on the API being up; database and ollama readiness come back in the body.
     body = {"status": "ok", "database": False, "ollama": False, "model": active_model(),
-            "provider": "hosted" if HOSTED else "ollama",
+            "provider": "hosted" if HOSTED else "ollama", "provider_label": provider_label(),
             "model_ready": False, "api_key_required": bool(API_KEY)}
     try:
         fetchone("SELECT 1")

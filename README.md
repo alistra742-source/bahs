@@ -1,11 +1,11 @@
 # bahs
 
 FastAPI service that generates Roblox Lua scripts, learns from feedback, and ships a
-Roblox executor GUI in [`client.lua`](client.lua). It answers with Ollama running in the
-same project (`qwen2.5-coder:3b`) by default, or with a hosted OpenAI-compatible model
-if you set `INFERENCE_URL`/`INFERENCE_KEY` — see [Hosted
-inference](#hosted-inference-the-fast-answer), which is what you want if CPU-only
-inference is taking minutes per request.
+Roblox executor GUI in [`client.lua`](client.lua). It answers through Hugging Face's
+Inference Providers router (any OpenAI-compatible endpoint works) when the token is in
+its variables, and through Ollama running in the same project (`qwen2.5-coder:3b`)
+otherwise — see [Hosted inference](#hosted-inference-the-fast-answer), which is what you
+want if CPU-only inference is taking minutes per request.
 
 The repo builds exactly one thing: the API. Ollama is a stock Docker-image service.
 
@@ -160,37 +160,44 @@ one request per model, and an abandoned request can hold that slot until it fini
 
 CPU-only inference has a floor this API cannot get under: a prompt of a few hundred
 tokens takes many minutes to evaluate on a small container, and the answer comes after
-that. If you want seconds instead, point the API at a hosted OpenAI-compatible model and
-leave the local weights behind.
+that. If you want seconds instead, put a hosted model behind the API and leave the local
+weights behind.
 
-1. Create an account and an API key on a hosted inference provider. The default in this
-   repo targets **SambaNova** (`https://api.sambanova.ai/v1`, bearer key, models
-   `DeepSeek-V3.1`, `gpt-oss-120b`, `Meta-Llama-3.3-70B-Instruct`), and any
-   OpenAI-compatible endpoint works the same way.
-2. On the **`bahs`** service → Settings → Variables, add:
+1. Get a Hugging Face token with the **Inference Providers** permission — Settings →
+   Access Tokens on huggingface.co. A token without that permission authenticates but is
+   rejected with `401` on `/chat/completions`.
+2. On the **`bahs`** service → Settings → Variables, add **one** variable:
 
-| Variable           | Value                          |
-| ------------------ | ------------------------------ |
-| `INFERENCE_URL`    | `https://api.sambanova.ai/v1`  |
-| `INFERENCE_KEY`    | the key from the provider      |
-| `INFERENCE_MODEL`  | `DeepSeek-V3.1`                |
+| Variable  | Value        |
+| --------- | ------------ |
+| `HF_API`  | `hf_...`     |
 
-3. Redeploy `bahs`. The page's `ollama` chip then reads `not used -- hosted inference`
-   and the `model` chip names the hosted model, because nothing is pulled or warmed any
-   more. Answers arrive in seconds and the `ollama` service (and its volume) can be
-   deleted.
+   A key under any of the names `INFERENCE_KEY`, `HF_API` or `HF_TOKEN` turns hosted
+   inference on, and without `INFERENCE_URL` the default endpoint is Hugging Face's
+   router (`https://router.huggingface.co/v1`).
+3. Redeploy `bahs`. The page's `ollama` chip then reads `not used -- hosted
+   (router.huggingface.co)` and the `model` chip names the hosted model, because nothing
+   is pulled, loaded or warmed any more. Answers arrive in seconds, and the `ollama`
+   service (and its volume) can be deleted.
 
-Other providers are the same three variables, for example
-`INFERENCE_URL=https://api.groq.com/openai/v1`,
-`INFERENCE_URL=https://openrouter.ai/api/v1`, or
-`INFERENCE_URL=https://api.openai.com/v1`. Leave all three unset and the API behaves
-exactly as it did, on Ollama over the private network.
+Two optional variables change where and what it calls:
 
-Both API surfaces go through it: the page's `/generate/stream` jobs and `client.lua`'s
-blocking `/generate`. With a hosted model the single-slot `409 already generating a
-script` guard is skipped as well, since there is no local model to queue behind, so
-several scripts can be written at once. The key stays in the service's variables: it is
-never written into the page, and `API_KEY` still gates who can call the API.
+| Variable           | Default                                 | Notes |
+| ------------------ | --------------------------------------- | ----- |
+| `INFERENCE_URL`    | `https://router.huggingface.co/v1`      | Any OpenAI-compatible `/chat/completions` host |
+| `INFERENCE_MODEL`  | `Qwen/Qwen2.5-Coder-32B-Instruct`       | Router model id, optionally with a provider suffix |
+
+Good router models to try: `Qwen/Qwen2.5-Coder-32B-Instruct` (the default, fast and
+code-specialised, the best fit for Luau), `Qwen/Qwen3-Coder-480B-A35B-Instruct` (stronger
+and heavier), `openai/gpt-oss-120b`, `zai-org/GLM-4.5`. A provider suffix such as
+`:baseten` or `:ovhcloud` pins one backend; without it the router picks.
+
+Hosted inference is used by both API surfaces: the page's `/generate/stream` jobs and
+`client.lua`'s blocking `/generate`. With a hosted model the single-slot `409 already
+generating a script` guard is skipped as well, since there is no local model to queue
+behind, so several scripts can be written at once. The token stays in the service's
+variables: it is never written into the page, and `API_KEY` still gates who can call the
+API.
 
 ## Model quality
 
@@ -271,9 +278,9 @@ localStorage and sends it with each request.
 | `HEARTBEAT`    | `5`                                    | Seconds of silence between keep-alive frames on `/generate/stream/{job}` |
 | `JOB_TTL`      | `3600`                                 | Seconds a finished job stays readable, so a late page can still reattach |
 | `EXAMPLE_CHARS` | `500`                                 | Total characters of past scripts allowed in a prompt; they cost minutes on CPU |
-| `INFERENCE_URL` | —                                      | Set with `INFERENCE_KEY` to answer from a hosted OpenAI-compatible endpoint instead of Ollama |
-| `INFERENCE_KEY` | —                                      | Bearer key for `INFERENCE_URL`; never sent to the browser |
-| `INFERENCE_MODEL` | `DeepSeek-V3.1`                       | Model name sent to `INFERENCE_URL` when hosted inference is on |
+| `HF_API` / `INFERENCE_KEY` / `HF_TOKEN` | —                        | Any of these being set turns on hosted inference instead of Ollama |
+| `INFERENCE_URL` | `https://router.huggingface.co/v1`      | Endpoint used when a hosted key is set; any OpenAI-compatible host |
+| `INFERENCE_MODEL` | `Qwen/Qwen2.5-Coder-32B-Instruct`     | Model id sent to `INFERENCE_URL` when hosted inference is on |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
 

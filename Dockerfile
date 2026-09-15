@@ -9,9 +9,10 @@
 # a volume at /root/.ollama, reached over Railway private networking. This API pulls
 # MODEL into it on startup. Scripts and feedback live in Railway Postgres.
 #
-# Set INFERENCE_URL + INFERENCE_KEY (+ INFERENCE_MODEL) to answer from a hosted
-# OpenAI-compatible model instead; the image then never touches Ollama, so the ollama
-# service is optional. See "Hosted inference" in README.md.
+# Set HF_API (a Hugging Face token) to answer from Hugging Face's Inference Providers
+# router instead; the image then never touches Ollama, so the ollama service is optional.
+# INFERENCE_URL / INFERENCE_MODEL point at a different model or endpoint. See "Hosted
+# inference" in README.md.
 FROM python:3.12-slim
 
 # OLLAMA_URL points at the `ollama` service's private hostname by default, so the API

@@ -347,7 +347,7 @@ footer a{color:var(--blue);text-decoration:none}
         var hosted = s.provider === "hosted";
         setChip("api", true, "online");
         setChip("postgres", s.database, s.database ? "connected" : (s.database_error || "not configured"));
-        setChip("ollama", s.ollama || hosted, hosted ? "not used -- hosted inference" : (s.ollama ? "reachable" : (s.error || "unreachable")));
+        setChip("ollama", s.ollama || hosted, hosted ? "not used -- " + (s.provider_label || "hosted inference") : (s.ollama ? "reachable" : (s.error || "unreachable")));
         setChip("model", s.model_ready, s.model + (hosted ? " (hosted)" : (s.model_ready ? " ready" : " pulling")));
         if (s.api_key_required) $("keyPanel").hidden = false;
       })
