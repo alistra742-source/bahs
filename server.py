@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
-import hmac, html, httpx, json, os, threading, time
+import hmac, html, httpx, json, os, threading, time, uuid
 import psycopg
 
 def normalise_ollama_url(raw: str) -> str:
@@ -41,6 +41,13 @@ NUM_CTX = int(os.getenv("NUM_CTX", "2048"))
 # Ollama serves one request per model, so a 5 minute warm-up on a starved container
 # delays the first real request by 5 minutes. Off is the better trade there.
 WARM_MODEL = os.getenv("WARM_MODEL", "on").strip().lower() not in ("0", "off", "false", "no")
+# A generation is a server-side job, so a reader can go quiet for minutes without the
+# answer being lost. That quiet is exactly what proxies and sleeping phones drop, so
+# the stream is punctuated with a heartbeat this often.
+HEARTBEAT = float(os.getenv("HEARTBEAT", "5"))
+# How long a finished job stays readable, so a browser that comes back late can still
+# collect the answer instead of finding nothing.
+JOB_TTL = float(os.getenv("JOB_TTL", "3600"))
 
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
@@ -73,6 +80,74 @@ def release_slot() -> None:
     global _busy_until
     with _busy_lock:
         _busy_until = 0.0
+
+class Job:
+    """One generation, owned by a background thread rather than by the caller.
+
+    A phone that gave up on a slow answer used to take the whole generation with it:
+    the request was the only thing driving Ollama, so nothing was left to read. A job
+    runs to completion on its own thread, keeps every piece it has produced, and any
+    number of readers can attach to it — including one that comes back after the
+    connection dropped, which replays the output from the start and follows along.
+    """
+
+    def __init__(self, prompt: str, payload: dict, note: str):
+        self.id = uuid.uuid4().hex[:12]
+        self.prompt = prompt
+        self.payload = payload
+        self.note = note
+        self.pieces: list = []
+        self.code = ""
+        self.script_id = None
+        self.error = ""
+        self.status = "queued"  # queued -> running -> done | error
+        self.started = time.time()
+        self.finished = 0.0
+        self.cond = threading.Condition()
+
+    def text(self) -> str:
+        return "".join(self.pieces)
+
+    def add(self, piece: str) -> None:
+        with self.cond:
+            self.pieces.append(piece)
+            self.cond.notify_all()
+
+    def finish(self, **fields) -> None:
+        """Publish the outcome and wake every reader waiting on it."""
+        with self.cond:
+            for name, value in fields.items():
+                setattr(self, name, value)
+            if self.status in ("done", "error"):
+                self.finished = self.finished or time.time()
+            self.cond.notify_all()
+
+    def report(self) -> dict:
+        """Where the job stands; what the page shows next to its running timer."""
+        return {
+            "status": self.status,
+            "note": self.note,
+            "elapsed": round((self.finished or time.time()) - self.started, 1),
+            "chars": len(self.text()),
+        }
+
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
+
+def register(job: Job) -> None:
+    """Remember the job so a reader that comes back can still find its own."""
+    with _jobs_lock:
+        _jobs[job.id] = job
+        stale = [jid for jid, j in _jobs.items() if j.finished and time.time() - j.finished > JOB_TTL]
+        for jid in stale:
+            _jobs.pop(jid, None)
+
+def lookup(job_id: str) -> Job:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown or expired job; start a new generation")
+    return job
 
 async def model_loaded() -> bool:
     """Whether Ollama currently holds MODEL in RAM (as opposed to loading it)."""
@@ -300,6 +375,56 @@ def chat_timeout() -> httpx.Timeout:
     """Generous read window: the first token waits on a model load, the rest on CPU."""
     return httpx.Timeout(CHAT_TIMEOUT, connect=10.0)
 
+def ollama_stream(payload: dict):
+    """Yield Ollama's answer a piece at a time, raising what the caller can act on."""
+    with httpx.Client(timeout=chat_timeout(), follow_redirects=True) as c:
+        with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
+            if r.status_code >= 400:
+                detail = r.read().decode("utf-8", "replace").strip()
+                # 404 here almost always means the model is still being pulled.
+                raise HTTPException(503 if r.status_code == 404 else 502,
+                                    f"ollama ({MODEL}) {r.status_code}: {detail or 'no detail'}")
+            for line in r.iter_lines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                except ValueError:
+                    continue
+                if data.get("error"):
+                    raise HTTPException(502, f"ollama ({MODEL}): {data['error']}")
+                piece = (data.get("message") or {}).get("content") or ""
+                if piece:
+                    yield piece
+                if data.get("done"):
+                    return
+
+def run_job(job: Job) -> None:
+    """Produce the script on a thread of its own: no reader, no lost work."""
+    job.finish(status="running")
+    try:
+        for piece in ollama_stream(job.payload):
+            job.add(piece)
+        code = strip_fences(job.text())
+        if not code:
+            job.finish(status="error", error="the model returned nothing; try again")
+            return
+        try:
+            script_id = store_script(job.prompt, code)
+        except HTTPException as e:
+            # The script did arrive, so it is still shown even though it was not stored.
+            job.finish(status="error", error=f"generated, but not saved: {e.detail}", code=code)
+            return
+        job.finish(status="done", code=code, script_id=script_id)
+    except HTTPException as e:
+        job.finish(status="error", error=str(e.detail))
+    except httpx.HTTPError as e:
+        job.finish(status="error", error=ollama_failure(e).detail)
+    except Exception as e:  # a bug here must never leave a reader waiting forever
+        job.finish(status="error", error=f"{e.__class__.__name__}: {e}")
+    finally:
+        release_slot()
+
 def chip(ok: bool, name: str, detail: str) -> str:
     """One status chip on the page. The browser refreshes these from /health."""
     return (
@@ -355,12 +480,46 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
 def frame(payload: dict) -> str:
     return json.dumps(payload) + "\n"
 
-@app.post("/generate/stream")
-async def generate_stream(req: GenReq, _: None = Depends(require_key)):
-    """Same as /generate, but streams the tokens as NDJSON so the page shows progress.
+def job_frames(job: Job):
+    """NDJSON for one reader: everything the job has so far, then each new piece.
 
-    Waiting 100s for a whole answer is what made this feel broken; sending each piece
-    as it is produced means the first line shows up in seconds.
+    Every reader starts at zero, so a browser whose connection died just asks again and
+    rebuilds the same output while the job carries on. The frames in between matter even
+    when there is nothing to report: a stream that goes silent for the minutes a cold
+    model takes is what a proxy or a sleeping phone drops, so the wait is punctuated
+    with heartbeats.
+    """
+    index = 0
+    yield frame({"replay": True, "job": job.id, **job.report()})
+    while True:
+        with job.cond:
+            # Wait only while there is nothing new and the job is still going: a
+            # finished job is handed over at once rather than after a heartbeat.
+            if not job.pieces[index:] and job.status in ("queued", "running"):
+                job.cond.wait(timeout=HEARTBEAT)
+            pieces = job.pieces[index:]
+            index += len(pieces)
+            report = job.report()
+            status, error, code, script_id = job.status, job.error, job.code, job.script_id
+
+        for piece in pieces:
+            yield frame({"t": piece})
+        if status == "error":
+            # Sent with the script when it was generated but could not be stored.
+            yield frame({"error": error, "code": code})
+            return
+        if status == "done":
+            yield frame({"done": True, "id": script_id, "code": code})
+            return
+        if not pieces:
+            yield frame({"beat": True, **report})
+
+@app.post("/generate/stream")
+async def start_stream(req: GenReq, _: None = Depends(require_key)):
+    """Start the generation and hand back its job id immediately.
+
+    Nothing is generated on this request, so it cannot hang and be dropped: the waiting
+    happens on the job's thread, and the page watches /generate/stream/{job} instead.
     """
     try:
         fails = get_failures()
@@ -370,58 +529,20 @@ async def generate_stream(req: GenReq, _: None = Depends(require_key)):
     payload = chat_payload(build_system(fails, examples), req.prompt, req.temperature)
     payload["stream"] = True
     claim_slot()
+    # Say what the wait is for: a cold model load and a stuck request look identical
+    # from the browser otherwise.
+    loaded = await model_loaded()
+    job = Job(req.prompt, payload, "model ready" if loaded else f"loading {MODEL} into RAM")
+    register(job)
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return {"job": job.id, "model": MODEL, "timeout": CHAT_TIMEOUT}
 
-    async def body():
-        chunks = []
-        try:
-            # Say what the wait is for: a cold model load and a stuck request look
-            # identical from the browser otherwise.
-            loaded = await model_loaded()
-            yield frame({"status": "model ready" if loaded else f"loading {MODEL} into RAM"})
-
-            async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
-                async with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
-                    if r.status_code >= 400:
-                        text = (await r.aread()).decode("utf-8", "replace").strip()
-                        # 404 here almost always means the model is still being pulled.
-                        yield frame({"error": f"ollama ({MODEL}) {r.status_code}: {text or 'no detail'}"})
-                        return
-                    async for line in r.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except ValueError:
-                            continue
-                        piece = (data.get("message") or {}).get("content") or ""
-                        if piece:
-                            chunks.append(piece)
-                            yield frame({"t": piece})
-                        if data.get("done"):
-                            break
-        except httpx.TimeoutException:
-            yield frame({"error": f"ollama ({MODEL}) timed out after {CHAT_TIMEOUT:g}s; it may still be loading"})
-            return
-        except httpx.HTTPError as e:
-            yield frame({"error": f"cannot reach ollama at {OLLAMA}: {e.__class__.__name__}"})
-            return
-        finally:
-            release_slot()
-
-        code = strip_fences("".join(chunks))
-        try:
-            script_id = store_script(req.prompt, code)
-        except Exception as e:
-            # Any failure here still gets a frame: a stream that just stops would leave
-            # the page waiting on a script that already arrived.
-            detail = e.detail if isinstance(e, HTTPException) else f"{e.__class__.__name__}: {e}"
-            yield frame({"error": f"generated, but not saved: {detail}"})
-            return
-        # The final frame carries the cleaned code, since the stream included the fences.
-        yield frame({"done": True, "id": script_id, "code": code})
-
+@app.get("/generate/stream/{job_id}")
+async def watch_stream(job_id: str, _: None = Depends(require_key)):
+    """Stream a job's progress. Calling it again after a drop is the whole point."""
+    job = lookup(job_id)
     return StreamingResponse(
-        body(),
+        job_frames(job),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

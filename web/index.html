@@ -91,7 +91,8 @@ footer a{color:var(--blue);text-decoration:none}
   </section>
 
   <footer>
-    <code>GET /health</code> &middot; <code>POST /generate</code> &middot; <code>POST /feedback</code> &middot; <a href="/docs">/docs</a><br>
+    <code>GET /health</code> &middot; <code>POST /generate/stream</code> &middot; <code>POST /feedback</code> &middot; <a href="/docs">/docs</a><br>
+    Generation runs as a server-side job, so a dropped connection reattaches to the answer instead of losing it.<br>
     The Roblox executor client lives in <code>client.lua</code> and calls the same API.
   </footer>
 </div>
@@ -101,10 +102,28 @@ footer a{color:var(--blue);text-decoration:none}
   var $ = function (id) { return document.getElementById(id); };
   var KEY_REQUIRED = document.body.dataset.keyRequired === "true";
   var STORE = "bahs-api-key";
+  // The generation runs as a job on the server, so the id of the one this page is
+  // following is kept here: reloading, or coming back after the connection dropped,
+  // reattaches to the answer that was already being written.
+  var LAST = "bahs-last-job";
+  var currentJob = null;
   var scriptId = null;
   var timer = null;
   var streamed = false;
   var statusText = "";
+  var offset = 0;
+  var startedAt = Date.now();
+
+  function remember(job, prompt) {
+    try { localStorage.setItem(LAST, JSON.stringify({ job: job, prompt: prompt })); } catch (e) {}
+  }
+  function forget() {
+    currentJob = null;
+    try { localStorage.removeItem(LAST); } catch (e) {}
+  }
+  function recall() {
+    try { return JSON.parse(localStorage.getItem(LAST) || "null"); } catch (e) { return null; }
+  }
 
   function readKey() { try { return localStorage.getItem(STORE) || ""; } catch (e) { return ""; } }
   function writeKey(v) { try { v ? localStorage.setItem(STORE, v) : localStorage.removeItem(STORE); } catch (e) {} }
@@ -150,44 +169,110 @@ footer a{color:var(--blue);text-decoration:none}
   }
 
   function startTimer() {
-    var started = Date.now();
+    startedAt = Date.now();
     clearInterval(timer);
     timer = setInterval(function () {
       var parts = [];
       if (statusText) parts.push(statusText);
-      parts.push(Math.round((Date.now() - started) / 1000) + "s");
+      // offset keeps the clock honest across a reattach: it is the job's real age.
+      parts.push(Math.round((offset + Date.now() - startedAt) / 1000) + "s");
       if (streamed) parts.push($("code").textContent.length + " chars");
       var el = $("msg");
       el.className = "msg";
       el.textContent = "generating... " + parts.join(" \u00b7 ");
     }, 250);
-    return started;
   }
 
-  // Returns true once the final frame is handled, so the reader can stop right there
-  // instead of waiting for the socket to close.
-  function handleFrame(line, started) {
+  function elapsedSeconds() {
+    return Math.max(1, Math.round((offset + Date.now() - startedAt) / 1000));
+  }
+
+  // Returns true once the job is over, so the reader can stop right there instead of
+  // waiting for the socket to close.
+  function handleFrame(line) {
     if (!line.trim()) return false;
     var d;
     try { d = JSON.parse(line); } catch (e) { return false; }
-    if (d.status) { statusText = d.status; return false; }
+    if (d.replay) {
+      // Every read starts at the job's beginning, so a reattach rebuilds the output
+      // instead of appending a second copy of it.
+      $("code").textContent = "";
+      streamed = false;
+      offset = (d.elapsed || 0) * 1000;
+      statusText = d.note || d.status || "";
+      return false;
+    }
+    if (d.beat) { statusText = d.note || d.status || statusText; return false; }
     if (d.t) {
       if (!streamed) { $("code").textContent = ""; streamed = true; }
       $("code").textContent += d.t;
     }
     if (d.error) {
-      if (!streamed) $("code").textContent = "-- " + d.error;
+      if (d.code) $("code").textContent = d.code;
+      else if (!streamed) $("code").textContent = "-- " + d.error;
       flash(d.error, true);
+      forget();
+      return true;
     }
     if (d.done) {
       scriptId = d.id;
       $("code").textContent = d.code;
       showFeedbackButtons(true);
-      var secs = Math.max(1, Math.round((Date.now() - started) / 1000));
-      flash("script #" + d.id + " in " + secs + "s -- run it, then mark it works or broken");
+      flash("script #" + d.id + " in " + elapsedSeconds() + "s -- run it, then mark it works or broken");
+      forget();
       return true;
     }
     return false;
+  }
+
+  // One read of a job. Resolves when the job finished, rejects when this read did not
+  // manage to see it through -- a dropped connection is not a failed generation.
+  function read(job) {
+    var finished = false;
+    return fetch("/generate/stream/" + job, { headers: keyHeaders(), cache: "no-store" })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (text) {
+            var detail = "";
+            try { detail = JSON.parse(text).detail || ""; } catch (e) {}
+            var err = new Error(detail || ("HTTP " + res.status));
+            // A 4xx means this job will never be readable: retrying cannot help.
+            err.fatal = res.status < 500;
+            throw err;
+          });
+        }
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        function pump() {
+          return reader.read().then(function (chunk) {
+            if (chunk.done) return;
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (var i = 0; i < lines.length && !finished; i++) finished = handleFrame(lines[i]);
+            if (finished) { reader.cancel(); return; }
+            return pump();
+          });
+        }
+        return pump();
+      });
+  }
+
+  // Follow a job for as long as it takes, reattaching if a read dies part way.
+  async function watch(job) {
+    for (var attempt = 1; ; attempt++) {
+      try {
+        await read(job);
+        return;
+      } catch (e) {
+        // The job is still running on the server, so the answer is not lost -- only
+        // this read is. Only give up when nothing about it can be retried.
+        if (e.fatal || attempt >= 8) throw e;
+        statusText = "connection dropped, reattaching (try " + attempt + ")";
+        await new Promise(function (r) { setTimeout(r, 1000 * attempt); });
+      }
+    }
   }
 
   async function generate() {
@@ -195,12 +280,12 @@ footer a{color:var(--blue);text-decoration:none}
     if (!prompt) { flash("describe what the script should do first", true); return; }
     scriptId = null;
     streamed = false;
-    statusText = "";
+    statusText = "starting";
+    offset = 0;
     showFeedbackButtons(false);
     busy(true);
     $("code").textContent = "-- waiting for the model...";
-    var started = startTimer();
-    var finished = false;
+    startTimer();
 
     try {
       var res = await fetch("/generate/stream", {
@@ -208,34 +293,23 @@ footer a{color:var(--blue);text-decoration:none}
         headers: keyHeaders(),
         body: JSON.stringify({ prompt: prompt, temperature: 0.7 })
       });
-      if (!res.ok) {
-        var text = await res.text();
-        var detail = "";
-        try { detail = JSON.parse(text).detail || ""; } catch (e) {}
-        throw new Error(detail || ("HTTP " + res.status));
-      }
-      var reader = res.body.getReader();
-      var decoder = new TextDecoder();
-      var buffer = "";
-      while (!finished) {
-        var read = await reader.read();
-        if (read.done) break;
-        buffer += decoder.decode(read.value, { stream: true });
-        var lines = buffer.split("\n");
-        buffer = lines.pop();
-        for (var i = 0; i < lines.length && !finished; i++) {
-          finished = handleFrame(lines[i], started);
-        }
-      }
-      if (finished) reader.cancel();
+      var text = await res.text();
+      var data = {};
+      try { data = JSON.parse(text); } catch (e) {}
+      if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+      currentJob = data.job;
+      remember(data.job, prompt);
+      await watch(data.job);
       if (scriptId === null) throw new Error("the stream ended before the script arrived");
     } catch (e) {
       scriptId = null;
+      // Nothing started, so there is nothing on the server to come back to.
+      if (!currentJob) forget();
       var msg = (e && e.message) ? e.message : "request failed";
       if (msg === "Load failed" || msg === "Failed to fetch") {
-        // Safari and Chrome word a dropped connection differently, and it reads like a
-        // crash when really the browser gave up waiting and the API is fine.
-        msg += " -- the browser dropped the connection, usually because the model is slow enough that a phone gave up. Try again.";
+        // Safari and Chrome word a dropped connection differently. The generation
+        // itself survives on the server, so this is a reattach, not a lost script.
+        msg = "the connection dropped before the script arrived. It is still being generated -- reload this page to pick it back up.";
       }
       if (!streamed) $("code").textContent = "-- " + msg;
       flash(msg, true);
@@ -282,6 +356,7 @@ footer a{color:var(--blue);text-decoration:none}
     $("prompt").value = "";
     $("code").textContent = "-- the generated script lands here";
     scriptId = null;
+    forget();
     showFeedbackButtons(false);
   };
   $("works").onclick = function () { feedback(true); };
@@ -300,6 +375,28 @@ footer a{color:var(--blue);text-decoration:none}
 
   poll();
   setInterval(poll, 8000);
+
+  // A phone that dropped the connection can come straight back to the same answer:
+  // the job outlives the request, so reattach and replay it instead of starting over.
+  var last = recall();
+  if (last && last.job) {
+    currentJob = last.job;
+    if (last.prompt && !$("prompt").value) $("prompt").value = last.prompt;
+    busy(true);
+    $("code").textContent = "-- reattaching to the script that was being generated...";
+    statusText = "reattaching";
+    offset = 0;
+    startTimer();
+    watch(last.job)
+      .then(function () {
+        if (scriptId === null) flash("that generation is gone -- press Generate again", true);
+      })
+      .catch(function (e) {
+        forget();
+        flash(e.fatal ? "that generation is gone -- press Generate again" : e.message, true);
+      })
+      .finally(function () { clearInterval(timer); busy(false); });
+  }
 })();
 </script>
 </body>

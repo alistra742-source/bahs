@@ -63,11 +63,31 @@ Inference is CPU-only, so these are what actually decide how long a script takes
 - **Answers are capped.** `MAX_TOKENS` (default `512`) keeps a script from rambling.
 - **The page streams.** It calls `/generate/stream`, so code appears as it is written
   instead of after the whole answer, with a running timer.
+- **A generation outlives its reader.** The answer is produced by a background job, not
+  by the request that asked for it. Generation carries on when the browser goes away,
+  and a page that comes back replays the job from its start instead of starting over.
+- **The stream never goes quiet.** A stream that sends nothing for the minutes a cold
+  model takes is what a proxy or a sleeping phone drops, so the wait is punctuated with
+  a heartbeat frame every `HEARTBEAT` seconds (default `5`).
 - **The prompt is kept small.** The Luau rules are dense and constant, only two past
   examples are reused (truncated to 800 characters), and `NUM_CTX` is `2048` — prompt
   tokens cost the same CPU time as generated ones.
 - **The private network is used.** With no `OLLAMA_URL` set, model traffic never leaves
   Railway; going through the public domain adds a hop and its own timeouts.
+
+### If the page says `Load failed`
+
+That wording comes from the browser, not the API: it gave up on a connection that was
+quiet for too long, which a phone on a slow network does during a cold model load. The
+generation is not lost. Once the page has the job id it reattaches on its own (eight
+tries with a growing back-off) and replays the output from the start, and if the browser
+was closed or reloaded it reattaches from `localStorage` when the page loads again. The
+footer of the page states the same thing, and nothing has to be generated twice.
+
+If a reload still shows nothing to reattach to, the job was not created: check the log
+for the `bahs` service — `409 already generating a script` means the previous generation
+still holds Ollama's only slot, and `401 missing or invalid API key` means the key typed
+into the page does not match `API_KEY` on the service.
 
 ### If nothing appears for minutes
 
@@ -96,9 +116,12 @@ set on **`bahs`**:
 - `MODEL=qwen2.5-coder:7b` — better at Luau, needs several GB of RAM.
 
 A second request while one is generating returns `409 already generating a script`
-rather than queueing behind it and looking hung. If Ollama itself seems stuck, restart
-the `ollama` service: it serves one request per model, and an abandoned request can hold
-that slot until it finishes.
+rather than queueing behind it and looking hung. Because the generation runs on its own
+job, that slot is held for the whole answer even if every reader has gone: a job that is
+still running when you press Generate again is the one thing you cannot start past.
+Check `/health` for the two chips that matter, and give the job time — its age is the
+timer on the page. If Ollama itself seems stuck, restart the `ollama` service: it serves
+one request per model, and an abandoned request can hold that slot until it finishes.
 
 `CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
 
@@ -126,20 +149,26 @@ model name is read. Leave the Ollama service untouched.
 | ------ | ----------- | ---------------------------------------------------------- |
 | GET    | `/`         | The site: type a prompt, get a script, mark it works/broken |
 | GET    | `/health`   | Always `200`; body reports Postgres and Ollama state        |
-| POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`                  |
-| POST   | `/generate/stream` | Same, but streams NDJSON frames while the answer is written |
+| POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`; blocks until the script is ready |
+| POST   | `/generate/stream` | Same body; starts a job and returns `{"job": "ab12..."}` at once  |
+| GET    | `/generate/stream/{job}` | NDJSON frames for that job — `replay`, `beat`, `t`, then `done` or `error`. Open it again after a drop and it replays the job from its start |
 | POST   | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }`           |
 
-Once `API_KEY` is set on the service, `/generate` and `/feedback` require it; `/`,
-`/health` and `/docs` stay open. Scripts and feedback live in Postgres (`scripts`
-table, created on first use).
+Once `API_KEY` is set on the service, `/generate`, `/generate/stream` and `/feedback`
+require it; `/`, `/health` and `/docs` stay open. Scripts and feedback live in Postgres
+(`scripts` table, created on first use). The site is the two-step streaming flow: the
+POST only starts the job, so it can never hang on a slow model, and generation keeps
+going whether or not a browser is still reading it. `client.lua` uses the blocking
+`/generate` and needs no change.
 
 ## Using the site
 
 Open the `bahs` domain, paste the API key if the page asks for it (the field only
-appears when the service requires one), describe the script, and hit **Generate**. Once
-you have run it in the executor, mark it **works** or **broken**: working scripts are
-fed into later prompts as examples, broken ones as mistakes to avoid. The chips in the
+appears when the service requires one), describe the script, and hit **Generate**. The
+script arrives as it is written, and if the connection drops the page reattaches to the
+job that is still running rather than making you wait for a second generation. Once you
+have run it in the executor, mark it **works** or **broken**: working scripts are fed
+into later prompts as examples, broken ones as mistakes to avoid. The chips in the
 header poll `/health`, so the page also tells you whether Postgres, Ollama and the model
 are up.
 
@@ -171,7 +200,9 @@ localStorage and sends it with each request.
 | `MAX_TOKENS`   | `512`                                  | Cap on answer length; shorter answers finish sooner |
 | `NUM_CTX`      | `2048`                                 | Context window; smaller processes faster |
 | `WARM_MODEL`   | `on`                                   | Loads the model at startup; `off` on a container too small to run it |
-| `CHAT_TIMEOUT` | `600`                                  | Seconds to wait for an answer before returning `504` |
+| `CHAT_TIMEOUT` | `600`                                  | Seconds a job waits for its answer before giving up on it |
+| `HEARTBEAT`    | `5`                                    | Seconds of silence between keep-alive frames on `/generate/stream/{job}` |
+| `JOB_TTL`      | `3600`                                 | Seconds a finished job stays readable, so a late page can still reattach |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
 
