@@ -1,0 +1,84 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import httpx, sqlite3, os
+from pathlib import Path
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
+MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
+DB = Path("/data/learning.db")
+
+DB.parent.mkdir(parents=True, exist_ok=True)
+conn = sqlite3.connect(DB, check_same_thread=False)
+conn.execute("""CREATE TABLE IF NOT EXISTS scripts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT,
+    code TEXT,
+    success INTEGER DEFAULT -1,
+    fail_reason TEXT DEFAULT ''
+)""")
+conn.commit()
+
+class GenReq(BaseModel):
+    prompt: str
+    temperature: Optional[float] = 0.7
+
+class FeedbackReq(BaseModel):
+    script_id: int
+    worked: bool
+    notes: Optional[str] = ""
+
+def get_examples(prompt: str, limit: int = 3):
+    keywords = set(prompt.lower().split())
+    rows = conn.execute("SELECT * FROM scripts WHERE success=1 ORDER BY id DESC LIMIT 50").fetchall()
+    scored = sorted(rows, key=lambda r: len(keywords & set(r[1].lower().split())), reverse=True)
+    return [r for r in scored[:limit] if len(keywords & set(r[1].lower().split())) > 0]
+
+def get_failures():
+    return [r[0] for r in conn.execute("SELECT fail_reason FROM scripts WHERE success=0 AND fail_reason!='' ORDER BY id DESC LIMIT 10").fetchall()]
+
+@app.post("/generate")
+async def generate(req: GenReq):
+    system = "You are a Roblox Lua scripting assistant. Output only valid Lua code with no markdown fences, no explanation."
+    fails = get_failures()
+    if fails:
+        system += "\n\nAvoid these mistakes:\n" + "\n".join(f"- {f}" for f in fails)
+    examples = get_examples(req.prompt)
+    if examples:
+        system += "\n\nSuccessful examples:\n"
+        for ex in examples:
+            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2]}\n"
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(f"{OLLAMA}/api/chat", json={
+                "model": MODEL,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": req.prompt}],
+                "stream": False,
+                "options": {"temperature": req.temperature}
+            })
+            r.raise_for_status()
+            code = r.json()["message"]["content"].strip()
+            if code.startswith("```"):
+                lines = code.split("\n")
+                code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+            cur = conn.execute("INSERT INTO scripts (prompt, code) VALUES (?, ?)", (req.prompt, code))
+            conn.commit()
+            return {"id": cur.lastrowid, "code": code}
+    except httpx.HTTPError as e:
+        raise HTTPException(502, str(e))
+
+@app.post("/feedback")
+async def feedback(req: FeedbackReq):
+    conn.execute("UPDATE scripts SET success=?, fail_reason=? WHERE id=?", (1 if req.worked else 0, "" if req.worked else req.notes, req.script_id))
+    conn.commit()
+    return {"status": "ok"}
+
+@app.get("/health")
+async def health():
+    async with httpx.AsyncClient(timeout=5) as c:
+        r = await c.get(f"{OLLAMA}/api/tags")
+        return {"status": "ok", "ollama": r.json()}
