@@ -69,12 +69,27 @@ Inference is CPU-only, so these are what actually decide how long a script takes
 - **The private network is used.** With no `OLLAMA_URL` set, model traffic never leaves
   Railway; going through the public domain adds a hop and its own timeouts.
 
-If a script still takes minutes, that is the Ollama service's CPU: give it more vCPU or
-RAM. `CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
+### If nothing appears for minutes
 
-Want it faster at the cost of quality? Set `MODEL=qwen2.5-coder:1.5b` on `bahs` — the
-model is pulled into the volume automatically like any other. Going the other way,
-`qwen2.5-coder:7b` is noticeably better at Luau and needs several GB of RAM.
+The page reports what it is waiting for — `loading qwen2.5-coder:3b into RAM` or
+`model ready` — next to a running timer and character count, so a cold model load is
+tellable apart from an actual hang.
+
+A 3B model on a small container generates single-digit tokens per second: a 300-token
+script is 30–90s of pure generation, and loading the model costs more once. For the real
+number, open the **`ollama`** service → Logs while a script runs; the `eval time` lines
+report tokens per second. If that is low, the fix is vCPU/RAM on that service
+(Settings → Resources), not the API — or a different model, set on **`bahs`**:
+
+- `MODEL=qwen2.5-coder:1.5b` — much faster, noticeably less capable.
+- `MODEL=qwen2.5-coder:7b` — better at Luau, needs several GB of RAM.
+
+A second request while one is generating returns `409 already generating a script`
+rather than queueing behind it and looking hung. If Ollama itself seems stuck, restart
+the `ollama` service: it serves one request per model, and an abandoned request can hold
+that slot until it finishes.
+
+`CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
 
 ## Model quality
 

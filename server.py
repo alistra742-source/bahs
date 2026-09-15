@@ -49,6 +49,38 @@ def ollama_models() -> list:
     except httpx.HTTPError:
         return []
 
+_busy_until = 0.0
+_busy_lock = threading.Lock()
+
+def claim_slot() -> None:
+    """Refuse a second generation instead of queueing it behind the first.
+
+    Ollama serves one request per model, so an extra request merely waits — which looks
+    exactly like a hang. The claim expires on its own so a dropped stream can never lock
+    the service out permanently.
+    """
+    global _busy_until
+    with _busy_lock:
+        now = time.time()
+        if now < _busy_until:
+            raise HTTPException(409, "already generating a script; wait for that one to finish")
+        _busy_until = now + CHAT_TIMEOUT + 30
+
+def release_slot() -> None:
+    global _busy_until
+    with _busy_lock:
+        _busy_until = 0.0
+
+async def model_loaded() -> bool:
+    """Whether Ollama currently holds MODEL in RAM (as opposed to loading it)."""
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
+            r = await c.get(f"{OLLAMA}/api/ps")
+            r.raise_for_status()
+            return MODEL in [m.get("name") or m.get("model") for m in r.json().get("models", [])]
+    except httpx.HTTPError:
+        return False
+
 def warm_model() -> None:
     """Load the weights once so the first real request is not the slow one.
 
@@ -300,6 +332,7 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
         raise db_unavailable(e)
 
     system = build_system(fails, examples)
+    claim_slot()
     try:
         async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
             r = await c.post(f"{OLLAMA}/api/chat", json=chat_payload(system, req.prompt, req.temperature))
@@ -307,6 +340,8 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
             code = strip_fences(r.json()["message"]["content"])
     except httpx.HTTPError as e:
         raise ollama_failure(e)
+    finally:
+        release_slot()
     return {"id": store_script(req.prompt, code), "code": code}
 
 def frame(payload: dict) -> str:
@@ -326,10 +361,16 @@ async def generate_stream(req: GenReq, _: None = Depends(require_key)):
         raise db_unavailable(e)
     payload = chat_payload(build_system(fails, examples), req.prompt, req.temperature)
     payload["stream"] = True
+    claim_slot()
 
     async def body():
         chunks = []
         try:
+            # Say what the wait is for: a cold model load and a stuck request look
+            # identical from the browser otherwise.
+            loaded = await model_loaded()
+            yield frame({"status": "model ready" if loaded else f"loading {MODEL} into RAM"})
+
             async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
                 async with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
                     if r.status_code >= 400:
@@ -356,6 +397,8 @@ async def generate_stream(req: GenReq, _: None = Depends(require_key)):
         except httpx.HTTPError as e:
             yield frame({"error": f"cannot reach ollama at {OLLAMA}: {e.__class__.__name__}"})
             return
+        finally:
+            release_slot()
 
         code = strip_fences("".join(chunks))
         try:

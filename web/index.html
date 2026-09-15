@@ -104,6 +104,7 @@ footer a{color:var(--blue);text-decoration:none}
   var scriptId = null;
   var timer = null;
   var streamed = false;
+  var statusText = "";
 
   function readKey() { try { return localStorage.getItem(STORE) || ""; } catch (e) { return ""; } }
   function writeKey(v) { try { v ? localStorage.setItem(STORE, v) : localStorage.removeItem(STORE); } catch (e) {} }
@@ -152,9 +153,13 @@ footer a{color:var(--blue);text-decoration:none}
     var started = Date.now();
     clearInterval(timer);
     timer = setInterval(function () {
+      var parts = [];
+      if (statusText) parts.push(statusText);
+      parts.push(Math.round((Date.now() - started) / 1000) + "s");
+      if (streamed) parts.push($("code").textContent.length + " chars");
       var el = $("msg");
       el.className = "msg";
-      el.textContent = "generating... " + Math.round((Date.now() - started) / 1000) + "s";
+      el.textContent = "generating... " + parts.join(" \u00b7 ");
     }, 250);
     return started;
   }
@@ -165,6 +170,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (!line.trim()) return false;
     var d;
     try { d = JSON.parse(line); } catch (e) { return false; }
+    if (d.status) { statusText = d.status; return false; }
     if (d.t) {
       if (!streamed) { $("code").textContent = ""; streamed = true; }
       $("code").textContent += d.t;
@@ -189,6 +195,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (!prompt) { flash("describe what the script should do first", true); return; }
     scriptId = null;
     streamed = false;
+    statusText = "";
     showFeedbackButtons(false);
     busy(true);
     $("code").textContent = "-- waiting for the model...";
