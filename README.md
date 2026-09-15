@@ -25,28 +25,51 @@ learns from feedback, and ships a Roblox executor GUI in [`client.lua`](client.l
 
 ## Railway layout
 
-All three services can deploy from this repository. Each one just needs a different
-Dockerfile path in **Settings → Build → Dockerfile Path** (or `RAILWAY_DOCKERFILE_PATH`):
+The project is **one service**. This container runs its own Ollama server *and* the
+FastAPI app, and the SQLite database lives on the same volume.
 
-| Service  | Dockerfile path   | Volume mount    | Env                                                                 |
-| -------- | ----------------- | --------------- | ------------------------------------------------------------------- |
-| `bahs`   | `Dockerfile`      | `/data`         | — (runs its own Ollama by default)                                   |
-| `ollama` | `Dockerfile.ollama` | `/data`       | optional `MODEL`                                                    |
-| `data`   | *see below*       | —               | —                                                                   |
+| Service | Source             | Dockerfile path | Volume  | Env |
+| ------- | ------------------ | --------------- | ------- | --- |
+| `bahs`  | this repo (`main`) | `Dockerfile`    | `/data` | —   |
 
-If `bahs` is meant to use the separate `ollama` service instead of the bundled one,
-set `OLLAMA_URL=http://ollama.railway.internal:11434` and `START_OLLAMA=0` on `bahs`.
+Delete the `ollama` and `data` services in Railway. Neither can work as configured:
 
-### About the `data` service
+- A Railway volume attaches to exactly **one** service, so a separate `data` service
+  can never share `/data` with `bahs`. The API already creates `/data/learning.db`
+  on the `bahs` volume.
+- `bahs` already starts Ollama itself, so a second Ollama service just duplicates the
+  model weights in RAM.
 
-Railway volumes are attached to **one** service, so a separate `data` service cannot
-share storage with `bahs`. Two valid options:
+If you want scripts and feedback outside the container, replace the `data` service
+with a **Railway PostgreSQL** plugin instead of a Docker image.
 
-1. **Drop the `data` service** and attach its volume to `bahs` at `/data`. The API
-   creates and uses `/data/learning.db` automatically. (Simplest — the app is
-   self-contained.)
-2. **Make `data` a real database** (Railway PostgreSQL) if you want the scripts and
-   feedback to live outside the app container.
+### Why `ollama` / `data` fail with a pull error
+
+```
+The image "docker.io/library/ollama:latest" could not be pulled from the registry.
+```
+
+That message means the service is set to **Deploy from a Docker image** whose name is
+just the service name — it is not building this repository at all (there is no build
+step, only `Initialization → Create container`). Pushing to `main` therefore cannot
+change the result, because no commit is ever checked out.
+
+Fix it on the service itself — **Settings → Source → change from Docker Image to the
+GitHub repo `alistra742-source/bahs`, branch `main`** (then set Dockerfile Path) — or
+simply delete the service as described above.
+
+### Optional: split Ollama into its own service
+
+Only do this on a plan with enough RAM for a dedicated model server.
+
+| Service  | Source             | Dockerfile path     | Volume  | Env              |
+| -------- | ------------------ | ------------------- | ------- | ---------------- |
+| `ollama` | this repo (`main`) | `Dockerfile.ollama` | `/data` | optional `MODEL` |
+
+Then on `bahs` set `OLLAMA_URL=http://ollama.railway.internal:11434` and
+`START_OLLAMA=0` so it uses the remote server instead of its bundled one.
+Alternatively leave the source as a Docker image, but use a real image name:
+`ollama/ollama:latest` (there is no `library/ollama` image on Docker Hub).
 
 ## Local run
 
