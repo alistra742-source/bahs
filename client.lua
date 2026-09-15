@@ -1,6 +1,9 @@
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game:GetService("Players").LocalPlayer
-local API_URL = "https://ollama-production-02e0.up.railway.app"
+-- Public domain of the `bahs` service (Railway -> bahs -> Settings -> Networking
+-- -> Generate Domain). Not the ollama service: the API reaches its model internally
+-- at ollama.railway.internal:11434 and never over a public URL.
+local API_URL = "https://REPLACE-WITH-BAHS-DOMAIN.up.railway.app"
 
 local function generate(prompt)
     local r = request({

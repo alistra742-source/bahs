@@ -1,41 +1,21 @@
-# Combined Ollama + API image: this is the whole app in one service.
+# Ollama model server for the `bahs` project — this is the `ollama` service.
 #
-#   Railway -> this service -> Settings -> Build   -> Dockerfile Path = Dockerfile.ollama
-#   Railway -> this service -> Settings -> Volumes -> one volume at /root/.ollama
-#   Railway -> this service -> Settings -> Variables -> DATABASE_URL (reference Postgres)
+#   Railway -> this service -> Settings -> Source   -> must be the GitHub repo, NOT a Docker Image
+#   Railway -> this service -> Settings -> Build    -> Dockerfile Path = Dockerfile.ollama
+#   Railway -> this service -> Settings -> Volumes  -> one volume at /root/.ollama
 #
-# Ollama listens on loopback only; the FastAPI app is the public surface on $PORT,
-# which is the port Railway's edge proxy routes the service domain to. One service
-# means one volume, and /root/.ollama is the model root Ollama already uses.
+# The `bahs` API service reaches it over private networking at
+# http://ollama.railway.internal:11434, so this service needs no public domain.
 FROM ollama/ollama:latest
 
-ENV PYTHONUNBUFFERED=1 \
-    PORT=8000 \
-    MODEL=qwen2.5-coder:3b \
+ENV OLLAMA_HOST=0.0.0.0:11434 \
     OLLAMA_MODELS=/root/.ollama \
-    OLLAMA_URL=http://127.0.0.1:11434
+    MODEL=qwen2.5-coder:3b
 
-WORKDIR /app
+EXPOSE 11434
 
-# The ollama image is Ubuntu 24.04 with no Python, and its system pip is PEP 668
-# managed, so the API's dependencies live in a venv instead of site-packages.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
- && rm -rf /var/lib/apt/lists/* \
- && python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
-
-ENV PATH=/opt/venv/bin:$PATH
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY server.py .
 COPY entrypoint-ollama.sh /usr/local/bin/entrypoint-ollama.sh
 
-# Only the API port is published; Ollama stays on loopback inside the container.
-EXPOSE 8000
-
-# The base image ships ENTRYPOINT ["/bin/ollama"]; this image runs both processes instead.
+# The base image ships ENTRYPOINT ["/bin/ollama"]; clear it before setting our own CMD.
 ENTRYPOINT []
 CMD ["sh", "/usr/local/bin/entrypoint-ollama.sh"]

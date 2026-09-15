@@ -1,13 +1,19 @@
-# API-only image for the `bahs` project, for a split deployment where Ollama runs
-# in its own service (see Dockerfile.ollama for the combined single-service image,
-# which is what the public site is served from by default).
+# API service for the `bahs` project — this is the `bahs` service.
 #
-# Ollama is reached through OLLAMA_URL, while scripts and feedback live in Railway
-# Postgres (DATABASE_URL). This container holds no state and needs no volume.
+#   Railway -> this service -> Settings -> Source  -> GitHub repo, branch main
+#   Railway -> this service -> Settings -> Build   -> Dockerfile Path = Dockerfile (default)
+#   Railway -> this service -> Settings -> Volumes -> none (it holds no state)
+#   Railway -> this service -> Settings -> Variables -> DATABASE_URL (reference Postgres)
+#
+# Ollama runs in the separate `ollama` service (see Dockerfile.ollama) and is reached
+# over Railway private networking. Scripts and feedback live in Railway Postgres.
 FROM python:3.12-slim
 
+# OLLAMA_URL points at the `ollama` service's private hostname by default, so the API
+# works with no variables set. Override it only if that service is named differently.
 ENV PYTHONUNBUFFERED=1 \
-    PORT=8000
+    PORT=8000 \
+    OLLAMA_URL=http://ollama.railway.internal:11434
 
 WORKDIR /app
 
