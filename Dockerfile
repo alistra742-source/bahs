@@ -5,8 +5,9 @@
 #   Railway -> this service -> Settings -> Volumes -> none (it holds no state)
 #   Railway -> this service -> Settings -> Variables -> DATABASE_URL (reference Postgres)
 #
-# Ollama runs in the separate `ollama` service (see Dockerfile.ollama) and is reached
-# over Railway private networking. Scripts and feedback live in Railway Postgres.
+# Ollama runs as a separate service deployed from the stock `ollama/ollama` image with
+# a volume at /root/.ollama, reached over Railway private networking. This API pulls
+# MODEL into it on startup. Scripts and feedback live in Railway Postgres.
 FROM python:3.12-slim
 
 # OLLAMA_URL points at the `ollama` service's private hostname by default, so the API

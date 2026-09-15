@@ -3,16 +3,62 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
-import html, httpx, os, threading
+from contextlib import asynccontextmanager
+import html, httpx, os, threading, time
 import psycopg
-
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
 # Railway's Postgres plugin injects DATABASE_URL; POSTGRES_URL is the older name.
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
+
+def ollama_models() -> list:
+    """Model names Ollama currently holds, or [] when it cannot be reached."""
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.get(f"{OLLAMA}/api/tags")
+            r.raise_for_status()
+            return [m.get("name", "") for m in r.json().get("models", [])]
+    except httpx.HTTPError:
+        return []
+
+def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
+    """Pull MODEL into the Ollama service while it is missing.
+
+    The Ollama service is the stock `ollama/ollama` image with a volume attached, so
+    nothing pulls the model there. The API is what knows the model name, so it pulls
+    it here; the weights then live in the Ollama service's volume.
+    """
+    for attempt in range(1, attempts + 1):
+        if MODEL in ollama_models():
+            print(f"[model] {MODEL} is in the ollama volume", flush=True)
+            return
+        try:
+            print(f"[model] pulling {MODEL} (attempt {attempt})", flush=True)
+            with httpx.Client(timeout=None) as c:
+                with c.stream("POST", f"{OLLAMA}/api/pull", json={"model": MODEL}) as r:
+                    r.raise_for_status()
+                    for _ in r.iter_lines():
+                        pass
+            print(f"[model] {MODEL} pulled", flush=True)
+            return
+        except httpx.HTTPStatusError as e:
+            # 4xx means Ollama refused it (unknown tag, for example): retrying cannot help.
+            print(f"[model] ollama refused {MODEL}: {e}", flush=True)
+            return
+        except httpx.HTTPError as e:
+            print(f"[model] ollama not ready yet ({e}); retrying in {delay:g}s", flush=True)
+            time.sleep(delay)
+    print(f"[model] gave up on {MODEL}; /generate returns 503 until it is present", flush=True)
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # On a thread so the API answers /health and / while the weights download.
+    threading.Thread(target=ensure_model, daemon=True).start()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS scripts (
     id SERIAL PRIMARY KEY,
