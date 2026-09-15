@@ -1,16 +1,22 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
-import html, httpx, os, threading, time
+from pathlib import Path
+import hmac, html, httpx, os, threading, time
 import psycopg
 
 OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
 # Railway's Postgres plugin injects DATABASE_URL; POSTGRES_URL is the older name.
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
+# When API_KEY is set on the service, /generate and /feedback require it back as the
+# X-API-Key header (or an Authorization: Bearer token). Unset means open, so local runs
+# and a fresh deploy work before the variable exists.
+API_KEY = os.getenv("API_KEY", "")
+INDEX = Path(__file__).parent / "web" / "index.html"
 
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
@@ -59,6 +65,16 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def require_key(x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)) -> None:
+    """Gate the model endpoints when the service defines API_KEY."""
+    if not API_KEY:
+        return
+    supplied = x_api_key or ""
+    if not supplied and authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not hmac.compare_digest(supplied, API_KEY):
+        raise HTTPException(401, "missing or invalid API key (send it as the X-API-Key header)")
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS scripts (
     id SERIAL PRIMARY KEY,
@@ -126,95 +142,39 @@ def get_examples(prompt: str, limit: int = 3):
 def get_failures():
     return [r[0] for r in fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 10")]
 
-# Status page served at / so the service domain shows something useful instead of
-# raw JSON. Placeholders are replaced in root(), which avoids escaping the CSS braces.
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="10">
-<title>bahs - Roblox Lua generator</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box}
-body{margin:0;background:#0b0d12;color:#e6e8ef;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(900px 500px at 12% -10%,rgba(47,129,247,.16),transparent 60%),radial-gradient(700px 420px at 100% 0,rgba(63,185,80,.10),transparent 55%)}
-.wrap{position:relative;max-width:820px;margin:0 auto;padding:56px 24px 64px}
-.brand{display:flex;align-items:center;gap:12px;font-size:26px;font-weight:650;letter-spacing:-.02em}
-.logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,#2f81f7,#3fb950);display:grid;place-items:center;font:600 16px ui-monospace,monospace;color:#0b0d12}
-.sub{margin-top:10px;color:#9aa4b8}
-.sub code,footer code{background:#151a23;border:1px solid #222b38;border-radius:6px;padding:2px 6px;font:12px ui-monospace,monospace;color:#c9d3e4}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:28px 0 8px}
-.card{background:#11151d;border:1px solid #202836;border-radius:12px;padding:14px 16px}
-.card.ok{border-color:#1f4d2c;background:linear-gradient(180deg,#101a14,#11151d)}
-.card.bad{border-color:#4d2420;background:linear-gradient(180deg,#1a1311,#11151d)}
-.row{display:flex;align-items:center;gap:8px}
-.led{width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 10px rgba(63,185,80,.55);flex:none}
-.card.bad .led{background:#f85149;box-shadow:0 0 10px rgba(248,81,73,.55)}
-.name{font:600 13px ui-monospace,monospace;text-transform:uppercase;letter-spacing:.08em;color:#cbd5e5}
-.detail{margin-top:6px;font:12px/1.5 ui-monospace,monospace;color:#8c96ab;overflow-wrap:anywhere}
-h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:#8c96ab;margin:32px 0 12px}
-ul{list-style:none;margin:0;padding:0;border:1px solid #202836;border-radius:12px;overflow:hidden}
-li{display:flex;gap:12px;align-items:baseline;padding:11px 16px;background:#11151d;border-top:1px solid #1a212c}
-li:first-child{border-top:0}
-.verb{font:600 11px ui-monospace,monospace;color:#3fb950;min-width:44px}
-.path{font:12px ui-monospace,monospace;color:#79c0ff;min-width:92px}
-.desc{color:#9aa4b8;font-size:13px}
-pre{margin:0;background:#0e131b;border:1px solid #202836;border-radius:12px;padding:16px;overflow:auto;font:12px/1.7 ui-monospace,monospace;color:#c9d3e4}
-pre .k{color:#79c0ff}
-footer{margin-top:36px;padding-top:18px;border-top:1px solid #1a212c;color:#69738a;font-size:12px}
-footer a{color:#79c0ff;text-decoration:none}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="brand"><span class="logo">b</span> bahs</div>
-  <div class="sub">Roblox Lua generator API &middot; Ollama <code>__MODEL__</code> &middot; __STATUS__</div>
-  <section class="cards">__CARDS__</section>
-  <h2>Endpoints</h2>
-  <ul>
-    <li><span class="verb">GET</span><span class="path">/health</span><span class="desc">Postgres and Ollama status, always 200</span></li>
-    <li><span class="verb">POST</span><span class="path">/generate</span><span class="desc">{"prompt": "...", "temperature": 0.7} &rarr; {"id", "code"}</span></li>
-    <li><span class="verb">POST</span><span class="path">/feedback</span><span class="desc">{"script_id": 1, "worked": true, "notes": ""} feeds later prompts</span></li>
-    <li><span class="verb">GET</span><span class="path">/docs</span><span class="desc">interactive OpenAPI docs</span></li>
-  </ul>
-  <h2>Quickstart</h2>
-  <pre>curl -X POST <span class="k">"$API/generate"</span> -H <span class="k">'Content-Type: application/json'</span> \
-  -d <span class="k">'{"prompt":"kill aura with a toggle key"}'</span></pre>
-  <footer>Live status, refreshes every 10s &middot; send requests from the Roblox executor client in <code>client.lua</code>.</footer>
-</div>
-</body>
-</html>
-"""
-
-def pill(ok: bool, name: str, detail: str) -> str:
+def chip(ok: bool, name: str, detail: str) -> str:
+    """One status chip on the page. The browser refreshes these from /health."""
     return (
-        f'<div class="card {"ok" if ok else "bad"}"><div class="row">'
-        f'<span class="led"></span><span class="name">{name}</span></div>'
-        f'<div class="detail">{html.escape(detail)}</div></div>'
+        f'<div class="chip {"ok" if ok else "bad"}" data-chip="{name}">'
+        f'<span class="led"></span><span class="name">{html.escape(name)}</span>'
+        f'<span class="detail">{html.escape(detail)}</span></div>'
     )
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
     state = await snapshot()
-    cards = "".join([
-        pill(True, "api", "uvicorn online"),
-        pill(state["database"], "postgres", "connected" if state["database"]
-             else str(state.get("database_error", "not configured (add DATABASE_URL)"))),
-        pill(state["ollama"], "ollama", "reachable on loopback" if state["ollama"]
+    chips = "".join([
+        chip(True, "api", "online"),
+        chip(state["database"], "postgres", "connected" if state["database"]
+             else str(state.get("database_error", "not configured"))),
+        chip(state["ollama"], "ollama", "reachable" if state["ollama"]
              else str(state.get("error", "unreachable"))),
-        pill(state["model_ready"], "model", f"{MODEL} ready" if state["model_ready"]
-             else f"{MODEL} pulling or missing"),
+        chip(state["model_ready"], "model", f"{MODEL} ready" if state["model_ready"]
+             else f"{MODEL} pulling"),
     ])
+    try:
+        page = INDEX.read_text(encoding="utf-8")
+    except OSError:
+        # The API stays usable if the static page was not copied into the image.
+        return HTMLResponse("<h1>bahs</h1><p>web/index.html is missing; use /health and /docs.</p>")
     return HTMLResponse(
-        PAGE.replace("__CARDS__", cards)
+        page.replace("__CHIPS__", chips)
             .replace("__MODEL__", html.escape(MODEL))
-            .replace("__STATUS__", html.escape(state["status"]))
+            .replace("__KEY_REQUIRED__", "true" if API_KEY else "false")
     )
 
 @app.post("/generate")
-async def generate(req: GenReq):
+async def generate(req: GenReq, _: None = Depends(require_key)):
     try:
         fails = get_failures()
         examples = get_examples(req.prompt)
@@ -254,7 +214,7 @@ async def generate(req: GenReq):
         raise HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e}")
 
 @app.post("/feedback")
-async def feedback(req: FeedbackReq):
+async def feedback(req: FeedbackReq, _: None = Depends(require_key)):
     try:
         fetchone(
             "UPDATE scripts SET success = %s, fail_reason = %s WHERE id = %s RETURNING id",
@@ -267,7 +227,8 @@ async def feedback(req: FeedbackReq):
 async def snapshot() -> dict:
     # Always reports rather than raising, so the platform healthcheck only depends
     # on the API being up; database and ollama readiness come back in the body.
-    body = {"status": "ok", "database": False, "ollama": False, "model": MODEL, "model_ready": False}
+    body = {"status": "ok", "database": False, "ollama": False, "model": MODEL,
+            "model_ready": False, "api_key_required": bool(API_KEY)}
     try:
         fetchone("SELECT 1")
         body["database"] = True

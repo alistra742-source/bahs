@@ -54,14 +54,41 @@ model name is read. Leave the Ollama service untouched.
 
 ## Endpoints
 
-| Method | Path        | Purpose                                               |
-| ------ | ----------- | ----------------------------------------------------- |
-| GET    | `/`         | Status page (live Postgres / Ollama / model state)     |
-| GET    | `/health`   | Always `200`; body reports Postgres and Ollama state   |
-| POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`             |
-| POST   | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }`      |
+| Method | Path        | Purpose                                                    |
+| ------ | ----------- | ---------------------------------------------------------- |
+| GET    | `/`         | The site: type a prompt, get a script, mark it works/broken |
+| GET    | `/health`   | Always `200`; body reports Postgres and Ollama state        |
+| POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`                  |
+| POST   | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }`           |
 
-Scripts and feedback live in Postgres (`scripts` table, created on first use).
+Once `API_KEY` is set on the service, `/generate` and `/feedback` require it; `/`,
+`/health` and `/docs` stay open. Scripts and feedback live in Postgres (`scripts`
+table, created on first use).
+
+## Using the site
+
+Open the `bahs` domain, paste the API key if the page asks for it (the field only
+appears when the service requires one), describe the script, and hit **Generate**. Once
+you have run it in the executor, mark it **works** or **broken**: working scripts are
+fed into later prompts as examples, broken ones as mistakes to avoid. The chips in the
+header poll `/health`, so the page also tells you whether Postgres, Ollama and the model
+are up.
+
+`client.lua` calls the same endpoints and sends the same key — paste it into `API_KEY`
+near the top of that file.
+
+## API key
+
+Set `API_KEY` on the **`bahs`** service (Settings → Variables) to lock down the model
+endpoints. Callers then send it as a header:
+
+```
+X-API-Key: <the value>            # or: Authorization: Bearer <the value>
+```
+
+With `API_KEY` unset the endpoints are open, which is what a fresh deploy or a local run
+gets. The key is never written into the page: the site stores it in that browser's
+localStorage and sends it with each request.
 
 ## Environment variables
 
@@ -70,6 +97,7 @@ Scripts and feedback live in Postgres (`scripts` table, created on first use).
 | `PORT`         | `8000`                                 | Injected by Railway; the API binds it             |
 | `MODEL`        | `qwen2.5-coder:3b`                     | Pulled by the API into Ollama's volume            |
 | `OLLAMA_URL`   | `http://ollama.railway.internal:11434` | Baked into the `bahs` image; override to move it  |
+| `API_KEY`      | —                                      | When set, `/generate` and `/feedback` need `X-API-Key` |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
 

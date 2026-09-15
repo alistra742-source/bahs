@@ -4,14 +4,26 @@ local LocalPlayer = game:GetService("Players").LocalPlayer
 -- -> Generate Domain). Not the ollama service: the API reaches its model internally
 -- at ollama.railway.internal:11434 and never over a public URL.
 local API_URL = "https://REPLACE-WITH-BAHS-DOMAIN.up.railway.app"
+-- Paste the API_KEY value from the bahs service here. Leave "" if you never set one.
+local API_KEY = ""
+
+-- The API answers 401 without this header when API_KEY is set on the service.
+local function headers()
+    local h = {["Content-Type"] = "application/json"}
+    if API_KEY ~= "" then h["X-API-Key"] = API_KEY end
+    return h
+end
 
 local function generate(prompt)
     local r = request({
         Url = API_URL .. "/generate",
         Method = "POST",
-        Headers = {["Content-Type"] = "application/json"},
+        Headers = headers(),
         Body = HttpService:JSONEncode({prompt = prompt, temperature = 0.7})
     })
+    if r.StatusCode >= 400 then
+        error("API " .. tostring(r.StatusCode) .. ": " .. tostring(r.Body), 0)
+    end
     return HttpService:JSONDecode(r.Body)
 end
 
@@ -19,7 +31,7 @@ local function feedback(id, worked, notes)
     request({
         Url = API_URL .. "/feedback",
         Method = "POST",
-        Headers = {["Content-Type"] = "application/json"},
+        Headers = headers(),
         Body = HttpService:JSONEncode({script_id = id, worked = worked, notes = notes or ""})
     })
 end
