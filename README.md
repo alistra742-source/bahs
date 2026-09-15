@@ -63,11 +63,26 @@ Inference is CPU-only, so these are what actually decide how long a script takes
 - **Answers are capped.** `MAX_TOKENS` (default `512`) keeps a script from rambling.
 - **The page streams.** It calls `/generate/stream`, so code appears as it is written
   instead of after the whole answer, with a running timer.
+- **The prompt is kept small.** The Luau rules are dense and constant, only two past
+  examples are reused (truncated to 800 characters), and `NUM_CTX` is `2048` — prompt
+  tokens cost the same CPU time as generated ones.
 - **The private network is used.** With no `OLLAMA_URL` set, model traffic never leaves
   Railway; going through the public domain adds a hop and its own timeouts.
 
 If a script still takes minutes, that is the Ollama service's CPU: give it more vCPU or
 RAM. `CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
+
+Want it faster at the cost of quality? Set `MODEL=qwen2.5-coder:1.5b` on `bahs` — the
+model is pulled into the volume automatically like any other. Going the other way,
+`qwen2.5-coder:7b` is noticeably better at Luau and needs several GB of RAM.
+
+## Model quality
+
+The system prompt (`RULES` in `server.py`) targets Luau rather than Lua 5.1: `task.*`
+threading, cached services, `:FindFirstChild` guards, `pcall` around yields, connection
+and instance cleanup on toggle, `Humanoid:MoveTo`/`CFrame`/`Raycast`/`TweenService` over
+workarounds, and a keybind toggle for anything that runs continuously. Feedback from the
+**works** / **broken** buttons is appended to it, so the results improve as you use it.
 
 ## Model pull
 
@@ -128,6 +143,7 @@ localStorage and sends it with each request.
 | `API_KEY`      | —                                      | When set, `/generate` and `/feedback` need `X-API-Key` |
 | `KEEP_ALIVE`   | `30m`                                  | How long Ollama holds the model in RAM between requests |
 | `MAX_TOKENS`   | `512`                                  | Cap on answer length; shorter answers finish sooner |
+| `NUM_CTX`      | `2048`                                 | Context window; smaller processes faster |
 | `CHAT_TIMEOUT` | `600`                                  | Seconds to wait for an answer before returning `504` |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |

@@ -35,6 +35,9 @@ INDEX = Path(__file__).parent / "web" / "index.html"
 CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT", "600"))
 KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
+# A smaller context window means less prompt to process on every request, and the
+# rules below plus a couple of examples fit comfortably inside this.
+NUM_CTX = int(os.getenv("NUM_CTX", "2048"))
 
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
@@ -59,7 +62,8 @@ def warm_model() -> None:
                 "messages": [{"role": "user", "content": "hi"}],
                 "stream": False,
                 "keep_alive": KEEP_ALIVE,
-                "options": {"num_predict": 1},
+                # Same context size as real requests, so the cache is ready for them.
+                "options": {"num_predict": 1, "num_ctx": NUM_CTX},
             })
         print(f"[model] {MODEL} warmed and held for {KEEP_ALIVE}", flush=True)
     except httpx.HTTPError as e:
@@ -172,24 +176,43 @@ class FeedbackReq(BaseModel):
     worked: bool
     notes: Optional[str] = ""
 
-def get_examples(prompt: str, limit: int = 3):
+def get_examples(prompt: str, limit: int = 2):
     keywords = set(prompt.lower().split())
     rows = fetchall("SELECT id, prompt, code FROM scripts WHERE success = 1 ORDER BY id DESC LIMIT 50")
     scored = sorted(rows, key=lambda r: len(keywords & set(r[1].lower().split())), reverse=True)
     return [r for r in scored[:limit] if len(keywords & set(r[1].lower().split())) > 0]
 
 def get_failures():
-    return [r[0] for r in fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 10")]
+    return [r[0] for r in fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 5")]
 
-def build_system(prompt: str, fails: list, examples: list) -> str:
-    system = "You are a Roblox Lua scripting assistant. Output only valid Lua code with no markdown fences, no explanation."
+# Dense on purpose: prompt tokens cost as much CPU time as generated ones. The rules
+# stay constant and the examples/mistakes are appended last, so Ollama's prompt cache
+# can reuse the prefix between requests.
+RULES = """You are a senior Roblox Luau developer. Reply with the script only, no prose and no markdown fences.
+
+- Write Luau, not Lua 5.1: task.wait, task.spawn, task.delay. Never wait/spawn/delay.
+- Cache services at the top with game:GetService("..."); never index game.Players style.
+- Guard what can be nil with :FindFirstChild, and give :WaitForChild a timeout.
+- Wrap yielding calls and the risky body of the script in pcall, and check the result.
+- Keep every RunService connection and created Instance in a local, and disconnect or
+  destroy them when the feature is toggled off. Leave nothing leaking.
+- Prefer Humanoid:MoveTo, CFrame, Raycast and TweenService over hacky workarounds.
+- Client-side executor: loadstring, request and getgenv() are available.
+- Continuous features get a keybind toggle via UserInputService.InputBegan, ignoring
+  gameProcessedEvent, and must survive being toggled on and off.
+- Ambiguous request: pick the most common Roblox interpretation and build it.
+- Complete and runnable as-is: no stubs, no "rest of the code here", as short as the
+  feature allows."""
+
+def build_system(fails: list, examples: list) -> str:
+    system = RULES
     if fails:
-        system += "\n\nAvoid these mistakes:\n" + "\n".join(f"- {f}" for f in fails)
+        system += "\n\nWhat went wrong on earlier attempts (do not repeat it):\n" + "\n".join(f"- {f}" for f in fails[:3])
     if examples:
-        system += "\n\nSuccessful examples:\n"
+        system += "\n\nScripts that already worked for this user:\n"
         for ex in examples:
-            # Truncated: every extra token of prompt is time spent on CPU inference.
-            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2][:1500]}\n"
+            # Truncated hard: prompt tokens are seconds on CPU inference.
+            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2][:800]}\n"
     return system
 
 def chat_payload(system: str, prompt: str, temperature: Optional[float]) -> dict:
@@ -198,7 +221,11 @@ def chat_payload(system: str, prompt: str, temperature: Optional[float]) -> dict
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
         "stream": False,
         "keep_alive": KEEP_ALIVE,
-        "options": {"temperature": temperature, "num_predict": MAX_TOKENS},
+        "options": {
+            "temperature": temperature,
+            "num_predict": MAX_TOKENS,
+            "num_ctx": NUM_CTX,
+        },
     }
 
 def strip_fences(code: str) -> str:
@@ -272,7 +299,7 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
     except (psycopg.Error, RuntimeError) as e:
         raise db_unavailable(e)
 
-    system = build_system(req.prompt, fails, examples)
+    system = build_system(fails, examples)
     try:
         async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
             r = await c.post(f"{OLLAMA}/api/chat", json=chat_payload(system, req.prompt, req.temperature))
@@ -297,7 +324,7 @@ async def generate_stream(req: GenReq, _: None = Depends(require_key)):
         examples = get_examples(req.prompt)
     except (psycopg.Error, RuntimeError) as e:
         raise db_unavailable(e)
-    payload = chat_payload(build_system(req.prompt, fails, examples), req.prompt, req.temperature)
+    payload = chat_payload(build_system(fails, examples), req.prompt, req.temperature)
     payload["stream"] = True
 
     async def body():
@@ -333,13 +360,20 @@ async def generate_stream(req: GenReq, _: None = Depends(require_key)):
         code = strip_fences("".join(chunks))
         try:
             script_id = store_script(req.prompt, code)
-        except HTTPException as e:
-            yield frame({"error": f"generated, but not saved: {e.detail}"})
+        except Exception as e:
+            # Any failure here still gets a frame: a stream that just stops would leave
+            # the page waiting on a script that already arrived.
+            detail = e.detail if isinstance(e, HTTPException) else f"{e.__class__.__name__}: {e}"
+            yield frame({"error": f"generated, but not saved: {detail}"})
             return
         # The final frame carries the cleaned code, since the stream included the fences.
         yield frame({"done": True, "id": script_id, "code": code})
 
-    return StreamingResponse(body(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 @app.post("/feedback")
 async def feedback(req: FeedbackReq, _: None = Depends(require_key)):

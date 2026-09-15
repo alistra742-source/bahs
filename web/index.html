@@ -159,10 +159,12 @@ footer a{color:var(--blue);text-decoration:none}
     return started;
   }
 
+  // Returns true once the final frame is handled, so the reader can stop right there
+  // instead of waiting for the socket to close.
   function handleFrame(line, started) {
-    if (!line.trim()) return;
+    if (!line.trim()) return false;
     var d;
-    try { d = JSON.parse(line); } catch (e) { return; }
+    try { d = JSON.parse(line); } catch (e) { return false; }
     if (d.t) {
       if (!streamed) { $("code").textContent = ""; streamed = true; }
       $("code").textContent += d.t;
@@ -175,59 +177,60 @@ footer a{color:var(--blue);text-decoration:none}
       scriptId = d.id;
       $("code").textContent = d.code;
       showFeedbackButtons(true);
-      clearInterval(timer);
       var secs = Math.max(1, Math.round((Date.now() - started) / 1000));
       flash("script #" + d.id + " in " + secs + "s -- run it, then mark it works or broken");
+      return true;
     }
+    return false;
   }
 
-  function generate() {
+  async function generate() {
     var prompt = $("prompt").value.trim();
     if (!prompt) { flash("describe what the script should do first", true); return; }
-    busy(true);
     scriptId = null;
     streamed = false;
     showFeedbackButtons(false);
+    busy(true);
     $("code").textContent = "-- waiting for the model...";
     var started = startTimer();
+    var finished = false;
 
-    fetch("/generate/stream", {
-      method: "POST",
-      headers: keyHeaders(),
-      body: JSON.stringify({ prompt: prompt, temperature: 0.7 })
-    })
-      .then(function (res) {
-        if (!res.ok) {
-          return res.text().then(function (t) {
-            var d;
-            try { d = JSON.parse(t); } catch (e) { d = {}; }
-            throw new Error(d.detail || ("HTTP " + res.status));
-          });
-        }
-        var reader = res.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = "";
-        function pump() {
-          return reader.read().then(function (r) {
-            if (r.done) return;
-            buffer += decoder.decode(r.value, { stream: true });
-            var lines = buffer.split("\n");
-            buffer = lines.pop();
-            lines.forEach(function (line) { handleFrame(line, started); });
-            return pump();
-          });
-        }
-        return pump();
-      })
-      .catch(function (e) {
-        $("code").textContent = "-- " + e.message;
-        scriptId = null;
-        flash(e.message, true);
-      })
-      .then(function () {
-        clearInterval(timer);
-        busy(false);
+    try {
+      var res = await fetch("/generate/stream", {
+        method: "POST",
+        headers: keyHeaders(),
+        body: JSON.stringify({ prompt: prompt, temperature: 0.7 })
       });
+      if (!res.ok) {
+        var text = await res.text();
+        var detail = "";
+        try { detail = JSON.parse(text).detail || ""; } catch (e) {}
+        throw new Error(detail || ("HTTP " + res.status));
+      }
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      while (!finished) {
+        var read = await reader.read();
+        if (read.done) break;
+        buffer += decoder.decode(read.value, { stream: true });
+        var lines = buffer.split("\n");
+        buffer = lines.pop();
+        for (var i = 0; i < lines.length && !finished; i++) {
+          finished = handleFrame(lines[i], started);
+        }
+      }
+      if (finished) reader.cancel();
+      if (scriptId === null) throw new Error("the stream ended before the script arrived");
+    } catch (e) {
+      scriptId = null;
+      if (!streamed) $("code").textContent = "-- " + e.message;
+      flash(e.message, true);
+    } finally {
+      // Runs however the request ended, so the page can never sit stuck generating.
+      clearInterval(timer);
+      busy(false);
+    }
   }
 
   function feedback(worked) {
