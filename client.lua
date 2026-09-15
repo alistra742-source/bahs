@@ -1,8 +1,8 @@
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game:GetService("Players").LocalPlayer
 -- Public domain of the `bahs` service (Railway -> bahs -> Settings -> Networking
--- -> Generate Domain). Not the ollama service: the API reaches its model internally
--- at ollama.railway.internal:11434 and never over a public URL.
+-- -> Generate Domain). The API calls Hugging Face for the model itself, so this URL is
+-- the only one needed anywhere.
 local API_URL = "https://bahs-production-d68f.up.railway.app"
 -- Paste the API_KEY value from the bahs service here. Leave "" if you never set one.
 local API_KEY = ""

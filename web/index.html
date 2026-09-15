@@ -342,13 +342,11 @@ footer a{color:var(--blue);text-decoration:none}
     fetch("/health", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (s) {
-        // "hosted" means the answers come from an inference API rather than the local
-        // Ollama service, so the ollama chip says so instead of claiming it is up.
-        var hosted = s.provider === "hosted";
         setChip("api", true, "online");
         setChip("postgres", s.database, s.database ? "connected" : (s.database_error || "not configured"));
-        setChip("ollama", s.ollama || hosted, hosted ? "not used -- " + (s.provider_label || "hosted inference") : (s.ollama ? "reachable" : (s.error || "unreachable")));
-        setChip("model", s.model_ready, s.model + (hosted ? " (hosted)" : (s.model_ready ? " ready" : " pulling")));
+        // inference is the Hugging Face token: without it there is no model to call.
+        setChip("inference", s.inference, s.inference ? (s.provider_label || "configured") : (s.error || "HF_API is not set"));
+        setChip("model", s.model_ready, s.model + (s.model_ready ? " ready" : " idle"));
         if (s.api_key_required) $("keyPanel").hidden = false;
       })
       .catch(function () { setChip("api", false, "unreachable"); });

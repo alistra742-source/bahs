@@ -8,129 +8,57 @@ from pathlib import Path
 import asyncio, hmac, html, httpx, json, os, threading, time, uuid
 import psycopg
 
-def normalise_ollama_url(raw: str) -> str:
-    """Tidy an OLLAMA_URL: drop trailing slashes and give a bare host a scheme.
-
-    A trailing slash plus our paths produced "//api/tags", which Railway's edge
-    answered with a 307 back to "/api/tags" instead of proxying it, and a bare host
-    (no scheme) is not a URL httpx will touch at all.
-    """
-    url = (raw or "").strip().rstrip("/")
-    if url and "://" not in url:
-        local = url.startswith(("localhost", "127.0.0.1", "0.0.0.0")) or ".railway.internal" in url
-        url = ("http://" if local else "https://") + url
-    return url or "http://localhost:11434"
-
-OLLAMA = normalise_ollama_url(os.getenv("OLLAMA_URL", "http://localhost:11434"))
-MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
 # Railway's Postgres plugin injects DATABASE_URL; POSTGRES_URL is the older name.
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
 # When API_KEY is set on the service, /generate and /feedback require it back as the
 # X-API-Key header (or an Authorization: Bearer token). Unset means open, so local runs
 # and a fresh deploy work before the variable exists.
 API_KEY = os.getenv("API_KEY", "")
-# Hosted inference: the way out of CPU-only inference. A 3B model on a container short
-# of RAM spends ~20 minutes evaluating a prompt before it writes a character, and no
-# API-side change fixes that. With a key present, jobs stream from an OpenAI-compatible
-# /chat/completions endpoint instead and the Ollama service is not touched at all — no
-# pull, no warm-up, no single-slot queue. Without one, Ollama stays the default.
-#
-# Hugging Face's Inference Providers router is the default endpoint, so setting the
-# token alone is enough to switch everything over. Any other compatible endpoint
-# (SambaNova, Groq, OpenRouter, OpenAI) works too: point INFERENCE_URL at it.
+# The model runs on Hugging Face's Inference Providers router: one OpenAI-compatible
+# /chat/completions endpoint in front of hosted models. This service holds no weights,
+# so there is nothing to pull, load, warm or queue behind — that was the whole reason a
+# script used to take minutes. INFERENCE_URL moves it to another compatible provider.
 HF_ROUTER = "https://router.huggingface.co/v1"
 
 def inference_key() -> str:
-    """The hosted key, under whichever name it was put in the service's variables."""
-    for name in ("INFERENCE_KEY", "HF_API", "HF_TOKEN"):
+    """The Hugging Face token, under whichever name it was put in the variables."""
+    for name in ("HF_API", "INFERENCE_KEY", "HF_TOKEN"):
         value = os.getenv(name, "").strip()
         if value:
             return value
     return ""
 
 INFERENCE_KEY = inference_key()
-INFERENCE_URL = os.getenv("INFERENCE_URL", "").strip().rstrip("/") or (HF_ROUTER if INFERENCE_KEY else "")
+INFERENCE_URL = os.getenv("INFERENCE_URL", "").strip().rstrip("/") or HF_ROUTER
 INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct").strip()
-HOSTED = bool(INFERENCE_URL and INFERENCE_KEY)
-
-def active_model() -> str:
-    """The model that answers right now: the hosted one, or the local Ollama."""
-    return INFERENCE_MODEL if HOSTED else MODEL
-
-def endpoint() -> str:
-    """Where inference actually happens, for error messages."""
-    return INFERENCE_URL if HOSTED else OLLAMA
+# Every request needs a token, so without one the API says so plainly instead of
+# sending an empty bearer to Hugging Face and reporting its 401 back to the user.
+CONFIGURED = bool(INFERENCE_KEY)
+NOT_CONFIGURED = ("inference is not configured: set HF_API on this service to a Hugging "
+                  "Face token with the Inference Providers permission")
 
 def provider_label() -> str:
-    """Short name of whatever is answering, for the page's chips."""
-    if not HOSTED:
-        return "ollama"
-    host = INFERENCE_URL.split("//", 1)[-1].split("/", 1)[0]
-    return f"hosted ({host})"
+    """Short name of whoever is answering, for the page's chips."""
+    return INFERENCE_URL.split("//", 1)[-1].split("/", 1)[0]
 
 INDEX = Path(__file__).parent / "web" / "index.html"
-# Inference without a GPU is slow, so the defaults lean on repeated use: the weights
-# stay resident between requests instead of reloading, and answers are length-capped.
+# How long one request may take end to end. A hosted model answers in seconds, so this
+# is only a backstop for a provider that hangs.
 CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT", "600"))
-# A day, not 30 minutes: unloading the weights costs a ~2 GB reload that on a slow
-# container is minutes, and this box runs one model for one user. Ollama still evicts
-# the model by itself if it needs the memory.
-KEEP_ALIVE = os.getenv("KEEP_ALIVE", "24h")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
-# A smaller context window means less prompt to process on every request, and the
-# rules below plus a couple of examples fit comfortably inside this.
-NUM_CTX = int(os.getenv("NUM_CTX", "2048"))
-# Ollama serves one request per model, so a 5 minute warm-up on a starved container
-# delays the first real request by 5 minutes. Off is the better trade there.
-WARM_MODEL = os.getenv("WARM_MODEL", "on").strip().lower() not in ("0", "off", "false", "no")
-# A generation is a server-side job, so a reader can go quiet for minutes without the
-# answer being lost. That quiet is exactly what proxies and sleeping phones drop, so
-# the stream is punctuated with a heartbeat this often.
+# A generation is a server-side job, so a reader can go quiet without the answer being
+# lost. That quiet is exactly what proxies and sleeping phones drop, so the stream is
+# punctuated with a heartbeat this often.
 HEARTBEAT = float(os.getenv("HEARTBEAT", "5"))
 # How long a finished job stays readable, so a browser that comes back late can still
 # collect the answer instead of finding nothing.
 JOB_TTL = float(os.getenv("JOB_TTL", "3600"))
 
-def ollama_models() -> list:
-    """Model names Ollama currently holds, or [] when it cannot be reached."""
-    try:
-        with httpx.Client(timeout=10, follow_redirects=True) as c:
-            r = c.get(f"{OLLAMA}/api/tags")
-            r.raise_for_status()
-            return [m.get("name", "") for m in r.json().get("models", [])]
-    except httpx.HTTPError:
-        return []
-
-_busy_until = 0.0
-_busy_lock = threading.Lock()
-
-def claim_slot() -> None:
-    """Refuse a second generation instead of queueing it behind the first.
-
-    Ollama serves one request per model, so an extra request merely waits — which looks
-    exactly like a hang. The claim expires on its own so a dropped stream can never lock
-    the service out permanently. A hosted endpoint answers in parallel, so nothing is
-    claimed there.
-    """
-    if HOSTED:
-        return
-    global _busy_until
-    with _busy_lock:
-        now = time.time()
-        if now < _busy_until:
-            raise HTTPException(409, "already generating a script; wait for that one to finish")
-        _busy_until = now + CHAT_TIMEOUT + 30
-
-def release_slot() -> None:
-    global _busy_until
-    with _busy_lock:
-        _busy_until = 0.0
-
 class Job:
     """One generation, owned by a background thread rather than by the caller.
 
-    A phone that gave up on a slow answer used to take the whole generation with it:
-    the request was the only thing driving Ollama, so nothing was left to read. A job
+    A phone that gave up on an answer used to take the whole generation with it: the
+    request was the only thing driving the model, so nothing was left to read. A job
     runs to completion on its own thread, keeps every piece it has produced, and any
     number of readers can attach to it — including one that comes back after the
     connection dropped, which replays the output from the start and follows along.
@@ -175,7 +103,7 @@ class Job:
             while self.status not in ("done", "error"):
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    raise HTTPException(504, f"timed out after {timeout:g}s waiting on {endpoint()}")
+                    raise HTTPException(504, f"timed out after {timeout:g}s waiting on {INFERENCE_URL}")
                 self.cond.wait(timeout=remaining)
 
     def report(self) -> dict:
@@ -205,83 +133,13 @@ def lookup(job_id: str) -> Job:
         raise HTTPException(404, "unknown or expired job; start a new generation")
     return job
 
-async def model_loaded() -> bool:
-    """Whether Ollama currently holds MODEL in RAM (as opposed to loading it)."""
-    try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
-            r = await c.get(f"{OLLAMA}/api/ps")
-            r.raise_for_status()
-            return MODEL in [m.get("name") or m.get("model") for m in r.json().get("models", [])]
-    except httpx.HTTPError:
-        return False
-
-def warm_model() -> None:
-    """Load the weights once so the first real request is not the slow one.
-
-    Loading a 3B model is the slowest part of a cold request, so ask for a single
-    token instead of making the first user wait for it. The prompt is the real system
-    prompt, so the same prefix lands in Ollama's prompt cache: the first genuine
-    request after a restart then only has to evaluate its own few words rather than
-    the rules again. On a container too small to run the model at a usable speed this
-    just hogs the single slot, so WARM_MODEL=off skips it.
-    """
-    if not WARM_MODEL:
-        print("[model] warm-up skipped (WARM_MODEL=off)", flush=True)
-        return
-    try:
-        with httpx.Client(timeout=None, follow_redirects=True) as c:
-            c.post(f"{OLLAMA}/api/chat", json={
-                "model": MODEL,
-                "messages": [{"role": "system", "content": RULES},
-                             {"role": "user", "content": "hi"}],
-                "stream": False,
-                "keep_alive": KEEP_ALIVE,
-                # Same context size as real requests, so the cache is ready for them.
-                "options": {"num_predict": 1, "num_ctx": NUM_CTX},
-            })
-        print(f"[model] {MODEL} warmed and held for {KEEP_ALIVE}", flush=True)
-    except httpx.HTTPError as e:
-        print(f"[model] warm-up skipped ({e.__class__.__name__})", flush=True)
-
-def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
-    """Pull MODEL into the Ollama service while it is missing.
-
-    The Ollama service is the stock `ollama/ollama` image with a volume attached, so
-    nothing pulls the model there. The API is what knows the model name, so it pulls
-    it here; the weights then live in the Ollama service's volume.
-    """
-    for attempt in range(1, attempts + 1):
-        if MODEL in ollama_models():
-            print(f"[model] {MODEL} is in the ollama volume", flush=True)
-            warm_model()
-            return
-        try:
-            print(f"[model] pulling {MODEL} (attempt {attempt})", flush=True)
-            with httpx.Client(timeout=None, follow_redirects=True) as c:
-                with c.stream("POST", f"{OLLAMA}/api/pull", json={"model": MODEL}) as r:
-                    r.raise_for_status()
-                    for _ in r.iter_lines():
-                        pass
-            print(f"[model] {MODEL} pulled", flush=True)
-            warm_model()
-            return
-        except httpx.HTTPStatusError as e:
-            # 4xx means Ollama refused it (unknown tag, for example): retrying cannot help.
-            print(f"[model] ollama refused {MODEL}: {e}", flush=True)
-            return
-        except httpx.HTTPError as e:
-            print(f"[model] ollama not ready yet ({e}); retrying in {delay:g}s", flush=True)
-            time.sleep(delay)
-    print(f"[model] gave up on {MODEL}; /generate returns 503 until it is present", flush=True)
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    if HOSTED:
-        # Nothing to pull or warm: the weights are somebody else's problem now.
-        print(f"[model] hosted inference at {INFERENCE_URL} using {INFERENCE_MODEL}", flush=True)
+    # Nothing to load or warm: there are no local weights, only an API call.
+    if CONFIGURED:
+        print(f"[model] inference at {INFERENCE_URL} using {INFERENCE_MODEL}", flush=True)
     else:
-        # On a thread so the API answers /health and / while the weights download.
-        threading.Thread(target=ensure_model, daemon=True).start()
+        print(f"[model] {NOT_CONFIGURED}", flush=True)
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -369,9 +227,8 @@ def get_failures():
     rows = fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 5")
     return [r[0] for r in rows if r[0].strip().lower() != "did not work in the executor"]
 
-# Dense on purpose: prompt tokens cost as much CPU time as generated ones. The rules
-# stay constant and the examples/mistakes are appended last, so Ollama's prompt cache
-# can reuse the prefix between requests.
+# Dense on purpose: the rules are sent with every request, so they are kept tight, and
+# the rules stay constant with the examples/mistakes appended last.
 RULES = """You are a senior Roblox Luau developer. Reply with the script only, no prose and no markdown fences.
 
 - Write Luau, not Lua 5.1: task.wait, task.spawn, task.delay. Never wait/spawn/delay.
@@ -406,19 +263,6 @@ def build_system(fails: list, examples: list) -> str:
         system += f"\n\n{ex[1]}\n{head}"
     return system
 
-def chat_payload(system: str, prompt: str, temperature: Optional[float]) -> dict:
-    return {
-        "model": MODEL,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        "stream": False,
-        "keep_alive": KEEP_ALIVE,
-        "options": {
-            "temperature": temperature,
-            "num_predict": MAX_TOKENS,
-            "num_ctx": NUM_CTX,
-        },
-    }
-
 def strip_fences(code: str) -> str:
     code = code.strip()
     if code.startswith("```"):
@@ -439,49 +283,20 @@ def inference_failure(e: httpx.HTTPError) -> HTTPException:
     httpx timeouts often carry no message at all, so that case is named explicitly
     rather than reported as an empty reason.
     """
-    name, where = active_model(), endpoint()
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
         detail = (e.response.text or str(e) or repr(e))[:300]
-        return HTTPException(503 if code == 404 else 502, f"{name}: {detail}")
+        return HTTPException(503 if code == 404 else 502, f"{INFERENCE_MODEL}: {detail}")
     if isinstance(e, httpx.TimeoutException):
-        return HTTPException(504, f"{name} timed out after {CHAT_TIMEOUT:g}s at {where}")
-    return HTTPException(502, f"cannot reach {where}: {e.__class__.__name__}")
+        return HTTPException(504, f"{INFERENCE_MODEL} timed out after {CHAT_TIMEOUT:g}s at {INFERENCE_URL}")
+    return HTTPException(502, f"cannot reach {INFERENCE_URL}: {e.__class__.__name__}")
 
 def chat_timeout() -> httpx.Timeout:
-    """Generous read window: the first token waits on a model load, the rest on CPU."""
+    """Generous read window: a hosted model answers in seconds, this is a backstop."""
     return httpx.Timeout(CHAT_TIMEOUT, connect=10.0)
 
-def ollama_stream(payload: dict):
-    """Yield Ollama's answer a piece at a time, raising what the caller can act on."""
-    with httpx.Client(timeout=chat_timeout(), follow_redirects=True) as c:
-        with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
-            if r.status_code >= 400:
-                detail = r.read().decode("utf-8", "replace").strip()
-                # 404 here almost always means the model is still being pulled.
-                raise HTTPException(503 if r.status_code == 404 else 502,
-                                    f"ollama ({MODEL}) {r.status_code}: {detail or 'no detail'}")
-            for line in r.iter_lines():
-                if not line.strip():
-                    continue
-                try:
-                    data = json.loads(line)
-                except ValueError:
-                    continue
-                if data.get("error"):
-                    raise HTTPException(502, f"ollama ({MODEL}): {data['error']}")
-                piece = (data.get("message") or {}).get("content") or ""
-                if piece:
-                    yield piece
-                if data.get("done"):
-                    return
-
 def hosted_stream(system: str, prompt: str, temperature: Optional[float]):
-    """Stream from an OpenAI-compatible /chat/completions endpoint.
-
-    Same shape as `ollama_stream`, so the job machinery does not care which provider is
-    behind it; the frames are the same NDJSON either way.
-    """
+    """Stream a Hugging Face (OpenAI-compatible) /chat/completions answer piece by piece."""
     body = {
         "model": INFERENCE_MODEL,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
@@ -513,19 +328,11 @@ def hosted_stream(system: str, prompt: str, temperature: Optional[float]):
                 if piece:
                     yield piece
 
-def answer_stream(system: str, prompt: str, temperature: Optional[float]):
-    """Yield the answer in pieces, from the hosted endpoint when one is configured."""
-    if HOSTED:
-        return hosted_stream(system, prompt, temperature)
-    payload = chat_payload(system, prompt, temperature)
-    payload["stream"] = True
-    return ollama_stream(payload)
-
 def run_job(job: Job) -> None:
     """Produce the script on a thread of its own: no reader, no lost work."""
     job.finish(status="running")
     try:
-        for piece in answer_stream(job.system, job.prompt, job.temperature):
+        for piece in hosted_stream(job.system, job.prompt, job.temperature):
             job.add(piece)
         code = strip_fences(job.text())
         if not code:
@@ -544,8 +351,6 @@ def run_job(job: Job) -> None:
         job.finish(status="error", error=inference_failure(e).detail)
     except Exception as e:  # a bug here must never leave a reader waiting forever
         job.finish(status="error", error=f"{e.__class__.__name__}: {e}")
-    finally:
-        release_slot()
 
 def chip(ok: bool, name: str, detail: str) -> str:
     """One status chip on the page. The browser refreshes these from /health."""
@@ -562,11 +367,10 @@ async def root():
         chip(True, "api", "online"),
         chip(state["database"], "postgres", "connected" if state["database"]
              else str(state.get("database_error", "not configured"))),
-        chip(state["ollama"], "ollama",
-             f"not used -- {provider_label()}" if HOSTED
-             else "reachable" if state["ollama"] else str(state.get("error", "unreachable"))),
-        chip(state["model_ready"], "model", f"{active_model()} ready" if state["model_ready"]
-             else f"{active_model()} pulling"),
+        chip(state["inference"], "inference",
+             provider_label() if state["inference"] else "HF_API is not set"),
+        chip(state["model_ready"], "model", f"{INFERENCE_MODEL} ready" if state["model_ready"]
+             else "waiting for HF_API"),
     ])
     try:
         page = INDEX.read_text(encoding="utf-8")
@@ -575,28 +379,27 @@ async def root():
         return HTMLResponse("<h1>bahs</h1><p>web/index.html is missing; use /health and /docs.</p>")
     return HTMLResponse(
         page.replace("__CHIPS__", chips)
-            .replace("__MODEL__", html.escape(active_model()))
+            .replace("__MODEL__", html.escape(INFERENCE_MODEL))
             .replace("__KEY_REQUIRED__", "true" if API_KEY else "false")
     )
 
 def start_job(prompt: str, temperature: Optional[float], note: str) -> Job:
     """Look up what the model should know, then set the work going on its own thread."""
+    if not CONFIGURED:
+        raise HTTPException(503, NOT_CONFIGURED)
     try:
         fails = get_failures()
         examples = get_examples(prompt)
     except (psycopg.Error, RuntimeError) as e:
         raise db_unavailable(e)
-    claim_slot()
     job = Job(build_system(fails, examples), prompt, temperature, note)
     register(job)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
 
-async def wait_note() -> str:
-    """What the wait is for: a cold model load and a stuck request look identical otherwise."""
-    if HOSTED:
-        return f"{INFERENCE_MODEL} via hosted inference"
-    return "model ready" if await model_loaded() else f"loading {MODEL} into RAM"
+def wait_note() -> str:
+    """What the wait is for: which model is answering, and where."""
+    return f"{INFERENCE_MODEL} via {provider_label()}"
 
 @app.post("/generate")
 async def generate(req: GenReq, _: None = Depends(require_key)):
@@ -605,7 +408,7 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
     It runs the same job the streaming flow runs, so both go through whichever provider
     is configured, and then waits for that job to finish.
     """
-    job = start_job(req.prompt, req.temperature, await wait_note())
+    job = start_job(req.prompt, req.temperature, wait_note())
     await asyncio.to_thread(job.wait, CHAT_TIMEOUT + 30)
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -655,8 +458,8 @@ async def start_stream(req: GenReq, _: None = Depends(require_key)):
     Nothing is generated on this request, so it cannot hang and be dropped: the waiting
     happens on the job's thread, and the page watches /generate/stream/{job} instead.
     """
-    job = start_job(req.prompt, req.temperature, await wait_note())
-    return {"job": job.id, "model": active_model(), "timeout": CHAT_TIMEOUT}
+    job = start_job(req.prompt, req.temperature, wait_note())
+    return {"job": job.id, "model": INFERENCE_MODEL, "timeout": CHAT_TIMEOUT}
 
 @app.get("/generate/stream/{job_id}")
 async def watch_stream(job_id: str, _: None = Depends(require_key)):
@@ -680,32 +483,19 @@ async def feedback(req: FeedbackReq, _: None = Depends(require_key)):
     return {"status": "ok"}
 
 async def snapshot() -> dict:
-    # Always reports rather than raising, so the platform healthcheck only depends
-    # on the API being up; database and ollama readiness come back in the body.
-    body = {"status": "ok", "database": False, "ollama": False, "model": active_model(),
-            "provider": "hosted" if HOSTED else "ollama", "provider_label": provider_label(),
-            "model_ready": False, "api_key_required": bool(API_KEY)}
+    # Always reports rather than raising, so the platform healthcheck only depends on
+    # the API being up; database and inference readiness come back in the body.
+    body = {"status": "ok", "database": False, "model": INFERENCE_MODEL,
+            "inference": CONFIGURED, "provider_label": provider_label(), "endpoint": INFERENCE_URL,
+            "model_ready": CONFIGURED, "api_key_required": bool(API_KEY)}
     try:
         fetchone("SELECT 1")
         body["database"] = True
     except (psycopg.Error, RuntimeError) as e:
         body["database_error"] = str(e)
-    if HOSTED:
-        # Nothing local to pull or hold: the configured endpoint is the whole story.
-        body["ollama"] = True
-        body["model_ready"] = True
-        return body
-    try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
-            r = await c.get(f"{OLLAMA}/api/tags")
-            r.raise_for_status()
-            models = [m.get("name") for m in r.json().get("models", [])]
-            body["ollama"] = True
-            body["models"] = models
-            body["model_ready"] = MODEL in models
-    except httpx.HTTPError as e:
+    if not CONFIGURED:
         body["status"] = "degraded"
-        body["error"] = str(e)
+        body["error"] = NOT_CONFIGURED
     return body
 
 @app.get("/health")
