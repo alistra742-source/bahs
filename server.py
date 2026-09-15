@@ -33,7 +33,10 @@ INDEX = Path(__file__).parent / "web" / "index.html"
 # Inference without a GPU is slow, so the defaults lean on repeated use: the weights
 # stay resident between requests instead of reloading, and answers are length-capped.
 CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT", "600"))
-KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
+# A day, not 30 minutes: unloading the weights costs a ~2 GB reload that on a slow
+# container is minutes, and this box runs one model for one user. Ollama still evicts
+# the model by itself if it needs the memory.
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "24h")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 # A smaller context window means less prompt to process on every request, and the
 # rules below plus a couple of examples fit comfortably inside this.
@@ -163,9 +166,11 @@ def warm_model() -> None:
     """Load the weights once so the first real request is not the slow one.
 
     Loading a 3B model is the slowest part of a cold request, so ask for a single
-    token instead of making the first user wait for it. On a container too small to
-    run the model at a usable speed this just hogs the single slot, so WARM_MODEL=off
-    skips it.
+    token instead of making the first user wait for it. The prompt is the real system
+    prompt, so the same prefix lands in Ollama's prompt cache: the first genuine
+    request after a restart then only has to evaluate its own few words rather than
+    the rules again. On a container too small to run the model at a usable speed this
+    just hogs the single slot, so WARM_MODEL=off skips it.
     """
     if not WARM_MODEL:
         print("[model] warm-up skipped (WARM_MODEL=off)", flush=True)
@@ -174,7 +179,8 @@ def warm_model() -> None:
         with httpx.Client(timeout=None, follow_redirects=True) as c:
             c.post(f"{OLLAMA}/api/chat", json={
                 "model": MODEL,
-                "messages": [{"role": "user", "content": "hi"}],
+                "messages": [{"role": "system", "content": RULES},
+                             {"role": "user", "content": "hi"}],
                 "stream": False,
                 "keep_alive": KEEP_ALIVE,
                 # Same context size as real requests, so the cache is ready for them.
@@ -298,7 +304,13 @@ def get_examples(prompt: str, limit: int = 2):
     return [r for r in scored[:limit] if len(keywords & set(r[1].lower().split())) > 0]
 
 def get_failures():
-    return [r[0] for r in fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 5")]
+    """Notes from scripts marked broken, minus the page's own placeholder note.
+
+    "did not work in the executor" is what the broken button sends with no detail, so
+    it says nothing to the model while still costing prompt tokens.
+    """
+    rows = fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 5")
+    return [r[0] for r in rows if r[0].strip().lower() != "did not work in the executor"]
 
 # Dense on purpose: prompt tokens cost as much CPU time as generated ones. The rules
 # stay constant and the examples/mistakes are appended last, so Ollama's prompt cache
@@ -319,15 +331,22 @@ RULES = """You are a senior Roblox Luau developer. Reply with the script only, n
 - Complete and runnable as-is: no stubs, no "rest of the code here", as short as the
   feature allows."""
 
+# Prompt tokens cost the same CPU time as generated ones, so the optional parts have a
+# hard budget rather than a per-example cap: two examples at 800 characters each was a
+# second copy of the rules being evaluated on every single request.
+EXAMPLE_CHARS = int(os.getenv("EXAMPLE_CHARS", "500"))
+
 def build_system(fails: list, examples: list) -> str:
     system = RULES
     if fails:
-        system += "\n\nWhat went wrong on earlier attempts (do not repeat it):\n" + "\n".join(f"- {f}" for f in fails[:3])
-    if examples:
-        system += "\n\nScripts that already worked for this user:\n"
-        for ex in examples:
-            # Truncated hard: prompt tokens are seconds on CPU inference.
-            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2][:800]}\n"
+        system += "\n\nAvoid:\n" + "\n".join(f"- {f[:120]}" for f in fails[:2])
+    budget = EXAMPLE_CHARS
+    for ex in examples:
+        if budget <= 0:
+            break
+        head = ex[2][:budget]
+        budget -= len(head)
+        system += f"\n\n{ex[1]}\n{head}"
     return system
 
 def chat_payload(system: str, prompt: str, temperature: Optional[float]) -> dict:
