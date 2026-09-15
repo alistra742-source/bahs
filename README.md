@@ -8,42 +8,43 @@ learns from feedback, and ships a Roblox executor GUI in [`client.lua`](client.l
 | Method | Path        | Purpose                                            |
 | ------ | ----------- | -------------------------------------------------- |
 | GET    | `/`         | Service info                                       |
-| GET    | `/health`   | Always `200`; body reports whether Ollama is ready |
+| GET    | `/health`   | Always `200`; body reports Postgres and Ollama state |
 | POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`          |
 | POST   | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }`  |
 
+Scripts and feedback are stored in **Postgres** (`scripts` table, created on first
+use), so the API container is stateless and needs no volume.
+
 ## Environment variables
 
-| Variable          | Default                     | Notes                                             |
-| ----------------- | --------------------------- | ------------------------------------------------- |
-| `PORT`            | `8000`                      | Injected by Railway; the API binds it             |
-| `MODEL`           | `qwen2.5-coder:3b`          | Pulled on first start                             |
-| `OLLAMA_URL`      | `http://localhost:11434`    | Point at the Ollama service when running split    |
-| `OLLAMA_MODELS`   | `/data/ollama`              | Model cache, put it on a volume                   |
-| `DB_PATH`         | `/data/learning.db`         | Falls back to `./learning.db` if `/data` is absent |
-| `START_OLLAMA`    | `1`                         | Set `0` to skip the bundled Ollama server          |
+| Variable       | Default                  | Notes                                                    |
+| -------------- | ------------------------ | -------------------------------------------------------- |
+| `PORT`         | `8000`                   | Injected by Railway; the API binds it                     |
+| `MODEL`        | `qwen2.5-coder:3b`       | Pulled by the `ollama` service, requested by `bahs`       |
+| `OLLAMA_URL`   | `http://localhost:11434` | On Railway: `http://ollama.railway.internal:11434`        |
+| `DATABASE_URL` | —                        | Injected by the Railway Postgres plugin                   |
+| `POSTGRES_URL` | —                        | Older alias, accepted as a fallback for `DATABASE_URL`    |
 
 ## Railway layout
 
-The project is **one service**. This container runs its own Ollama server *and* the
-FastAPI app, and the SQLite database lives on the same volume.
+Three pieces, **one volume total** — the API keeps its data in Postgres and the
+volume on `ollama` covers the model weights.
 
-| Service | Source             | Dockerfile path | Volume  | Env |
-| ------- | ------------------ | --------------- | ------- | --- |
-| `bahs`  | this repo (`main`) | `Dockerfile`    | `/data` | —   |
+| Piece    | Source             | Dockerfile path     | Volume                           | Env |
+| -------- | ------------------ | ------------------- | -------------------------------- | --- |
+| `bahs`   | this repo (`main`) | `Dockerfile`        | none (stateless)                 | `OLLAMA_URL=http://ollama.railway.internal:11434` |
+| `ollama` | this repo (`main`) | `Dockerfile.ollama` | one, mounted at **`/root/.ollama`** | optional `MODEL` |
+| Postgres | Railway plugin     | —                   | —                                | injects `DATABASE_URL` |
 
-Delete the `ollama` and `data` services in Railway. Neither can work as configured:
+Mount the volume at `/root/.ollama`, not `/data`: that is the model root the
+`ollama` image already uses, so no `OLLAMA_MODELS` override is required and the
+weights survive redeploys.
 
-- A Railway volume attaches to exactly **one** service, so a separate `data` service
-  can never share `/data` with `bahs`. The API already creates `/data/learning.db`
-  on the `bahs` volume.
-- `bahs` already starts Ollama itself, so a second Ollama service just duplicates the
-  model weights in RAM.
+Delete any leftover `data` service — the API no longer reads a SQLite file, so it
+has nothing to share. A Railway volume also attaches to exactly one service, which
+is why the database moved to the Postgres plugin instead.
 
-If you want scripts and feedback outside the container, replace the `data` service
-with a **Railway PostgreSQL** plugin instead of a Docker image.
-
-### Why `ollama` / `data` fail with a pull error
+### Why a `data` service used to fail with a pull error
 
 ```
 The image "docker.io/library/ollama:latest" could not be pulled from the registry.
@@ -55,33 +56,26 @@ step, only `Initialization → Create container`). Pushing to `main` therefore c
 change the result, because no commit is ever checked out.
 
 Fix it on the service itself — **Settings → Source → change from Docker Image to the
-GitHub repo `alistra742-source/bahs`, branch `main`** (then set Dockerfile Path) — or
-simply delete the service as described above.
-
-### Optional: split Ollama into its own service
-
-Only do this on a plan with enough RAM for a dedicated model server.
-
-| Service  | Source             | Dockerfile path     | Volume  | Env              |
-| -------- | ------------------ | ------------------- | ------- | ---------------- |
-| `ollama` | this repo (`main`) | `Dockerfile.ollama` | `/data` | optional `MODEL` |
-
-Then on `bahs` set `OLLAMA_URL=http://ollama.railway.internal:11434` and
-`START_OLLAMA=0` so it uses the remote server instead of its bundled one.
-Alternatively leave the source as a Docker image, but use a real image name:
-`ollama/ollama:latest` (there is no `library/ollama` image on Docker Hub).
+GitHub repo `alistra742-source/bahs`, branch `main`** (then set Dockerfile Path to
+`Dockerfile.ollama` for the Ollama service) — or simply delete the service.
 
 ## Local run
+
+Needs a Postgres to point at (any instance works; the `scripts` table is created on
+first request) and an Ollama server:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-OLLAMA_URL=http://localhost:11434 uvicorn server:app --port 8000
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+OLLAMA_URL=http://localhost:11434 \
+uvicorn server:app --port 8000
 ```
 
 The API can be up before the model finishes downloading — `/health` reports
 `"model_ready": false` until the pull completes, and `/generate` returns `503`
-until then.
+until then. `/health` also reports `"database": false` while Postgres is unreachable,
+and `/generate` returns `503` instead of crashing.
 
 > Note: `client.lua` still points at the placeholder `https://your-app.up.railway.app`.
 > Replace it with the real domain of the `bahs` service.

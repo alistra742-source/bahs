@@ -1,11 +1,12 @@
 #!/bin/sh
 # Standalone Ollama server: serves the API and keeps $MODEL pulled in the
-# background. Used with Dockerfile.ollama.
+# background. Used with Dockerfile.ollama, with a volume at /root/.ollama.
 set -eu
 
 MODEL="${MODEL:-qwen2.5-coder:3b}"
 OLLAMA_HOST="${OLLAMA_HOST:-0.0.0.0:11434}"
-OLLAMA_MODELS="${OLLAMA_MODELS:-/data/ollama}"
+# /root/.ollama is the image default; the volume is mounted there.
+OLLAMA_MODELS="${OLLAMA_MODELS:-/root/.ollama}"
 export OLLAMA_HOST OLLAMA_MODELS
 
 echo "[ollama] serving on ${OLLAMA_HOST} (models: ${OLLAMA_MODELS})"

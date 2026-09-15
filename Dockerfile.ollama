@@ -1,17 +1,19 @@
-# Use this Dockerfile for a dedicated Ollama service:
+# Use this Dockerfile for the dedicated Ollama service:
 #   Railway -> service -> Settings -> Build -> Dockerfile Path = Dockerfile.ollama
 # (or set RAILWAY_DOCKERFILE_PATH=Dockerfile.ollama)
-# Mount that service's volume at /data so model weights persist across deploys.
+#
+# Mount that service's only volume at /root/.ollama: it is the model root the
+# ollama image already uses, so no OLLAMA_MODELS override is needed and the
+# model weights persist across redeploys.
 FROM ollama/ollama:latest
 
 ENV OLLAMA_HOST=0.0.0.0:11434 \
-    OLLAMA_MODELS=/data/ollama \
     MODEL=qwen2.5-coder:3b
 
 EXPOSE 11434
 
 COPY entrypoint-ollama.sh /usr/local/bin/entrypoint-ollama.sh
 
-# Base image ships ENTRYPOINT ["/bin/ollama"]; clear it before setting our own CMD.
+# The base image ships ENTRYPOINT [/bin/ollama]; clear it before setting our own CMD.
 ENTRYPOINT []
 CMD ["sh", "/usr/local/bin/entrypoint-ollama.sh"]
