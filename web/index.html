@@ -113,6 +113,9 @@ footer a{color:var(--blue);text-decoration:none}
   var statusText = "";
   var offset = 0;
   var startedAt = Date.now();
+  // The job's own failure, kept because it is the only place the provider's reason is
+  // written down. Without it, a failed job looks like a stream that just stopped.
+  var jobError = "";
 
   function remember(job, prompt) {
     try { localStorage.setItem(LAST, JSON.stringify({ job: job, prompt: prompt })); } catch (e) {}
@@ -132,12 +135,14 @@ footer a{color:var(--blue);text-decoration:none}
   $("key").value = readKey();
 
   var msgTimer = null;
-  function flash(text, bad) {
+  function flash(text, bad, sticky) {
     var el = $("msg");
     el.textContent = text;
     el.className = bad ? "msg bad" : "msg";
     clearTimeout(msgTimer);
-    msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
+    // An error stays on screen: it carries the reason, and 8 seconds is not enough to
+    // read one on a phone.
+    if (!sticky) msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
   }
 
   function keyHeaders() {
@@ -208,9 +213,10 @@ footer a{color:var(--blue);text-decoration:none}
       $("code").textContent += d.t;
     }
     if (d.error) {
+      jobError = d.error;
       if (d.code) $("code").textContent = d.code;
       else if (!streamed) $("code").textContent = "-- " + d.error;
-      flash(d.error, true);
+      flash(d.error, true, true);
       forget();
       return true;
     }
@@ -246,7 +252,13 @@ footer a{color:var(--blue);text-decoration:none}
         var buffer = "";
         function pump() {
           return reader.read().then(function (chunk) {
-            if (chunk.done) return;
+            if (chunk.done) {
+              // Closed without a done or error frame: that is a dropped connection, not
+              // an answer. Rejecting lets watch() reattach and replay instead of
+              // reporting a script that never arrived.
+              if (!finished) throw new Error("the stream ended early");
+              return;
+            }
             buffer += decoder.decode(chunk.value, { stream: true });
             var lines = buffer.split("\n");
             buffer = lines.pop();
@@ -280,6 +292,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (!prompt) { flash("describe what the script should do first", true); return; }
     scriptId = null;
     streamed = false;
+    jobError = "";
     statusText = "starting";
     offset = 0;
     showFeedbackButtons(false);
@@ -300,19 +313,27 @@ footer a{color:var(--blue);text-decoration:none}
       currentJob = data.job;
       remember(data.job, prompt);
       await watch(data.job);
-      if (scriptId === null) throw new Error("the stream ended before the script arrived");
+      if (scriptId === null && !jobError) {
+        throw new Error("the job ended without a script -- see the message above");
+      }
     } catch (e) {
       scriptId = null;
       // Nothing started, so there is nothing on the server to come back to.
       if (!currentJob) forget();
       var msg = (e && e.message) ? e.message : "request failed";
-      if (msg === "Load failed" || msg === "Failed to fetch") {
-        // Safari and Chrome word a dropped connection differently. The generation
-        // itself survives on the server, so this is a reattach, not a lost script.
-        msg = "the connection dropped before the script arrived. It is still being generated -- reload this page to pick it back up.";
+      if (jobError) {
+        // The job said why it failed; this is only what the reader saw, and burying the
+        // provider's message is what made a rejected token look like a hung stream.
+        msg = jobError;
+      } else {
+        if (msg === "Load failed" || msg === "Failed to fetch") {
+          // Safari and Chrome word a dropped connection differently. The generation
+          // itself survives on the server, so this is a reattach, not a lost script.
+          msg = "the connection dropped before the script arrived. It is still being generated -- reload this page to pick it back up.";
+        }
+        if (!streamed) $("code").textContent = "-- " + msg;
+        flash(msg, true, true);
       }
-      if (!streamed) $("code").textContent = "-- " + msg;
-      flash(msg, true);
     } finally {
       // Runs however the request ended, so the page can never sit stuck generating.
       clearInterval(timer);
@@ -344,8 +365,10 @@ footer a{color:var(--blue);text-decoration:none}
       .then(function (s) {
         setChip("api", true, "online");
         setChip("postgres", s.database, s.database ? "connected" : (s.database_error || "not configured"));
-        // inference is the Hugging Face token: without it there is no model to call.
-        setChip("inference", s.inference, s.inference ? (s.provider_label || "configured") : (s.error || "HF_API is not set"));
+        // inference is the Hugging Face token: without it there is no model to call, and
+        // a failed generation is reported here too, since the error frame scrolls away.
+        setChip("inference", s.inference && !s.last_error, s.last_error ||
+          (s.inference ? (s.provider_label || "configured") : (s.error || "HF_API is not set")));
         setChip("model", s.model_ready, s.model + (s.model_ready ? " ready" : " idle"));
         if (s.api_key_required) $("keyPanel").hidden = false;
       })
@@ -390,11 +413,11 @@ footer a{color:var(--blue);text-decoration:none}
     startTimer();
     watch(last.job)
       .then(function () {
-        if (scriptId === null) flash("that generation is gone -- press Generate again", true);
+        if (scriptId === null && !jobError) { flash("that generation is gone -- press Generate again", true, true); }
       })
       .catch(function (e) {
         forget();
-        flash(e.fatal ? "that generation is gone -- press Generate again" : e.message, true);
+        flash(jobError || (e.fatal ? "that generation is gone -- press Generate again" : e.message), true, true);
       })
       .finally(function () { clearInterval(timer); busy(false); });
   }

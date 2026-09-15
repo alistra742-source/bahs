@@ -118,6 +118,20 @@ class Job:
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
+# The last thing that went wrong, so /health (and the page's chip) can report it long
+# after the error frame has scrolled by. Cleared by the next generation that succeeds.
+_last_error = ""
+_last_error_lock = threading.Lock()
+
+def note_error(text: str) -> None:
+    global _last_error
+    with _last_error_lock:
+        _last_error = text[:300]
+
+def last_error() -> str:
+    with _last_error_lock:
+        return _last_error
+
 def register(job: Job) -> None:
     """Remember the job so a reader that comes back can still find its own."""
     with _jobs_lock:
@@ -311,6 +325,12 @@ def hosted_stream(system: str, prompt: str, temperature: Optional[float]):
                 detail = r.read().decode("utf-8", "replace").strip()
                 raise HTTPException(429 if r.status_code == 429 else 502,
                                     f"inference ({INFERENCE_MODEL}) {r.status_code}: {detail or 'no detail'}")
+            if "event-stream" not in r.headers.get("content-type", ""):
+                # Not a stream: either the provider rejected the request with a 200, or it
+                # ignored stream=true and answered in one piece. Reading the body tells us
+                # which; reporting an empty answer would hide the reason.
+                yield from single_response(r.read().decode("utf-8", "replace"))
+                return
             for line in r.iter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -327,6 +347,22 @@ def hosted_stream(system: str, prompt: str, temperature: Optional[float]):
                 piece = ((choices[0].get("delta") or {}).get("content") or "") if choices else ""
                 if piece:
                     yield piece
+
+def single_response(body: str):
+    """Handle a non-streamed answer: use its text, or fail with the provider's reason."""
+    detail = (body or "").strip()
+    try:
+        payload = json.loads(detail)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        choices = payload.get("choices") or []
+        text = ((choices[0].get("message") or {}).get("content") or "") if choices else ""
+        if text:
+            print("[model] provider answered in one piece instead of streaming", flush=True)
+            yield text
+            return
+    raise HTTPException(502, f"inference ({INFERENCE_MODEL}) sent no stream: {detail[:300] or 'empty body'}")
 
 def run_job(job: Job) -> None:
     """Produce the script on a thread of its own: no reader, no lost work."""
@@ -345,11 +381,21 @@ def run_job(job: Job) -> None:
             job.finish(status="error", error=f"generated, but not saved: {e.detail}", code=code)
             return
         job.finish(status="done", code=code, script_id=script_id)
+        note_error("")
+        print(f"[job] {job.id} done in {job.report()['elapsed']:g}s, {len(code)} chars", flush=True)
     except HTTPException as e:
+        # Printed as well as sent: the page shows it once, the log keeps it.
+        print(f"[job] {job.id} failed: {e.detail}", flush=True)
+        note_error(str(e.detail))
         job.finish(status="error", error=str(e.detail))
     except httpx.HTTPError as e:
-        job.finish(status="error", error=inference_failure(e).detail)
+        detail = inference_failure(e).detail
+        print(f"[job] {job.id} failed: {detail}", flush=True)
+        note_error(detail)
+        job.finish(status="error", error=detail)
     except Exception as e:  # a bug here must never leave a reader waiting forever
+        print(f"[job] {job.id} crashed: {e.__class__.__name__}: {e}", flush=True)
+        note_error(f"{e.__class__.__name__}: {e}")
         job.finish(status="error", error=f"{e.__class__.__name__}: {e}")
 
 def chip(ok: bool, name: str, detail: str) -> str:
@@ -394,6 +440,7 @@ def start_job(prompt: str, temperature: Optional[float], note: str) -> Job:
         raise db_unavailable(e)
     job = Job(build_system(fails, examples), prompt, temperature, note)
     register(job)
+    print(f"[job] {job.id} started via {INFERENCE_MODEL}: {prompt.strip()[:60]!r}", flush=True)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
 
@@ -487,7 +534,7 @@ async def snapshot() -> dict:
     # the API being up; database and inference readiness come back in the body.
     body = {"status": "ok", "database": False, "model": INFERENCE_MODEL,
             "inference": CONFIGURED, "provider_label": provider_label(), "endpoint": INFERENCE_URL,
-            "model_ready": CONFIGURED, "api_key_required": bool(API_KEY)}
+            "last_error": last_error(), "model_ready": CONFIGURED, "api_key_required": bool(API_KEY)}
     try:
         fetchone("SELECT 1")
         body["database"] = True
