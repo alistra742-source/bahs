@@ -1,214 +1,112 @@
-# bahs — a bridge to Qwen
+# bahs
 
-This service is a **bridge**. It holds one secret — your Qwen access token — turns
-[`qwen-api`](https://github.com/encryptarun/qwen-api) into endpoints anything can call,
-and exposes them OpenAI-compatible, so the site, `client.lua` and any OpenAI client all
-go through it:
+A bridge to Qwen, and one chat on top of it.
 
 ```
-            chat.qwen.ai                        Railway -> bahs                   callers
-   ┌───────────────────────────┐        ┌───────────────────────────────┐    ┌──────────────────┐
-   │  Qwen web API (no API key)│◀──────▶│  qwen-api proxy (QWEN_URL)    │    │  the site  /     │
-   │  authenticated by the     │        │  OpenAI-compatible /v1/...    │◀──▶│  client.lua      │
-   │  token in your browser    │        │  validates QWEN_TOKEN         │    │  any OpenAI SDK  │
-   └───────────────────────────┘        └───────────────────────────────┘    └──────────────────┘
-                                          ▲ this repo = the bridge
+chat.qwen.ai  <-  qwen-api (OpenAI-shaped)  <-  bahs  <-  the page, client.lua, anything OpenAI
+                                                  ^
+                                      holds QWEN_TOKEN, callers use API_KEY
 ```
 
-Why the extra hop is worth it:
+chat.qwen.ai has no public API. [`qwen-api`](https://github.com/encryptarun/qwen-api) turns
+it into OpenAI-compatible endpoints, but it authenticates with the Qwen *access token* that
+chat.qwen.ai keeps in your browser (`localStorage.token`). That token is the key to a whole
+Qwen account, so it lives in **this** service's variables and never in a page or a Roblox
+script. Callers talk to `bahs` with an API key instead.
 
-- **The Qwen token never leaves the server.** It is the key to a whole Qwen account, so a
-  browser page and a Roblox client must never hold it. Callers authenticate with
-  `API_KEY` instead; the token is only ever put on the request this service makes.
-- **Everything qwen-api does still works** through the bridge: streaming, `thinking_mode`
-  / `reasoning_effort`, web search with citations, tool calling, image/video models, and
-  the hidden continuation metadata that makes follow-up turns continue an existing chat.
-- **Nothing to run.** No weights, no GPU, no volume, no Ollama service, no model size
-  limit — Qwen3.8-Max answers instead of a 3B model on a starved container.
+There is no model here: nothing is pulled, loaded or warmed, and there is no database. The
+conversation lives in the browser and is sent back with every turn.
 
-## What you need to do
+## The flow
 
-### 1. Get your Qwen access token
+1. **Every turn is the whole conversation.** The page keeps the turns -- what you asked and
+   what came back -- and sends them with the next request, so a follow-up is answered in the
+   same chat by a model that can see what it already said. It survives a reload of the page;
+   **new chat** drops it. `client.lua` keeps its own list the same way.
+2. **Every question is addressed.** What you type is sent as `Hy kanha <your question>` --
+   the greeting is applied by the service (and by the page, so the bubble shows exactly what
+   went out) and never doubled. Set `GREETING` to `""` on the service to send messages
+   untouched.
+3. **One model, one mode.** Every generation goes to `QWEN_MODEL` with `thinking_mode:
+   "fast"`, whoever is asking and whatever they asked for.
+4. **A dropped connection is not a lost answer.** A generation is a server-side job, so a
+   phone that gives up reattaches and replays instead of starting over.
 
-Sign in at [chat.qwen.ai](https://chat.qwen.ai), open the browser console (F12 →
-Console), paste this and run it — it copies your token to the clipboard:
+## Endpoints
 
-```js
-(function(){const t=localStorage.getItem("token");if(!t){alert("not logged in");return}navigator.clipboard.writeText(t).then(()=>alert("token copied")).catch(()=>prompt("token:",t))})();
+| Endpoint | What it is |
+| --- | --- |
+| `POST /chat/stream` | `{messages: [{role, content}, ...]}` -> `{job, model, thinking, turns}`. Starts the turn, returns at once |
+| `GET /chat/stream/{job}` | NDJSON for that turn: `{replay}`, `{t}` pieces, `{beat}` heartbeats, then `{done, text}` or `{error}` |
+| `POST /generate` | blocking, no history -- what `client.lua` uses: `{prompt}` -> `{text, code, model}` |
+| `POST /generate/stream` | the same as `/chat/stream`, one prompt, no conversation |
+| `POST /v1/chat/completions` | OpenAI-compatible. The newest user turn gets the greeting, the model and thinking are pinned, everything else (`tools`, `web_search_options`, `reasoning_effort`, `temperature`, `stream`) passes through untouched |
+| `GET /v1/models` | `QWEN_MODEL` first, then whatever else the proxy serves |
+| `GET /health` | bridge, token, model, mode, greeting, and the last failure |
+| `GET /` | the chat page |
+
+An OpenAI client needs two lines changed:
+
+```python
+client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 ```
 
-To check it by hand, from a terminal (or /health on the service does this for you):
+## Setup on Railway
 
-```sh
-curl -X POST https://qwen.aikit.club/validate -H "Content-Type: application/json" \
-  -d '{"token": "YOUR_QWEN_ACCESS_TOKEN"}'
-```
-
-### 2. Put it in the `bahs` service's variables
-
-Railway → the **`bahs`** service → **Variables**:
+`bahs` -> Settings -> Variables:
 
 | Variable | Value |
 | --- | --- |
-| `QWEN_TOKEN` | the token you just copied |
-| `API_KEY` | *recommended*: any password you invent — callers (the page, `client.lua`) must send it. Without it the endpoints are open to anyone who finds the URL |
+| `QWEN_TOKEN` | a Qwen access token: sign in at chat.qwen.ai, DevTools console, `localStorage.token` |
+| `API_KEY` | *recommended* -- any password you invent. Without it, the API is open to whoever finds the URL |
 | `QWEN_MODEL` | optional, default `qwen3.8-max` |
 
-Redeploy. That is the whole setup — the bridge is already built.
+Redeploy. The page should read
+`api online · bridge qwen.aikit.club · token token accepted · model qwen3.8-max ·
+mode fast · Hy kanha`.
 
-### 3. Check it came up
+Then tidy up: delete any `ollama` service and its volume, and delete the Postgres service if
+you made one -- nothing here uses it. `HF_API`, `INFERENCE_*`, `MODEL`, `OLLAMA_URL`,
+`KEEP_ALIVE`, `NUM_CTX`, `WARM_MODEL` and `DATABASE_URL` are all dead now.
 
-Open the `bahs` domain. The header shows five chips; you want:
-
-```
-api online · bridge qwen.aikit.club · token token accepted · model qwen3.8-max
-```
-
-`token rejected` or `cannot reach …` is the one to care about: the first means the token
-is stale or was copied wrong (get a new one and update `QWEN_TOKEN`), the second means
-the proxy is unreachable from Railway.
-
-### 4. Tidy up
-
-- **Delete the `ollama` service and its volume** in Railway if they are still there —
-  nothing in this repo references a local model any more.
-- **Postgres is optional.** Keep the plugin (and `DATABASE_URL`) if you want the page's
-  *works* / *broken* buttons to teach later prompts; without it everything still works and
-  the page says the script was not saved.
-- If you had `HF_API`, `INFERENCE_URL`, `INFERENCE_MODEL`, `MODEL`, `OLLAMA_URL`,
-  `KEEP_ALIVE`, `NUM_CTX` or `WARM_MODEL` on the service, they are ignored — delete them.
-
-### 5. Refresh the token when it expires
-
-Qwen tokens are session tokens and stop working after a while (weeks, not forever). The
-symptom is a `token rejected` chip and a `401` on every generation. Fix = repeat step 1
-and update `QWEN_TOKEN`. Nothing else changes.
-
-## The bridge
-
-### `POST /v1/chat/completions`
-
-OpenAI-shaped, stream or not, with the Qwen token added server-side. Send whatever
-qwen-api accepts: `messages`, `model` (optional — the service default is used if you omit
-it), `temperature`, `max_tokens`, `stream`, `tools`, `web_search_options`,
-`reasoning_effort`, `thinking_mode`.
-
-```sh
-curl -N https://<your-bahs-domain>/v1/chat/completions \
-  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.8-max","stream":true,
-       "messages":[{"role":"user","content":"write a Luau kill aura with a toggle"}]}'
-```
-
-Any OpenAI SDK works — only the base URL and key change:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="https://<your-bahs-domain>/v1", api_key="<API_KEY>")
-print(client.chat.completions.create(
-    model="qwen3.8-max",
-    messages=[{"role": "user", "content": "hi"}],
-).choices[0].message.content)
-```
-
-### `GET /v1/models`
-
-The model ids this bridge can reach, straight from qwen-api. The site's dropdown is built
-from this list.
-
-| Model | Notes |
-| --- | --- |
-| `qwen3.8-max` | default: strongest, thinking, web search, tools |
-| `qwen3-coder-plus` | code-specialised, fastest for Luau |
-| `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus` | cheaper/faster general models |
-| `qwen3.5-omni-plus` | audio + image input |
-| `qwen-image`, `qwen-video` | image and video generation |
-| `qwen-web-dev`, `qwen-full-stack`, `qwen-slides`, `qwen-deep-research` | specialised flows |
-
-### The Luau script flow
-
-The site and `client.lua` use these instead of raw chat, because a real request is
-wrapped in the Luau rules and the answer is stripped of markdown fences:
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/generate` | `{ "prompt": "...", "model": "..." }`; blocks until the script is ready (`client.lua`) |
-| `POST` | `/generate/stream` | same body; starts a job and returns `{"job": "ab12..."}` at once |
-| `GET` | `/generate/stream/{job}` | NDJSON frames for that job — `replay`, `beat`, `t`, then `done` or `error`. Open it again after a drop and it replays from the start |
-| `POST` | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }` |
-| `GET` | `/health` | always `200`; reports the bridge, the token and Postgres |
-| `GET` | `/` | the site |
-| `GET` | `/docs` | interactive API docs |
-
-Feedback is what shapes later prompts: a script marked **works** is reused as an example
-for similar requests, and a **broken** one as a mistake to avoid (both capped by
-`EXAMPLE_CHARS`, so an old answer can never grow a new prompt).
-
-## Errors, and what each one means
-
-| What you see | What it means |
-| --- | --- |
-| `token rejected` chip, `401 QWEN_TOKEN was rejected` | the token is stale or wrong — repeat step 1 and update `QWEN_TOKEN` |
-| `503 the bridge is not configured` | `QWEN_TOKEN` is missing on the service |
-| `404 … is not a model this endpoint serves` | `QWEN_MODEL` isn't served — pick one from `/v1/models` |
-| `429 qwen-api is rate limiting` | too many calls; wait, or use another model |
-| `qwen-api is failing (5xx …)` | the proxy (or the public instance) is down; retry, or point `QWEN_URL` at your own deployment |
-| `401 missing or invalid API key` | the key typed into the page / used by `client.lua` does not match `API_KEY` |
-
-Everything the proxy or Qwen rejects is passed through with its own wording, on the error
-frame, in the chip and in the service log (`[job] <id> failed: …`).
-
-## Long generations, dropped phones
-
-A generation is a **job**, not a request:
-
-- `POST /generate/stream` only *starts* it and returns an id immediately, so the request
-  that asked for the script is never the thing waiting on Qwen.
-- `GET /generate/stream/{job}` streams the output, sends a heartbeat frame every
-  `HEARTBEAT` seconds of silence, and **replays from the start** whenever it is opened
-  again — a dropped connection costs nothing.
-- The page reattaches on its own (with back-off) and, if it was closed entirely, picks
-  the job back up from `localStorage` when it reopens. Jobs stay readable for `JOB_TTL`.
-
-`thinking_mode` is `fast` by default (answer straight away). `auto` or `thinking` makes
-Qwen reason first, and its reasoning arrives as `reasoning_content`, which the script flow
-ignores. Reasoning tokens count towards `MAX_TOKENS`, so raise `MAX_TOKENS` if you turn it
-on.
-
-## Environment variables
+## Other variables
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `QWEN_TOKEN` | — | **required**: Qwen access token from chat.qwen.ai. Also read as `QWEN_API_KEY` or `QWEN_ACCESS_TOKEN` |
-| `QWEN_URL` | `https://qwen.aikit.club/v1` | the qwen-api instance to bridge to (any OpenAI-compatible host) |
-| `QWEN_MODEL` | `qwen3.8-max` | default model; callers can override per request |
-| `QWEN_THINKING` | `fast` | `fast` \| `auto` \| `thinking` |
-| `API_KEY` | — | when set, everything except `/`, `/health` and `/docs` needs `X-API-Key` |
-| `MAX_TOKENS` | `512` | cap on answer length (reasoning included) |
-| `CHAT_TIMEOUT` | `300` | seconds a job waits on Qwen before giving up |
-| `HEARTBEAT` | `5` | seconds of silence between keep-alive frames |
-| `JOB_TTL` | `3600` | seconds a finished job stays readable |
-| `EXAMPLE_CHARS` | `500` | total characters of past scripts allowed in a prompt |
-| `TOKEN_CHECK_TTL` | `60` | how often `/health` may re-validate the token |
-| `DATABASE_URL` | — | optional Postgres; only the feedback memory needs it |
-| `PORT` | `8000` | injected by Railway; the API binds it |
+| `QWEN_URL` | `https://qwen.aikit.club/v1` | point it at your own qwen-api deployment if the public one is rate limited |
+| `QWEN_MODEL` | `qwen3.8-max` | the only model used |
+| `QWEN_THINKING` | `fast` | forced onto every request; reasoning tokens are billed against `MAX_TOKENS` |
+| `GREETING` | `Hy kanha` | put in front of every question; `""` sends it untouched |
+| `MAX_TOKENS` | `1024` | ceiling on one answer |
+| `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry; the newest turns always stay |
+| `HEARTBEAT` | `5` | seconds of quiet before a heartbeat frame |
+| `JOB_TTL` | `3600` | how long a finished answer stays readable |
+| `CHAT_TIMEOUT` | `300` | backstop for a provider that hangs |
 
-## Running it locally
+## Troubleshooting
 
-```sh
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-QWEN_TOKEN=<your token> API_KEY=local uvicorn server:app --port 8000
+| What you see | What it is |
+| --- | --- |
+| `token rejected` chip, `401`s | the Qwen token expired (they last weeks). Copy a fresh one and update `QWEN_TOKEN` |
+| `404 ... is not a model this endpoint serves` | `QWEN_MODEL` is retired; pick the proxy's id from `/v1/models` |
+| `429` | the shared public qwen-api is rate limiting -- deploy your own and set `QWEN_URL` |
+| the answer stops mid-sentence | the phone dropped the connection; reload the page and the job replays |
+| a question never gets an answer | check the chips: the last failure is kept on `bridge` until a generation succeeds, and every failure is printed to the service log as `[job] <id> failed: ...` |
+
+## The in-game client
+
+`client.lua` talks to `/v1/chat/completions`, keeps its own `messages` table so a follow-up
+lands in the same chat, and has **ask**, **execute** (runs a fenced ```lua block from the
+answer), **new chat** and **copy** buttons. Paste your service domain and `API_KEY` at the
+top; leave `API_KEY` empty if you never set one.
+
+## Curl
+
+```bash
+curl -s https://<your-domain>/chat/stream \
+  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"make walkspeed 100"}]}'
+# -> {"job":"...","model":"qwen3.8-max","thinking":"fast","turns":1}
+
+curl -sN https://<your-domain>/chat/stream/<job> -H "X-API-Key: $API_KEY"
 ```
-
-`/` and `/health` report `"database": false` while Postgres is unreachable, and
-generations still work — only feedback is skipped. With no `QWEN_TOKEN`, `/health` reports
-the bridge as degraded and every generation is refused with that reason instead of an
-opaque failure.
-
-## If you would rather host the proxy yourself
-
-`qwen-api` is a Cloudflare Worker; the public instance is shared and rate limited. Deploy
-the repository to your own Workers account and set `QWEN_URL` to its `/v1` (and nothing
-else changes). If your instance also drops the Qwen token into the requests, this bridge
-still works exactly the same — it sends `Authorization: Bearer $QWEN_TOKEN` on every call.

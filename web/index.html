@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>bahs - Roblox Lua generator</title>
+<title>bahs - Qwen chat</title>
 <style>
 :root{color-scheme:dark;--bg:#0b0d12;--panel:#11151d;--line:#202836;--txt:#e6e8ef;--dim:#9aa4b8;--blue:#79c0ff;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(900px 520px at 10% -10%,rgba(47,129,247,.18),transparent 60%),radial-gradient(700px 420px at 100% 0,rgba(63,185,80,.10),transparent 55%)}
-.wrap{position:relative;max-width:860px;margin:0 auto;padding:40px 20px 56px}
+.wrap{position:relative;max-width:880px;margin:0 auto;padding:36px 18px 48px}
 .top{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between}
 .brand{display:flex;align-items:center;gap:12px}
 .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#2f81f7,#3fb950);display:grid;place-items:center;font:700 18px ui-monospace,monospace;color:#0b0d12}
@@ -22,33 +22,41 @@ code{background:#151a23;border:1px solid #222b38;border-radius:6px;padding:1px 5
 .chip.bad .led{background:var(--red);box-shadow:0 0 8px rgba(248,81,73,.6)}
 .chip .name{text-transform:uppercase;letter-spacing:.07em;color:#cbd5e5;font-weight:600}
 .chip .detail{color:var(--dim)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;margin-top:18px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:16px}
 .ph{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}
 label{font-size:13px;font-weight:600;color:#cbd5e5}
 .hint,.msg{color:var(--dim);font:12px ui-monospace,monospace}
 .msg.bad{color:var(--red)}
-textarea,input{width:100%;background:#0e131b;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:12px;font:16px/1.5 ui-monospace,monospace;outline:none}
-textarea{min-height:88px;resize:vertical}
-textarea:focus,input:focus{border-color:#2f81f7}
+input,textarea{width:100%;background:#0e131b;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:12px;font:15px/1.5 ui-monospace,monospace;outline:none}
+textarea{resize:vertical}
+input:focus,textarea:focus{border-color:#2f81f7}
 .keyrow{display:flex;gap:8px}
 .keyrow input{flex:1}
-select{background:#0e131b;border:1px solid var(--line);border-radius:8px;color:#cbd5e5;padding:6px 8px;font:12px ui-monospace,monospace;outline:none}
-select:focus{border-color:#2f81f7}
-.actions{display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap}
 button{border:1px solid transparent;border-radius:10px;padding:11px 18px;font:600 14px inherit;cursor:pointer;color:#fff}
 button:disabled{opacity:.55;cursor:default}
 .primary{background:linear-gradient(135deg,#2f81f7,#1f6feb)}
 .ghost{background:#151a23;border-color:var(--line);color:#c9d3e4}
-.good{background:#1f6f34}
-.bad{background:#8c2b26}
-.outactions{display:flex;gap:8px}
-.outactions button{padding:7px 13px;font-size:13px}
-pre{margin:0;background:#0e131b;border:1px solid var(--line);border-radius:10px;padding:14px;max-height:48vh;overflow:auto;font:12.5px/1.65 ui-monospace,monospace;color:#9fe0a5;white-space:pre-wrap;overflow-wrap:anywhere}
-footer{margin-top:26px;color:#69738a;font-size:12px;line-height:2}
+.mini{background:#151a23;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:2px 8px;font:11px ui-monospace,monospace}
+.log{height:min(58vh,560px);min-height:300px;overflow:auto;background:#0e131b;border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px}
+.turn{max-width:90%;border-radius:12px;padding:9px 12px;border:1px solid var(--line);background:#131822}
+.turn .meta{display:flex;gap:10px;align-items:center;margin-bottom:5px;font:11px ui-monospace,monospace;color:var(--dim)}
+.turn .body{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.62 ui-monospace,monospace}
+.turn.user{align-self:flex-end;background:#16233a;border-color:#26374f}
+.turn.user .body{color:#dbe6f7}
+.turn.bot{align-self:flex-start;background:#101720}
+.turn.bot .body{color:#cfe9d4}
+.turn.pending .body{color:var(--dim)}
+.turn.err{background:#1d1214;border-color:#8c2b26}
+.turn.err .body{color:#ffb4ae}
+.note{align-self:center;font:11px ui-monospace,monospace;color:var(--dim);background:#12161f;border:1px dashed var(--line);border-radius:999px;padding:4px 12px;max-width:100%}
+.composer{display:flex;gap:10px;align-items:flex-end;margin-top:12px}
+.composer textarea{min-height:56px;max-height:180px}
+.composer button{flex:none;height:44px}
+footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-key-required="__KEY_REQUIRED__">
+<body data-model="__MODEL__" data-key-required="__KEY_REQUIRED__" data-greeting="__GREETING__">
 <div class="wrap">
 
   <div class="top">
@@ -56,7 +64,7 @@ footer a{color:var(--blue);text-decoration:none}
       <span class="logo">b</span>
       <div>
         <div class="ttl">bahs</div>
-        <div class="sub">Roblox Lua generator on Qwen &middot; bridged by this service</div>
+        <div class="sub">Qwen chat &middot; every question goes out as "__GREETING__ ..."</div>
       </div>
     </div>
     <div class="chips" id="chips">__CHIPS__</div>
@@ -72,118 +80,65 @@ footer a{color:var(--blue);text-decoration:none}
 
   <section class="panel">
     <div class="ph">
-      <label for="prompt">What should the script do?</label>
-      <span class="hint"><select id="model" title="QWEN_MODEL on the service"></select> &middot; Ctrl / Cmd + Enter</span>
-    </div>
-    <textarea id="prompt" placeholder="kill aura with a toggle key&#10;walkspeed toggle bound to F&#10;teleport to nearest player"></textarea>
-    <div class="actions">
-      <button class="primary" id="go">Generate</button>
-      <button class="ghost" id="clear">clear</button>
-      <span class="msg" id="msg"></span>
-    </div>
-  </section>
-
-  <section class="panel">
-    <div class="ph">
-      <label>Output</label>
-      <div class="outactions">
-        <button class="ghost" id="copy" hidden>copy</button>
-        <button class="good" id="works" hidden>works</button>
-        <button class="bad" id="broken" hidden>broken</button>
+      <label>Chat</label>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="hint" id="turns">one conversation, kept in this browser</span>
+        <button class="ghost" id="newChat">new chat</button>
       </div>
     </div>
-    <pre id="code">-- the generated script lands here, then tell it whether it worked so later prompts get better</pre>
+    <div class="log" id="log"></div>
+    <div class="composer">
+      <textarea id="prompt" rows="2" placeholder="type your question - it is sent as &quot;__GREETING__ ...&quot;&#10;Ctrl / Cmd + Enter to send"></textarea>
+      <button class="primary" id="send">Send</button>
+    </div>
+    <div class="msg" id="msg"></div>
   </section>
 
   <footer>
-    <code>POST /v1/chat/completions</code> &middot; <code>GET /v1/models</code> &middot; <code>POST /generate/stream</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
-    This service is a bridge: the Qwen token stays in its variables, and callers use the API key above.<br>
-    Generation runs as a server-side job, so a dropped connection reattaches instead of losing the answer.<br>
-    The Roblox executor client lives in <code>client.lua</code> and calls the same API.
+    <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
+    Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
+    Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code> with thinking off.<br>
+    The Qwen token stays in this service's variables; callers use the API key above.
   </footer>
 </div>
 
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
-  var KEY_REQUIRED = document.body.dataset.keyRequired === "true";
+  var BODY = document.body;
+  var KEY_REQUIRED = BODY.dataset.keyRequired === "true";
+  var MODEL = BODY.dataset.model || "";
+  var GREETING = BODY.dataset.greeting || "";
+
   var STORE = "bahs-api-key";
-  // The generation runs as a job on the server, so the id of the one this page is
-  // following is kept here: reloading, or coming back after the connection dropped,
-  // reattaches to the answer that was already being written.
-  var LAST = "bahs-last-job";
-  var currentJob = null;
-  var scriptId = null;
-  var timer = null;
-  var streamed = false;
+  // The whole conversation lives in the browser: what was asked and what was answered.
+  // Every turn is sent with it, which is what makes the model answer inside the same chat
+  // instead of starting over, and it survives a reload of this page.
+  var CHAT = "bahs-chat";
+
+  var chat = loadChat();
+  var sending = false;      // a turn is in flight
+  var pending = null;       // the bubble the arriving answer goes into
+  var jobError = "";        // the job's own failure, the only place the reason is written
   var statusText = "";
   var offset = 0;
-  var startedAt = Date.now();
-  // The job's own failure, kept because it is the only place the provider's reason is
-  // written down. Without it, a failed job looks like a stream that just stopped.
-  var jobError = "";
-  // The model comes from the service (QWEN_MODEL); the list of what else Qwen offers is
-  // read from this service's /v1/models once the key is known.
-  var DEFAULT_MODEL = document.body.dataset.model || "";
-  var MODEL_STORE = "bahs-model";
+  var startedAt = 0;
+  var timer = null;
+  var streamed = false;
 
-  function savedModel() { try { return localStorage.getItem(MODEL_STORE) || ""; } catch (e) { return ""; } }
-
-  // One option per model, the service default first and the saved choice selected.
-  function fillModels(ids) {
-    var sel = $("model");
-    var want = savedModel() || DEFAULT_MODEL;
-    var seen = [];
-    sel.textContent = "";
-    (ids || []).concat([DEFAULT_MODEL]).forEach(function (id) {
-      if (id && seen.indexOf(id) === -1) seen.push(id);
-    });
-    seen.forEach(function (id) {
-      var opt = document.createElement("option");
-      opt.value = id;
-      opt.textContent = id;
-      sel.appendChild(opt);
-    });
-    if (seen.indexOf(want) !== -1) sel.value = want;
+  function loadChat() {
+    var empty = { messages: [], job: null };
+    try {
+      var raw = JSON.parse(localStorage.getItem(CHAT) || "null");
+      if (!raw || !Array.isArray(raw.messages)) return empty;
+      return { messages: raw.messages, job: raw.job || null };
+    } catch (e) { return empty; }
   }
-
-  function loadModels() {
-    fetch("/v1/models", { headers: keyHeaders(), cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        if (!d || !d.data) return;
-        fillModels(d.data.map(function (m) { return m.id; }));
-      })
-      .catch(function () {});
+  function save() {
+    try { localStorage.setItem(CHAT, JSON.stringify(chat)); } catch (e) {}
   }
-
-  function remember(job, prompt) {
-    try { localStorage.setItem(LAST, JSON.stringify({ job: job, prompt: prompt })); } catch (e) {}
-  }
-  function forget() {
-    currentJob = null;
-    try { localStorage.removeItem(LAST); } catch (e) {}
-  }
-  function recall() {
-    try { return JSON.parse(localStorage.getItem(LAST) || "null"); } catch (e) { return null; }
-  }
-
   function readKey() { try { return localStorage.getItem(STORE) || ""; } catch (e) { return ""; } }
   function writeKey(v) { try { v ? localStorage.setItem(STORE, v) : localStorage.removeItem(STORE); } catch (e) {} }
-
-  if (KEY_REQUIRED) $("keyPanel").hidden = false;
-  $("key").value = readKey();
-
-  var msgTimer = null;
-  function flash(text, bad, sticky) {
-    var el = $("msg");
-    el.textContent = text;
-    el.className = bad ? "msg bad" : "msg";
-    clearTimeout(msgTimer);
-    // An error stays on screen: it carries the reason, and 8 seconds is not enough to
-    // read one on a phone.
-    if (!sticky) msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
-  }
 
   function keyHeaders() {
     var headers = { "Content-Type": "application/json" };
@@ -192,25 +147,121 @@ footer a{color:var(--blue);text-decoration:none}
     return headers;
   }
 
-  function api(path, body) {
-    return fetch(path, { method: "POST", headers: keyHeaders(), body: JSON.stringify(body) })
-      .then(function (r) {
-        return r.text().then(function (text) {
-          var data;
-          try { data = JSON.parse(text); } catch (e) { data = { detail: text.slice(0, 300) }; }
-          if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
-          return data;
-        });
+  function api(path, body, method) {
+    return fetch(path, {
+      method: method || "POST",
+      headers: keyHeaders(),
+      cache: "no-store",
+      body: body === undefined ? undefined : JSON.stringify(body)
+    }).then(function (r) {
+      return r.text().then(function (text) {
+        var data;
+        try { data = JSON.parse(text); } catch (e) { data = { detail: text.slice(0, 300) }; }
+        if (!r.ok) throw new Error(data.detail || (r.status === 401 ? "API key rejected" : "HTTP " + r.status));
+        return data;
       });
+    });
+  }
+
+  var msgTimer = null;
+  function flash(text, bad, sticky) {
+    var el = $("msg");
+    el.textContent = text;
+    el.className = bad ? "msg bad" : "msg";
+    clearTimeout(msgTimer);
+    // An error stays on screen: it carries the reason, and a few seconds is not enough
+    // to read one on a phone.
+    if (!sticky) msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
+  }
+
+  function bodyOf(el) { return el.querySelector(".body"); }
+
+  function turnEl(role, text) {
+    var el = document.createElement("div");
+    el.className = "turn " + (role === "user" ? "user" : "bot");
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    var who = document.createElement("span");
+    who.textContent = role === "user" ? "you" : "kanha";
+    meta.appendChild(who);
+    var copy = document.createElement("button");
+    copy.className = "mini";
+    copy.textContent = "copy";
+    copy.onclick = function () {
+      var text = bodyOf(el).textContent;
+      navigator.clipboard.writeText(text).then(function () {
+        copy.textContent = "copied";
+        setTimeout(function () { copy.textContent = "copy"; }, 1200);
+      });
+    };
+    meta.appendChild(copy);
+    el.appendChild(meta);
+    var body = document.createElement("div");
+    body.className = "body";
+    body.textContent = text || "";
+    el.appendChild(body);
+    return el;
+  }
+
+  function noteEl(text) {
+    var el = document.createElement("div");
+    el.className = "note";
+    el.textContent = text;
+    return el;
+  }
+
+  function scrollDown() {
+    var log = $("log");
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function addPending() {
+    pending = turnEl("bot", "thinking...");
+    pending.classList.add("pending");
+    $("log").appendChild(pending);
+    scrollDown();
+    return pending;
+  }
+
+  function render() {
+    var log = $("log");
+    log.textContent = "";
+    if (!chat.messages.length) {
+      log.appendChild(noteEl(GREETING
+        ? "ask something below -- it is sent as \"" + GREETING + " your question\""
+        : "ask something below"));
+    }
+    chat.messages.forEach(function (m) {
+      log.appendChild(turnEl(m.role, m.content));
+    });
+    $("turns").textContent = chat.messages.length
+      ? chat.messages.length + " turns in this chat"
+      : "one conversation, kept in this browser";
+    scrollDown();
+  }
+
+  function showError(text) {
+    jobError = text;
+    var el = turnEl("assistant", text);
+    el.classList.add("err");
+    var retry = document.createElement("button");
+    retry.className = "mini";
+    retry.textContent = "retry";
+    retry.onclick = function () {
+      el.remove();
+      flash("");
+      start(outbound());
+    };
+    el.querySelector(".meta").appendChild(retry);
+    $("log").appendChild(el);
+    scrollDown();
+    flash(text, true, true);
   }
 
   function busy(on) {
-    $("go").disabled = on;
-    $("go").textContent = on ? "Generating..." : "Generate";
-  }
-
-  function showFeedbackButtons(on) {
-    $("copy").hidden = $("works").hidden = $("broken").hidden = !on;
+    sending = on;
+    $("send").disabled = on;
+    $("send").textContent = on ? "..." : "Send";
   }
 
   function startTimer() {
@@ -221,10 +272,10 @@ footer a{color:var(--blue);text-decoration:none}
       if (statusText) parts.push(statusText);
       // offset keeps the clock honest across a reattach: it is the job's real age.
       parts.push(Math.round((offset + Date.now() - startedAt) / 1000) + "s");
-      if (streamed) parts.push($("code").textContent.length + " chars");
+      if (streamed && pending) parts.push(bodyOf(pending).textContent.length + " chars");
       var el = $("msg");
       el.className = "msg";
-      el.textContent = "generating... " + parts.join(" \u00b7 ");
+      el.textContent = "waiting... " + parts.join(" \u00b7 ");
     }, 250);
   }
 
@@ -239,9 +290,9 @@ footer a{color:var(--blue);text-decoration:none}
     var d;
     try { d = JSON.parse(line); } catch (e) { return false; }
     if (d.replay) {
-      // Every read starts at the job's beginning, so a reattach rebuilds the output
+      // Every read starts at the job's beginning, so a reattach rebuilds the answer
       // instead of appending a second copy of it.
-      $("code").textContent = "";
+      if (pending) bodyOf(pending).textContent = "";
       streamed = false;
       offset = (d.elapsed || 0) * 1000;
       statusText = d.note || d.status || "";
@@ -249,40 +300,38 @@ footer a{color:var(--blue);text-decoration:none}
     }
     if (d.beat) { statusText = d.note || d.status || statusText; return false; }
     if (d.t) {
-      if (!streamed) { $("code").textContent = ""; streamed = true; }
-      $("code").textContent += d.t;
+      if (!pending) addPending();
+      if (!streamed) { bodyOf(pending).textContent = ""; streamed = true; pending.classList.remove("pending"); }
+      bodyOf(pending).textContent += d.t;
+      scrollDown();
     }
     if (d.error) {
-      jobError = d.error;
-      if (d.code) $("code").textContent = d.code;
-      else if (!streamed) $("code").textContent = "-- " + d.error;
-      flash(d.error, true, true);
-      forget();
+      if (pending) { pending.remove(); pending = null; }
+      chat.job = null;
+      save();
+      showError(d.error);
       return true;
     }
     if (d.done) {
-      scriptId = d.id || null;
-      $("code").textContent = d.code || "";
-      // No id means the script was generated but there was nowhere to store it, so
-      // there is nothing to send feedback about.
-      if (d.id) {
-        showFeedbackButtons(true);
-        flash("script #" + d.id + " in " + elapsedSeconds() + "s -- run it, then mark it works or broken");
-      } else {
-        showFeedbackButtons(false);
-        flash("script in " + elapsedSeconds() + "s (not saved: no database on the service)");
-      }
-      forget();
+      var text = d.text || d.code || "";
+      if (pending) { pending.remove(); pending = null; }
+      // The answer becomes part of the conversation, so the next question is asked in
+      // the same chat the model has been answering in.
+      chat.messages.push({ role: "assistant", content: text });
+      chat.job = null;
+      save();
+      render();
+      flash("answered in " + elapsedSeconds() + "s");
       return true;
     }
     return false;
   }
 
   // One read of a job. Resolves when the job finished, rejects when this read did not
-  // manage to see it through -- a dropped connection is not a failed generation.
+  // manage to see it through -- a dropped connection is not a failed answer.
   function read(job) {
     var finished = false;
-    return fetch("/generate/stream/" + job, { headers: keyHeaders(), cache: "no-store" })
+    return fetch("/chat/stream/" + job, { headers: keyHeaders(), cache: "no-store" })
       .then(function (res) {
         if (!res.ok) {
           return res.text().then(function (text) {
@@ -302,7 +351,7 @@ footer a{color:var(--blue);text-decoration:none}
             if (chunk.done) {
               // Closed without a done or error frame: that is a dropped connection, not
               // an answer. Rejecting lets watch() reattach and replay instead of
-              // reporting a script that never arrived.
+              // reporting an answer that never arrived.
               if (!finished) throw new Error("the stream ended early");
               return;
             }
@@ -334,71 +383,67 @@ footer a{color:var(--blue);text-decoration:none}
     }
   }
 
-  async function generate() {
-    var prompt = $("prompt").value.trim();
-    if (!prompt) { flash("describe what the script should do first", true); return; }
-    scriptId = null;
-    streamed = false;
-    jobError = "";
-    statusText = "starting";
-    offset = 0;
-    showFeedbackButtons(false);
-    busy(true);
-    $("code").textContent = "-- waiting for the model...";
-    startTimer();
+  // What one request carries: the newest turns, so a long chat cannot grow the request
+  // without limit. The oldest turns are dropped first.
+  function outbound() {
+    var msgs = chat.messages.slice();
+    var head = 0;
+    while (msgs.length - head > 30) msgs.splice(head, 1);
+    var chars = 0;
+    for (var i = msgs.length - 1; i >= head && msgs.length - head > 2; i--) {
+      var len = typeof msgs[i].content === "string" ? msgs[i].content.length : 0;
+      chars += len;
+      if (chars > 100000) msgs.splice(i, 1);
+    }
+    return msgs;
+  }
 
+  async function start(messages) {
+    if (sending) return;
+    jobError = "";
+    streamed = false;
+    offset = 0;
+    statusText = "starting";
+    busy(true);
+    addPending();
+    startTimer();
     try {
-      var res = await fetch("/generate/stream", {
-        method: "POST",
-        headers: keyHeaders(),
-        body: JSON.stringify({
-          prompt: prompt,
-          temperature: 0.7,
-          model: $("model").value || DEFAULT_MODEL
-        })
-      });
-      var text = await res.text();
-      var data = {};
-      try { data = JSON.parse(text); } catch (e) {}
-      if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
-      currentJob = data.job;
-      remember(data.job, prompt);
+      var data = await api("/chat/stream", { messages: messages });
+      chat.job = data.job;
+      save();
       await watch(data.job);
-      if (scriptId === null && !jobError) {
-        throw new Error("the job ended without a script -- see the message above");
-      }
     } catch (e) {
-      scriptId = null;
-      // Nothing started, so there is nothing on the server to come back to.
-      if (!currentJob) forget();
-      var msg = (e && e.message) ? e.message : "request failed";
-      if (jobError) {
-        // The job said why it failed; this is only what the reader saw, and burying the
-        // provider's message is what made a rejected token look like a hung stream.
-        msg = jobError;
-      } else {
+      if (pending) { pending.remove(); pending = null; }
+      if (!jobError) {
+        var msg = (e && e.message) ? e.message : "request failed";
         if (msg === "Load failed" || msg === "Failed to fetch") {
-          // Safari and Chrome word a dropped connection differently. The generation
-          // itself survives on the server, so this is a reattach, not a lost script.
-          msg = "the connection dropped before the script arrived. It is still being generated -- reload this page to pick it back up.";
+          // Safari and Chrome word a dropped connection differently. The answer is still
+          // being written on the server, so this is a reattach, not a lost reply.
+          msg = "the connection dropped before the answer arrived. It is still being written -- reload this page to pick it back up.";
         }
-        if (!streamed) $("code").textContent = "-- " + msg;
-        flash(msg, true, true);
+        showError(msg);
       }
     } finally {
-      // Runs however the request ended, so the page can never sit stuck generating.
       clearInterval(timer);
       busy(false);
     }
   }
 
-  function feedback(worked) {
-    if (scriptId === null) return;
-    api("/feedback", { script_id: scriptId, worked: worked, notes: worked ? "" : "did not work in the executor" })
-      .then(function () {
-        flash(worked ? "saved -- similar requests reuse this script" : "saved -- later prompts avoid this mistake");
-      })
-      .catch(function (e) { flash(e.message, true); });
+  function send() {
+    if (sending) return;
+    var text = $("prompt").value.trim();
+    if (!text) return;
+    $("prompt").value = "";
+    // The greeting is put in front here so the bubble shows exactly what was sent; the
+    // service adds it too, and leaves it alone when it is already there.
+    var outgoing = text;
+    if (GREETING && text.toLowerCase().indexOf(GREETING.toLowerCase()) !== 0) {
+      outgoing = GREETING + " " + text;
+    }
+    chat.messages.push({ role: "user", content: outgoing });
+    save();
+    render();
+    start(outbound());
   }
 
   function setChip(name, ok, detail) {
@@ -418,68 +463,61 @@ footer a{color:var(--blue);text-decoration:none}
         setChip("bridge", s.bridge && !s.last_error, s.last_error ||
           (s.bridge ? (s.provider_label || "configured") : (s.error || "QWEN_TOKEN is not set")));
         // The Qwen token is the credential this service holds; an expired one is the
-        // failure that otherwise looks like a generation that never starts.
+        // failure that otherwise looks like a question that never gets an answer.
         setChip("token", s.token_ok, s.token_detail || (s.token_ok ? "ok" : "unknown"));
-        setChip("postgres", s.database, s.database ? "connected" : "off (feedback disabled)");
         setChip("model", true, s.model);
+        setChip("mode", true, s.greeting ? s.thinking + " \u00b7 " + s.greeting : s.thinking);
         if (s.api_key_required) $("keyPanel").hidden = false;
       })
       .catch(function () { setChip("api", false, "unreachable"); });
   }
 
-  $("go").onclick = generate;
-  $("clear").onclick = function () {
-    $("prompt").value = "";
-    $("code").textContent = "-- the generated script lands here";
-    scriptId = null;
-    forget();
-    showFeedbackButtons(false);
-  };
-  $("works").onclick = function () { feedback(true); };
-  $("broken").onclick = function () { feedback(false); };
-  $("copy").onclick = function () {
-    navigator.clipboard.writeText($("code").textContent).then(function () { flash("copied"); });
+  if (KEY_REQUIRED) $("keyPanel").hidden = false;
+  $("key").value = readKey();
+
+  $("send").onclick = send;
+  $("prompt").addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  $("newChat").onclick = function () {
+    if (sending) { flash("wait for the answer first", true); return; }
+    if (chat.messages.length && !confirm("Start a new chat? The history is dropped.")) return;
+    chat = { messages: [], job: null };
+    save();
+    render();
+    flash("new chat");
   };
   $("keySave").onclick = function () {
     writeKey($("key").value.trim());
-    // The model list needs the key, so saving it is the moment to try again.
-    loadModels();
     flash("key saved in this browser");
-  };
-  $("model").onchange = function () {
-    try { localStorage.setItem(MODEL_STORE, $("model").value); } catch (e) {}
-    flash("using " + $("model").value);
+    poll();
   };
   $("key").addEventListener("input", function () { writeKey($("key").value.trim()); });
-  $("prompt").addEventListener("keydown", function (e) {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); generate(); }
-  });
 
-  fillModels([]);
   poll();
   setInterval(poll, 8000);
-  loadModels();
+  render();
 
-  // A phone that dropped the connection can come straight back to the same answer:
-  // the job outlives the request, so reattach and replay it instead of starting over.
-  var last = recall();
-  if (last && last.job) {
-    currentJob = last.job;
-    if (last.prompt && !$("prompt").value) $("prompt").value = last.prompt;
+  // A page that was reloaded mid-answer comes back to the same job: the answer is
+  // replayed into the bubble instead of being asked for again.
+  if (chat.job && chat.messages.length && chat.messages[chat.messages.length - 1].role === "user") {
     busy(true);
-    $("code").textContent = "-- reattaching to the script that was being generated...";
+    addPending();
     statusText = "reattaching";
-    offset = 0;
     startTimer();
-    watch(last.job)
+    watch(chat.job)
       .then(function () {
-        if (scriptId === null && !jobError) { flash("that generation is gone -- press Generate again", true, true); }
+        if (!jobError) flash("that answer is gone -- ask again", true, true);
       })
       .catch(function (e) {
-        forget();
-        flash(jobError || (e.fatal ? "that generation is gone -- press Generate again" : e.message), true, true);
+        chat.job = null;
+        save();
+        showError(jobError || (e.fatal ? "that answer is gone -- ask again" : e.message));
       })
       .finally(function () { clearInterval(timer); busy(false); });
+  } else if (chat.job) {
+    chat.job = null;
+    save();
   }
 })();
 </script>
