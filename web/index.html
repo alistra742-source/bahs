@@ -102,6 +102,8 @@ footer a{color:var(--blue);text-decoration:none}
   var KEY_REQUIRED = document.body.dataset.keyRequired === "true";
   var STORE = "bahs-api-key";
   var scriptId = null;
+  var timer = null;
+  var streamed = false;
 
   function readKey() { try { return localStorage.getItem(STORE) || ""; } catch (e) { return ""; } }
   function writeKey(v) { try { v ? localStorage.setItem(STORE, v) : localStorage.removeItem(STORE); } catch (e) {} }
@@ -118,11 +120,15 @@ footer a{color:var(--blue);text-decoration:none}
     msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
   }
 
-  function api(path, body) {
+  function keyHeaders() {
     var headers = { "Content-Type": "application/json" };
     var key = ($("key").value || readKey()).trim();
     if (key) headers["X-API-Key"] = key;
-    return fetch(path, { method: "POST", headers: headers, body: JSON.stringify(body) })
+    return headers;
+  }
+
+  function api(path, body) {
+    return fetch(path, { method: "POST", headers: keyHeaders(), body: JSON.stringify(body) })
       .then(function (r) {
         return r.text().then(function (text) {
           var data;
@@ -142,25 +148,86 @@ footer a{color:var(--blue);text-decoration:none}
     $("copy").hidden = $("works").hidden = $("broken").hidden = !on;
   }
 
+  function startTimer() {
+    var started = Date.now();
+    clearInterval(timer);
+    timer = setInterval(function () {
+      var el = $("msg");
+      el.className = "msg";
+      el.textContent = "generating... " + Math.round((Date.now() - started) / 1000) + "s";
+    }, 250);
+    return started;
+  }
+
+  function handleFrame(line, started) {
+    if (!line.trim()) return;
+    var d;
+    try { d = JSON.parse(line); } catch (e) { return; }
+    if (d.t) {
+      if (!streamed) { $("code").textContent = ""; streamed = true; }
+      $("code").textContent += d.t;
+    }
+    if (d.error) {
+      if (!streamed) $("code").textContent = "-- " + d.error;
+      flash(d.error, true);
+    }
+    if (d.done) {
+      scriptId = d.id;
+      $("code").textContent = d.code;
+      showFeedbackButtons(true);
+      clearInterval(timer);
+      var secs = Math.max(1, Math.round((Date.now() - started) / 1000));
+      flash("script #" + d.id + " in " + secs + "s -- run it, then mark it works or broken");
+    }
+  }
+
   function generate() {
     var prompt = $("prompt").value.trim();
     if (!prompt) { flash("describe what the script should do first", true); return; }
     busy(true);
-    $("code").textContent = "-- generating...";
+    scriptId = null;
+    streamed = false;
     showFeedbackButtons(false);
-    api("/generate", { prompt: prompt, temperature: 0.7 })
-      .then(function (data) {
-        scriptId = data.id;
-        $("code").textContent = data.code;
-        showFeedbackButtons(true);
-        flash("script #" + data.id + " -- run it, then mark it works or broken");
+    $("code").textContent = "-- waiting for the model...";
+    var started = startTimer();
+
+    fetch("/generate/stream", {
+      method: "POST",
+      headers: keyHeaders(),
+      body: JSON.stringify({ prompt: prompt, temperature: 0.7 })
+    })
+      .then(function (res) {
+        if (!res.ok) {
+          return res.text().then(function (t) {
+            var d;
+            try { d = JSON.parse(t); } catch (e) { d = {}; }
+            throw new Error(d.detail || ("HTTP " + res.status));
+          });
+        }
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = "";
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) return;
+            buffer += decoder.decode(r.value, { stream: true });
+            var lines = buffer.split("\n");
+            buffer = lines.pop();
+            lines.forEach(function (line) { handleFrame(line, started); });
+            return pump();
+          });
+        }
+        return pump();
       })
       .catch(function (e) {
         $("code").textContent = "-- " + e.message;
         scriptId = null;
         flash(e.message, true);
       })
-      .then(function () { busy(false); });
+      .then(function () {
+        clearInterval(timer);
+        busy(false);
+      });
   }
 
   function feedback(worked) {

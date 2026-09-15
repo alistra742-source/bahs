@@ -51,6 +51,24 @@ trailing slashes and follows redirects, but the variable is also unnecessary: de
 `http://ollama.railway.internal:11434` is used, which stays on the private network
 (no egress, no public hop, and it works even if the ollama service has no domain).
 
+## Speed
+
+Inference is CPU-only, so these are what actually decide how long a script takes:
+
+- **The model stays loaded.** Every request sends `keep_alive` (`KEEP_ALIVE`, default
+  `30m`), so the weights sit in RAM between requests. Reloading them is the slowest
+  part of a cold request.
+- **It is warmed on startup.** After the pull finishes, the API asks for a single token
+  so the model is loaded before you ask for anything.
+- **Answers are capped.** `MAX_TOKENS` (default `512`) keeps a script from rambling.
+- **The page streams.** It calls `/generate/stream`, so code appears as it is written
+  instead of after the whole answer, with a running timer.
+- **The private network is used.** With no `OLLAMA_URL` set, model traffic never leaves
+  Railway; going through the public domain adds a hop and its own timeouts.
+
+If a script still takes minutes, that is the Ollama service's CPU: give it more vCPU or
+RAM. `CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
+
 ## Model pull
 
 Whoever starts first, the API sorts it out: on startup it checks Ollama's `/api/tags`
@@ -68,6 +86,7 @@ model name is read. Leave the Ollama service untouched.
 | GET    | `/`         | The site: type a prompt, get a script, mark it works/broken |
 | GET    | `/health`   | Always `200`; body reports Postgres and Ollama state        |
 | POST   | `/generate` | `{ "prompt": "...", "temperature": 0.7 }`                  |
+| POST   | `/generate/stream` | Same, but streams NDJSON frames while the answer is written |
 | POST   | `/feedback` | `{ "script_id": 1, "worked": true, "notes": "" }`           |
 
 Once `API_KEY` is set on the service, `/generate` and `/feedback` require it; `/`,
@@ -107,6 +126,9 @@ localStorage and sends it with each request.
 | `MODEL`        | `qwen2.5-coder:3b`                     | Pulled by the API into Ollama's volume            |
 | `OLLAMA_URL`   | `http://ollama.railway.internal:11434` | Baked into the `bahs` image. Leave it unset to keep model traffic on the private network. A trailing slash or a bare host is tolerated |
 | `API_KEY`      | —                                      | When set, `/generate` and `/feedback` need `X-API-Key` |
+| `KEEP_ALIVE`   | `30m`                                  | How long Ollama holds the model in RAM between requests |
+| `MAX_TOKENS`   | `512`                                  | Cap on answer length; shorter answers finish sooner |
+| `CHAT_TIMEOUT` | `600`                                  | Seconds to wait for an answer before returning `504` |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
 

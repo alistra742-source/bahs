@@ -1,11 +1,11 @@
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
-import hmac, html, httpx, os, threading, time
+import hmac, html, httpx, json, os, threading, time
 import psycopg
 
 def normalise_ollama_url(raw: str) -> str:
@@ -30,6 +30,11 @@ DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
 # and a fresh deploy work before the variable exists.
 API_KEY = os.getenv("API_KEY", "")
 INDEX = Path(__file__).parent / "web" / "index.html"
+# Inference without a GPU is slow, so the defaults lean on repeated use: the weights
+# stay resident between requests instead of reloading, and answers are length-capped.
+CHAT_TIMEOUT = float(os.getenv("CHAT_TIMEOUT", "600"))
+KEEP_ALIVE = os.getenv("KEEP_ALIVE", "30m")
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
@@ -41,6 +46,25 @@ def ollama_models() -> list:
     except httpx.HTTPError:
         return []
 
+def warm_model() -> None:
+    """Load the weights once so the first real request is not the slow one.
+
+    Loading a 3B model is the slowest part of a cold request, so ask for a single
+    token instead of making the first user wait for it.
+    """
+    try:
+        with httpx.Client(timeout=None, follow_redirects=True) as c:
+            c.post(f"{OLLAMA}/api/chat", json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "keep_alive": KEEP_ALIVE,
+                "options": {"num_predict": 1},
+            })
+        print(f"[model] {MODEL} warmed and held for {KEEP_ALIVE}", flush=True)
+    except httpx.HTTPError as e:
+        print(f"[model] warm-up skipped ({e.__class__.__name__})", flush=True)
+
 def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
     """Pull MODEL into the Ollama service while it is missing.
 
@@ -51,6 +75,7 @@ def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
     for attempt in range(1, attempts + 1):
         if MODEL in ollama_models():
             print(f"[model] {MODEL} is in the ollama volume", flush=True)
+            warm_model()
             return
         try:
             print(f"[model] pulling {MODEL} (attempt {attempt})", flush=True)
@@ -60,6 +85,7 @@ def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
                     for _ in r.iter_lines():
                         pass
             print(f"[model] {MODEL} pulled", flush=True)
+            warm_model()
             return
         except httpx.HTTPStatusError as e:
             # 4xx means Ollama refused it (unknown tag, for example): retrying cannot help.
@@ -155,6 +181,58 @@ def get_examples(prompt: str, limit: int = 3):
 def get_failures():
     return [r[0] for r in fetchall("SELECT fail_reason FROM scripts WHERE success = 0 AND fail_reason != '' ORDER BY id DESC LIMIT 10")]
 
+def build_system(prompt: str, fails: list, examples: list) -> str:
+    system = "You are a Roblox Lua scripting assistant. Output only valid Lua code with no markdown fences, no explanation."
+    if fails:
+        system += "\n\nAvoid these mistakes:\n" + "\n".join(f"- {f}" for f in fails)
+    if examples:
+        system += "\n\nSuccessful examples:\n"
+        for ex in examples:
+            # Truncated: every extra token of prompt is time spent on CPU inference.
+            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2][:1500]}\n"
+    return system
+
+def chat_payload(system: str, prompt: str, temperature: Optional[float]) -> dict:
+    return {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "stream": False,
+        "keep_alive": KEEP_ALIVE,
+        "options": {"temperature": temperature, "num_predict": MAX_TOKENS},
+    }
+
+def strip_fences(code: str) -> str:
+    code = code.strip()
+    if code.startswith("```"):
+        lines = code.split("\n")
+        code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+    return code.strip()
+
+def store_script(prompt: str, code: str) -> int:
+    try:
+        row = fetchone("INSERT INTO scripts (prompt, code) VALUES (%s, %s) RETURNING id", (prompt, code))
+    except (psycopg.Error, RuntimeError) as e:
+        raise db_unavailable(e)
+    return row[0]
+
+def ollama_failure(e: httpx.HTTPError) -> HTTPException:
+    """Map an httpx failure onto a status the caller can act on.
+
+    httpx timeouts often carry no message at all, so that case is named explicitly
+    rather than reported as an empty reason.
+    """
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        detail = (e.response.text or str(e) or repr(e))[:300]
+        return HTTPException(503 if code == 404 else 502, f"ollama ({MODEL}): {detail}")
+    if isinstance(e, httpx.TimeoutException):
+        return HTTPException(504, f"ollama ({MODEL}) timed out after {CHAT_TIMEOUT:g}s at {OLLAMA}")
+    return HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e.__class__.__name__}")
+
+def chat_timeout() -> httpx.Timeout:
+    """Generous read window: the first token waits on a model load, the rest on CPU."""
+    return httpx.Timeout(CHAT_TIMEOUT, connect=10.0)
+
 def chip(ok: bool, name: str, detail: str) -> str:
     """One status chip on the page. The browser refreshes these from /health."""
     return (
@@ -194,39 +272,74 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
     except (psycopg.Error, RuntimeError) as e:
         raise db_unavailable(e)
 
-    system = "You are a Roblox Lua scripting assistant. Output only valid Lua code with no markdown fences, no explanation."
-    if fails:
-        system += "\n\nAvoid these mistakes:\n" + "\n".join(f"- {f}" for f in fails)
-    if examples:
-        system += "\n\nSuccessful examples:\n"
-        for ex in examples:
-            system += f"\nRequest: {ex[1]}\nCode:\n{ex[2]}\n"
+    system = build_system(req.prompt, fails, examples)
     try:
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
-            r = await c.post(f"{OLLAMA}/api/chat", json={
-                "model": MODEL,
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": req.prompt}],
-                "stream": False,
-                "options": {"temperature": req.temperature}
-            })
+        async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
+            r = await c.post(f"{OLLAMA}/api/chat", json=chat_payload(system, req.prompt, req.temperature))
             r.raise_for_status()
-            code = r.json()["message"]["content"].strip()
-            if code.startswith("```"):
-                lines = code.split("\n")
-                code = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
-            try:
-                row = fetchone("INSERT INTO scripts (prompt, code) VALUES (%s, %s) RETURNING id", (req.prompt, code))
-            except (psycopg.Error, RuntimeError) as e:
-                raise db_unavailable(e)
-            return {"id": row[0], "code": code}
-    except httpx.HTTPStatusError as e:
-        # 404 here almost always means the model is still being pulled. Other statuses
-        # often carry an empty body (redirects, for instance), so fall back to the
-        # exception's own description rather than reporting nothing.
-        detail = (e.response.text or str(e))[:300]
-        raise HTTPException(503 if e.response.status_code == 404 else 502, f"ollama ({MODEL}): {detail}")
+            code = strip_fences(r.json()["message"]["content"])
     except httpx.HTTPError as e:
-        raise HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e}")
+        raise ollama_failure(e)
+    return {"id": store_script(req.prompt, code), "code": code}
+
+def frame(payload: dict) -> str:
+    return json.dumps(payload) + "\n"
+
+@app.post("/generate/stream")
+async def generate_stream(req: GenReq, _: None = Depends(require_key)):
+    """Same as /generate, but streams the tokens as NDJSON so the page shows progress.
+
+    Waiting 100s for a whole answer is what made this feel broken; sending each piece
+    as it is produced means the first line shows up in seconds.
+    """
+    try:
+        fails = get_failures()
+        examples = get_examples(req.prompt)
+    except (psycopg.Error, RuntimeError) as e:
+        raise db_unavailable(e)
+    payload = chat_payload(build_system(req.prompt, fails, examples), req.prompt, req.temperature)
+    payload["stream"] = True
+
+    async def body():
+        chunks = []
+        try:
+            async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
+                async with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
+                    if r.status_code >= 400:
+                        text = (await r.aread()).decode("utf-8", "replace").strip()
+                        # 404 here almost always means the model is still being pulled.
+                        yield frame({"error": f"ollama ({MODEL}) {r.status_code}: {text or 'no detail'}"})
+                        return
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except ValueError:
+                            continue
+                        piece = (data.get("message") or {}).get("content") or ""
+                        if piece:
+                            chunks.append(piece)
+                            yield frame({"t": piece})
+                        if data.get("done"):
+                            break
+        except httpx.TimeoutException:
+            yield frame({"error": f"ollama ({MODEL}) timed out after {CHAT_TIMEOUT:g}s; it may still be loading"})
+            return
+        except httpx.HTTPError as e:
+            yield frame({"error": f"cannot reach ollama at {OLLAMA}: {e.__class__.__name__}"})
+            return
+
+        code = strip_fences("".join(chunks))
+        try:
+            script_id = store_script(req.prompt, code)
+        except HTTPException as e:
+            yield frame({"error": f"generated, but not saved: {e.detail}"})
+            return
+        # The final frame carries the cleaned code, since the stream included the fences.
+        yield frame({"done": True, "id": script_id, "code": code})
+
+    return StreamingResponse(body(), media_type="application/x-ndjson")
 
 @app.post("/feedback")
 async def feedback(req: FeedbackReq, _: None = Depends(require_key)):
