@@ -1,19 +1,32 @@
 FROM ollama/ollama:latest
 
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
+# The base image is Ubuntu based and sets ENTRYPOINT ["/bin/ollama"] CMD ["serve"].
+# Anything we put in CMD is therefore passed to the ollama binary as arguments
+# (ollama would receive "/bin/sh" and exit with `unknown command`), so we must
+# clear the inherited entrypoint and start an explicit shell command.
+ENV DEBIAN_FRONTEND=noninteractive \
+    OLLAMA_HOST=0.0.0.0:11434 \
+    OLLAMA_MODELS=/data/ollama \
+    MODEL=qwen2.5-coder:3b \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
 
-RUN python3 -m venv /opt/venv
+COPY requirements.txt .
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-EXPOSE 11434 8000
+EXPOSE 8000 11434
 
-CMD ollama serve & \
-    sleep 10 && \
-    ollama pull qwen2.5-coder:3b && \
-    uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
+ENTRYPOINT []
+# `sh` is used so the script does not depend on the executable bit surviving the copy.
+CMD ["sh", "/usr/local/bin/entrypoint.sh"]

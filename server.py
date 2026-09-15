@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Optional
 import httpx, sqlite3, os
 from pathlib import Path
 
@@ -10,18 +10,32 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
-DB = Path("/data/learning.db")
 
-DB.parent.mkdir(parents=True, exist_ok=True)
-conn = sqlite3.connect(DB, check_same_thread=False)
-conn.execute("""CREATE TABLE IF NOT EXISTS scripts (
+SCHEMA = """CREATE TABLE IF NOT EXISTS scripts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt TEXT,
     code TEXT,
     success INTEGER DEFAULT -1,
     fail_reason TEXT DEFAULT ''
-)""")
-conn.commit()
+)"""
+
+def open_db() -> sqlite3.Connection:
+    """Prefer the mounted volume, fall back to the app directory if it is absent."""
+    candidates = [Path(os.getenv("DB_PATH", "/data/learning.db")), Path(__file__).with_name("learning.db")]
+    last_error: Optional[Exception] = None
+    for path in candidates:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(path, check_same_thread=False)
+            connection.execute(SCHEMA)
+            connection.commit()
+            print(f"[db] using {path}", flush=True)
+            return connection
+        except (sqlite3.Error, OSError) as e:
+            last_error = e
+    raise RuntimeError(f"could not open sqlite database: {last_error}")
+
+conn = open_db()
 
 class GenReq(BaseModel):
     prompt: str
@@ -40,6 +54,10 @@ def get_examples(prompt: str, limit: int = 3):
 
 def get_failures():
     return [r[0] for r in conn.execute("SELECT fail_reason FROM scripts WHERE success=0 AND fail_reason!='' ORDER BY id DESC LIMIT 10").fetchall()]
+
+@app.get("/")
+async def root():
+    return {"service": "roblox-lua-generator", "model": MODEL, "ollama": OLLAMA, "endpoints": ["/generate", "/feedback", "/health"]}
 
 @app.post("/generate")
 async def generate(req: GenReq):
@@ -68,8 +86,12 @@ async def generate(req: GenReq):
             cur = conn.execute("INSERT INTO scripts (prompt, code) VALUES (?, ?)", (req.prompt, code))
             conn.commit()
             return {"id": cur.lastrowid, "code": code}
+    except httpx.HTTPStatusError as e:
+        # 404 here almost always means the model is still being pulled.
+        detail = e.response.text[:300]
+        raise HTTPException(503 if e.response.status_code == 404 else 502, f"ollama ({MODEL}): {detail}")
     except httpx.HTTPError as e:
-        raise HTTPException(502, str(e))
+        raise HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e}")
 
 @app.post("/feedback")
 async def feedback(req: FeedbackReq):
@@ -79,6 +101,13 @@ async def feedback(req: FeedbackReq):
 
 @app.get("/health")
 async def health():
-    async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.get(f"{OLLAMA}/api/tags")
-        return {"status": "ok", "ollama": r.json()}
+    # Always 200 so the platform healthcheck only depends on the API being up;
+    # ollama readiness is reported in the body.
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{OLLAMA}/api/tags")
+            r.raise_for_status()
+            models = [m.get("name") for m in r.json().get("models", [])]
+            return {"status": "ok", "ollama": True, "model": MODEL, "models": models, "model_ready": MODEL in models}
+    except httpx.HTTPError as e:
+        return {"status": "degraded", "ollama": False, "model": MODEL, "error": str(e)}
