@@ -8,7 +8,20 @@ from pathlib import Path
 import hmac, html, httpx, os, threading, time
 import psycopg
 
-OLLAMA = os.getenv("OLLAMA_URL", "http://localhost:11434")
+def normalise_ollama_url(raw: str) -> str:
+    """Tidy an OLLAMA_URL: drop trailing slashes and give a bare host a scheme.
+
+    A trailing slash plus our paths produced "//api/tags", which Railway's edge
+    answered with a 307 back to "/api/tags" instead of proxying it, and a bare host
+    (no scheme) is not a URL httpx will touch at all.
+    """
+    url = (raw or "").strip().rstrip("/")
+    if url and "://" not in url:
+        local = url.startswith(("localhost", "127.0.0.1", "0.0.0.0")) or ".railway.internal" in url
+        url = ("http://" if local else "https://") + url
+    return url or "http://localhost:11434"
+
+OLLAMA = normalise_ollama_url(os.getenv("OLLAMA_URL", "http://localhost:11434"))
 MODEL = os.getenv("MODEL", "qwen2.5-coder:3b")
 # Railway's Postgres plugin injects DATABASE_URL; POSTGRES_URL is the older name.
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
@@ -21,7 +34,7 @@ INDEX = Path(__file__).parent / "web" / "index.html"
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
     try:
-        with httpx.Client(timeout=10) as c:
+        with httpx.Client(timeout=10, follow_redirects=True) as c:
             r = c.get(f"{OLLAMA}/api/tags")
             r.raise_for_status()
             return [m.get("name", "") for m in r.json().get("models", [])]
@@ -41,7 +54,7 @@ def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
             return
         try:
             print(f"[model] pulling {MODEL} (attempt {attempt})", flush=True)
-            with httpx.Client(timeout=None) as c:
+            with httpx.Client(timeout=None, follow_redirects=True) as c:
                 with c.stream("POST", f"{OLLAMA}/api/pull", json={"model": MODEL}) as r:
                     r.raise_for_status()
                     for _ in r.iter_lines():
@@ -189,7 +202,7 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
         for ex in examples:
             system += f"\nRequest: {ex[1]}\nCode:\n{ex[2]}\n"
     try:
-        async with httpx.AsyncClient(timeout=120) as c:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
             r = await c.post(f"{OLLAMA}/api/chat", json={
                 "model": MODEL,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": req.prompt}],
@@ -207,8 +220,10 @@ async def generate(req: GenReq, _: None = Depends(require_key)):
                 raise db_unavailable(e)
             return {"id": row[0], "code": code}
     except httpx.HTTPStatusError as e:
-        # 404 here almost always means the model is still being pulled.
-        detail = e.response.text[:300]
+        # 404 here almost always means the model is still being pulled. Other statuses
+        # often carry an empty body (redirects, for instance), so fall back to the
+        # exception's own description rather than reporting nothing.
+        detail = (e.response.text or str(e))[:300]
         raise HTTPException(503 if e.response.status_code == 404 else 502, f"ollama ({MODEL}): {detail}")
     except httpx.HTTPError as e:
         raise HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e}")
@@ -235,7 +250,7 @@ async def snapshot() -> dict:
     except (psycopg.Error, RuntimeError) as e:
         body["database_error"] = str(e)
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
             r = await c.get(f"{OLLAMA}/api/tags")
             r.raise_for_status()
             models = [m.get("name") for m in r.json().get("models", [])]

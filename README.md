@@ -42,6 +42,15 @@ nothing but the image and the volume — no start command, no variables, no repo
    `client.lua` needs.
 5. No volume.
 
+### `Redirect response '307 Temporary Redirect' for url '...//api/tags'`
+
+`OLLAMA_URL` ends in a slash, so the request path becomes `//api/tags`; Railway's edge
+answers that with a 307 to `/api/tags` instead of proxying it. The API now strips
+trailing slashes and follows redirects, but the variable is also unnecessary: delete
+`OLLAMA_URL` from the `bahs` service and the image's baked-in
+`http://ollama.railway.internal:11434` is used, which stays on the private network
+(no egress, no public hop, and it works even if the ollama service has no domain).
+
 ## Model pull
 
 Whoever starts first, the API sorts it out: on startup it checks Ollama's `/api/tags`
@@ -96,7 +105,7 @@ localStorage and sends it with each request.
 | -------------- | -------------------------------------- | ------------------------------------------------ |
 | `PORT`         | `8000`                                 | Injected by Railway; the API binds it             |
 | `MODEL`        | `qwen2.5-coder:3b`                     | Pulled by the API into Ollama's volume            |
-| `OLLAMA_URL`   | `http://ollama.railway.internal:11434` | Baked into the `bahs` image; override to move it  |
+| `OLLAMA_URL`   | `http://ollama.railway.internal:11434` | Baked into the `bahs` image. Leave it unset to keep model traffic on the private network. A trailing slash or a bare host is tolerated |
 | `API_KEY`      | —                                      | When set, `/generate` and `/feedback` need `X-API-Key` |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
