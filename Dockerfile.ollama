@@ -1,19 +1,41 @@
-# Use this Dockerfile for the dedicated Ollama service:
-#   Railway -> service -> Settings -> Build -> Dockerfile Path = Dockerfile.ollama
-# (or set RAILWAY_DOCKERFILE_PATH=Dockerfile.ollama)
+# Combined Ollama + API image: this is the whole app in one service.
 #
-# Mount that service's only volume at /root/.ollama: it is the model root the
-# ollama image already uses, so no OLLAMA_MODELS override is needed and the
-# model weights persist across redeploys.
+#   Railway -> this service -> Settings -> Build   -> Dockerfile Path = Dockerfile.ollama
+#   Railway -> this service -> Settings -> Volumes -> one volume at /root/.ollama
+#   Railway -> this service -> Settings -> Variables -> DATABASE_URL (reference Postgres)
+#
+# Ollama listens on loopback only; the FastAPI app is the public surface on $PORT,
+# which is the port Railway's edge proxy routes the service domain to. One service
+# means one volume, and /root/.ollama is the model root Ollama already uses.
 FROM ollama/ollama:latest
 
-ENV OLLAMA_HOST=0.0.0.0:11434 \
-    MODEL=qwen2.5-coder:3b
+ENV PYTHONUNBUFFERED=1 \
+    PORT=8000 \
+    MODEL=qwen2.5-coder:3b \
+    OLLAMA_MODELS=/root/.ollama \
+    OLLAMA_URL=http://127.0.0.1:11434
 
-EXPOSE 11434
+WORKDIR /app
 
+# The ollama image is Ubuntu 24.04 with no Python, and its system pip is PEP 668
+# managed, so the API's dependencies live in a venv instead of site-packages.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir --upgrade pip
+
+ENV PATH=/opt/venv/bin:$PATH
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY server.py .
 COPY entrypoint-ollama.sh /usr/local/bin/entrypoint-ollama.sh
 
-# The base image ships ENTRYPOINT [/bin/ollama]; clear it before setting our own CMD.
+# Only the API port is published; Ollama stays on loopback inside the container.
+EXPOSE 8000
+
+# The base image ships ENTRYPOINT ["/bin/ollama"]; this image runs both processes instead.
 ENTRYPOINT []
 CMD ["sh", "/usr/local/bin/entrypoint-ollama.sh"]

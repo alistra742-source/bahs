@@ -1,8 +1,9 @@
-# API service for the `bahs` project.
+# API-only image for the `bahs` project, for a split deployment where Ollama runs
+# in its own service (see Dockerfile.ollama for the combined single-service image,
+# which is what the public site is served from by default).
 #
-# Ollama runs in its own service (see Dockerfile.ollama) and is reached through
-# OLLAMA_URL, while scripts and feedback live in Railway Postgres (DATABASE_URL).
-# This container therefore holds no state and needs no volume.
+# Ollama is reached through OLLAMA_URL, while scripts and feedback live in Railway
+# Postgres (DATABASE_URL). This container holds no state and needs no volume.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

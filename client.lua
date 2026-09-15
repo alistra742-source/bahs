@@ -1,6 +1,6 @@
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game:GetService("Players").LocalPlayer
-local API_URL = "https://your-app.up.railway.app"
+local API_URL = "https://ollama-production-02e0.up.railway.app"
 
 local function generate(prompt)
     local r = request({
