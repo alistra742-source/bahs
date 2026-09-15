@@ -75,11 +75,22 @@ The page reports what it is waiting for — `loading qwen2.5-coder:3b into RAM` 
 `model ready` — next to a running timer and character count, so a cold model load is
 tellable apart from an actual hang.
 
-A 3B model on a small container generates single-digit tokens per second: a 300-token
-script is 30–90s of pure generation, and loading the model costs more once. For the real
-number, open the **`ollama`** service → Logs while a script runs; the `eval time` lines
-report tokens per second. If that is low, the fix is vCPU/RAM on that service
-(Settings → Resources), not the API — or a different model, set on **`bahs`**:
+Open the **`ollama`** service → Logs while a script runs and read the two timings. On a
+container with real CPU, prompt eval is tens of tokens per second and generation is
+single digits — a script in 20–40s. Numbers this far off mean the container is starved,
+and no API change can help:
+
+```
+llama-server started in 270.36 seconds
+prompt eval time = 114874.64 ms / 30 tokens ( 3829.15 ms per token, 0.26 tokens per second)
+```
+
+That is 3.8s for *one* prompt token, so a 300-token prompt would need ~19 minutes. The
+fix is vCPU/RAM on the `ollama` service (Settings → Resources) — a 3B model wants ~3 GB
+of RAM to avoid thrashing and at least 2 vCPU. `WARM_MODEL=off` is worth setting while it
+is that slow, since a background warm-up otherwise holds the model's only slot for
+minutes before your own request is served. Beyond that, the options are a smaller model
+set on **`bahs`**:
 
 - `MODEL=qwen2.5-coder:1.5b` — much faster, noticeably less capable.
 - `MODEL=qwen2.5-coder:7b` — better at Luau, needs several GB of RAM.
@@ -159,6 +170,7 @@ localStorage and sends it with each request.
 | `KEEP_ALIVE`   | `30m`                                  | How long Ollama holds the model in RAM between requests |
 | `MAX_TOKENS`   | `512`                                  | Cap on answer length; shorter answers finish sooner |
 | `NUM_CTX`      | `2048`                                 | Context window; smaller processes faster |
+| `WARM_MODEL`   | `on`                                   | Loads the model at startup; `off` on a container too small to run it |
 | `CHAT_TIMEOUT` | `600`                                  | Seconds to wait for an answer before returning `504` |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |

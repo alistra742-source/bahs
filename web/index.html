@@ -231,8 +231,14 @@ footer a{color:var(--blue);text-decoration:none}
       if (scriptId === null) throw new Error("the stream ended before the script arrived");
     } catch (e) {
       scriptId = null;
-      if (!streamed) $("code").textContent = "-- " + e.message;
-      flash(e.message, true);
+      var msg = (e && e.message) ? e.message : "request failed";
+      if (msg === "Load failed" || msg === "Failed to fetch") {
+        // Safari and Chrome word a dropped connection differently, and it reads like a
+        // crash when really the browser gave up waiting and the API is fine.
+        msg += " -- the browser dropped the connection, usually because the model is slow enough that a phone gave up. Try again.";
+      }
+      if (!streamed) $("code").textContent = "-- " + msg;
+      flash(msg, true);
     } finally {
       // Runs however the request ended, so the page can never sit stuck generating.
       clearInterval(timer);

@@ -38,6 +38,9 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "512"))
 # A smaller context window means less prompt to process on every request, and the
 # rules below plus a couple of examples fit comfortably inside this.
 NUM_CTX = int(os.getenv("NUM_CTX", "2048"))
+# Ollama serves one request per model, so a 5 minute warm-up on a starved container
+# delays the first real request by 5 minutes. Off is the better trade there.
+WARM_MODEL = os.getenv("WARM_MODEL", "on").strip().lower() not in ("0", "off", "false", "no")
 
 def ollama_models() -> list:
     """Model names Ollama currently holds, or [] when it cannot be reached."""
@@ -85,8 +88,13 @@ def warm_model() -> None:
     """Load the weights once so the first real request is not the slow one.
 
     Loading a 3B model is the slowest part of a cold request, so ask for a single
-    token instead of making the first user wait for it.
+    token instead of making the first user wait for it. On a container too small to
+    run the model at a usable speed this just hogs the single slot, so WARM_MODEL=off
+    skips it.
     """
+    if not WARM_MODEL:
+        print("[model] warm-up skipped (WARM_MODEL=off)", flush=True)
+        return
     try:
         with httpx.Client(timeout=None, follow_redirects=True) as c:
             c.post(f"{OLLAMA}/api/chat", json={
