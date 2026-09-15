@@ -1,6 +1,6 @@
 #!/bin/sh
-# Serves the FastAPI app on $PORT. The model runs on Hugging Face's inference router
-# (HF_API) and the database is Postgres (DATABASE_URL), so there is nothing to boot first.
+# Serves the FastAPI app on $PORT. Qwen is called over HTTP (QWEN_TOKEN, QWEN_URL) and
+# Postgres is optional (DATABASE_URL), so there is nothing to boot or warm first.
 set -eu
 
 PORT="${PORT:-8000}"

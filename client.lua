@@ -1,11 +1,13 @@
 local HttpService = game:GetService("HttpService")
 local LocalPlayer = game:GetService("Players").LocalPlayer
 -- Public domain of the `bahs` service (Railway -> bahs -> Settings -> Networking
--- -> Generate Domain). The API calls Hugging Face for the model itself, so this URL is
--- the only one needed anywhere.
+-- -> Generate Domain). That service is the bridge: it holds the Qwen token and calls
+-- Qwen for the model, so this URL is the only one needed anywhere.
 local API_URL = "https://bahs-production-d68f.up.railway.app"
 -- Paste the API_KEY value from the bahs service here. Leave "" if you never set one.
 local API_KEY = ""
+-- Optional: a model id from the service's /v1/models (qwen3.8-max is the default).
+local MODEL = ""
 
 -- The API answers 401 without this header when API_KEY is set on the service.
 local function headers()
@@ -19,7 +21,7 @@ local function generate(prompt)
         Url = API_URL .. "/generate",
         Method = "POST",
         Headers = headers(),
-        Body = HttpService:JSONEncode({prompt = prompt, temperature = 0.7})
+        Body = HttpService:JSONEncode({prompt = prompt, temperature = 0.7, model = MODEL})
     })
     if r.StatusCode >= 400 then
         error("API " .. tostring(r.StatusCode) .. ": " .. tostring(r.Body), 0)
