@@ -1,7 +1,11 @@
 # bahs
 
-FastAPI service that generates Roblox Lua scripts with Ollama (`qwen2.5-coder:3b`),
-learns from feedback, and ships a Roblox executor GUI in [`client.lua`](client.lua).
+FastAPI service that generates Roblox Lua scripts, learns from feedback, and ships a
+Roblox executor GUI in [`client.lua`](client.lua). It answers with Ollama running in the
+same project (`qwen2.5-coder:3b`) by default, or with a hosted OpenAI-compatible model
+if you set `INFERENCE_URL`/`INFERENCE_KEY` — see [Hosted
+inference](#hosted-inference-the-fast-answer), which is what you want if CPU-only
+inference is taking minutes per request.
 
 The repo builds exactly one thing: the API. Ollama is a stock Docker-image service.
 
@@ -11,6 +15,9 @@ The repo builds exactly one thing: the API. Ollama is a stock Docker-image servi
 | -------- | ---------------------------- | ------------------------------ | ----------------------------- | ----------------- |
 | `bahs`   | this repo, branch `main`     | Dockerfile Path = `Dockerfile` | none (stateless)              | yes — the site    |
 | `ollama` | Docker Image `ollama/ollama` | none, the image runs as-is     | one, at **`/root/.ollama`**   | none              |
+
+`ollama` is optional: give `bahs` a hosted model (below) and this service can be deleted
+along with its volume — the API then has no local weights to pull, load or hold.
 | Postgres | Railway plugin               | —                              | (its own)                     | none              |
 
 `bahs` reaches Ollama over private networking at `http://ollama.railway.internal:11434`
@@ -149,6 +156,42 @@ one request per model, and an abandoned request can hold that slot until it fini
 
 `CHAT_TIMEOUT` (default `600`) is how long the API waits before returning `504`.
 
+## Hosted inference (the fast answer)
+
+CPU-only inference has a floor this API cannot get under: a prompt of a few hundred
+tokens takes many minutes to evaluate on a small container, and the answer comes after
+that. If you want seconds instead, point the API at a hosted OpenAI-compatible model and
+leave the local weights behind.
+
+1. Create an account and an API key on a hosted inference provider. The default in this
+   repo targets **SambaNova** (`https://api.sambanova.ai/v1`, bearer key, models
+   `DeepSeek-V3.1`, `gpt-oss-120b`, `Meta-Llama-3.3-70B-Instruct`), and any
+   OpenAI-compatible endpoint works the same way.
+2. On the **`bahs`** service → Settings → Variables, add:
+
+| Variable           | Value                          |
+| ------------------ | ------------------------------ |
+| `INFERENCE_URL`    | `https://api.sambanova.ai/v1`  |
+| `INFERENCE_KEY`    | the key from the provider      |
+| `INFERENCE_MODEL`  | `DeepSeek-V3.1`                |
+
+3. Redeploy `bahs`. The page's `ollama` chip then reads `not used -- hosted inference`
+   and the `model` chip names the hosted model, because nothing is pulled or warmed any
+   more. Answers arrive in seconds and the `ollama` service (and its volume) can be
+   deleted.
+
+Other providers are the same three variables, for example
+`INFERENCE_URL=https://api.groq.com/openai/v1`,
+`INFERENCE_URL=https://openrouter.ai/api/v1`, or
+`INFERENCE_URL=https://api.openai.com/v1`. Leave all three unset and the API behaves
+exactly as it did, on Ollama over the private network.
+
+Both API surfaces go through it: the page's `/generate/stream` jobs and `client.lua`'s
+blocking `/generate`. With a hosted model the single-slot `409 already generating a
+script` guard is skipped as well, since there is no local model to queue behind, so
+several scripts can be written at once. The key stays in the service's variables: it is
+never written into the page, and `API_KEY` still gates who can call the API.
+
 ## Model quality
 
 The system prompt (`RULES` in `server.py`) targets Luau rather than Lua 5.1: `task.*`
@@ -217,7 +260,7 @@ localStorage and sends it with each request.
 | Variable       | Default                                | Notes                                            |
 | -------------- | -------------------------------------- | ------------------------------------------------ |
 | `PORT`         | `8000`                                 | Injected by Railway; the API binds it             |
-| `MODEL`        | `qwen2.5-coder:3b`                     | Pulled by the API into Ollama's volume            |
+| `MODEL`        | `qwen2.5-coder:3b`                     | Pulled by the API into Ollama's volume; ignored when hosted inference is configured |
 | `OLLAMA_URL`   | `http://ollama.railway.internal:11434` | Baked into the `bahs` image. Leave it unset to keep model traffic on the private network. A trailing slash or a bare host is tolerated |
 | `API_KEY`      | —                                      | When set, `/generate` and `/feedback` need `X-API-Key` |
 | `KEEP_ALIVE`   | `24h`                                  | How long Ollama holds the model in RAM between requests; unloading costs a multi-minute reload |
@@ -228,6 +271,9 @@ localStorage and sends it with each request.
 | `HEARTBEAT`    | `5`                                    | Seconds of silence between keep-alive frames on `/generate/stream/{job}` |
 | `JOB_TTL`      | `3600`                                 | Seconds a finished job stays readable, so a late page can still reattach |
 | `EXAMPLE_CHARS` | `500`                                 | Total characters of past scripts allowed in a prompt; they cost minutes on CPU |
+| `INFERENCE_URL` | —                                      | Set with `INFERENCE_KEY` to answer from a hosted OpenAI-compatible endpoint instead of Ollama |
+| `INFERENCE_KEY` | —                                      | Bearer key for `INFERENCE_URL`; never sent to the browser |
+| `INFERENCE_MODEL` | `DeepSeek-V3.1`                       | Model name sent to `INFERENCE_URL` when hosted inference is on |
 | `DATABASE_URL` | —                                      | Injected by the Railway Postgres plugin           |
 | `POSTGRES_URL` | —                                      | Older alias, accepted as a fallback               |
 

@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
-import hmac, html, httpx, json, os, threading, time, uuid
+import asyncio, hmac, html, httpx, json, os, threading, time, uuid
 import psycopg
 
 def normalise_ollama_url(raw: str) -> str:
@@ -29,6 +29,25 @@ DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or ""
 # X-API-Key header (or an Authorization: Bearer token). Unset means open, so local runs
 # and a fresh deploy work before the variable exists.
 API_KEY = os.getenv("API_KEY", "")
+# Hosted inference: the way out of CPU-only inference. A 3B model on a container short
+# of RAM spends ~20 minutes evaluating a prompt before it writes a character, and no
+# API-side change fixes that. Set INFERENCE_URL and INFERENCE_KEY to any
+# OpenAI-compatible /chat/completions endpoint (SambaNova, Groq, OpenRouter, OpenAI) and
+# jobs stream from there instead — the Ollama service is then not touched at all.
+# Unset, nothing changes: Ollama over the private network stays the default.
+INFERENCE_URL = os.getenv("INFERENCE_URL", "").strip().rstrip("/")
+INFERENCE_KEY = os.getenv("INFERENCE_KEY", "").strip()
+INFERENCE_MODEL = os.getenv("INFERENCE_MODEL", "DeepSeek-V3.1").strip()
+HOSTED = bool(INFERENCE_URL and INFERENCE_KEY)
+
+def active_model() -> str:
+    """The model that answers right now: the hosted one, or the local Ollama."""
+    return INFERENCE_MODEL if HOSTED else MODEL
+
+def endpoint() -> str:
+    """Where inference actually happens, for error messages."""
+    return INFERENCE_URL if HOSTED else OLLAMA
+
 INDEX = Path(__file__).parent / "web" / "index.html"
 # Inference without a GPU is slow, so the defaults lean on repeated use: the weights
 # stay resident between requests instead of reloading, and answers are length-capped.
@@ -70,8 +89,11 @@ def claim_slot() -> None:
 
     Ollama serves one request per model, so an extra request merely waits — which looks
     exactly like a hang. The claim expires on its own so a dropped stream can never lock
-    the service out permanently.
+    the service out permanently. A hosted endpoint answers in parallel, so nothing is
+    claimed there.
     """
+    if HOSTED:
+        return
     global _busy_until
     with _busy_lock:
         now = time.time()
@@ -94,10 +116,11 @@ class Job:
     connection dropped, which replays the output from the start and follows along.
     """
 
-    def __init__(self, prompt: str, payload: dict, note: str):
+    def __init__(self, system: str, prompt: str, temperature: Optional[float], note: str):
         self.id = uuid.uuid4().hex[:12]
+        self.system = system
         self.prompt = prompt
-        self.payload = payload
+        self.temperature = temperature
         self.note = note
         self.pieces: list = []
         self.code = ""
@@ -124,6 +147,16 @@ class Job:
             if self.status in ("done", "error"):
                 self.finished = self.finished or time.time()
             self.cond.notify_all()
+
+    def wait(self, timeout: float) -> None:
+        """Block until the job ends; the blocking /generate is the only caller."""
+        deadline = time.time() + timeout
+        with self.cond:
+            while self.status not in ("done", "error"):
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise HTTPException(504, f"timed out after {timeout:g}s waiting on {endpoint()}")
+                self.cond.wait(timeout=remaining)
 
     def report(self) -> dict:
         """Where the job stands; what the page shows next to its running timer."""
@@ -223,8 +256,10 @@ def ensure_model(attempts: int = 40, delay: float = 15.0) -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # On a thread so the API answers /health and / while the weights download.
-    threading.Thread(target=ensure_model, daemon=True).start()
+    # Nothing to pull or warm when a hosted endpoint does the work.
+    if not HOSTED:
+        # On a thread so the API answers /health and / while the weights download.
+        threading.Thread(target=ensure_model, daemon=True).start()
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -376,19 +411,20 @@ def store_script(prompt: str, code: str) -> int:
         raise db_unavailable(e)
     return row[0]
 
-def ollama_failure(e: httpx.HTTPError) -> HTTPException:
-    """Map an httpx failure onto a status the caller can act on.
+def inference_failure(e: httpx.HTTPError) -> HTTPException:
+    """Map an httpx failure onto a status the caller can act on, whoever served it.
 
     httpx timeouts often carry no message at all, so that case is named explicitly
     rather than reported as an empty reason.
     """
+    name, where = active_model(), endpoint()
     if isinstance(e, httpx.HTTPStatusError):
         code = e.response.status_code
         detail = (e.response.text or str(e) or repr(e))[:300]
-        return HTTPException(503 if code == 404 else 502, f"ollama ({MODEL}): {detail}")
+        return HTTPException(503 if code == 404 else 502, f"{name}: {detail}")
     if isinstance(e, httpx.TimeoutException):
-        return HTTPException(504, f"ollama ({MODEL}) timed out after {CHAT_TIMEOUT:g}s at {OLLAMA}")
-    return HTTPException(502, f"cannot reach ollama at {OLLAMA}: {e.__class__.__name__}")
+        return HTTPException(504, f"{name} timed out after {CHAT_TIMEOUT:g}s at {where}")
+    return HTTPException(502, f"cannot reach {where}: {e.__class__.__name__}")
 
 def chat_timeout() -> httpx.Timeout:
     """Generous read window: the first token waits on a model load, the rest on CPU."""
@@ -418,11 +454,56 @@ def ollama_stream(payload: dict):
                 if data.get("done"):
                     return
 
+def hosted_stream(system: str, prompt: str, temperature: Optional[float]):
+    """Stream from an OpenAI-compatible /chat/completions endpoint.
+
+    Same shape as `ollama_stream`, so the job machinery does not care which provider is
+    behind it; the frames are the same NDJSON either way.
+    """
+    body = {
+        "model": INFERENCE_MODEL,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": MAX_TOKENS,
+        "stream": True,
+    }
+    headers = {"Authorization": f"Bearer {INFERENCE_KEY}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=chat_timeout(), follow_redirects=True) as c:
+        with c.stream("POST", f"{INFERENCE_URL}/chat/completions", json=body, headers=headers) as r:
+            if r.status_code >= 400:
+                detail = r.read().decode("utf-8", "replace").strip()
+                raise HTTPException(429 if r.status_code == 429 else 502,
+                                    f"inference ({INFERENCE_MODEL}) {r.status_code}: {detail or 'no detail'}")
+            for line in r.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    return
+                if not data:
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    continue
+                choices = chunk.get("choices") or []
+                piece = ((choices[0].get("delta") or {}).get("content") or "") if choices else ""
+                if piece:
+                    yield piece
+
+def answer_stream(system: str, prompt: str, temperature: Optional[float]):
+    """Yield the answer in pieces, from the hosted endpoint when one is configured."""
+    if HOSTED:
+        return hosted_stream(system, prompt, temperature)
+    payload = chat_payload(system, prompt, temperature)
+    payload["stream"] = True
+    return ollama_stream(payload)
+
 def run_job(job: Job) -> None:
     """Produce the script on a thread of its own: no reader, no lost work."""
     job.finish(status="running")
     try:
-        for piece in ollama_stream(job.payload):
+        for piece in answer_stream(job.system, job.prompt, job.temperature):
             job.add(piece)
         code = strip_fences(job.text())
         if not code:
@@ -438,7 +519,7 @@ def run_job(job: Job) -> None:
     except HTTPException as e:
         job.finish(status="error", error=str(e.detail))
     except httpx.HTTPError as e:
-        job.finish(status="error", error=ollama_failure(e).detail)
+        job.finish(status="error", error=inference_failure(e).detail)
     except Exception as e:  # a bug here must never leave a reader waiting forever
         job.finish(status="error", error=f"{e.__class__.__name__}: {e}")
     finally:
@@ -459,10 +540,11 @@ async def root():
         chip(True, "api", "online"),
         chip(state["database"], "postgres", "connected" if state["database"]
              else str(state.get("database_error", "not configured"))),
-        chip(state["ollama"], "ollama", "reachable" if state["ollama"]
-             else str(state.get("error", "unreachable"))),
-        chip(state["model_ready"], "model", f"{MODEL} ready" if state["model_ready"]
-             else f"{MODEL} pulling"),
+        chip(state["ollama"], "ollama",
+             "not used -- hosted inference" if HOSTED
+             else "reachable" if state["ollama"] else str(state.get("error", "unreachable"))),
+        chip(state["model_ready"], "model", f"{active_model()} ready" if state["model_ready"]
+             else f"{active_model()} pulling"),
     ])
     try:
         page = INDEX.read_text(encoding="utf-8")
@@ -471,30 +553,41 @@ async def root():
         return HTMLResponse("<h1>bahs</h1><p>web/index.html is missing; use /health and /docs.</p>")
     return HTMLResponse(
         page.replace("__CHIPS__", chips)
-            .replace("__MODEL__", html.escape(MODEL))
+            .replace("__MODEL__", html.escape(active_model()))
             .replace("__KEY_REQUIRED__", "true" if API_KEY else "false")
     )
 
-@app.post("/generate")
-async def generate(req: GenReq, _: None = Depends(require_key)):
+def start_job(prompt: str, temperature: Optional[float], note: str) -> Job:
+    """Look up what the model should know, then set the work going on its own thread."""
     try:
         fails = get_failures()
-        examples = get_examples(req.prompt)
+        examples = get_examples(prompt)
     except (psycopg.Error, RuntimeError) as e:
         raise db_unavailable(e)
-
-    system = build_system(fails, examples)
     claim_slot()
-    try:
-        async with httpx.AsyncClient(timeout=chat_timeout(), follow_redirects=True) as c:
-            r = await c.post(f"{OLLAMA}/api/chat", json=chat_payload(system, req.prompt, req.temperature))
-            r.raise_for_status()
-            code = strip_fences(r.json()["message"]["content"])
-    except httpx.HTTPError as e:
-        raise ollama_failure(e)
-    finally:
-        release_slot()
-    return {"id": store_script(req.prompt, code), "code": code}
+    job = Job(build_system(fails, examples), prompt, temperature, note)
+    register(job)
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return job
+
+async def wait_note() -> str:
+    """What the wait is for: a cold model load and a stuck request look identical otherwise."""
+    if HOSTED:
+        return f"{INFERENCE_MODEL} via hosted inference"
+    return "model ready" if await model_loaded() else f"loading {MODEL} into RAM"
+
+@app.post("/generate")
+async def generate(req: GenReq, _: None = Depends(require_key)):
+    """Block until the script is ready — this is the path `client.lua` uses.
+
+    It runs the same job the streaming flow runs, so both go through whichever provider
+    is configured, and then waits for that job to finish.
+    """
+    job = start_job(req.prompt, req.temperature, await wait_note())
+    await asyncio.to_thread(job.wait, CHAT_TIMEOUT + 30)
+    if job.status == "error":
+        raise HTTPException(502, job.error)
+    return {"id": job.script_id, "code": job.code}
 
 def frame(payload: dict) -> str:
     return json.dumps(payload) + "\n"
@@ -540,21 +633,8 @@ async def start_stream(req: GenReq, _: None = Depends(require_key)):
     Nothing is generated on this request, so it cannot hang and be dropped: the waiting
     happens on the job's thread, and the page watches /generate/stream/{job} instead.
     """
-    try:
-        fails = get_failures()
-        examples = get_examples(req.prompt)
-    except (psycopg.Error, RuntimeError) as e:
-        raise db_unavailable(e)
-    payload = chat_payload(build_system(fails, examples), req.prompt, req.temperature)
-    payload["stream"] = True
-    claim_slot()
-    # Say what the wait is for: a cold model load and a stuck request look identical
-    # from the browser otherwise.
-    loaded = await model_loaded()
-    job = Job(req.prompt, payload, "model ready" if loaded else f"loading {MODEL} into RAM")
-    register(job)
-    threading.Thread(target=run_job, args=(job,), daemon=True).start()
-    return {"job": job.id, "model": MODEL, "timeout": CHAT_TIMEOUT}
+    job = start_job(req.prompt, req.temperature, await wait_note())
+    return {"job": job.id, "model": active_model(), "timeout": CHAT_TIMEOUT}
 
 @app.get("/generate/stream/{job_id}")
 async def watch_stream(job_id: str, _: None = Depends(require_key)):
@@ -580,13 +660,19 @@ async def feedback(req: FeedbackReq, _: None = Depends(require_key)):
 async def snapshot() -> dict:
     # Always reports rather than raising, so the platform healthcheck only depends
     # on the API being up; database and ollama readiness come back in the body.
-    body = {"status": "ok", "database": False, "ollama": False, "model": MODEL,
+    body = {"status": "ok", "database": False, "ollama": False, "model": active_model(),
+            "provider": "hosted" if HOSTED else "ollama",
             "model_ready": False, "api_key_required": bool(API_KEY)}
     try:
         fetchone("SELECT 1")
         body["database"] = True
     except (psycopg.Error, RuntimeError) as e:
         body["database_error"] = str(e)
+    if HOSTED:
+        # Nothing local to pull or hold: the configured endpoint is the whole story.
+        body["ollama"] = True
+        body["model_ready"] = True
+        return body
     try:
         async with httpx.AsyncClient(timeout=5, follow_redirects=True) as c:
             r = await c.get(f"{OLLAMA}/api/tags")
