@@ -6,7 +6,7 @@ import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CALLS = []
-STUB = {"users_code": 0}          # what /users/current should answer
+STUB = {"users_code": 0, "api_code": 0}   # what /users/current and a rejected API key answer
 DRAFT = "```lua\n-- draft\nprint('hi')\n```"
 REVIEW = ("VERDICT: ISSUES\n"
           "1. the loop never ends | where: line 4 | why it fails: it runs forever | fix: add a break")
@@ -64,7 +64,7 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
-        if self.path.endswith("/v1/models"):
+        if self.path.endswith("/models"):
             return self._send(200, {"object": "list", "data": [{"id": "deepseek-v4-flash"}]})
         if self.path.endswith("/users/current"):
             if STUB["users_code"]:
@@ -81,6 +81,11 @@ class Stub(BaseHTTPRequestHandler):
         record = {"path": self.path, "body": body,
                   "headers": {k.lower(): v for k, v in self.headers.items()}}
         CALLS.append(record)
+        if STUB["api_code"] and self.path.endswith("/api-reject/chat/completions"):
+            # The API's own wording when a chat.deepseek.com session token is presented as a key.
+            return self._send(STUB["api_code"],
+                              {"error": {"message": "Authentication Fails, Your api key: "
+                                                        "****VEFK is invalid"}})
         if self.path.endswith("/chat_session/create"):
             return self._send(200, {"code": 0, "data": {"biz_data": {"id": "sess-1"}}})
         if self.path.endswith("/chat/create_pow_challenge"):
@@ -212,6 +217,47 @@ check("deepseek-web is chosen without being asked", server.REVIEW_SHAPE, "deepse
 check("the transport is attached", server.REVIEWER.web is not None, True)
 check("the reviewer is on", server.review_enabled(), True)
 check("and labelled as the site", server.REVIEWER.web.label, "chat.deepseek.com")
+
+print("\n-- a session token with no endpoint chosen goes to the site, not the API --")
+os.environ.pop("REVIEW_URL", None)
+os.environ.pop("REVIEW_SHAPE", None)
+reload_with(DEEPSEEK_TOKEN="user-token-xyz")
+check("the endpoint follows the credential", server.REVIEW_URL, "https://chat.deepseek.com")
+check("and it was not asked for", server.REVIEW_URL_AUTO, True)
+check("so the shape is the site's", server.REVIEW_SHAPE, "deepseek-web")
+check("the transport is attached", server.REVIEWER.web is not None, True)
+check("and the reviewer is on", server.review_enabled(), True)
+
+print("\n-- REVIEW_URL left pointing at the API with a session token also goes to the site --")
+reload_with(REVIEW_URL="https://api.deepseek.com", DEEPSEEK_TOKEN="user-token-xyz")
+check("the API is not used with a session token", server.REVIEW_URL, "https://chat.deepseek.com")
+check("and the site's shape comes with it", server.REVIEW_SHAPE, "deepseek-web")
+
+print("\n-- a bridge someone set by hand is left alone --")
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
+            DEEPSEEK_TOKEN="user-token-xyz")
+check("an endpoint that is not the API is respected", server.REVIEW_URL_AUTO, False)
+check("and the endpoint is the one that was set", server.REVIEW_URL,
+      f"http://127.0.0.1:{PORT}/deepseek")
+
+print("\n-- an sk- key still means the API --")
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
+            DEEPSEEK_TOKEN="sk-real-api-key")
+check("nothing was switched for an API key", server.REVIEW_URL_AUTO, False)
+check("and the shape stays OpenAI", server.REVIEW_SHAPE, "openai")
+
+print("\n-- a session token the API rejects is blamed on the endpoint, not the token --")
+STUB["api_code"] = 401
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api-reject", REVIEW_SHAPE="openai",
+            DEEPSEEK_TOKEN="user-token-xyz")
+out, done, calls = turn("make me a walk script")
+review = "".join(f.get("t", "") for f in out if f.get("ch") == "review")
+check("the draft still ships, unrefined", "-- draft" in (done.get("text") or ""), True)
+check("the reason names the fix",
+      "REVIEW_URL=https://chat.deepseek.com" in review, True)
+check("and says which credential it is", "session token, not an API key" in review, True)
+check("the api's own words are kept", "Authentication Fails" in review, True)
+STUB["api_code"] = 0
 
 print(f"\n{count[0]} checks, {len(failures)} failed")
 if failures:

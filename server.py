@@ -383,20 +383,25 @@ class DeepSeekWeb:
 # DeepSeek V4 Flash, thinking off, search off. It is only ever sent a script to criticise,
 # never the user's conversation, so it never needs to be the model the user chose.
 #
-# Two things about "chat.deepseek.com" that decide the shape of this section:
-#   * chat.deepseek.com is a web app with no public API. Calling it directly needs a
-#     signed-in browser session that has passed its AWS WAF human-check (a cf_clearance
-#     cookie) and a proof of work solved per request by executing DeepSeek's own wasm. A
-#     server cannot clear that check, so this service does not pretend to try.
-#   * DeepSeek's *API* is the thing that takes a token, and it is the same models. A key
-#     from platform.deepseek.com goes in DEEPSEEK_TOKEN and everything works from here.
-#
-# If you would rather go through the web chat, it has to be through a bridge that sits in
-# front of it and speaks OpenAI (a browser-running deployment of xtekky/deepseek4free or
-# sums001/Deepseek-API do exactly that): point REVIEW_URL at it, paste its token into
-# DEEPSEEK_TOKEN, and set REVIEW_SHAPE=web so the toggles are sent in the shape it expects.
-REVIEW_URL = env("REVIEW_URL", "DEEPSEEK_URL", default="https://api.deepseek.com")
+# Two credentials fit in DEEPSEEK_TOKEN, and which one it is decides the endpoint:
+#   * an API key (`sk-...`) from platform.deepseek.com -> the API, OpenAI-shaped.
+#   * the `userToken` chat.deepseek.com keeps in localStorage -> the site's own endpoints,
+#     driven by the DeepSeekWeb transport above, because the API does not take that token.
+# The endpoint follows the credential on its own, so a pasted userToken is not rejected by the
+# API first: that 401 says the token is bad when it is only in the wrong place.
 REVIEW_KEY = env("DEEPSEEK_TOKEN", "REVIEW_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_KEY")
+# Where the review goes. Left alone it is DeepSeek's API -- unless the credential is not an API key,
+# in which case it is the site. DeepSeek's API keys start with `sk-` and the token chat.deepseek.com
+# keeps in localStorage does not, and sending one of those to the API earns a 401 that reads like
+# the token is broken when the endpoint is. Picking the endpoint from the credential itself means a
+# pasted userToken works without a second variable.
+_review_asked_url = env("REVIEW_URL", "DEEPSEEK_URL")
+_session_token = bool(REVIEW_KEY) and not REVIEW_KEY.startswith("sk-")
+# The API takes only an `sk-` key, so a session token aimed at it (or at nothing) goes to the site
+# instead: that pair cannot authenticate, and the 401 it earns reads like a broken token.
+REVIEW_URL_AUTO = _session_token and (not _review_asked_url or "api.deepseek.com" in _review_asked_url)
+REVIEW_URL = ("https://chat.deepseek.com" if REVIEW_URL_AUTO
+              else (_review_asked_url or "https://api.deepseek.com"))
 REVIEW_MODEL = env("REVIEW_MODEL", "DEEPSEEK_MODEL", default="deepseek-v4-flash")
 # openai (an OpenAI-shaped endpoint, including api.deepseek.com) | web (a bridge in front of
 # chat.deepseek.com: no system role, and the toggles are plain booleans) | deepseek-web (the
@@ -776,9 +781,16 @@ def failure_reason(status: int, body: str, provider: Provider) -> str:
     who = provider.name
     if status == 401:
         if who != "qwen":
-            return (f"{who} rejected the key ({message}) -- put an API key from "
-                    f"platform.deepseek.com in DEEPSEEK_TOKEN on this service (a "
-                    "chat.deepseek.com session token is not an API key)")
+            # A userToken sent to the API reads as a bad key, which is a misleading diagnosis: the
+            # credential is fine, the endpoint is the wrong one. Say which fix is the right one.
+            session_token = bool(provider.key) and not provider.key.startswith("sk-")
+            if session_token and provider.web is None:
+                return (f"{provider.label()} rejected the token ({message}) -- DEEPSEEK_TOKEN holds "
+                        "a chat.deepseek.com session token, not an API key, and the review is "
+                        "still going to the API. Set REVIEW_URL=https://chat.deepseek.com to use "
+                        "the web transport, or put an `sk-...` API key from platform.deepseek.com "
+                        "in DEEPSEEK_TOKEN")
+            return (f"{provider.label()} rejected the key ({message}) -- check DEEPSEEK_TOKEN")
         return (f"QWEN_TOKEN was rejected by qwen-api ({message}) -- copy a fresh token from "
                 "chat.qwen.ai (DevTools console: localStorage.token) and update the variable")
     if status == 403:
@@ -1191,6 +1203,9 @@ async def lifespan(_app: FastAPI):
         print(f"[review] {where} -> {REVIEWER.model} (thinking: {REVIEW_THINKING}, "
               f"shape: {REVIEW_SHAPE}), brief {len(BRIEF)} chars from "
               f"{BRIEF_PATH.name if BRIEF else 'the built-in rubric'}", flush=True)
+        if REVIEW_URL_AUTO:
+            print("[review] DEEPSEEK_TOKEN is not an sk-... API key, so the review goes to the "
+                  "site instead of the API. Set REVIEW_URL to override that", flush=True)
         if REVIEWER.web is not None:
             print("[review] the userToken is the credential; search and thinking are sent false, "
                   "and a proof of work is asked for per message with no solver bundled",

@@ -32,7 +32,7 @@ conversation lives in the browser and is sent back with every turn.
 | Variable | Value |
 | --- | --- |
 | `QWEN_TOKEN` | Qwen access token: chat.qwen.ai -> F12 -> Console -> `localStorage.token` |
-| `DEEPSEEK_TOKEN` | either the `userToken` from chat.deepseek.com (with `REVIEW_URL=https://chat.deepseek.com`) or an API key (`sk-...`) from [platform.deepseek.com](https://platform.deepseek.com) |
+| `DEEPSEEK_TOKEN` | either the `userToken` from chat.deepseek.com or an API key (`sk-...`) from [platform.deepseek.com](https://platform.deepseek.com) -- the endpoint follows the credential, see below |
 | `API_KEY` | *optional* — if you set it, the API (`/v1`, `/chat`, `/generate`) requires it. Left unset, the Qwen token is the key. The page never needs one |
 
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
@@ -40,12 +40,29 @@ reviewer key set, model served · model qwen3.8-max · mode fast · Hy kanha`.
 
 ### `chat.deepseek.com` with a `userToken`
 
-`DEEPSEEK_TOKEN` takes either credential, and which one it is decides the transport:
+`DEEPSEEK_TOKEN` takes either credential, and which one it is decides the transport **by itself**:
 
 | What goes in `DEEPSEEK_TOKEN` | Transport | What to set |
 | --- | --- | --- |
-| the `userToken` from chat.deepseek.com | the web transport built in here | `REVIEW_URL=https://chat.deepseek.com` — the shape (`deepseek-web`) is picked for you |
-| an API key from platform.deepseek.com | OpenAI-shaped, the default | nothing; `REVIEW_URL` is already `https://api.deepseek.com` |
+| the `userToken` from chat.deepseek.com | the web transport built in here | nothing — `REVIEW_URL` becomes `https://chat.deepseek.com` and the shape (`deepseek-web`) comes with it |
+| an API key from platform.deepseek.com (`sk-...`) | OpenAI-shaped | nothing; `REVIEW_URL` stays `https://api.deepseek.com` |
+
+An API key starts with `sk-` and a `userToken` does not, so a session token with no endpoint set
+goes to the site instead of being rejected by the API — and so does one left pointed at
+`api.deepseek.com`, because that pair cannot authenticate either. Any other endpoint set by hand
+(a bridge, a mirror) is used exactly as given.
+The switch is reported at boot (`[review] DEEPSEEK_TOKEN is not an sk-... API key, so the review goes
+to the site instead of the API`) and on `/health` as `reviewer.endpoint`.
+
+The error this prevents — and what it means if you see it anyway, because `REVIEW_URL` was set by
+hand to the API:
+
+```
+deepseek rejected the token (Authentication Fails, Your api key: ****VEFK is invalid)
+-- DEEPSEEK_TOKEN holds a chat.deepseek.com session token, not an API key, and the review is
+   still going to the API. Set REVIEW_URL=https://chat.deepseek.com to use the web transport,
+   or put an `sk-...` API key from platform.deepseek.com in DEEPSEEK_TOKEN
+```
 
 Same model either way; what differs is which side of your account answers. The site's endpoints
 were probed from this container rather than assumed, and they answered:
@@ -220,7 +237,8 @@ that, which is exactly why the client polls.
 | What you see | What it is |
 | --- | --- |
 | `token rejected`, `401`s | the Qwen token expired (they last weeks). Copy a fresh one |
-| `deepseek rejected the key` | `DEEPSEEK_TOKEN` is not an API key — see [About chat.deepseek.com](#about-chatdeepseekcom) |
+| `deepseek rejected the token`, `your api key ... is invalid` | a chat `userToken` was sent to the API because `REVIEW_URL` was set by hand — clear it, or set it to `https://chat.deepseek.com` |
+| `deepseek rejected the key` | an API key that is wrong or revoked; make a new one at [platform.deepseek.com](https://platform.deepseek.com) |
 | `deepseek is rate limiting` | free-tier quota; wait, or `REVIEW_MODEL=deepseek-v4-pro` |
 | reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> review failed: ...` |
 | the draft is the answer, no rewrite | the reviewer answered `VERDICT: OK`, or a failed review meant there was no list to apply |
