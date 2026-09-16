@@ -16,10 +16,16 @@
 # There is no database either: the conversation lives in the browser and is sent back with
 # every turn.
 #
-# The brief handed to the reviewer before anything else is part of the image. There are two in
-# the repo (send.txt and Send.txt, differing only in case); send.txt is the newer and the one
-# used, and Send.txt is the fallback. A missing one is not fatal -- the built-in rubric still
-# applies -- but which one was used is reported on /health so it is visible rather than silent.
+# The brief handed to the reviewer before anything else is part of the image. It goes out on its
+# own first, and the request for a script only follows once the reviewer has answered it. There
+# are two briefs in the repo (send.txt and Send.txt, differing only in case); send.txt is the
+# newer and the one used, and Send.txt is the fallback. A missing one is not fatal -- the built-in
+# rubric still applies -- but which one was used is reported on /health so it is visible rather
+# than silent.
+#
+# Two Python modules: bridge.py is everything that talks to a provider (tokens, config, the two
+# transports, the brief, the job record) and server.py is the service on top of it (the chain, the
+# endpoints, the page).
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -31,6 +37,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py ./
+COPY bridge.py ./
 COPY pow_solver.py ./
 COPY web ./web
 COPY send.txt ./

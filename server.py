@@ -1,876 +1,11 @@
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel
-from typing import Optional
-from contextlib import asynccontextmanager
-from pathlib import Path
-from collections import defaultdict, deque
-import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid
-
-import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
-
-# --------------------------------------------------------------------------------------
-# What this service is: two models, in a chain, behind one API.
-#
-#   you -- ask --> bahs -- draft -->                    Qwen      (qwen-api)
-#                      \
-#                       `- review -->                    DeepSeek  (V4 Flash, thinking off)
-#                           \
-#                            `- refine, same chat as the draft --> Qwen
-#
-# chat.qwen.ai has no public API. github.com/encryptarun/qwen-api turns it into
-# OpenAI-compatible endpoints using the Qwen *access token* from the browser
-# (chat.qwen.ai -> DevTools console -> localStorage.token). That token is the key to a
-# whole Qwen account, so it lives here and never in a page or a Roblox script.
-#
-# The reviewer is DeepSeek V4 Flash, with thinking and search switched off and never the
-# caller's to choose. Which DeepSeek it is depends on the credential: an `sk-...` API key
-# reviews through api.deepseek.com, and a chat.deepseek.com `userToken` reviews through the
-# site's own endpoints (see DeepSeekWeb below) -- where the message call needs a proof of work,
-# solved here with DeepSeek's own sha3 module (pow_solver.py).
-#
-#   POST /chat/stream           one turn -> a job id, the whole chain runs in the job
-#   GET  /chat/stream/{job}     NDJSON: replay, text, phase changes, heartbeats, done
-#   POST /chat                  the same chain, blocking (client.lua)
-#   POST /generate[...]         one prompt, no history, same chain
-#   POST /v1/chat/completions   OpenAI-compatible passthrough, pinned to Qwen
-#   GET  /v1/models, /health
-#
-# Every question is sent as "Hy kanha <your question>" (GREETING), always to QWEN_MODEL
-# with thinking off. The conversation belongs to the caller: the turns it sends are the
-# turns the model sees, so a follow-up is answered in the same chat it has been answering
-# in. The review and the refine instruction are internal turns -- they are never part of
-# what the user's next question carries.
-#
-# Nothing is pulled, loaded or warmed: no weights, no GPU, no volume, no database. The one
-# file this service reads is Send.txt, the brief handed to the reviewer before anything
-# else (REVIEW_BRIEF).
-# --------------------------------------------------------------------------------------
-
-
-def env(*names: str, default: str = "") -> str:
-    """The first of these variables that is set, so an old name keeps working."""
-    for name in names:
-        value = os.getenv(name, "").strip()
-        if value:
-            return value
-    return default
-
-
-# --- the two providers ------------------------------------------------------------------
-
-class Provider:
-    """One OpenAI-compatible endpoint, plus whatever it calls "answer without thinking".
-
-    Both sides speak the same request and response shape, so the only per-provider
-    knowledge is where it lives, what it calls the model, and how it spells "no thinking".
-    """
-
-    def __init__(self, name: str, url: str, key: str, model: str, dialect: dict,
-                 timeout: float, extra: Optional[dict] = None, shape: str = "openai",
-                 web: Optional["DeepSeekWeb"] = None):
-        self.name = name
-        self.url = url.rstrip("/")
-        self.key = key
-        self.model = model
-        self.dialect = dialect
-        self.timeout = timeout
-        self.extra = extra or {}
-        self.shape = shape
-        # Set when this provider is chat.deepseek.com itself: those endpoints are not
-        # OpenAI-shaped, so the request goes through the web transport instead.
-        self.web = web
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.key and self.url and self.model)
-
-    def label(self) -> str:
-        """Short host name, for the page's chips."""
-        return self.url.split("//", 1)[-1].split("/", 1)[0]
-
-    def endpoint(self) -> str:
-        if self.url.endswith("/chat/completions"):
-            return self.url
-        return f"{self.url}/chat/completions"
-
-    def headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
-
-    def request(self, messages: list, temperature: Optional[float], max_tokens: int,
-                stream: bool = True) -> dict:
-        """An OpenAI-shaped body, pinned to this provider's model and thinking mode.
-
-        The model is not the caller's to choose: one model per role, so a request behaves
-        the same whoever sends it.
-        """
-        body = {
-            "model": self.model,
-            "messages": fold(self.shape, messages),
-            "stream": stream,
-            **self.dialect,
-            **self.extra,
-        }
-        if temperature is not None:
-            body["temperature"] = temperature
-        if max_tokens > 0:
-            body["max_tokens"] = max_tokens
-        # What goes out is logged with what comes back: without it, a short answer, a request that
-        # never carried the brief, and a provider that stopped early all look the same afterwards.
-        # The token checks do not come through here (stream=False), so this is one line per call.
-        if stream and env("LOG_REQUESTS", default="1") != "0":
-            asked = sum(len(m.get("content") or "") for m in body["messages"]
-                        if isinstance(m, dict))
-            print(f"[upstream] {self.name} -> {self.model}: {len(body['messages'])} message(s), "
-                  f"{asked} chars, max_tokens {body.get('max_tokens', 'unset')}", flush=True)
-        return body
-
-
-def fold(shape: str, messages: list) -> list:
-    """One prompt for an endpoint that has no system role (the web-chat bridges).
-
-    The brief has to come before anything else, so the turns are concatenated in the order
-    they were built -- system first -- rather than being dropped or reordered. An
-    OpenAI-shaped endpoint gets the turns untouched.
-    """
-    if shape != "web":
-        return messages
-    parts = []
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        parts.append(content.strip())
-    return [{"role": "user", "content": "\n\n".join(parts)}]
-
-
-def qwen_token() -> str:
-    """The Qwen access token, under whichever name it was put in the variables."""
-    return env("QWEN_TOKEN", "QWEN_API_KEY", "QWEN_ACCESS_TOKEN")
-
-
-QWEN_URL = env("QWEN_URL", default="https://qwen.aikit.club/v1")
-# qwen-api also serves its own bookkeeping endpoints (/validate) at the root.
-QWEN_ROOT = QWEN_URL[: -len("/v1")] if QWEN_URL.endswith("/v1") else QWEN_URL
-
-QWEN_TOKEN = qwen_token()
-# Every generation is sent to this model. There is no picker: one model, one behaviour.
-QWEN_MODEL = env("QWEN_MODEL", default="qwen3.8-max")
-# fast (answer straight away) | auto | thinking. Forced onto every request: reasoning
-# tokens are billed against max_tokens and the answer is what is wanted, not the thinking.
-QWEN_THINKING = env("QWEN_THINKING", default="fast")
-# Qwen answers in seconds; this is a backstop for a provider that hangs.
-CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="300"))
-
-QWEN = Provider(
-    "qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
-    {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT,
-)
-
-# --- chat.deepseek.com, driven by the token the site itself stores -----------------------
-#
-# The web app has no public API, but its own endpoints answer a server, so a *userToken* -- the
-# value behind chat.deepseek.com -> F12 -> Console ->
-# JSON.parse(localStorage.getItem("userToken")).value -- is enough to review a script. Three of
-# the four calls need nothing else:
-#
-#   GET  /users/current             is the token still good?
-#   POST /chat_session/create       a session id, {"character_id": null}
-#   POST /chat/create_pow_challenge a challenge for the message about to be sent
-#   POST /chat/completion           the answer -- and this one is gated by a proof of work
-#
-# The proof of work is the one piece that cannot be solved here: it needs DeepSeek's own
-# sha3_wasm_bg.wasm, and the copies published with the two open-source bridges are stale (their
-# wasm_solve writes nothing for any difficulty or input -- the README has the measurement). So the
-# challenge is fetched and logged, no header is invented, and whatever the API answers is what
-# gets reported -- which is how you find out whether it is enforced for your account at all.
-#
-# thinking_enabled and search_enabled are sent false, always. The reviewer reads a script; it does
-# not reason out loud and it does not search the web. The site takes no temperature or token
-# ceiling, so those are ignored on this path.
-
-LOGIN_HINT = ("copy a fresh userToken: chat.deepseek.com -> F12 -> Console -> "
-              "JSON.parse(localStorage.getItem(\"userToken\")).value")
-
-
-def as_prompt(messages: list) -> str:
-    """The turns as one string, in order, system first.
-
-    The web endpoint has no roles: one prompt field. Concatenating in the order the turns were
-    built is what keeps the brief ahead of everything else on this path too.
-    """
-    parts = []
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content.strip())
-    return "\n\n".join(parts)
-
-
-def read_chunk(chunk: dict, box: Optional[dict] = None) -> str:
-    """One piece of the answer out of a chat.deepseek.com frame, in either shape it uses.
-
-    The site has streamed an OpenAI-like frame and an older one (v, with fragments under p).
-    Both are accepted rather than betting on one. Thinking is dropped -- it is switched off,
-    and the reviewer's answer is what is wanted -- and a status or error frame yields nothing
-    so it cannot arrive as text.
-    """
-    choices = chunk.get("choices") or []
-    if choices:
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        if box is not None and choice.get("finish_reason"):
-            box["finish"] = choice["finish_reason"]
-        if str(delta.get("type") or "").lower() in ("thinking", "reasoning"):
-            return ""
-        return delta.get("content") or ""
-    path = str(chunk.get("p") or "")
-    value = chunk.get("v")
-    if path == "response/status":
-        if box is not None and str(value).strip().upper() == "FINISHED":
-            box["finish"] = box.get("finish") or "stop"
-        return ""
-    if "thinking" in path.lower():
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "".join(part.get("content") or "" for part in value
-                       if isinstance(part, dict)
-                       and str(part.get("type") or "RESPONSE").upper() == "RESPONSE")
-    return ""
-
-
-class DeepSeekWeb:
-    """chat.deepseek.com as a reviewer, over the endpoints the web app itself calls.
-
-    `base` points at the site by default; it can be pointed somewhere else, which is both how this
-    is tested and how a mirror would be used (a base ending in /api/v0).
-    """
-
-    DEFAULT_BASE = "https://chat.deepseek.com/api/v0"
-
-    def __init__(self, token: str, timeout: float, cookies: str = "", base: str = ""):
-        self.token = token
-        self.timeout = timeout
-        self.cookie = (cookies or "").strip()
-        self.base = (base or self.DEFAULT_BASE).rstrip("/")
-        self.label = self.base.split("//", 1)[-1].split("/", 1)[0]
-        self.model = "deepseek-web"
-
-    def headers(self, pow_value: Optional[str] = None) -> dict:
-        """What the site's own client sends, so the request looks like the site's."""
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {self.token}",
-            "content-type": "application/json",
-            "origin": "https://chat.deepseek.com",
-            "referer": "https://chat.deepseek.com/",
-            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"),
-            "x-app-version": "20241129.1",
-            "x-client-locale": "en_US",
-            "x-client-platform": "web",
-            "x-client-version": "1.0.0-always",
-        }
-        if self.cookie:
-            headers["cookie"] = self.cookie
-        if pow_value:
-            headers["x-ds-pow-response"] = pow_value
-        return headers
-
-    def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0),
-                            follow_redirects=True)
-
-    def _call(self, method: str, path: str, payload: Optional[dict] = None):
-        try:
-            with self._client() as c:
-                return c.request(method, self.base + path, json=payload, headers=self.headers())
-        except httpx.HTTPError as e:
-            raise HTTPException(502, f"cannot reach chat.deepseek.com ({e.__class__.__name__})")
-
-    @staticmethod
-    def _json(response) -> dict:
-        try:
-            body = response.json()
-        except ValueError:
-            return {}
-        return body if isinstance(body, dict) else {}
-
-    def _explain(self, body: dict, status: int = 0) -> str:
-        """What chat.deepseek.com said, with the one fix that is not obvious."""
-        code = body.get("code")
-        message = str(body.get("msg") or "").strip()
-        if code == 40002:
-            return "chat.deepseek.com: Missing Token -- DEEPSEEK_TOKEN is not set on this service"
-        if code == 40003:
-            return (f"chat.deepseek.com rejected DEEPSEEK_TOKEN ({message or 'invalid token'}) -- "
-                    + LOGIN_HINT)
-        # The two proof-of-work refusals, told apart rather than pooled: 40300 is the header not
-        # being there (no module, an unknown algorithm, or a challenge that could not be solved),
-        # 40301 is an answer the server rejected -- a different problem with a different fix.
-        if code == 40300:
-            return (f"chat.deepseek.com: MISSING_HEADER ({message or 'no detail'}) -- the message "
-                    "was refused for the proof-of-work header. The [deepseek] lines in this "
-                    "service's log say which half failed: the sha3 module, or the solve")
-        if code == 40301:
-            return (f"chat.deepseek.com: INVALID_POW_RESPONSE ({message or 'no detail'}) -- the "
-                    "proof of work was solved with a module that is not the one the site uses")
-        text = json.dumps(body)[:300] if body else f"HTTP {status}"
-        if "pow" in text.lower() or "proof" in text.lower():
-            return f"chat.deepseek.com refused the proof of work ({text})"
-        return f"chat.deepseek.com said {code}: {message}" if code else text
-
-    def validate(self) -> tuple:
-        """Whether the userToken is still good, for the chip."""
-        response = self._call("GET", "/users/current")
-        body = self._json(response)
-        if response.status_code >= 400 and not body:
-            return False, f"chat.deepseek.com answered HTTP {response.status_code}"
-        if body.get("code") not in (None, 0):
-            return False, self._explain(body, response.status_code)
-        return True, "token accepted"
-
-    def create_session(self) -> str:
-        """A fresh chat for this review, so reviews never read each other."""
-        response = self._call("POST", "/chat_session/create", {"character_id": None})
-        body = self._json(response)
-        session = (((body.get("data") or {}).get("biz_data") or {}).get("id"))
-        if not session:
-            raise HTTPException(502, self._explain(body, response.status_code))
-        return str(session)
-
-    def challenge(self):
-        """The proof-of-work challenge for the next message, when it can be had at all."""
-        try:
-            response = self._call("POST", "/chat/create_pow_challenge",
-                                  {"target_path": "/api/v0/chat/completion"})
-        except HTTPException:
-            return None
-        body = self._json(response)
-        return (((body.get("data") or {}).get("biz_data") or {}).get("challenge"))
-
-    def stream(self, prompt: str, box: Optional[dict] = None):
-        """Send one prompt and stream the answer back."""
-        session = self.create_session()
-        challenge = self.challenge() or {}
-        pow_value = ""
-        if challenge:
-            # The solve is native and bounded by the challenge's difficulty (~10 ms for the 144000
-            # the site hands out), and solve() returns "" rather than raising when it cannot.
-            pow_value = pow_solver.solve(challenge)
-            if not pow_value:
-                print(f"[deepseek] the challenge (difficulty {challenge.get('difficulty')}) was not "
-                      "solved; this message goes out without the header, which the API answers "
-                      "with 40300 MISSING_HEADER", flush=True)
-        # The prompt's size and whether the brief survived into it, in one line: this is the answer
-        # to "is the whole send.txt being sent", and it is checkable in the service's own log.
-        if BRIEF:
-            print(f"[deepseek] sending {len(prompt)} chars (brief {len(BRIEF)} chars from "
-                  f"{BRIEF_PATH.name}: {'whole' if BRIEF in prompt else 'NOT COMPLETE'}), "
-                  "thinking off, search off", flush=True)
-        else:
-            print(f"[deepseek] sending {len(prompt)} chars (no brief loaded), thinking off, "
-                  "search off", flush=True)
-        payload = {
-            "chat_session_id": session,
-            "parent_message_id": None,
-            "prompt": prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": False,
-            "search_enabled": False,
-        }
-        with self._client() as c:
-            with c.stream("POST", f"{self.base}/chat/completion", json=payload,
-                          headers=self.headers(pow_value)) as r:
-                if r.status_code >= 400 or "event-stream" not in r.headers.get("content-type", ""):
-                    raw = r.read().decode("utf-8", "replace")
-                    try:
-                        body = json.loads(raw)
-                    except ValueError:
-                        body = {"msg": raw[:300]}
-                    raise HTTPException(502, self._explain(
-                        body if isinstance(body, dict) else {}, r.status_code))
-                for line in r.iter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    if not isinstance(chunk, dict):
-                        continue
-                    if chunk.get("code") and chunk.get("msg") and chunk.get("v") is None:
-                        raise HTTPException(502, self._explain(chunk, 200))
-                    piece = read_chunk(chunk, box)
-                    if piece:
-                        yield piece
-                if box is not None and not box.get("finish"):
-                    # The site never said it had finished writing, so this review is whatever
-                    # arrived before the stream stopped -- said out loud rather than passed off as
-                    # the whole answer.
-                    print("[deepseek] the site's stream ended without a finished status: the "
-                          "review may be only the part it managed to write", flush=True)
-
-
-# --- the reviewer ------------------------------------------------------------------------
-#
-# DeepSeek V4 Flash, thinking off, search off. It is only ever sent a script to criticise,
-# never the user's conversation, so it never needs to be the model the user chose.
-#
-# Two credentials fit in DEEPSEEK_TOKEN, and which one it is decides the endpoint:
-#   * an API key (`sk-...`) from platform.deepseek.com -> the API, OpenAI-shaped.
-#   * the `userToken` chat.deepseek.com keeps in localStorage -> the site's own endpoints,
-#     driven by the DeepSeekWeb transport above, because the API does not take that token.
-# The endpoint follows the credential on its own, so a pasted userToken is not rejected by the
-# API first: that 401 says the token is bad when it is only in the wrong place.
-REVIEW_KEY = env("DEEPSEEK_TOKEN", "REVIEW_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_KEY")
-# Where the review goes. Left alone it is DeepSeek's API -- unless the credential is not an API key,
-# in which case it is the site. DeepSeek's API keys start with `sk-` and the token chat.deepseek.com
-# keeps in localStorage does not, and sending one of those to the API earns a 401 that reads like
-# the token is broken when the endpoint is. Picking the endpoint from the credential itself means a
-# pasted userToken works without a second variable.
-_review_asked_url = env("REVIEW_URL", "DEEPSEEK_URL")
-_session_token = bool(REVIEW_KEY) and not REVIEW_KEY.startswith("sk-")
-# The API takes only an `sk-` key, so a session token aimed at it (or at nothing) goes to the site
-# instead: that pair cannot authenticate, and the 401 it earns reads like a broken token.
-REVIEW_URL_AUTO = _session_token and (not _review_asked_url or "api.deepseek.com" in _review_asked_url)
-REVIEW_URL = ("https://chat.deepseek.com" if REVIEW_URL_AUTO
-              else (_review_asked_url or "https://api.deepseek.com"))
-REVIEW_MODEL = env("REVIEW_MODEL", "DEEPSEEK_MODEL", default="deepseek-v4-flash")
-# openai (an OpenAI-shaped endpoint, including api.deepseek.com) | web (a bridge in front of
-# chat.deepseek.com: no system role, and the toggles are plain booleans) | deepseek-web (the
-# site's own endpoints, driven by the userToken -- the DeepSeekWeb transport above).
-REVIEW_SHAPE = env("REVIEW_SHAPE", default="openai").lower()
-# A userToken is the site's own token, so pointing REVIEW_URL at the site selects its transport
-# without having to be asked. An API key from platform.deepseek.com keeps the OpenAI shape.
-if "chat.deepseek.com" in REVIEW_URL:
-    REVIEW_SHAPE = "deepseek-web"
-# The cf_clearance cookie, in case chat.deepseek.com ever answers a request with a browser check.
-REVIEW_COOKIE = env("DEEPSEEK_COOKIE", "REVIEW_COOKIE")
-# The web endpoints take no model id: the session's model is whatever the account is set to, so
-# claiming a specific one would be a lie on the chip.
-if REVIEW_SHAPE == "deepseek-web" and not env("REVIEW_MODEL", "DEEPSEEK_MODEL"):
-    REVIEW_MODEL = "deepseek-web"
-# Thinking is enabled by default on DeepSeek V4, so it is switched off explicitly, and search
-# is never switched on anywhere in this service: a review has to be cheap, quick, and about
-# the script in front of it rather than about the web.
-REVIEW_THINKING = env("REVIEW_THINKING", default="off").lower()
-SEARCH_OFF = True
-REVIEW_TEMPERATURE = float(env("REVIEW_TEMPERATURE", default="0.2"))
-REVIEW_MAX_TOKENS = int(env("REVIEW_MAX_TOKENS", default="2048"))
-# Most reviewers will list anything. A cap keeps the refine instruction — and the cost of
-# applying it — bounded.
-REVIEW_ITEMS = int(env("REVIEW_ITEMS", default="8"))
-# The script sent for review is bounded too: a 1M-token context is not a reason to use it.
-REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="48000"))
-# How much of the brief in front of the review is sent. Send.txt is yours; this is the
-# ceiling on it, so a stray huge file cannot become the whole prompt.
-REVIEW_BRIEF_MAX = int(env("REVIEW_BRIEF_MAX", default="60000"))
-# What the script is supposed to run in. Handed to the reviewer so its complaints are about
-# this runtime and not about a general-purpose script.
-TARGET_RUNTIME = env("TARGET_RUNTIME", default="Roblox Luau (a Roblox script, run in Studio or an executor)")
-
-REVIEW_EXTRA: dict = {}
-try:
-    _extra = json.loads(env("REVIEW_EXTRA", default="{}") or "{}")
-    if isinstance(_extra, dict):
-        REVIEW_EXTRA = _extra
-except ValueError:
-    print("[bridge] REVIEW_EXTRA is not valid JSON; ignoring it", flush=True)
-
-def reviewer_dialect() -> dict:
-    """DeepSeek's off-switches, in whichever shape the endpoint expects.
-
-    The API takes `thinking: {"type": "disabled"}`. A bridge in front of the web chat takes
-    booleans. Search is set to false in both, and is never set true anywhere in this file.
-    """
-    thinking_on = REVIEW_THINKING in ("on", "thinking", "enabled", "slow")
-    if REVIEW_SHAPE == "web":
-        return {"thinking": thinking_on, "search": not SEARCH_OFF,
-                "thinking_enabled": thinking_on, "search_enabled": not SEARCH_OFF}
-    return {"thinking": {"type": "enabled" if thinking_on else "disabled"}}
-
-
-REVIEW_TIMEOUT = float(env("REVIEW_TIMEOUT", default="180"))
-
-REVIEWER = Provider(
-    "deepseek", REVIEW_URL, REVIEW_KEY, REVIEW_MODEL, reviewer_dialect(),
-    REVIEW_TIMEOUT,
-    REVIEW_EXTRA,
-    REVIEW_SHAPE,
-    (DeepSeekWeb(REVIEW_KEY, REVIEW_TIMEOUT, REVIEW_COOKIE,
-                 REVIEW_URL if "/api/v0" in REVIEW_URL else "")
-     if REVIEW_SHAPE == "deepseek-web" else None),
-)
-
-# on (always) | off (never) | auto (only when a reviewer key is set)
-PIPELINE = env("PIPELINE", default="auto").lower()
-
-
-def review_enabled() -> bool:
-    """Whether a question goes through the reviewer as well.
-
-    A reviewer pointed at chat.deepseek.com is a real reviewer: that path is the web transport
-    above, driven by the userToken. It only looks unconfigured when there is no token at all.
-    """
-    if not REVIEWER.configured:
-        return False
-    if PIPELINE in ("off", "0", "false", "no"):
-        return False
-    return True
-
-
-# --- the tokens one call may use ---------------------------------------------------------
-#
-# Three calls, three ceilings. The draft and the rewrite produce whole scripts, so they get
-# room; the review produces a list, so it does not. A draft that stops at its ceiling is
-# reported as a failure instead of being shipped, because everything after it would be built
-# on a cut-off script.
-# Both Qwen calls exist to produce a whole script, and 4096 tokens is roughly 200 lines of Luau.
-# An answer that stops at its ceiling is refused rather than shipped, so a ceiling that is too low
-# shows up as a failed turn -- the rewrite can be long as well, so it gets the larger room.
-MAX_TOKENS = int(env("MAX_TOKENS", default="4096"))
-DRAFT_TOKENS = int(env("DRAFT_TOKENS", default="8192"))
-REFINE_TOKENS = int(env("REFINE_TOKENS", default="16384"))
-# How much of a review is pasted into the refine instruction when it came back as prose.
-REVIEW_PASTE_MAX = int(env("REVIEW_PASTE_MAX", default="4000"))
-
-# --- jobs, history and limits ------------------------------------------------------------
-#
-# How much of a long chat one request may carry. The newest turns are kept; the middle of a
-# conversation is dropped rather than growing the prompt forever.
-HISTORY_MESSAGES = int(env("HISTORY_MESSAGES", default="40"))
-HISTORY_CHARS = int(env("HISTORY_CHARS", default="120000"))
-# A generation is a server-side job, so a reader can go quiet without the answer being lost.
-# That quiet is exactly what proxies and sleeping phones drop, so the stream is punctuated with
-# a heartbeat this often.
-HEARTBEAT = float(env("HEARTBEAT", default="5"))
-# How long a finished job stays readable, so a browser that comes back late can still collect
-# the answer instead of finding nothing.
-JOB_TTL = float(env("JOB_TTL", default="3600"))
-# How often /health may ask a provider whether its key still works.
-TOKEN_CHECK_TTL = float(env("TOKEN_CHECK_TTL", default="60"))
-# Requests per minute per IP on the endpoints the page uses, and how many chains may run at
-# once. The page has no login by design, so these are what stand between the URL and the two
-# accounts behind it. RATE_LIMIT 0 disables the per-IP window.
-RATE_LIMIT = int(env("RATE_LIMIT", default="30"))
-MAX_CONCURRENT = int(env("MAX_CONCURRENT", default="4"))
-# The key callers must send on /v1, /chat and /generate: API_KEY when it is set, otherwise the
-# Qwen token itself -- one secret to keep. "" leaves those endpoints open as well.
-API_KEY = env("API_KEY")
-CALLER_KEY = API_KEY or QWEN_TOKEN
-
-INDEX = Path(__file__).parent / "web" / "index.html"
-
-
-# --- the brief handed to the reviewer ----------------------------------------------------
-
-# Which file is the brief. The repo has two -- send.txt and Send.txt -- because they differ
-# only in the case of one letter, which is a trap: a clone on a case-insensitive filesystem
-# can only hold one of them. The lowercase one is the newer, so it is the one used, and the
-# other is the fallback rather than being silently ignored. Either can be forced with
-# REVIEW_BRIEF, and whichever is in use is named on /health as reviewer.brief.
-_BRIEF_HERE = Path(__file__).parent
-BRIEF_CHOICES = [_BRIEF_HERE / name for name in ("send.txt", "Send.txt")]
-_BRIEF_ASKED = env("REVIEW_BRIEF", default="")
-BRIEF_PATH = (Path(_BRIEF_ASKED) if _BRIEF_ASKED
-              else next((p for p in BRIEF_CHOICES if p.exists()), BRIEF_CHOICES[-1]))
-
-
-def load_brief() -> str:
-    """Send.txt: what the reviewer is told before it is asked anything.
-
-    Read once at boot. A missing file is not an error -- the built-in rubric below still
-    makes the review usable -- but it is reported on /health so a file that did not make it
-    into the image is visible rather than silent.
-    """
-    try:
-        text = BRIEF_PATH.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    text = text.strip()
-    if len(text) > REVIEW_BRIEF_MAX:
-        text = text[:REVIEW_BRIEF_MAX] + "\n\n[... brief truncated ...]"
-    return text
-
-
-BRIEF = load_brief()
-
-# Appended to the brief (or used alone), because the review has to come back in a shape the
-# refine step can act on. Prose reviews are what make a chain like this useless.
-RUBRIC = f"""You are the reviewer in a two-model chain. Another model wrote the script below in \
-answer to a request; your review is the only thing standing between it and the user.
-
-Judge only whether it will actually work in {TARGET_RUNTIME}. Ignore style, naming and \
-formatting. Report a point only when you can name the concrete failure it causes.
-
-Answer in exactly this format, and nothing else:
-
-VERDICT: OK
-
-if there is nothing that would stop it working, or
-
-VERDICT: ISSUES
-1. <what is wrong> | where: <the function or line> | why it fails: <what actually goes wrong> | fix: <the exact change to make>
-2. ...
-
-At most {REVIEW_ITEMS} points, most serious first. Rules for this format:
-- One point per line, starting with its number. No blank lines between points.
-- The four parts are separated by " | ". Keep each part to one sentence.
-- Look for: API names and properties that do not exist in Roblox, deprecated globals that \
-no longer run, server/client confusion, a yield where none can happen, a loop that never \
-ends, an event that is connected twice, and anything that throws on the first line.
-- Do not praise. Do not summarise. Do not rewrite the script. Do not explain what you like.
-- If the script is a fragment or the request was conversational rather than a request for \
-code, answer VERDICT: OK."""
-
-
-# --- addressing the model ---------------------------------------------------------------
-
-# Every question is addressed to the model with this in front of it, so a request that reads
-# "make me this" is sent as "Hy kanha make me this". Set GREETING to "" to send messages
-# untouched.
-GREETING = env("GREETING", default="Hy kanha")
-
-# Without a token there is nothing to call, so the API says so plainly instead of forwarding
-# an empty bearer and reporting the proxy's 401 back to the user.
-CONFIGURED = bool(QWEN_TOKEN)
-NOT_CONFIGURED = ("the bridge is not configured: set QWEN_TOKEN on this service to a "
-                  "Qwen access token from chat.qwen.ai")
-
-
-def greet(messages: list) -> list:
-    """Address the model before the newest question: "make me this" -> "Hy kanha make me this".
-
-    Only the last user turn is touched. The earlier ones already carry the greeting, since it
-    was applied when they were sent, and a caller that writes the greeting itself is not
-    prefixed twice. Internal turns (the refine instruction) never go through this.
-    """
-    if not GREETING:
-        return messages
-    for index in range(len(messages) - 1, -1, -1):
-        turn = messages[index]
-        if turn.get("role") != "user" or not isinstance(turn.get("content"), str):
-            continue
-        text = turn["content"].strip()
-        if not text or text.lower().startswith(GREETING.lower()):
-            return messages
-        out = list(messages)
-        out[index] = dict(turn, content=f"{GREETING} {turn['content'].lstrip()}")
-        return out
-    return messages
-
-
-# --- the turns of a conversation --------------------------------------------------------
-
-ROLES = ("system", "user", "assistant", "tool", "function")
-
-
-def clean_messages(raw) -> list:
-    """The caller's turns, as the provider wants them: a role and some content."""
-    if not isinstance(raw, list):
-        raise HTTPException(400, "messages must be a list")
-    turns = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("role") or "").strip() not in ROLES:
-            continue
-        if item.get("content") is None:
-            continue
-        turns.append(item)
-    if not turns:
-        raise HTTPException(400, "messages must contain at least one turn with content")
-    return turns
-
-
-def trim_messages(messages: list) -> list:
-    """Keep the newest turns inside the history budget.
-
-    `head` is what is never dropped: the system message a caller put in front. Everything
-    after it is a turn, and the oldest ones go first once the conversation is longer than
-    HISTORY_MESSAGES or fatter than HISTORY_CHARS. The draft and the refine instruction are
-    appended after this, so the turn being worked on is never the one that gets dropped.
-    """
-    head = 0
-    while head < len(messages) and messages[head].get("role") == "system":
-        head += 1
-    kept = list(messages)
-
-    def size() -> int:
-        return sum(len(m["content"]) for m in kept if isinstance(m.get("content"), str))
-
-    while (len(kept) - head > HISTORY_MESSAGES or size() > HISTORY_CHARS) and len(kept) - head > 2:
-        kept.pop(head)
-    return kept
-
-
-def last_user_text(messages: list) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "user" and isinstance(m.get("content"), str):
-            return m["content"]
-    return ""
-
-
-def without_greeting(text: str) -> str:
-    """The question as it was typed, without the greeting the model was addressed with.
-
-    Quoting it back to the reviewer with "Hy kanha" in front of it adds nothing and reads like
-    part of the request, so the reviewer is shown the question the user actually asked.
-    """
-    stripped = (text or "").strip()
-    if GREETING and stripped.lower().startswith(GREETING.lower()):
-        return stripped[len(GREETING):].lstrip()
-    return stripped
-
-
-def asked_for(messages: list, count: int = 3) -> list:
-    """The newest user turns -- the request the draft is being judged against."""
-    out = [m["content"] for m in messages
-           if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    return out[-count:]
-
-
-# --- secrets never leave for the reviewer ------------------------------------------------
-
-SECRET_PATTERNS = [
-    re.compile(r"hf_[A-Za-z0-9]{12,}"),
-    re.compile(r"sk-[A-Za-z0-9_\-]{12,}"),
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]{16,}"),
-    re.compile(r"https://(?:discord|discordapp)\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+"),
-    re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd|pwd)\b\s*[:=]\s*[\"'][^\"'\s]{8,}[\"']"),
-    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
-]
-
-
-def redact(text: str) -> tuple:
-    """Mask credentials before a script goes to a second company.
-
-    A generated script often carries a webhook, a token or an asset key. The reviewer does
-    not need any of them to say whether the code works, and the second provider is one more
-    place they would end up. Returns the masked text and how many things were masked.
-    """
-    count = 0
-    for pattern in SECRET_PATTERNS:
-        text, found = pattern.subn("<redacted>", text)
-        count += found
-    return text, count
-
-
-# --- reading the draft -------------------------------------------------------------------
-
-FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*\n(.*?)\n?```\s*$", re.S)
-
-
-def strip_fences(text: str) -> str:
-    """A whole answer wrapped in one ``` block is unwrapped; anything else is left alone."""
-    match = FENCE.match(text or "")
-    return match.group(1).strip() if match else (text or "").strip()
-
-
-def structural_notes(text: str, finish: Optional[str]) -> tuple:
-    """What can be checked without running the script, and whether it is worth shipping.
-
-    This is deliberately a *structural* check, not a verdict on correctness: it catches the
-    failures that make everything after it pointless -- an empty answer, one cut off by the
-    token ceiling, an unterminated fence -- and hands the rest to the reviewer as evidence
-    instead of pretending a text model can verify code.
-    """
-    code = (text or "").strip()
-    notes = []
-    if not code:
-        notes.append("the answer is empty")
-    if finish == "length":
-        notes.append("the answer was cut off by the token ceiling (finish_reason=length)")
-    if finish == "content_filter":
-        notes.append("the provider stopped it with a content filter")
-    if code.count("```") % 2:
-        notes.append("a markdown code fence is left open")
-    usable = bool(code) and finish not in ("length", "content_filter")
-    return notes, usable
-
-
-# --- what the provider said, when it said no -------------------------------------------
-
-def failure_reason(status: int, body: str, provider: Provider) -> str:
-    """The provider's own sentence for a failure, plus the one fix that is not obvious.
-
-    Whatever the endpoint rejected the call with is the useful part, so it is passed through
-    verbatim instead of being replaced by a generic message.
-    """
-    text = (body or "").strip()
-    message = text
-    try:
-        payload = json.loads(text)
-    except ValueError:
-        payload = None
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            message = str(error.get("message") or error.get("type") or text)
-        elif error:
-            message = str(error)
-        elif payload.get("detail"):
-            message = str(payload["detail"])
-    message = " ".join(str(message).split())[:300] or "no detail"
-    model = provider.model
-    who = provider.name
-    if status == 401:
-        if who != "qwen":
-            # A userToken sent to the API reads as a bad key, which is a misleading diagnosis: the
-            # credential is fine, the endpoint is the wrong one. Say which fix is the right one.
-            session_token = bool(provider.key) and not provider.key.startswith("sk-")
-            if session_token and provider.web is None:
-                return (f"{provider.label()} rejected the token ({message}) -- DEEPSEEK_TOKEN holds "
-                        "a chat.deepseek.com session token, not an API key, and the review is "
-                        "still going to the API. Set REVIEW_URL=https://chat.deepseek.com to use "
-                        "the web transport, or put an `sk-...` API key from platform.deepseek.com "
-                        "in DEEPSEEK_TOKEN")
-            return (f"{provider.label()} rejected the key ({message}) -- check DEEPSEEK_TOKEN")
-        return (f"QWEN_TOKEN was rejected by qwen-api ({message}) -- copy a fresh token from "
-                "chat.qwen.ai (DevTools console: localStorage.token) and update the variable")
-    if status == 403:
-        return f"{who} refused the request ({message})"
-    if status == 404:
-        return f"{model} is not a model {who} serves ({message})"
-    if status == 429:
-        return (f"{who} is rate limiting ({message}) -- retry shortly, or point REVIEW_MODEL/"
-                "QWEN_MODEL at another model")
-    if status >= 500:
-        return f"{who} is failing ({status}: {message})"
-    return f"{who} {status}: {message}"
-
-
-def sse(payload: dict) -> str:
-    return "data: " + json.dumps(payload) + "\n\n"
-
-
-def sse_error(message: str) -> str:
-    """An OpenAI-style error frame; the only shape a reader can report once a stream began."""
-    return sse({"error": {"message": message, "type": "upstream_error"}})
-
-
-def message_text(body: str) -> str:
-    """The assistant text out of a non-streamed completion, or '' if it is not one."""
-    try:
-        payload = json.loads((body or "").strip())
-    except ValueError:
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    choices = payload.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    return message.get("content") or ""
+"""The service: the chain, the jobs, the endpoints and the page.
+
+Everything that talks to a provider -- the tokens, the config, the two transports, the brief,
+and the job record a reader attaches to -- lives in `bridge`. This module is what turns that
+into a service: the app, the chain that runs one turn, and the endpoints the page and the
+Roblox client use.
+"""
+from bridge import *  # noqa: F401,F403 -- the providers, the config and the job record
 
 
 # --- the model list, and whether the tokens still work ----------------------------------
@@ -966,7 +101,7 @@ def _reviewer_probe(force: bool = False) -> dict:
     """Whether the reviewer key works and the model exists, remembered briefly.
 
     A retired model id and a rejected key look exactly alike from the page (the chain just
-    never refines), so the reviewer is checked the same way the Qwen token is.
+    never answers), so the reviewer is checked the same way the Qwen token is.
     """
     with _reviewer_lock:
         cached = dict(_reviewer)
@@ -1034,7 +169,7 @@ def reviewer_state(force: bool = False) -> dict:
         state = {"at": state["at"], "ok": False, "detail": note}
     return {**state, "shape": REVIEW_SHAPE, "search": not SEARCH_OFF,
             "last_note": note, "brief_chars": len(BRIEF), "brief": BRIEF_PATH.name,
-            "items": REVIEW_ITEMS}
+            "rounds": NEGOTIATE_ROUNDS, "seed": SEED_BRIEF}
 
 
 # --- jobs ------------------------------------------------------------------------------
@@ -1048,8 +183,9 @@ class Job:
     readers can attach to it -- including one that comes back after the connection dropped,
     which replays the output from the start and follows along.
 
-    Text arrives on three channels, because there are three things to show: the draft, the
-    reviewer's list, and the answer that comes back after it.
+    Text arrives on five channels, because there are five things to show: the reviewer reading
+    the brief, the draft, the reviewer's own version of the script, what the reviewer said about
+    the merged one, and the answer that comes out of it.
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, review: bool):
@@ -1059,10 +195,10 @@ class Job:
         self.note = note
         self.want_review = review
         self.pieces: list = []          # (channel, piece)
-        self.buffers: dict = {"draft": [], "review": [], "answer": []}
+        self.buffers: dict = {"seed": [], "draft": [], "peer": [], "review": [], "answer": []}
         self.error = ""
         self.status = "queued"          # queued -> running -> done | error
-        self.phase = "queued"           # queued | draft | check | review | refine | done
+        self.phase = "queued"           # queued | draft | seed | peer | merge | agree | done
         self.phases: list = []          # one record per model call
         self.review_text = ""
         self.started = time.time()
@@ -1073,7 +209,7 @@ class Job:
         return "".join(self.buffers.get(name, []))
 
     def text(self) -> str:
-        """What the caller asked for: the refined answer, or the draft when there is none."""
+        """What the caller asked for: the negotiated answer, or the draft without one."""
         return self.channel("answer") or self.channel("draft")
 
     def add(self, channel: str, piece: str) -> None:
@@ -1085,10 +221,10 @@ class Job:
     def reset_channel(self, channel: str) -> None:
         """Throw away what a channel has produced so far.
 
-        The one caller is the regression guard: a rewrite that came back cut off has already
-        been streamed to whoever is reading, and it has to be replaced by the draft rather
-        than shown above it. The reset is itself a piece, so a reader that attaches later
-        replays the same sequence and ends up with the same text.
+        The callers are the regression guard and the negotiation: a merge or a version that came
+        back cut off has already been streamed to whoever is reading, and it has to be replaced
+        by the script that stands rather than shown above it. The reset is itself a piece, so a
+        reader that attaches later replays the same sequence and ends up with the same text.
         """
         with self.cond:
             self.pieces.append((channel, None))
@@ -1204,7 +340,7 @@ def client_ip(request: Optional[Request]) -> str:
     return request.client.host if request.client else "?"
 
 
-def rate_ok(ip: str) -> bool:
+def rate_ok(ip: str) -> bool:  # per IP, per minute
     """A sliding window per IP; RATE_LIMIT per minute, 0 disables it."""
     if RATE_LIMIT <= 0:
         return True
@@ -1290,6 +426,7 @@ def poll_job(job_id: str):
         "note": job.note,
         "text": job.text(),
         "draft": job.channel("draft"),
+        "peer": job.channel("peer"),
         "review": job.review_text,
         "model": QWEN_MODEL,
         "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
@@ -1325,15 +462,18 @@ def require_key(x_api_key: Optional[str] = Header(None),
 # --- talking to a provider --------------------------------------------------------------
 
 def stream_answer(messages: list, temperature: Optional[float], provider: Provider,
-                  max_tokens: int, box: Optional[dict] = None):
+                  max_tokens: int, box: Optional[dict] = None,
+                  web_session: Optional[object] = None):
     """Stream an answer, piece by piece, out of a provider's /chat/completions.
 
-    `box` gets the finish reason and any token usage, which is how a truncated answer is
-    caught instead of being shipped.
+    `box` gets the finish reason and any token usage, which is how a truncated answer is caught
+    instead of being shipped. `web_session` is the chat on chat.deepseek.com this message belongs
+    to when the caller holds one open; without it, a site call is a chat of its own.
     """
     if provider.web is not None:
-        # chat.deepseek.com: one prompt, the site's own endpoint, its own streamed frames.
-        yield from provider.web.stream(as_prompt(messages), box)
+        # chat.deepseek.com: the site's own endpoint and its own streamed frames -- either the
+        # first message of a review or the next one in the chat the brief opened.
+        yield from provider.web.stream(as_prompt(messages), box, web_session)
         return
     body = provider.request(messages, temperature, max_tokens, stream=True)
     try:
@@ -1406,7 +546,8 @@ def call_once(messages: list, temperature: Optional[float], provider: Provider,
 # --- the chain itself --------------------------------------------------------------------
 
 def run_phase(job: Job, messages: list, temperature: Optional[float], provider: Provider,
-              max_tokens: int, channel: str, phase: str, note: str) -> tuple:
+              max_tokens: int, channel: str, phase: str, note: str,
+              web_session: Optional[object] = None) -> tuple:
     """Stream one model call into a channel and record what it cost.
 
     Every call in the chain goes through here, so every call ends up in the job's phase
@@ -1417,7 +558,7 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], provider: 
     box: dict = {"finish": None, "usage": None}
     started = time.time()
     pieces: list = []
-    for piece in stream_answer(messages, temperature, provider, max_tokens, box):
+    for piece in stream_answer(messages, temperature, provider, max_tokens, box, web_session):
         pieces.append(piece)
         job.add(channel, piece)
     text = "".join(pieces)
@@ -1436,98 +577,313 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], provider: 
     return text, record
 
 
-def review_messages(job: Job, draft: str, notes: list) -> list:
-    """The reviewer's whole brief: what was asked, what came back, and what was checked."""
-    brief = BRIEF or "You are a senior reviewer of generated code."
+def request_body(job: Job, code: str, notes: list, heading: str) -> str:
+    """One asking-a-model-about-this-script body: the request, the target, the script, checks.
+
+    Both requests share it so the two can never drift apart in what they show: what the user
+    asked for, what it has to run in, the script in question (with secrets masked), and what
+    this service already checked about it.
+    """
     checked = "\n".join(f"- {n}" for n in notes) if notes else "- nothing flagged"
-    script, masked = redact(draft)
+    script, masked = redact(code)
     if len(script) > REVIEW_SCRIPT_MAX:
-        script = script[:REVIEW_SCRIPT_MAX] + "\n-- [script truncated for review] --"
-    asked = asked_for(job.messages)
-    request_text = "\n".join(f"- {without_greeting(t)[:2000]}" for t in asked) or "(none)"
-    user = f"""REQUEST (what the user asked for):
-{request_text}
+        script = script[:REVIEW_SCRIPT_MAX] + "\n-- [the rest was cut for length] --"
+    asked = "\n".join(f"- {without_greeting(t)[:2000]}" for t in asked_for(job.messages)) or "(none)"
+    if masked:
+        print(f"[job] {job.id} {heading}: {masked} secret(s) masked before sending", flush=True)
+    return f"""REQUEST (what the user asked for):
+{asked}
 
 TARGET: {TARGET_RUNTIME}
 
-DRAFT FROM THE OTHER MODEL:
+{heading.upper()}:
 {script}
 
-AUTOMATIC CHECKS ALREADY RUN:
-{checked}
-
-Review the draft against the request above."""
-    if masked:
-        print(f"[job] {job.id} review: {masked} secret(s) masked before sending", flush=True)
-    return [
-        {"role": "system", "content": brief + "\n\n" + RUBRIC},
-        {"role": "user", "content": user},
-    ]
+CHECKS THIS SERVICE ALREADY RAN:
+{checked}"""
 
 
-def parse_review(text: str) -> tuple:
-    """The reviewer's verdict and its numbered points, as the refine step needs them.
+def peer_request(job: Job, code: str, from_model: str, notes: list) -> str:
+    """What the reviewer is asked first: write the version of this script you would ship.
 
-    The format is what makes the chain work: prose reviews cannot be applied, a numbered list
-    can. If the reviewer ignored the format, its answer is passed on whole rather than being
-    thrown away.
+    Not a request for complaints. The answer is a script, because the step after it puts the
+    reviewer's script beside the writer's and keeps the best of both.
+    """
+    body = request_body(job, code, notes, f"the script {from_model} wrote")
+    return f"""{body}
+
+Write the version of this script you would ship for the request above, in the format you were \
+given: VERDICT: BETTER and then the complete script, or VERDICT: KEEP if nothing in it can be \
+made more reliable."""
+
+
+def verify_request(job: Job, code: str, from_model: str, notes: list) -> str:
+    """The later rounds: would you ship the merged script, or does it need another version?
+
+    This is the question that ends the negotiation. An answer of AGREE is the two models
+    agreeing on one script, and the writer is left with it.
+    """
+    body = request_body(job, code, notes, "the merged script")
+    return f"""The script below is what came out of the last merge: {from_model} took your last \
+version, kept whatever it judged more reliable, and put the rest back.
+
+{body}
+
+Would you ship this exactly as it is?
+- If you would: answer VERDICT: AGREE, and nothing else.
+- If you would not: answer VERDICT: BETTER and then the complete script, changing only what \
+would actually break and saying nothing about the rest."""
+
+
+def looks_like_code(text: str) -> bool:
+    """Whether what came back is a script rather than a sentence about one.
+
+    The verdict can be read off a line; a script cannot. This is what decides whether a round
+    has something to merge, so it is deliberately about structure -- most lines have to look
+    like Lua -- rather than about the words in them.
     """
     body = (text or "").strip()
-    verdict = "ISSUES"
+    if len(body) < 40:
+        return False
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    markers = ("local ", "function", "end", "then", "do ", "else", "return", "print(",
+               "Instance.", "game:", "script.", "require(", "task.", "wait(", "pcall", "--")
+    def code_line(line: str) -> bool:
+        if line.startswith("--"):
+            return True
+        if any(marker in line for marker in markers):
+            return True
+        return ("=" in line or "(" in line) and len(line) > 3
+    hits = sum(1 for line in lines if code_line(line))
+    return hits >= max(2, (len(lines) * 2) // 3)
+
+
+def parse_verdict(text: str) -> tuple:
+    """The reviewer's verdict and the script it wrote, when it wrote one.
+
+    BETTER carries a whole script; AGREE and KEEP mean the script in front of it stands. A
+    reviewer that ignored the format is read as kindly as it can be: a script is taken from
+    whatever it wrote, and an answer with no script in it is a round that changed nothing
+    rather than a round that failed.
+    """
+    body = (text or "").strip()
+    verdict = ""
     match = re.search(r"(?im)^\s*VERDICT\s*[:=]\s*([A-Za-z]+)", body)
     if match:
-        verdict = "OK" if match.group(1).strip().upper().startswith("OK") else "ISSUES"
+        verdict = match.group(1).strip().upper()
         body = body[match.end():].strip()
-    items: list = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        numbered = re.match(r"^(\d+)\s*[.)]\s*(.+)$", stripped)
-        if numbered:
-            items.append(f"{numbered.group(1)}. {numbered.group(2).strip()}")
-        elif items:
-            items[-1] = f"{items[-1]} {stripped}"
-        else:
-            items.append(stripped)
-    items = [i for i in items if len(i) > 3][:REVIEW_ITEMS]
-    if verdict == "OK":
-        return verdict, []
-    if not items:
-        # No list, but not an okay verdict: hand over whatever it said rather than nothing.
-        items = [body[:REVIEW_PASTE_MAX]] if body else []
-    return verdict, items
+    if verdict in ("AGREE", "OK", "KEEP", "SAME", "APPROVED"):
+        return "AGREE", ""
+    code = strip_fences(body)
+    if not looks_like_code(code):
+        return ("KEEP", "") if verdict else ("", "")
+    return "BETTER", code
 
 
-def refine_instruction(items: list, notes: list) -> str:
-    """What goes back into the same chat as the draft: the reviewer's list, and nothing more.
+def merge_instruction(proposed: str, from_model: str, notes: list) -> str:
+    """What goes back into the chat that wrote the draft: the other model's script, whole.
 
-    The draft is already an assistant turn in this conversation, so the model is editing its
-    own work rather than starting again -- which is the whole reason the refine step happens
-    in the same chat the script was written in.
+    The draft is already an assistant turn in that conversation, so this is one model editing
+    its own work against a competing version of it -- which is the whole reason the merge
+    happens in the same chat rather than starting the task again.
     """
-    listed = "\n".join(items)
+    block = proposed
+    if len(block) > MERGE_PASTE_MAX:
+        block = block[:MERGE_PASTE_MAX] + "\n-- [the rest was cut for length] --"
     extra = ""
     if notes:
-        extra = ("\nAutomatic checks also flagged:\n"
+        extra = ("\nThis service's own checks flagged:\n"
                  + "\n".join(f"- {n}" for n in notes) + "\n")
-    return f"""A reviewer checked the script you just wrote. Apply exactly these points and change \
-nothing else -- keep every part that already works, keep the same structure, do not rename \
-anything that was not named here.
+    return f"""{from_model} read the script you just wrote and wrote its own version of it. Here \
+it is, whole:
 
-{listed}
+{block}
 {extra}
-If a point is wrong, leave the code as it is and move on. Return the complete corrected script \
-and nothing else: no explanation, no notes, no commentary, no markdown code fences."""
+Produce the single best version of the script: keep everything in yours that already works, \
+take from the other version whatever is genuinely more reliable, and where the two disagree \
+choose the one that cannot fail at runtime. If something in the other version is wrong, ignore \
+it and keep yours. Change nothing else, and rename nothing the request did not name.
+
+Return the complete script and nothing else: no explanation, no notes, no commentary, no \
+markdown code fences."""
+
+
+class ReviewerChat:
+    """The reviewer's conversation: the brief first, and every question after it in one chat.
+
+    Two things matter here and nowhere else. The brief is sent on its own and its answer is
+    waited for before any request goes out, so Send.txt has been read before the reviewer is
+    asked to do anything. And every later question lands in the conversation the brief opened --
+    on the API path by carrying the turns, on the site path by holding one chat session open --
+    so the reviewer answers about the script it was shown instead of starting over.
+    """
+
+    def __init__(self, job: Job):
+        self.job = job
+        self.turns: list = []
+        self.last_answer = ""
+        self.contract_sent = False
+        # A live chat on chat.deepseek.com, when that is the transport: the site threads a
+        # conversation by message id, so the session is what makes the second message a
+        # continuation rather than a new branch of the same chat.
+        self.web = REVIEWER.web.new_session() if REVIEWER.web is not None else None
+
+    def _turns_for(self, text: str) -> list:
+        if not self.turns and not self.contract_sent:
+            # No seeding turn was asked for, so the brief and the contract both ride in front of
+            # the first request: the reviewer still reads Send.txt, and still knows the shape it
+            # has to answer in, without the extra call that waiting for an acknowledgement costs.
+            head = f"{BRIEF}\n\n" if BRIEF else ""
+            text = f"{head}{RUBRIC}\n\n{text}"
+        self.turns.append({"role": "user", "content": text})
+        # The API path sends the whole conversation; the site path sends only the new message,
+        # because the session itself is holding the earlier ones.
+        return [self.turns[-1]] if self.web is not None else list(self.turns)
+
+    def say(self, text: str, channel: str, phase: str, note: str, max_tokens: int) -> str:
+        answer, _ = run_phase(self.job, self._turns_for(text), REVIEW_TEMPERATURE, REVIEWER,
+                              max_tokens, channel, phase, note, self.web)
+        self.turns.append({"role": "assistant", "content": answer})
+        self.last_answer = answer
+        return answer
+
+    def seed(self) -> bool:
+        """Send the brief on its own, and wait for the answer to it, before anything is asked.
+
+        The brief alone means the reply is an acknowledgement rather than work: what comes back
+        here is thrown away on purpose. It is the *reading* of Send.txt that is wanted, and the
+        request that follows rides on it.
+        """
+        if not SEED_BRIEF:
+            return False
+        head = f"{BRIEF}\n\n" if BRIEF else ""
+        which = BRIEF_PATH.name if BRIEF else "the built-in rubric"
+        self.contract_sent = True
+        answer = self.say(f"{head}{RUBRIC}\n\n{SEED_NOTE}", "seed", "seed",
+                          f"{REVIEWER.model} reading {which}", SEED_TOKENS)
+        print(f"[job] {self.job.id} seed: {REVIEWER.model} read {which} ({len(BRIEF)} chars in, "
+              f"{len(answer)} back); the request goes out next", flush=True)
+        return True
+
+
+def merge_versions(job: Job, current: str, proposed: str, notes: list) -> str:
+    """The writer's turn: one script out of its own version and the reviewer's.
+
+    It happens in the chat that wrote the draft, so the model is editing its own work with the
+    other version in front of it. A merge that comes back unusable is discarded -- the same
+    guard the draft went through -- and the version being edited is what stands instead.
+    """
+    turns = list(job.messages) + [
+        {"role": "assistant", "content": current},
+        {"role": "user", "content": merge_instruction(proposed, REVIEWER.model, notes)},
+    ]
+    merged, record = run_phase(job, turns, job.temperature, QWEN, REFINE_TOKENS, "answer",
+                               "merge", f"{QWEN.model} merging both versions")
+    merged = strip_fences(merged)
+    if job.channel("answer").strip() != merged:
+        job.reset_channel("answer")
+        job.add("answer", merged)
+    _, usable = structural_notes(merged, record["finish"])
+    if not usable:
+        print(f"[job] {job.id} merge: the merged script was not usable; keeping the last one",
+              flush=True)
+        return ""
+    return merged
+
+
+def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list) -> tuple:
+    """The reviewer's own script, then the writer's merge, until the reviewer would ship it.
+
+    Round one is the reviewer writing the script itself instead of complaining about the other
+    one. Every round after that is the reviewer reading the merged script: AGREE ends the
+    negotiation, another version starts the next merge. Bounded by NEGOTIATE_ROUNDS, so a pair
+    that never agrees still finishes -- and the last script that stands is what ships either way.
+    """
+    best = draft
+    outcome = "draft"
+    for index in range(max(0, NEGOTIATE_ROUNDS)):
+        opening = index == 0
+        phase = "peer" if opening else "agree"
+        note = (f"{REVIEWER.model} writing its own version" if opening
+                else f"{REVIEWER.model} reading the merged script")
+        request = (peer_request(job, best, QWEN_MODEL, notes) if opening
+                   else verify_request(job, best, QWEN_MODEL, notes))
+        answer = chat.say(request, phase, phase, note, PEER_TOKENS)
+        verdict, proposed = parse_verdict(answer)
+        if verdict == "AGREE":
+            outcome = "draft" if opening else "agreed"
+            who = "the draft" if opening else "the merged script"
+            print(f"[job] {job.id} {phase}: {REVIEWER.model} agreed with {who}", flush=True)
+            break
+        if verdict != "BETTER" or not proposed:
+            outcome = "draft" if opening else "kept"
+            print(f"[job] {job.id} {phase}: {REVIEWER.model} proposed nothing usable "
+                  f"({len(answer)} chars back); {QWEN_MODEL}'s version stands", flush=True)
+            break
+        print(f"[job] {job.id} {phase}: {REVIEWER.model} proposed a version "
+              f"({len(proposed)} chars of script)", flush=True)
+        # The bubble shows the script, not the verdict line in front of it.
+        if job.channel(phase).strip() != proposed:
+            job.reset_channel(phase)
+            job.add(phase, proposed)
+        merged = merge_versions(job, best, proposed, notes)
+        if not merged:
+            outcome = "kept"
+            break
+        best = merged
+        outcome = "merged"
+    return best, outcome
+
+
+def outcome_note(outcome: str, calls: int) -> str:
+    """One sentence for the turn's status line: what the two models settled on."""
+    if outcome == "agreed":
+        return f"{REVIEWER.model} agreed with the merged script"
+    if outcome == "merged":
+        return (f"{REVIEWER.model} still proposed changes; the last merged script ships "
+                f"({calls} model calls)")
+    if outcome == "kept":
+        return f"{QWEN.model} kept its own version"
+    if outcome == "stopped":
+        return f"{QWEN.model} answered; the negotiation stopped early"
+    return f"{REVIEWER.model} had nothing better; {QWEN.model}'s draft ships"
 
 
 def run_job(job: Job) -> None:
-    """Draft, check, review, refine -- on a thread of its own, so no reader can lose it."""
+    """Draft, then two models competing on the same script, on a thread of its own.
+
+    The shape is: the writer drafts, the reviewer is briefed and then writes its own version,
+    the writer merges the two in the chat it drafted in, and the reviewer says whether it would
+    ship that. Nothing here is a suggestion box -- both models produce scripts, and what is sent
+    to the user is the one they settled on.
+    """
     if not slot_take():
         job.finish(status="error",
                    error=f"{MAX_CONCURRENT} chains are already running; try again shortly")
         return
     try:
+        # The reviewer reads the brief on its own thread, while the writer drafts. The two are
+        # different providers and neither waits on the other, so the acknowledgement costs no
+        # turn time at all -- the only thing that has to be ordered is the request for a script,
+        # which cannot go until both the draft and the reading are done.
+        chat = (ReviewerChat(job) if (job.want_review and review_enabled() and NEGOTIATE_ROUNDS > 0)
+                else None)
+        seed_error: dict = {}
+
+        def seed_reviewer() -> None:
+            try:
+                chat.seed()
+            except HTTPException as e:
+                seed_error["detail"] = str(e.detail)
+            except Exception as e:  # never let a broken reviewer thread take the turn down
+                seed_error["detail"] = f"{e.__class__.__name__}: {e}"
+
+        seeder = threading.Thread(target=seed_reviewer, daemon=True)
+        if chat is not None:
+            seeder.start()
+
         draft, _ = run_phase(job, job.messages, job.temperature, QWEN, DRAFT_TOKENS,
                              "draft", "draft", f"{QWEN.model} writing a draft")
         draft = strip_fences(draft)
@@ -1541,67 +897,55 @@ def run_job(job: Job) -> None:
             reason = "; ".join(notes) or "the model returned nothing"
             raise HTTPException(502, f"{reason} -- try again, or raise DRAFT_TOKENS")
 
-        # Nothing is reviewed when nothing is configured or asked for: the draft is the answer,
-        # and the answer channel carries it so a reader sees one stream either way.
-        if not (job.want_review and review_enabled()):
+        # Nothing is reviewed when nothing is configured or asked for, and nothing is competed
+        # over when the negotiation is off: the draft is the answer, and the answer channel
+        # carries it so a reader sees one stream either way.
+        if chat is None:
             job.add("answer", draft)
-            job.finish(status="done", phase="done", note=f"{QWEN.model} answered")
+            job.finish(status="done", phase="done",
+                       note=(f"{QWEN.model} answered" if not (job.want_review and review_enabled())
+                             else "the competition is off; the draft ships"))
             note_error("")
             return
 
-        job.finish(phase="check", note="checking the draft")
-        review = ""
+        best = draft
+        outcome = "draft"
+        seeder.join()
+        if seed_error:
+            # A reviewer that is down, rate limited or out of credits must not cost the user the
+            # draft that is already written. It is recorded instead, so the reviewer chip shows it
+            # rather than looking like a negotiation that changed nothing.
+            detail = seed_error["detail"]
+            print(f"[job] {job.id} seed failed: {detail}", flush=True)
+            note_review_error(detail)
+            job.review_text = f"[the review did not happen: {detail}]"
+            job.add("review", job.review_text)
+            job.add("answer", best)
+            job.finish(status="done", phase="done", note=f"{QWEN.model} answered; no review")
+            return
+        note_review_error("")
+
         try:
-            review, _ = run_phase(job, review_messages(job, draft, notes), REVIEW_TEMPERATURE,
-                                  REVIEWER, REVIEW_MAX_TOKENS, "review", "review",
-                                  f"{REVIEWER.model} reviewing the draft")
-            note_review_error("")
+            best, outcome = negotiate(job, chat, draft, notes)
+            job.review_text = chat.last_answer[:MERGE_PASTE_MAX]
         except HTTPException as e:
-            # A reviewer that is down, rate limited or out of credits must not cost the user
-            # the draft that is already written. It is recorded instead, so the reviewer chip
-            # shows it rather than looking like a review that found nothing.
-            print(f"[job] {job.id} review failed: {e.detail}", flush=True)
-            job.add("review", f"\n[the review did not happen: {e.detail}]\n")
+            # The same rule half-way through: a reviewer that dies mid-negotiation leaves the
+            # script that stands, which is the last merged one rather than nothing.
+            print(f"[job] {job.id} negotiation stopped: {e.detail}", flush=True)
             note_review_error(str(e.detail))
-        job.review_text = review
+            job.review_text = f"[the review stopped early: {e.detail}]"
+            job.add("review", job.review_text)
+            outcome = "stopped"
 
-        verdict, items = parse_review(review)
-        if not items:
-            job.add("answer", draft)
-            note = (f"{REVIEWER.model} approved the draft" if review
-                    else "no review, shipping the draft")
-            job.finish(status="done", phase="done", note=note)
-            note_error("")
-            return
-
-        # The refine turn is internal: it is not greeted, and it is not part of the history the
-        # user's next question carries.
-        refine_turns = list(job.messages) + [
-            {"role": "assistant", "content": draft},
-            {"role": "user", "content": refine_instruction(items, notes)},
-        ]
-        final, _ = run_phase(job, refine_turns, job.temperature, QWEN, REFINE_TOKENS,
-                             "answer", "refine", f"{QWEN.model} applying the review")
-        final = strip_fences(final)
-        if job.channel("answer").strip() != final:
+        # What ships is the script the two settled on. If the answer channel is empty, or holds a
+        # merge that was thrown away, it is refilled from the one that stands.
+        if job.channel("answer").strip() != best.strip():
             job.reset_channel("answer")
-            job.add("answer", final)
-        shipped = final
-        _, refined_ok = structural_notes(final, job.phases[-1]["finish"])
-        if not refined_ok:
-            # The regression guard: a refine that comes back worse than the draft it was
-            # editing is discarded, and the draft is what gets shipped instead of it.
-            print(f"[job] {job.id} the refined script was not usable; shipping the draft", flush=True)
-            shipped = draft
-            job.reset_channel("answer")
-            job.add("answer", draft)
-            job.phases.append({"phase": "guard", "provider": "bridge", "model": "",
-                               "ms": 0, "chars": 0, "finish": "discarded the rewrite"})
-        job.finish(status="done", phase="done",
-                   note=f"{REVIEWER.model} found {len(items)} point(s); {QWEN.model} rewrote it")
+            job.add("answer", best)
         note_error("")
-        print(f"[job] {job.id} done in {job.report()['elapsed']:g}s, {len(shipped)} chars",
-              flush=True)
+        job.finish(status="done", phase="done", note=outcome_note(outcome, len(job.phases)))
+        print(f"[job] {job.id} done in {job.report()['elapsed']:g}s, {len(best)} chars, "
+              f"{len(job.phases)} model call(s)", flush=True)
     except HTTPException as e:
         # Printed as well as sent: the page shows it once, the log keeps it.
         print(f"[job] {job.id} failed: {e.detail}", flush=True)
@@ -1670,6 +1014,7 @@ def job_summary(job: Job) -> dict:
         "text": job.text(),
         "code": job.text(),
         "draft": job.channel("draft"),
+        "peer": job.channel("peer"),
         "review": job.review_text,
         "model": QWEN_MODEL,
         "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
@@ -1742,8 +1087,8 @@ def job_frames(job: Job):
             return
         if status == "done":
             yield frame({"done": True, "text": job.text(), "code": job.text(),
-                         "draft": job.channel("draft"), "review": job.review_text,
-                         "phases": job.phases, **report})
+                         "draft": job.channel("draft"), "peer": job.channel("peer"),
+                         "review": job.review_text, "phases": job.phases, **report})
             return
         if not pieces:
             yield frame({"beat": True, **report})
@@ -1777,6 +1122,7 @@ def job_result(job_id: str, _: None = Depends(require_key)):
         "phase": job.phase,
         "note": job.note,
         "draft": job.channel("draft"),
+        "peer": job.channel("peer"),
         "review": job.review_text,
         "model": QWEN_MODEL,
         "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
@@ -1789,9 +1135,16 @@ def job_result(job_id: str, _: None = Depends(require_key)):
 
 
 def job_wait() -> float:
-    """How long a blocking caller waits: a chain is three calls, so three windows."""
-    phases = 3 if review_enabled() else 1
-    return CHAT_TIMEOUT * phases + 30
+    """How long a blocking caller waits: a draft, then a seeded and negotiating review.
+
+    The chain is longer than it was -- the brief is read first, and every round is a version
+    from the reviewer plus a merge from the writer -- so the window is counted in calls rather
+    than in the old fixed three.
+    """
+    if not review_enabled() or NEGOTIATE_ROUNDS <= 0:
+        return CHAT_TIMEOUT + 30
+    rounds = max(1, min(NEGOTIATE_ROUNDS, 4))
+    return CHAT_TIMEOUT * (2 + 2 * rounds) + 30
 
 
 @app.post("/generate")
@@ -1955,7 +1308,8 @@ async def snapshot() -> dict:
         "review": review_enabled(),
         "reviewer": {**rev, "model": REVIEWER.model, "endpoint": REVIEW_URL,
                      "configured": REVIEWER.configured, "thinking": REVIEW_THINKING,
-                     "brief_chars": len(BRIEF), "items": REVIEW_ITEMS},
+                     "brief_chars": len(BRIEF), "rounds": NEGOTIATE_ROUNDS,
+                     "seed": SEED_BRIEF},
         "limits": {"per_minute": RATE_LIMIT, "concurrent": MAX_CONCURRENT,
                    "running": _running["now"]},
         "last_error": last_error(),

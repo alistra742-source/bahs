@@ -1,19 +1,64 @@
-"""Check the reviewer against stubbed providers, including chat.deepseek.com's own endpoints.
+"""Check the chain against stubbed providers, including chat.deepseek.com's own endpoints.
 
 Run from the project root:  .venv/bin/python verify_chain.py
+
+What the chain is now: the reviewer is sent Send.txt on its own and its answer is waited for,
+then the writer drafts, the reviewer writes its own version of that script, the writer merges
+the two in the chat it drafted in, and the reviewer says whether it would ship the merge.
 """
 import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CALLS = []
-STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False}
-DRAFT = "```lua\n-- draft\nprint('hi')\n```"
-REVIEW = ("VERDICT: ISSUES\n"
-          "1. the loop never ends | where: line 4 | why it fails: it runs forever | fix: add a break")
-REFINED = "```lua\n-- refined\nprint('hi')\n```"
-WEB_HEAD = "VERDICT: ISSUES\n"
-WEB_LIST = ("1. the loop never ends | where: line 4 | why it fails: it runs forever | "
-            "fix: add a break")
+STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False, "always_better": False,
+        "message_seq": 0}
+
+# The three things a model can be asked for in this chain, and what each one gets back. The
+# scripts are small but real: a merge is only ever attempted on something that looks like code.
+DRAFT_CODE = ("-- walk script\n"
+              "local Players = game:GetService(\"Players\")\n"
+              "local speed = 16\n"
+              "local function speedUp(plr)\n"
+              "    local humanoid = plr.Character and "
+              "plr.Character:FindFirstChildOfClass(\"Humanoid\")\n"
+              "    if humanoid then humanoid.WalkSpeed = speed end\n"
+              "end\n"
+              "Players.PlayerAdded:Connect(speedUp)")
+PEER_CODE = ("-- walk script\n"
+             "local Players = game:GetService(\"Players\")\n"
+             "local SPEED = 16\n"
+             "local function onPlayer(plr)\n"
+             "    plr.CharacterAdded:Connect(function(char)\n"
+             "        local humanoid = char:WaitForChild(\"Humanoid\")\n"
+             "        humanoid.WalkSpeed = SPEED\n"
+             "    end)\n"
+             "end\n"
+             "Players.PlayerAdded:Connect(onPlayer)")
+MERGED_CODE = ("-- walk script, merged\n"
+               "local Players = game:GetService(\"Players\")\n"
+               "local SPEED = 16\n"
+               "local function speed(plr)\n"
+               "    plr.CharacterAdded:Connect(function(char)\n"
+               "        char:WaitForChild(\"Humanoid\").WalkSpeed = SPEED\n"
+               "    end)\n"
+               "end\n"
+               "Players.PlayerAdded:Connect(speed)")
+
+
+def fenced(code):
+    return "```lua\n" + code + "\n```"
+
+
+SEED_ACK = "kanha:ready"
+DRAFT = fenced(DRAFT_CODE)
+PEER = "VERDICT: BETTER\n" + fenced(PEER_CODE)
+MERGED = fenced(MERGED_CODE)
+AGREE = "VERDICT: AGREE"
+# The sentence that only a peer request carries, and the one only an agreement question carries.
+PEER_ASK = "Write the version of this script you would ship"
+VERIFY_ASK = "Would you ship this exactly as it is?"
+SEED_ASK = "That is your standing instruction set"
+MERGE_ASK = "and wrote its own version of it"
 THINKING = "SECRET_THINKING_TEXT"
 
 
@@ -30,15 +75,32 @@ def stream(text):
     return (frame(text) + frame(None, "stop") + "data: [DONE]\n\n").encode()
 
 
-def ds_stream():
-    """The review split across both frame shapes the site has used.
+def reply_to(prompt):
+    """What a provider answers, decided by what it was asked -- the ask is the whole contract."""
+    if SEED_ASK in prompt:
+        return SEED_ACK
+    if PEER_ASK in prompt or (VERIFY_ASK in prompt and STUB["always_better"]):
+        return PEER
+    if VERIFY_ASK in prompt:
+        return AGREE
+    if MERGE_ASK in prompt:
+        return MERGED
+    return DRAFT
 
-    A thinking frame and a status frame ride along, and neither may reach the review text.
+
+def ds_stream(piece):
+    """A chat.deepseek.com answer split across both frame shapes the site has used.
+
+    A thinking frame, a status frame and the id of the message being written ride along: the
+    first two must never reach the text, and the id is what threads the next message onto this
+    one in the same chat.
     """
+    STUB["message_seq"] += 1
+    message_id = f"msg-{STUB['message_seq']}"
     return "".join([
-        frame(WEB_HEAD),
+        frame(piece),
         frame(THINKING, kind="thinking"),
-        raw_frame({"v": WEB_LIST}),
+        raw_frame({"p": "response/message_id", "v": message_id}),
         raw_frame({"p": "response/status", "v": "FINISHED"}),
         "data: [DONE]\n\n",
     ]).encode()
@@ -47,6 +109,19 @@ def ds_stream():
 def content_of(body):
     return "\n".join(m["content"] for m in body.get("messages", [])
                      if isinstance(m.get("content"), str))
+
+
+def latest_ask(body):
+    """The newest thing asked, which is what a real provider would be answering.
+
+    The stub decides from this rather than from the whole conversation: on the API path the
+    turns before it are still there (the brief, the acknowledgement), so matching against all of
+    them would answer the question that was asked three calls ago.
+    """
+    for message in reversed(body.get("messages") or []):
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            return message["content"]
+    return ""
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -100,12 +175,10 @@ class Stub(BaseHTTPRequestHandler):
                 challenge["challenge"] = "0" * 64
             return self._send(200, {"code": 0, "data": {"biz_data": {"challenge": challenge}}})
         if self.path.endswith("/chat/completion"):
-            return self._send(200, ds_stream(), "text/event-stream")
-        if body.get("model") == "deepseek-v4-flash":
-            return self._send(200, stream(REVIEW), "text/event-stream")
-        if "A reviewer checked the script you just wrote" in content_of(body):
-            return self._send(200, stream(REFINED), "text/event-stream")
-        return self._send(200, stream(DRAFT), "text/event-stream")
+            # The site takes one prompt, so one string is both the ask and the answer's routing.
+            return self._send(200, ds_stream(reply_to(body.get("prompt") or "")),
+                              "text/event-stream")
+        return self._send(200, stream(reply_to(latest_ask(body))), "text/event-stream")
 
 
 class StubServer(ThreadingHTTPServer):
@@ -129,13 +202,14 @@ os.environ.update({
     # a network call every 8 seconds; the test wants every check to be a fresh one.
     "TOKEN_CHECK_TTL": "0",
 })
-for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE"):
+for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS"):
     os.environ.pop(name, None)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
 import base64  # noqa: E402
 import pow_solver  # noqa: E402
+import bridge  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -159,7 +233,7 @@ def check(name, got, want):
         print(f"  ok   {name}")
 
 
-def turn(question):
+def turn(question="make me a walk script"):
     CALLS.clear()
     start = client.post("/chat/stream", json={"messages": [{"role": "user", "content": question}]})
     out = []
@@ -168,39 +242,144 @@ def turn(question):
             if line.strip():
                 out.append(json.loads(line))
     done = [f for f in out if f.get("done")]
-    return out, (done[0] if done else {}), CALLS[:]
+    channels = "".join(f.get("t", "") for f in out if f.get("ch") == "seed")
+    return out, (done[0] if done else {}), CALLS[:], channels
 
 
 def reload_with(**env):
     global server, client
     os.environ.update(env)
+    # The config and the providers live in bridge, and server binds its names at import, so both
+    # are reloaded -- otherwise a reloaded server would still hold the previous providers.
+    importlib.reload(bridge)
     server = importlib.reload(server)
     client = TestClient(server.app)
 
 
-print("\n-- the chain, reviewer on an OpenAI-shaped endpoint --")
-out, done, calls = turn("make me a walk script")
-reviewer = [c for c in calls if c["body"].get("model") == "deepseek-v4-flash"]
-check("three phases", [p["phase"] for p in done["phases"]], ["draft", "review", "refine"])
-check("the answer is the rewrite", done.get("text"), "-- refined\nprint('hi')")
-check("the brief is first in the review request",
-      reviewer[0]["body"]["messages"][0]["content"].startswith(server.BRIEF[:60]), True)
-check("thinking is off", reviewer[0]["body"].get("thinking"), {"type": "disabled"})
-check("no search parameter", [k for k in reviewer[0]["body"] if "search" in k.lower()], [])
-check("the brief is send.txt", server.BRIEF_PATH.name, "send.txt")
+def reviewer_calls(calls):
+    """Only the reviewer's calls, in order, whichever shape its endpoint takes."""
+    return [c for c in calls if c["body"].get("model") == "deepseek-v4-flash"
+            or c["path"].endswith("/chat/completion")]
+
+
+def asked_in(call):
+    """What one reviewer call was actually asked, as one string."""
+    if call["path"].endswith("/chat/completion"):
+        return call["body"].get("prompt") or ""
+    return "\n".join(m.get("content") or "" for m in call["body"].get("messages") or [])
+
+
+print("\n-- the brief goes first, on its own, and the request only after it --")
+out, done, calls, seed_stream = turn()
+review = reviewer_calls(calls)
+# The brief is read on its own thread while the draft is written, so those two may be recorded
+# in either order; everything after them is strictly ordered.
+phases = [p["phase"] for p in done["phases"]]
+check("the draft and the brief are read together, then the negotiation",
+      [sorted(phases[:2]), phases[2:]], [["draft", "seed"], ["peer", "merge", "agree"]])
+check("and the reviewer's own first message is the brief",
+      review[0]["path"].endswith("/deepseek/chat/completions"), True)
+check("the brief is the whole of that first ask",
+      asked_in(review[0]).startswith(server.BRIEF[:60]), True)
+check("and its answer is waited for: the seed is its own call",
+      [p["provider"] for p in done["phases"] if p["phase"] == "seed"], ["deepseek"])
+check("the seed call does not carry the user's request",
+      "make me a walk script" in asked_in(review[0]), False)
+check("the request goes out after it, in the same conversation",
+      "make me a walk script" in asked_in(review[1]), True)
+check("with the draft it is asking about", DRAFT_CODE in asked_in(review[1]), True)
+check("the reviewer's acknowledgement is streamed to the reader", seed_stream, SEED_ACK)
+check("what the reviewer is asked for is a script, not a list of complaints",
+      "VERDICT: BETTER" in asked_in(review[1]), True)
+check("and the version it wrote is shown as its own channel", done.get("peer"), PEER_CODE)
+check("the writer merged the two in the chat it drafted in",
+      [p["phase"] for p in done["phases"]].count("merge"), 1)
+check("the answer is the merged script", done.get("text"), MERGED_CODE)
+check("the reviewer was asked whether it would ship the merge",
+      "Would you ship this exactly as it is?" in asked_in(review[2]), True)
+check("and its verdict is kept", done.get("review"), AGREE)
+check("thinking is off in every reviewer call",
+      [c["body"].get("thinking") for c in review], [{"type": "disabled"}] * 3)
+check("no search parameter is ever sent",
+      sorted(k for c in review for k in c["body"] if "search" in k.lower()), [])
+
+print("\n-- the merge is a call, and it carries the other version --")
+merge_calls = [c for c in calls if MERGE_ASK in content_of(c["body"])]
+check("the merge happened once", len(merge_calls), 1)
+check("the merged script is asked for in that same chat",
+      merge_calls[0]["body"]["messages"][-2]["content"], DRAFT_CODE)
+check("the other model's version is in the instruction",
+      PEER_CODE in merge_calls[0]["body"]["messages"][-1]["content"], True)
+check("the writer's own script was not resent as history",
+      len([m for m in merge_calls[0]["body"]["messages"] if m["role"] == "user"]), 2)
+
+print("\n-- a reviewer that never agrees is bounded by the rounds --")
+STUB["always_better"] = True
+out, done, calls, _ = turn()
+phases = [p["phase"] for p in done["phases"]]
+check("two rounds, so two merges", [sorted(phases[:2]), phases[2:]],
+      [["draft", "seed"], ["peer", "merge", "agree", "merge"]])
+check("and the last merged script is what ships", done.get("text"), MERGED_CODE)
+STUB["always_better"] = False
+
+print("\n-- the competition can be switched off --")
+reload_with(NEGOTIATE_ROUNDS="0")
+out, done, calls, _ = turn()
+check("only the draft runs", [p["phase"] for p in done["phases"]], ["draft"])
+check("and it is the answer", done.get("text"), DRAFT_CODE)
+check("no reviewer call at all", len(reviewer_calls(calls)), 0)
+reload_with(NEGOTIATE_ROUNDS="2")
+
+print("\n-- SEED_BRIEF=off keeps the brief, and drops only the extra call --")
+reload_with(SEED_BRIEF="off")
+out, done, calls, _ = turn()
+check("no seed phase", [p["phase"] for p in done["phases"]], ["draft", "peer", "merge", "agree"])
+check("and one call fewer", len(done["phases"]), 4)
+check("the brief is still in front of the first request",
+      reviewer_calls(calls)[0] and asked_in(reviewer_calls(calls)[0]).startswith(
+          server.BRIEF[:60]), True)
+check("and the contract rides with it",
+      "VERDICT: BETTER" in asked_in(reviewer_calls(calls)[0]), True)
+os.environ.pop("SEED_BRIEF", None)
+reload_with()
+
+print("\n-- the brief is send.txt --")
+check("send.txt is the one in use", server.BRIEF_PATH.name, "send.txt")
+check("and /health names it", client.get("/health").json()["reviewer"]["brief"], "send.txt")
 
 print("\n-- chat.deepseek.com, driven by the userToken --")
 reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api/v0", REVIEW_SHAPE="deepseek-web",
             DEEPSEEK_TOKEN="user-token-xyz")
 check("the web transport is in use", server.REVIEWER.web is not None, True)
 check("and the reviewer is on", server.review_enabled(), True)
-out, done, calls = turn("make me a walk script")
+out, done, calls, seed_stream = turn()
 web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
-check("the site's completion endpoint was used", len(web), 1)
-check("a session was created for the review",
+check("three reviewer messages: the brief, its version, the agreement", len(web), 3)
+check("all three are in one chat", sorted({c["body"]["chat_session_id"] for c in web}), ["sess-1"])
+check("and one session was opened for them",
       len([c for c in calls if c["path"].endswith("/chat_session/create")]), 1)
-check("the challenge was asked for",
-      len([c for c in calls if c["path"].endswith("/chat/create_pow_challenge")]), 1)
+check("the site's message id threads the second onto the first",
+      [c["body"]["parent_message_id"] for c in web], [None, "msg-1", "msg-2"])
+check("the brief leads the first message",
+      web[0]["body"]["prompt"].startswith(server.BRIEF[:60]), True)
+check("the brief is not resent with the request that follows it",
+      server.BRIEF[:60] in web[1]["body"]["prompt"], False)
+check("the request is in that second message", "make me a walk script" in web[1]["body"]["prompt"],
+      True)
+check("each message asks for its own challenge",
+      len([c for c in calls if c["path"].endswith("/chat/create_pow_challenge")]), 3)
+check("thinking is switched off in every message",
+      [c["body"]["thinking_enabled"] for c in web], [False, False, False])
+check("search is switched off in every message",
+      [c["body"]["search_enabled"] for c in web], [False, False, False])
+check("the userToken is the bearer", web[0]["headers"].get("authorization"),
+      "Bearer user-token-xyz")
+check("the attempt looks like the site's", web[0]["headers"].get("x-client-platform"), "web")
+check("both frame shapes were read", done.get("peer"), PEER_CODE)
+check("a thinking frame never reaches the text",
+      [THINKING in asked_in(c) or THINKING in (done.get("peer") or "") for c in web], [False] * 3)
+check("a status frame never arrives as text", "FINISHED" in (done.get("peer") or ""), False)
+check("the merge still happened, in the writer's chat", done.get("text"), MERGED_CODE)
 pow_header = web[0]["headers"].get("x-ds-pow-response")
 if _solver is None:
     print("  (the proof-of-work checks are skipped: no sha3 module is available here)")
@@ -211,31 +390,33 @@ else:
     check("and the signature that came with it", answered.get("signature"), "sig")
     check("no state the challenge did not carry", answered.get("target_path"),
           "/api/v0/chat/completion")
-check("the userToken is the bearer", web[0]["headers"].get("authorization"),
-      "Bearer user-token-xyz")
-check("thinking is switched off in the payload", web[0]["body"].get("thinking_enabled"), False)
-check("search is switched off in the payload", web[0]["body"].get("search_enabled"), False)
-check("the attempt looks like the site's", web[0]["headers"].get("x-client-platform"), "web")
-check("the brief leads the prompt",
-      web[0]["body"]["prompt"].startswith(server.BRIEF[:60]), True)
-check("the request is in the prompt", "make me a walk script" in web[0]["body"]["prompt"], True)
-check("both frame shapes were read",
-      [WEB_HEAD in done["review"], WEB_LIST in done["review"]], [True, True])
-check("a thinking frame never reaches the review", THINKING in done["review"], False)
-check("a status frame never arrives as text", "FINISHED" in done["review"], False)
-check("the rewrite still ran in the same chat", done.get("text"), "-- refined\nprint('hi')")
+check("every message carries the proof of work",
+      [bool(c["headers"].get("x-ds-pow-response")) for c in web], [True, True, True])
 health = client.get("/health").json()
 check("the chip says the token works", health["reviewer"]["detail"], "token accepted")
 check("and names the shape", health["reviewer"]["shape"], "deepseek-web")
+check("and how many rounds it may run", health["reviewer"]["rounds"], 2)
 
 print("\n-- a challenge with no answer below its difficulty sends no header --")
 STUB["bad_challenge"] = True
-out, done, calls = turn("make me a walk script")
+out, done, calls, _ = turn()
 web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
 check("nothing was invented for an unsolvable challenge",
-      "x-ds-pow-response" in (web[0]["headers"] if web else {"x-ds-pow-response": "none"}), False)
-check("and the turn still ran", done.get("text"), "-- refined\nprint('hi')")
+      [("x-ds-pow-response" in c["headers"]) for c in web], [False, False, False])
+check("and the turn still ran", done.get("text"), MERGED_CODE)
 STUB["bad_challenge"] = False
+
+print("\n-- a reviewer that is down costs the draft, never the turn --")
+STUB["users_code"] = 0
+reload_with(REVIEW_URL="http://127.0.0.1:9/deepseek", REVIEW_SHAPE="openai",
+            DEEPSEEK_TOKEN="review-test-key")
+out, done, calls, _ = turn()
+check("the draft still ships", done.get("text"), DRAFT_CODE)
+check("the failure is recorded rather than silence", "did not happen" in (
+    done.get("review") or ""), True)
+check("and the turn is not an error", done.get("status"), "done")
+check("the chip reports it", client.get("/health").json()["reviewer"]["ok"], False)
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
 
 print("\n-- the proof-of-work solver's own rules --")
 check("the prefix spells an integer as an integer",
@@ -248,17 +429,17 @@ check("an absurd difficulty is refused, not stalled",
       pow_solver.solve({"algorithm": "DeepSeekHashV1", "challenge": "x",
                         "difficulty": 999999999999, "salt": "s", "expire_at": 1}), "")
 check("no challenge, no header", pow_solver.solve({}), "")
-check("a challenge off the openai path is not solved either",
-      pow_solver.solve({"algorithm": "DeepSeekHashV1", "challenge": "0" * 64,
-                        "difficulty": POW_DIFFICULTY, "salt": POW_SALT,
-                        "expire_at": POW_EXPIRE}), "")
 
 print("\n-- the userToken is rejected --")
 STUB["users_code"] = 40003
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api/v0", REVIEW_SHAPE="deepseek-web",
+            DEEPSEEK_TOKEN="user-token-xyz")
 health = client.get("/health").json()
 check("the chip is red", health["reviewer"]["ok"], False)
 check("and says how to get a new one", "userToken" in health["reviewer"]["detail"], True)
 STUB["users_code"] = 0
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
+            DEEPSEEK_TOKEN="review-test-key")
 
 print("\n-- pointing REVIEW_URL at the site picks the transport --")
 reload_with(REVIEW_URL="https://chat.deepseek.com")
@@ -299,29 +480,30 @@ print("\n-- a session token the API rejects is blamed on the endpoint, not the t
 STUB["api_code"] = 401
 reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api-reject", REVIEW_SHAPE="openai",
             DEEPSEEK_TOKEN="user-token-xyz")
-out, done, calls = turn("make me a walk script")
+out, done, calls, _ = turn()
 review = "".join(f.get("t", "") for f in out if f.get("ch") == "review")
-check("the draft still ships, unrefined", "-- draft" in (done.get("text") or ""), True)
-check("the reason names the fix",
-      "REVIEW_URL=https://chat.deepseek.com" in review, True)
+check("the draft still ships", DRAFT_CODE in (done.get("text") or ""), True)
+check("the reason names the fix", "REVIEW_URL=https://chat.deepseek.com" in review, True)
 check("and says which credential it is", "session token, not an API key" in review, True)
 check("the api's own words are kept", "Authentication Fails" in review, True)
 STUB["api_code"] = 0
 
 print("\n-- a page whose stream keeps being cut collects the answer by polling --")
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
 started = client.post("/chat/stream", json={"messages": [{"role": "user",
                                                           "content": "make me a walk script"}]})
 polled = {}
-for _ in range(200):
+for _ in range(400):
     polled = client.get(f"/chat/poll/{started.json()['job']}").json()
     if polled.get("done") or polled.get("status") == "error":
         break
     time.sleep(0.02)
 check("the poll says the turn is over", polled.get("done"), True)
-check("and carries the answer", polled.get("text"), "-- refined\nprint('hi')")
-check("with the draft and the review as well",
-      [bool(polled.get("draft")), bool(polled.get("review"))], [True, True])
-check("and the record of what each phase cost", len(polled.get("phases") or []), 3)
+check("and carries the answer", polled.get("text"), MERGED_CODE)
+check("with the draft, the other version and the review as well",
+      [bool(polled.get("draft")), bool(polled.get("peer")), bool(polled.get("review"))],
+      [True, True, True])
+check("and the record of what each phase cost", len(polled.get("phases") or []), 5)
 check("an unknown job is a 404, so the page can stop",
       client.get("/chat/poll/nope").status_code, 404)
 

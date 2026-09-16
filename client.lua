@@ -41,7 +41,7 @@ local function post(path, body)
 end
 
 -- Start the chain and follow it. `onStep` is called with each phase note so the caller can
--- show "deepseek-v4-flash reviewing the draft (44s)" instead of a silent wait.
+-- show "deepseek-v4-flash writing its own version (44s)" instead of a silent wait.
 local function ask(question, onStep)
     table.insert(messages, {role = "user", content = question})
     local ok, result = pcall(function()
@@ -200,7 +200,7 @@ makeBtn("review", 0.402, Color3.fromRGB(150, 110, 60), function()
     if lastReview and lastReview ~= "" then
         output.Text = "-- " .. lastReview
     else
-        output.Text = "-- the reviewer had nothing to say about the last answer"
+        output.Text = "-- no reviewer answered for the last turn"
     end
 end)
 

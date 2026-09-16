@@ -50,6 +50,10 @@ button:disabled{opacity:.55;cursor:default}
 .turn.err .body{color:#ffb4ae}
 .turn.draft{align-self:flex-start;background:#12131a;border-style:dashed;border-color:#2b3346}
 .turn.draft .body{color:#b9c2d4}
+.turn.peer{align-self:flex-start;background:#0f1a1b;border-style:dashed;border-color:#26494a}
+.turn.peer .body{color:#bcd6d6}
+.turn.seed{align-self:flex-start;background:#12161f;border-style:dashed;border-color:#242c3a;opacity:.85}
+.turn.seed .body{color:#8e99ad}
 .turn.rev{align-self:flex-start;background:#1a1512;border-color:#4a3a26}
 .turn.rev .body{color:#e6d3b3}
 details.meta{align-self:flex-start;max-width:100%;background:#12161f;border:1px dashed var(--line);border-radius:10px;padding:6px 12px;font:11px ui-monospace,monospace;color:var(--dim)}
@@ -97,7 +101,8 @@ footer a{color:var(--blue);text-decoration:none}
     <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
     Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
     Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code> with thinking off.<br>
-    __MODEL__ writes a draft, <code>__REVIEWER__</code> reviews it, then <code>__MODEL__</code> rewrites it in the same chat before it is sent to you.<br>
+    <code>__REVIEWER__</code> reads <code>send.txt</code> first, on its own, and is only asked after it answers.<br>
+    __MODEL__ writes a draft, <code>__REVIEWER__</code> writes its own version of it, __MODEL__ merges the two in the same chat, and <code>__REVIEWER__</code> says whether it would ship that.<br>
     The Qwen token and the reviewer key stay in this service's variables; they never reach this page.
   </footer>
 </div>
@@ -238,7 +243,8 @@ footer a{color:var(--blue);text-decoration:none}
 
   function bubble(channel, label) {
     if (bubbles[channel]) return bubbles[channel];
-    var cls = channel === "draft" ? "draft" : (channel === "review" ? "rev" : "");
+    var cls = (channel === "draft" || channel === "peer" || channel === "seed") ? channel
+      : (channel === "review" ? "rev" : "");
     var el = turnEl("assistant", "", label);
     if (cls) el.classList.add(cls);
     el.classList.add("pending");
@@ -259,7 +265,9 @@ footer a{color:var(--blue);text-decoration:none}
 
   function labelFor(channel) {
     if (channel === "review") return "review · " + (REVIEWER || "reviewer");
-    if (channel === "answer") return "final · " + MODEL;
+    if (channel === "answer") return "agreed · " + MODEL;
+    if (channel === "peer") return "also · " + (REVIEWER || "reviewer");
+    if (channel === "seed") return "brief · " + (REVIEWER || "reviewer");
     return "draft · " + MODEL;
   }
 
@@ -349,7 +357,7 @@ footer a{color:var(--blue);text-decoration:none}
       return false;
     }
     if (d.reset) {
-      // The server threw a channel away (a rewrite that came back unusable); clear its bubble
+      // The server threw a channel away (a version that came back unusable); clear its bubble
       // so what is left on screen is what is actually being shipped.
       var gone = bubbles[d.ch];
       if (gone) bodyOf(gone).textContent = "";
@@ -384,8 +392,9 @@ footer a{color:var(--blue);text-decoration:none}
       chat.job = null;
       save();
       render();
-      if (draft && draft !== text) metaEl("draft before the review", draft);
-      if (review) metaEl("review", review);
+      if (draft && draft !== text) metaEl("draft by " + MODEL, draft);
+      if (d.peer) metaEl("the other version, by " + (REVIEWER || "reviewer"), d.peer);
+      if (review) metaEl("the reviewer", review);
       if (phases.length > 1) {
         metaEl("chain", phases.map(function (p) {
           return p.phase + ": " + (p.model || p.provider) + " " + p.ms + "ms, " + p.chars +
@@ -492,6 +501,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (d.status === "error") return handleFrame(JSON.stringify({ error: d.error || "the turn failed" }));
     if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
     if (d.draft) setTransient("draft", d.draft);
+    if (d.peer) setTransient("peer", d.peer);
     if (d.text) setTransient("answer", d.text);
     return false;
   }
@@ -589,7 +599,7 @@ footer a{color:var(--blue);text-decoration:none}
   }
 
   $("flow").textContent = REVIEW_ON
-    ? "draft by " + MODEL + ", review by " + REVIEWER + ", rewrite in the same chat"
+    ? MODEL + " drafts · " + REVIEWER + " writes its own version · they merge in the same chat"
     : "Qwen chat · every question goes out as \"" + GREETING + " ...\"";
 
   $("send").onclick = send;

@@ -1,21 +1,32 @@
 # bahs
 
-Two models in a chain, behind one API, with a chat page on top.
+Two models competing over one script, behind one API, with a chat page on top.
 
 ```
-you -- ask --> bahs -- draft ----------------> Qwen        (qwen-api, thinking off)
+you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking off, search off)
+                  |                                    |
+                  |                                    +-- answers it, then waits
                   |
-                  +-- review ----------------> DeepSeek V4 Flash (thinking off, search off)
+                  +-- draft -----------------------> Qwen   (qwen-api, thinking off)
                   |
-                  +-- rewrite, same chat ----> Qwen
+                  +-- "write your version" -------> DeepSeek, in the brief's chat
+                  |
+                  +-- merge the two, same chat ---> Qwen
+                  |
+                  +-- "would you ship it?" -------> DeepSeek: AGREE, or another version
 ```
 
-1. **Qwen drafts** an answer to what you asked, in the conversation you are keeping.
-2. **DeepSeek reviews** that draft against your request and returns a numbered list of what
-   would actually break, what that looks like to the user, and the exact change to make.
-3. **Qwen rewrites it** — in the *same conversation the draft was written in*, with the
-   reviewer's list pasted in — and that rewrite is what you get. The draft and the review stay
-   available under the answer (collapsed), and neither is carried into your next question.
+1. **DeepSeek reads `send.txt` first**, alone, and is only asked for anything after it has
+   answered that.
+2. **Qwen drafts** an answer to what you asked, in the conversation you are keeping.
+3. **DeepSeek writes its own version** of that script — not a list of complaints: a script you
+   could run.
+4. **Qwen merges the two** in the *same conversation the draft was written in*, keeping whatever
+   is genuinely more reliable from each.
+5. **DeepSeek says whether it would ship the merge.** If it would not, it writes another version
+   and Qwen merges again — up to `NEGOTIATE_ROUNDS` rounds, and it stops the moment they agree.
+   The script they settled on is what you get; the draft, the other version and the verdict stay
+   under the answer (collapsed) and none of them is carried into your next question.
 
 chat.qwen.ai has no public API. [`qwen-api`](https://github.com/encryptarun/qwen-api) turns it
 into OpenAI-compatible endpoints using the Qwen *access token* from your browser
@@ -136,9 +147,14 @@ apply here.
 
 ## The brief (send.txt / Send.txt)
 
-The brief is read once at boot and put **before anything else** in the review request: it is
-the first system message (or, in the `web` shape, the very start of the single prompt), ahead of
-the request, the draft and the automatic checks. Nothing is prepended to it.
+The brief is read once at boot and sent **on its own, before anything else the reviewer is
+asked**: one message containing nothing but `send.txt` (plus the output contract and one line
+asking for a short acknowledgement), and the answer to it is waited for before the request for a
+script goes out. After that the request arrives in the *same* conversation — on the site path by
+threading the next message onto the id of the one before it — so the reviewer is answering inside
+the chat the brief was read in. The brief goes out on its own thread **while Qwen writes the
+draft**, so waiting for the acknowledgement costs no turn time: the only thing that has to be
+ordered is the request for a script, which cannot go until both are done.
 
 **There are two of them in the repo** — `send.txt` and `Send.txt` — because they differ only in
 the case of one letter. That is a trap worth knowing about: a clone on a case-insensitive
@@ -155,9 +171,11 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 * A missing file is not fatal — the built-in rubric still applies — but it is reported rather
   than silently skipped. `Dockerfile` copies both into the image; if you edit either on GitHub,
   the service picks it up on the next deploy.
-* The built-in rubric is always appended after it, because the review has to come back as
-  `VERDICT: OK` or a numbered list (`1. what is wrong | where | why it fails | fix`) for the
-  rewrite step to be able to apply it.
+* The output contract is always appended after it, because the answer has to come back as a
+  script for the merge step to be able to use it: `VERDICT: BETTER` plus the complete script, or
+  `VERDICT: KEEP` when nothing in the script in front of it can be made more reliable.
+* `SEED_BRIEF=off` keeps the brief but folds it into the first request instead of sending it on
+  its own, which saves one call and loses the acknowledgement.
 
 ## The flow in detail
 
@@ -165,17 +183,19 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 | --- | --- | --- |
 | draft | Qwen | The turn you asked, plus a ceiling of `DRAFT_TOKENS`. The answer is unwrapped from a single ``` fence |
 | check | this service | Empty, `finish_reason=length`, `content_filter`, an unterminated fence. A cut-off draft is **refused**, not shipped |
-| review | DeepSeek | Your request, the target runtime, the draft (secrets masked), and what the check found. `temperature 0.2`, ceiling `REVIEW_MAX_TOKENS` |
-| verdict | this service | `VERDICT: OK` -> the draft ships and no third call is spent. Otherwise the numbered list is capped at `REVIEW_ITEMS` |
-| rewrite | Qwen | The *same conversation*, plus the draft as its own assistant turn, plus the list pasted in whole. Asked to return the full script and nothing else |
-| guard | this service | If the rewrite comes back empty or cut off, it is discarded and the draft ships instead |
+| seed | DeepSeek | `send.txt` and the output contract, alone, with the acknowledgement waited for. Runs on its own thread alongside the draft, so it adds no waiting. Ceiling `SEED_TOKENS`, because it is only an acknowledgement |
+| peer | DeepSeek | Round 1: your request, the target runtime, Qwen's draft (secrets masked) and what the check found — answered with a complete script of its own. Ceiling `PEER_TOKENS` |
+| merge | Qwen | The *same conversation the draft was written in*, plus the draft as its own assistant turn, plus the other version pasted in whole. Asked for the single best script and nothing else |
+| agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` |
+| guard | this service | A merge that comes back empty or cut off is discarded, and the script it was editing is what stands |
 
 A few properties worth knowing:
 
-* **A review is not a proof.** DeepSeek reading code cannot know it runs. The chain is
-  "structural check -> reviewer's opinion -> constrained rewrite", not verification.
+* **Neither model is a verifier.** DeepSeek reading code cannot know it runs either, so what this
+  chain buys you is a second complete attempt at the script plus a second opinion on the merge —
+  not proof. The only machine evidence in play is the local structural check.
 * **The greeting is only for the model you are talking to.** `Hy kanha <your question>` is
-  applied to the newest user turn only; the rewrite instruction and the review prompt never
+  applied to the newest user turn only; the merge instruction and the request for a script never
   carry it, and the reviewer is shown the question as you typed it.
 * **Secrets do not go to the reviewer.** Webhooks, `hf_`/`sk-`/`ghp_` tokens, bearer strings,
   `key = "..."` assignments and long hex are replaced with `<redacted>` in the copy the reviewer
@@ -195,8 +215,8 @@ A few properties worth knowing:
 | Endpoint | What it is |
 | --- | --- |
 | `POST /chat/stream` | `{messages:[{role,content},...], review?: bool}` -> `{job, model, reviewer, turns}`. Starts the chain, returns at once |
-| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`draft` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, review, phases}` or `{error}` |
-| `POST /chat` | The same chain, blocking. `{text, draft, review, phases}` |
+| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`seed` / `draft` / `peer` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, peer, review, phases}` or `{error}` |
+| `POST /chat` | The same chain, blocking. `{text, draft, peer, review, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
 | `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
 | `POST /generate` | Blocking, one prompt, no history |
@@ -228,7 +248,10 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` for the slower, stronger one; ignored by the web transport, whose model is whatever your account is set to |
 | `REVIEW_SHAPE` | `openai` | `web` for a bridge, `deepseek-web` for the site itself (chosen for you when `REVIEW_URL` is chat.deepseek.com) |
 | `REVIEW_THINKING` | `off` | anything else turns it back on for the reviewer only |
-| `REVIEW_ITEMS` | `8` | cap on the numbered list |
+| `NEGOTIATE_ROUNDS` | `2` | how many rounds of "DeepSeek writes a version, Qwen merges" may run. Round 1 is the competition; each round after it is DeepSeek agreeing with the merge or proposing another version. `0` ships the draft alone |
+| `SEED_BRIEF` | `on` | send `send.txt` on its own and wait for the answer before the request. `off` folds it into the first request and saves a call |
+| `PEER_TOKENS` / `SEED_TOKENS` | `8192` / `512` | ceilings on the API path for DeepSeek writing a script, and for it acknowledging the brief |
+| `MERGE_PASTE_MAX` | `48000` | how much of the other version is pasted into a merge instruction |
 | `REVIEW_BRIEF` / `REVIEW_BRIEF_MAX` | `send.txt`, then `Send.txt` / `60000` | the brief, and the ceiling on it |
 | `REVIEW_SCRIPT_MAX` | `48000` | how much of the draft is sent for review; past this the reviewer is told the script is truncated |
 | `DRAFT_TOKENS` / `REFINE_TOKENS` | `8192` / `16384` | ceilings on the two Qwen calls. A whole script is the point of both, and 4096 tokens is roughly 200 lines of Luau; an answer that reaches its ceiling is refused rather than shipped, so a ceiling that is too low shows up as a failed turn |
@@ -259,8 +282,8 @@ Paste your domain and key at the top. The key is `API_KEY` if you set one, other
 token itself — and remember that a Roblox script is not a private place, so `API_KEY` is the
 better option if other people can read the script.
 
-A chain is three model calls, so allow for it: Roblox gives up on a single request well before
-that, which is exactly why the client polls.
+A chain is five model calls and up to two more per extra round, so allow for it: Roblox gives up
+on a single request well before that, which is exactly why the client polls.
 
 ## Troubleshooting
 
@@ -270,12 +293,13 @@ that, which is exactly why the client polls.
 | `deepseek rejected the token`, `your api key ... is invalid` | a chat `userToken` was sent to the API because `REVIEW_URL` was set by hand — clear it, or set it to `https://chat.deepseek.com` |
 | `deepseek rejected the key` | an API key that is wrong or revoked; make a new one at [platform.deepseek.com](https://platform.deepseek.com) |
 | `deepseek is rate limiting` | free-tier quota; wait, or `REVIEW_MODEL=deepseek-v4-pro` |
-| reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> review failed: ...` |
+| reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> seed failed: ...` or `[job] <id> negotiation stopped: ...` |
 | `40300 MISSING_HEADER` | the message went out without its proof-of-work header — see [The proof of work](#the-proof-of-work-pow_solverpy), and the `[deepseek]` lines in the log |
 | `40301 INVALID_POW_RESPONSE` | the proof of work was solved with the wrong module build |
-| the draft is the answer, no rewrite | the reviewer answered `VERDICT: OK`, or a failed review meant there was no list to apply |
+| the draft is the answer, nothing merged | DeepSeek answered `VERDICT: KEEP` (nothing in it could be made more reliable), a failed review meant there was nothing to merge, or `NEGOTIATE_ROUNDS=0` |
+| the answer is the draft even though the reviewer proposed a version | the merge came back empty or cut off and was thrown away; the log says `the merged script was not usable` |
 | `the answer was cut off by the token ceiling` | raise `DRAFT_TOKENS` (and `REFINE_TOKENS`), or ask for less at once |
-| a rewrite was thrown away | it came back empty or cut off; the log says so and the draft shipped |
+| a version was thrown away | it came back empty or cut off; the log says so and the script it was editing is what stands |
 | the answer stops mid-sentence | the phone dropped the connection; the job is still running, and the page reattaches and replays it -- and after three drops it collects the answer with `GET /chat/poll/{job}` instead, one short request at a time |
 | `the stream ended early` | the read was cut before the turn finished, which the page now treats as a reattach rather than a failure. It should no longer be the thing you see; if it is, the log line `[job] <id> ...` for that turn says how far it got |
 | `429 too many requests from ...` | `RATE_LIMIT` per IP, or `MAX_CONCURRENT` chains already running |
@@ -299,10 +323,16 @@ curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
 ## Verifying a change
 
 `verify_chain.py` runs the whole chain against stubbed Qwen and DeepSeek endpoints — no keys,
-no network — and covers the brief being first, the thinking/search toggles, the three phases,
-secret masking, the regression guard, the blocking and polling paths, and the chat.deepseek.com
-guard:
+no network. It covers the brief being sent alone and the request only after its answer, both
+provider shapes, the thinking/search toggles being off in every call, the round being bounded so
+a pair that never agrees still finishes, `SEED_BRIEF=off`, `NEGOTIATE_ROUNDS=0`, secret masking,
+the merge guard, a reviewer that dies mid-negotiation, the site's message id threading a second
+message onto the first, the proof of work, and the blocking and polling paths:
 
 ```bash
 .venv/bin/python verify_chain.py
 ```
+
+The service is two modules: `bridge.py` is everything that talks to a provider (tokens, config,
+the two transports, the brief, the job record) and `server.py` is the service on top of it (the
+chain, the endpoints, the page).
