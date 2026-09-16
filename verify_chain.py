@@ -672,12 +672,22 @@ check("and the turn is still done", done.get("status"), "done")
 
 print("\n-- without send2.txt the first brief stands in, and says so --")
 reload_with(SECOND_BRIEF=UNSET)
-check("the fallback is the first reader's brief", server.SECOND_BRIEF, server.BRIEF)
+# send2.txt is in the repo now, so "it is not there" is said by pointing the search at paths that
+# are not there, rather than by moving the real file around mid-test.
+saved_choices = peers.SECOND_BRIEF_CHOICES
+peers.SECOND_BRIEF_CHOICES = [Path(tempfile.gettempdir()) / "no-send2-here.txt"]
+try:
+    stood_in, stood_in_name, fell_back = peers.pick_second_brief()
+finally:
+    peers.SECOND_BRIEF_CHOICES = saved_choices
+check("the fallback is the first reader's brief", [stood_in == server.BRIEF, fell_back],
+      [True, True])
+check("named as the file that is not in the image", stood_in_name, peers.FALLBACK_BRIEF_NAME)
 health = client.get("/health").json()
-check("and /health names the file that actually goes out", health["second"]["brief"],
-      peers.FALLBACK_BRIEF_NAME)
-check("marked as a fallback rather than passed off as send2.txt",
-      health["second"]["brief_fallback"], True)
+check("and with the real send2.txt in the repo, that is the one named",
+      [health["second"]["brief"], health["second"]["brief_fallback"]], ["send2.txt", False])
+check("so its own text is what /health counts", health["second"]["brief_chars"],
+      len(peers.SECOND_BRIEF))
 reload_with()
 check("with a brief of its own, nothing is marked as a fallback",
       client.get("/health").json()["second"]["brief"], BRIEF2_FIXTURE.name)

@@ -254,11 +254,13 @@ asked of it, on its own thread alongside the draft and the first reader's brief,
 turn time either. Its request for a script only goes out after that answer lands, in the same
 chat.
 
-* Name it `send2.txt` or `Send2.txt`; `ZAI_BRIEF=/app/Send2.txt` forces a path.
-* **If it is not there, the first reader's brief is sent instead** (the same standing
+* Name it `send2.txt` or `Send2.txt`; `ZAI_BRIEF=/app/Send2.txt` forces a path. `send2.txt` is
+  **in the repository**, so this reader has its own brief (10,711 characters of it), and editing
+  that file on GitHub and redeploying is all it takes to change it.
+* **If it is ever not there, the first reader's brief is sent instead** (the same standing
   instructions are worth more than none), and `/health` says which one went out:
-  `second.brief` reads `send.txt (send2.txt is not in the image)`. Add the file and redeploy to
-  give GLM its own.
+  `second.brief` reads `send.txt (send2.txt is not in the image)` rather than claiming a file
+  nobody received.
 * `Dockerfile` copies `send*.txt`, so adding `send2.txt` **does not** need a Dockerfile change —
   the glob matches one file or two and the build never depends on which.
 
