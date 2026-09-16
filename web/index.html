@@ -100,10 +100,11 @@ footer a{color:var(--blue);text-decoration:none}
   <footer>
     <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
     Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
-    Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code> with thinking off.<br>
+    Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code>, with thinking on.<br>
     <code>__REVIEWER__</code> reads <code>send.txt</code> first, on its own, and is only asked after it answers.<br>
     Every message to <code>__REVIEWER__</code> opens with the warning that the target is a Roblox executor script, not Roblox Studio.<br>
     __MODEL__ writes a draft, <code>__REVIEWER__</code> writes its own version of it, __MODEL__ merges the two in the same chat, and <code>__REVIEWER__</code> says whether it would ship that.<br>
+    When __MODEL__ offers two scripts and asks which one is preferred, that question is answered here: the option with the most lines ships.<br>
     The Qwen token and the reviewer key stay in this service's variables; they never reach this page.
   </footer>
 </div>

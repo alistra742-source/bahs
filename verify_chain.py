@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CALLS = []
 STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False, "always_better": False,
-        "message_seq": 0}
+        "message_seq": 0, "choice_draft": False, "choice_merge": False, "choice_dud": False}
 
 # The three things a model can be asked for in this chain, and what each one gets back. The
 # scripts are small but real: a merge is only ever attempted on something that looks like code.
@@ -49,6 +49,34 @@ def fenced(code):
     return "```lua\n" + code + "\n```"
 
 
+# Two scripts of very different lengths, offered with the question the writer asks when it cannot
+# decide. The bridge answers that question itself, and the longer one is what has to ship.
+CHOICE_SHORT = ("-- walk script, simple\n"
+                "local p = game:GetService(\"Players\")\n"
+                "p.PlayerAdded:Connect(function(plr) plr.CharacterAdded:Connect(function(c)\n"
+                "    c:WaitForChild(\"Humanoid\").WalkSpeed = 16\n"
+                "end) end)")
+CHOICE_LONG = ("-- walk script, robust\n"
+               "local Players = game:GetService(\"Players\")\n"
+               "local SPEED = 16\n"
+               "local function apply(character)\n"
+               "    local humanoid = character:WaitForChild(\"Humanoid\", 10)\n"
+               "    if not humanoid then return end\n"
+               "    humanoid.WalkSpeed = SPEED\n"
+               "end\n"
+               "local function onPlayer(plr)\n"
+               "    if plr.Character then apply(plr.Character) end\n"
+               "    plr.CharacterAdded:Connect(apply)\n"
+               "end\n"
+               "Players.PlayerAdded:Connect(onPlayer)\n"
+               "for _, plr in ipairs(Players:GetPlayers()) do onPlayer(plr) end")
+CHOICE_QUESTION_TEXT = "Which choice do you prefer?"
+CHOICE_DRAFT = ("Here are two ways to do it.\n\nOption 1 (simple):\n" + fenced(CHOICE_SHORT)
+                + "\n\nOption 2 (robust):\n" + fenced(CHOICE_LONG)
+                + "\n\n" + CHOICE_QUESTION_TEXT)
+# The sentence only the reply to that question carries, which is how the stub routes it.
+CHOICE_ASK = "I prefer option"
+
 SEED_ACK = "kanha:ready"
 DRAFT = fenced(DRAFT_CODE)
 PEER = "VERDICT: BETTER\n" + fenced(PEER_CODE)
@@ -60,6 +88,7 @@ VERIFY_ASK = "Would you ship this exactly as it is?"
 SEED_ASK = "That is your standing instruction set"
 MERGE_ASK = "and wrote its own version of it"
 THINKING = "SECRET_THINKING_TEXT"
+REASONING = "SECRET_REASONING_TEXT"
 
 
 def frame(piece, finish=None, kind="RESPONSE"):
@@ -71,12 +100,24 @@ def raw_frame(payload):
     return "data: " + json.dumps(payload) + "\n\n"
 
 
-def stream(text):
-    return (frame(text) + frame(None, "stop") + "data: [DONE]\n\n").encode()
+def reasoning_frame(text):
+    """A thinking token on the writer's own stream, which is what thinking mode adds."""
+    return "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": text}}]}) + "\n\n"
+
+
+def stream(text, reasoning=REASONING):
+    """An OpenAI-shaped answer, with the thinking that precedes it on the same stream."""
+    return ((reasoning_frame(reasoning) if reasoning else "") + frame(text)
+            + frame(None, "stop") + "data: [DONE]\n\n").encode()
 
 
 def reply_to(prompt):
     """What a provider answers, decided by what it was asked -- the ask is the whole contract."""
+    if CHOICE_ASK in prompt:
+        # The bridge has just named the option it wants; the writer hands it over. `choice_dud`
+        # is a writer that will not decide even when told which one, which must still end in a
+        # script rather than in the question again.
+        return "I cannot decide for you." if STUB["choice_dud"] else fenced(CHOICE_LONG)
     if SEED_ASK in prompt:
         return SEED_ACK
     if PEER_ASK in prompt or (VERIFY_ASK in prompt and STUB["always_better"]):
@@ -84,8 +125,8 @@ def reply_to(prompt):
     if VERIFY_ASK in prompt:
         return AGREE
     if MERGE_ASK in prompt:
-        return MERGED
-    return DRAFT
+        return CHOICE_DRAFT if STUB["choice_merge"] else MERGED
+    return CHOICE_DRAFT if STUB["choice_draft"] else DRAFT
 
 
 def ds_stream(piece):
@@ -202,14 +243,16 @@ os.environ.update({
     # a network call every 8 seconds; the test wants every check to be a fresh one.
     "TOKEN_CHECK_TTL": "0",
 })
-for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS"):
+for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS",
+             "QWEN_THINKING", "CHOICE_ROUNDS"):
     os.environ.pop(name, None)
 
 # How the test starts, so a section that sets a variable cannot leak it into the next one: every
 # reload begins from this, not from whatever the section before it happened to leave behind.
 BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "REVIEW_URL", "DEEPSEEK_TOKEN", "REVIEW_SHAPE", "API_KEY",
-    "SEED_BRIEF", "NEGOTIATE_ROUNDS", "CHAT_TIMEOUT", "TOKEN_CHECK_TTL")}
+    "SEED_BRIEF", "NEGOTIATE_ROUNDS", "CHAT_TIMEOUT", "TOKEN_CHECK_TTL", "QWEN_THINKING",
+    "CHOICE_ROUNDS")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
@@ -280,6 +323,24 @@ def reviewer_calls(calls):
     """Only the reviewer's calls, in order, whichever shape its endpoint takes."""
     return [c for c in calls if c["body"].get("model") == "deepseek-v4-flash"
             or c["path"].endswith("/chat/completion")]
+
+
+def writer_calls(calls):
+    """Only the writer's calls, in order -- the draft, a merge, the answer to a choice."""
+    return [c for c in calls if c["body"].get("model") == "qwen3.8-max"]
+
+
+def streamed(out, channel="answer"):
+    """What one channel ends up holding, resets included -- which is what a reader replays."""
+    text = ""
+    for item in out:
+        if item.get("ch") != channel:
+            continue
+        if item.get("reset"):
+            text = ""
+        else:
+            text += item.get("t", "")
+    return text
 
 
 def asked_in(call):
@@ -593,6 +654,96 @@ job = started.json()["job"]
 check("the page can poll", client.get(f"/chat/poll/{job}").status_code, 200)
 check("while the API result stays gated", client.get(f"/chat/result/{job}").status_code, 401)
 reload_with()
+
+print("\n-- the writer thinks, and the thinking is not the answer --")
+reload_with()
+out, done, calls, _ = turn()
+wrote = writer_calls(calls)
+check("thinking is on by default", bridge.QWEN_THINKING, "thinking")
+check("and every writer call asks for it", [c["body"].get("thinking_mode") for c in wrote],
+      ["thinking"] * len(wrote))
+check("a reasoning delta never reaches the answer", REASONING in (done.get("text") or ""), False)
+check("nor the draft the reader is shown", REASONING in (done.get("draft") or ""), False)
+check("and the answer is still the merged script", done.get("text"), MERGED_CODE)
+reload_with(QWEN_THINKING="fast")
+check("it can be turned off as well", bridge.QWEN_THINKING, "fast")
+reload_with()
+
+print("\n-- the offered scripts are read, and the one with the most lines is the choice --")
+options = server.code_options(CHOICE_DRAFT)
+check("both offered scripts are read as options", len(options), 2)
+check("with their own line counts", [o["lines"] for o in options],
+      [server.code_line_count(CHOICE_SHORT), server.code_line_count(CHOICE_LONG)])
+check("and the one with the most lines is the pick",
+      server.longest_option(options)["code"], CHOICE_LONG)
+check("a single script is not a choice",
+      server.code_options(fenced(CHOICE_LONG) + "\n\n" + CHOICE_QUESTION_TEXT), [])
+check("and neither is an answer with no question in it", server.code_options(
+      fenced(CHOICE_SHORT) + "\n\n" + fenced(CHOICE_LONG) + "\n\nNothing to choose here."), [])
+
+print("\n-- \"Which choice do you prefer?\" is answered, not shipped --")
+reload_with(NEGOTIATE_ROUNDS="0")
+STUB["choice_draft"] = True
+out, done, calls, _ = turn()
+STUB["choice_draft"] = False
+wrote = writer_calls(calls)
+check("the writer offered two scripts and asked which", len(wrote), 2)
+check("the first call is the draft", "make me a walk script" in asked_last(wrote[0]), True)
+check("the question is answered in the same chat",
+      [m["role"] for m in wrote[1]["body"]["messages"]][-2:], ["assistant", "user"])
+check("with the question itself as the turn before it",
+      CHOICE_QUESTION_TEXT in wrote[1]["body"]["messages"][-2]["content"], True)
+check("the option named is the one with the most lines",
+      "option 2 (the second one)" in asked_last(wrote[1]), True)
+check("by the count that decided it",
+      f"{server.code_line_count(CHOICE_LONG)} lines" in asked_last(wrote[1]), True)
+check("and no question is asked back", "no questions" in asked_last(wrote[1]), True)
+check("what ships is the chosen script", done.get("text"), CHOICE_LONG)
+check("the question never reaches the reader",
+      CHOICE_QUESTION_TEXT in (done.get("text") or ""), False)
+check("and the chosen script is what the reader replays as the answer",
+      streamed(out), CHOICE_LONG)
+check("the phase says which one was taken", "choose" in [p["phase"] for p in done["phases"]], True)
+check("and the turn is done", done.get("status"), "done")
+
+print("\n-- a writer that will not decide still ends in a script --")
+reload_with(NEGOTIATE_ROUNDS="0")
+STUB["choice_draft"] = True
+STUB["choice_dud"] = True
+out, done, calls, _ = turn()
+STUB["choice_dud"] = False
+STUB["choice_draft"] = False
+check("the longest option ships as it stands", done.get("text"), CHOICE_LONG)
+check("nothing from the refusal is left in the answer",
+      "cannot decide" in (done.get("text") or ""), False)
+check("and the turn is still done", done.get("status"), "done")
+reload_with()
+
+print("\n-- a merge that asks which one is preferred is answered as well --")
+STUB["choice_merge"] = True
+out, done, calls, _ = turn()
+STUB["choice_merge"] = False
+phases = [p["phase"] for p in done["phases"]]
+check("the competition ran and then the question was settled",
+      [sorted(phases[:2]), phases[2:]], [["draft", "seed"], ["peer", "merge", "agree", "choose"]])
+check("the writer was asked to choose after merging", len(writer_calls(calls)), 3)
+check("and the longest option is what ships", done.get("text"), CHOICE_LONG)
+check("the merge's question is not shipped",
+      CHOICE_QUESTION_TEXT in (done.get("text") or ""), False)
+
+print("\n-- the choice handling can be turned off, and is clamped --")
+reload_with(NEGOTIATE_ROUNDS="0", CHOICE_ROUNDS="0")
+STUB["choice_draft"] = True
+out, done, calls, _ = turn()
+STUB["choice_draft"] = False
+check("with it off the question is what ships", done.get("text"), CHOICE_DRAFT)
+check("and nothing was asked back", len(writer_calls(calls)), 1)
+reload_with(CHOICE_ROUNDS="9")
+check("a value past the ceiling is clamped", server.CHOICE_ROUNDS, server.MAX_CHOICE_ROUNDS)
+reload_with(CHOICE_ROUNDS="-1")
+check("and a negative one means none", server.CHOICE_ROUNDS, 0)
+reload_with()
+check("the default is two", server.CHOICE_ROUNDS, 2)
 
 print("\n-- the page shows the brief going out first --")
 reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")

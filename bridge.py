@@ -46,10 +46,11 @@ import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 #   GET  /v1/models, /health
 #
 # Every question is sent as "Hy kanha <your question>" (GREETING), always to QWEN_MODEL
-# with thinking off. The conversation belongs to the caller: the turns it sends are the
-# turns the model sees, so a follow-up is answered in the same chat it has been answering
-# in. The brief, the reviewer's version and the merge instruction are internal turns -- they
-# are never part of what the user's next question carries.
+# with thinking on (QWEN_THINKING). The conversation belongs to the caller: the turns it sends
+# are the turns the model sees, so a follow-up is answered in the same chat it has been
+# answering in. The brief, the reviewer's version, the merge instruction and the answer to
+# "which choice do you prefer?" are internal turns -- they are never part of what the user's
+# next question carries.
 #
 # Nothing is pulled, loaded or warmed: no weights, no GPU, no volume, no database. The one
 # file this service reads is Send.txt, the brief handed to the reviewer before anything
@@ -177,9 +178,11 @@ QWEN_ROOT = QWEN_URL[: -len("/v1")] if QWEN_URL.endswith("/v1") else QWEN_URL
 QWEN_TOKEN = qwen_token()
 # Every generation is sent to this model. There is no picker: one model, one behaviour.
 QWEN_MODEL = env("QWEN_MODEL", default="qwen3.8-max")
-# fast (answer straight away) | auto | thinking. Forced onto every request: reasoning
-# tokens are billed against max_tokens and the answer is what is wanted, not the thinking.
-QWEN_THINKING = env("QWEN_THINKING", default="fast")
+# fast (answer straight away) | auto | thinking. Thinking is the default: the writer is producing
+# a whole script, and the extra reasoning is worth the wait. It costs nothing in the answer --
+# the stream's reasoning_content is dropped, so only the script is read (see stream_answer).
+# Set it to "fast" to have the writer answer without thinking, or "auto" to let the model decide.
+QWEN_THINKING = env("QWEN_THINKING", default="thinking")
 # Qwen answers in seconds; this is a backstop for a provider that hangs.
 # No ceiling on a generation, by default: a long negotiation is not an error, so nothing here
 # cuts a model off for taking its time. 0 (or less) means no limit at all -- connecting is still
@@ -579,6 +582,12 @@ SEED_TOKENS = int(env("SEED_TOKENS", default="512"))  # the acknowledgement only
 NEGOTIATE_ROUNDS = max(0, min(int(env("NEGOTIATE_ROUNDS", default="5")), MAX_NEGOTIATE_ROUNDS))
 # Whether the brief goes out on its own first, with the request only after the answer to it.
 SEED_BRIEF = env("SEED_BRIEF", default="on").lower() not in ("off", "0", "false", "no")
+# How many times the writer may be told to stop asking and hand over a script. It happens when
+# an answer offers two scripts and ends by asking which one is preferred: the bridge answers
+# that question itself -- the option with the most lines -- and the reply is the script that
+# ships. 2 rounds means one retry if the model asks again, and 0 disables it entirely.
+MAX_CHOICE_ROUNDS = 3
+CHOICE_ROUNDS = max(0, min(int(env("CHOICE_ROUNDS", default="2")), MAX_CHOICE_ROUNDS))
 # The script sent for review is bounded too: a 1M-token context is not a reason to use it.
 REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="48000"))
 # How much of the brief in front of the review is sent. Send.txt is yours; this is the

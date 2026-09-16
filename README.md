@@ -7,13 +7,15 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
                   |                                    |
                   |                                    +-- answers it, then waits
                   |
-                  +-- draft -----------------------> Qwen   (qwen-api, thinking off)
+                  +-- draft -----------------------> Qwen   (qwen-api, thinking on)
                   |
                   +-- "write your version" -------> DeepSeek, in the brief's chat
                   |
                   +-- merge the two, same chat ---> Qwen
                   |
                   +-- "would you ship it?" -------> DeepSeek: AGREE, or another version
+                  |
+                  +-- "which do you prefer?" ------> answered here: the longest script
 ```
 
 1. **DeepSeek reads `send.txt` first**, alone, and is only asked for anything after it has
@@ -30,6 +32,9 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
    and Qwen merges again — up to `NEGOTIATE_ROUNDS` rounds (5), and it stops the moment they agree.
    The script they settled on is what you get; the draft, the other version and the verdict stay
    under the answer (collapsed) and none of them is carried into your next question.
+6. **If Qwen offers two scripts and asks which one you prefer, that question is answered for
+   you** — the option with the most lines — in the same chat, and its answer is what ships. A
+   turn never ends on "Which choice do you prefer?"
 
 chat.qwen.ai has no public API. [`qwen-api`](https://github.com/encryptarun/qwen-api) turns it
 into OpenAI-compatible endpoints using the Qwen *access token* from your browser
@@ -50,7 +55,7 @@ conversation lives in the browser and is sent back with every turn.
 | `API_KEY` | *optional* — if you set it, the API (`/v1`, `/chat`, `/generate`) requires it. Left unset, the Qwen token is the key. The page never needs one |
 
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
-reviewer key set, model served · model qwen3.8-max · mode fast · Hy kanha`.
+reviewer key set, model served · model qwen3.8-max · mode thinking · Hy kanha`.
 
 ### `chat.deepseek.com` with a `userToken`
 
@@ -135,10 +140,14 @@ Requests on this path are made to look like the site's own client — its header
 `false` on every message, always. The site takes no temperature or token ceiling, so those do not
 apply here.
 
-## Search and thinking are never switched on
+## Thinking and search
 
-* The draft is sent with `thinking_mode: "fast"` (`QWEN_THINKING`), so the model answers instead
-  of spending the token budget reasoning.
+* The writer **thinks**: every Qwen call is sent `thinking_mode: "thinking"` (`QWEN_THINKING`),
+  because a whole Luau script is the kind of thing the reasoning is for. It costs no answer text —
+  a `reasoning_content` delta on the stream is dropped, so only the script is read. Set
+  `QWEN_THINKING=fast` to have the writer answer without thinking (quicker, thinner), or `auto`
+  to let the model decide per call. The values are qwen-api's own enum: `fast` | `auto` |
+  `thinking`.
 * The reviewer is sent `thinking: {"type": "disabled"}` — or `thinking: false, search: false` in
   the `web` shape. Every toggle the reviewer gets is built in one place (`reviewer_dialect()`),
   and **search is set to false there and cannot be set true anywhere**. Thinking is off unless
@@ -193,6 +202,7 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 | merge | Qwen | The *same conversation the draft was written in*, plus the draft as its own assistant turn, plus the other version pasted in whole. Asked for the single best script and nothing else |
 | agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` (5, so at most 12 model calls in a turn) |
 | guard | this service | A merge that comes back empty or cut off is discarded, and the script it was editing is what stands |
+| choose | this service → Qwen | Only when the script that stands ends by offering two scripts and asking which is preferred: the question is answered with the option that has the **most lines**, in the same chat as the draft, and its reply is what ships. Up to `CHOICE_ROUNDS` (2). If the model will not decide, that longest option is shipped as it stands |
 
 A few properties worth knowing:
 
@@ -250,7 +260,8 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | --- | --- | --- |
 | `QWEN_URL` | `https://qwen.aikit.club/v1` | point it at your own qwen-api deployment if the public one is rate limited |
 | `QWEN_MODEL` | `qwen3.8-max` | the only model used for drafting and rewriting |
-| `QWEN_THINKING` | `fast` | forced onto every Qwen call |
+| `QWEN_THINKING` | `thinking` | forced onto every Qwen call: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default — the writer is producing a whole script, and the reasoning is dropped from the answer, so it costs nothing but time. `fast` answers sooner |
+| `CHOICE_ROUNDS` | `2` | how many times the writer may be told to stop asking which of two scripts is preferred, capped at `3`. Each round is one extra Qwen call, and only happens when the answer really offers two scripts and asks. `0` ships the question as it stands |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
 | `REVIEW_URL` | follows `DEEPSEEK_TOKEN` | a `userToken` goes to `https://chat.deepseek.com`, an `sk-...` key to `https://api.deepseek.com`; set it by hand for any OpenAI-shaped endpoint / bridge and it is used as given |
 | `DEEPSEEK_TOKEN` | — | the reviewer's credential: a `userToken` or a platform API key |
@@ -313,6 +324,7 @@ chain itself.
 | `40300 MISSING_HEADER` | the message went out without its proof-of-work header — see [The proof of work](#the-proof-of-work-pow_solverpy), and the `[deepseek]` lines in the log |
 | `40301 INVALID_POW_RESPONSE` | the proof of work was solved with the wrong module build |
 | the draft is the answer, nothing merged | DeepSeek answered `VERDICT: KEEP` (nothing in it could be made more reliable), a failed review meant there was nothing to merge, or `NEGOTIATE_ROUNDS=0` |
+| the answer is the longer of two scripts you were never shown | Qwen offered two and asked which was preferred. The bridge answered for you with the one that has the most lines, in the same chat; the log says `[job] <id> choose: ... offered 2 script(s) (5, 14 lines)`. `CHOICE_ROUNDS=0` turns that off |
 | the answer is the draft even though the reviewer proposed a version | the merge came back empty or cut off and was thrown away; the log says `the merged script was not usable` |
 | `the answer was cut off by the token ceiling` | raise `DRAFT_TOKENS` (and `REFINE_TOKENS`), or ask for less at once |
 | a version was thrown away | it came back empty or cut off; the log says so and the script it was editing is what stands |
@@ -342,10 +354,13 @@ curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
 
 `verify_chain.py` runs the whole chain against stubbed Qwen and DeepSeek endpoints — no keys,
 no network. It covers the brief being sent alone and the request only after its answer, both
-provider shapes, the thinking/search toggles being off in every call, the round being bounded so
-a pair that never agrees still finishes, `SEED_BRIEF=off`, `NEGOTIATE_ROUNDS=0`, secret masking,
-the merge guard, a reviewer that dies mid-negotiation, the site's message id threading a second
-message onto the first, the proof of work, and the blocking and polling paths:
+provider shapes, thinking being on and switched off, a reasoning delta never reaching the answer,
+the reviewer's search/thinking toggles being off in every call, the round being bounded so a pair
+that never agrees still finishes, the choice question being answered with the option that has the
+most lines (and the fallbacks when the model will not decide), `CHOICE_ROUNDS=0`, `SEED_BRIEF=off`,
+`NEGOTIATE_ROUNDS=0`, secret masking, the merge guard, a reviewer that dies mid-negotiation, the
+site's message id threading a second message onto the first, the proof of work, and the blocking
+and polling paths:
 
 ```bash
 .venv/bin/python verify_chain.py

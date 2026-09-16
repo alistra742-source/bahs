@@ -169,7 +169,7 @@ def reviewer_state(force: bool = False) -> dict:
         state = {"at": state["at"], "ok": False, "detail": note}
     return {**state, "shape": REVIEW_SHAPE, "search": not SEARCH_OFF,
             "last_note": note, "brief_chars": len(BRIEF), "brief": BRIEF_PATH.name,
-            "rounds": NEGOTIATE_ROUNDS, "seed": SEED_BRIEF}
+            "rounds": NEGOTIATE_ROUNDS, "seed": SEED_BRIEF, "choices": CHOICE_ROUNDS}
 
 
 # --- jobs ------------------------------------------------------------------------------
@@ -185,7 +185,8 @@ class Job:
 
     Text arrives on five channels, because there are five things to show: the reviewer reading
     the brief, the draft, the reviewer's own version of the script, what the reviewer said about
-    the merged one, and the answer that comes out of it.
+    the merged one, and the answer that comes out of it -- which is also where the script chosen
+    for the writer's "which one do you prefer?" streams in, because that is the answer.
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, review: bool):
@@ -198,7 +199,7 @@ class Job:
         self.buffers: dict = {"seed": [], "draft": [], "peer": [], "review": [], "answer": []}
         self.error = ""
         self.status = "queued"          # queued -> running -> done | error
-        self.phase = "queued"           # queued | draft | seed | peer | merge | agree | done
+        self.phase = "queued"           # queued | draft | seed | peer | merge | agree | choose | done
         self.phases: list = []          # one record per model call
         self.review_text = ""
         self.started = time.time()
@@ -825,6 +826,128 @@ def merge_versions(job: Job, current: str, proposed: str, notes: list) -> str:
     return merged
 
 
+# --- when the writer asks which script you want --------------------------------------------
+#
+# A turn has to end with a script, and one way it does not is the model offering two and asking
+# which one is preferred. That is a question, not an answer, so the bridge answers it: the option
+# with the most lines wins, said back to the model in the chat that asked.
+
+# The question, in the shapes it gets asked. Only ever looked for near the end of an answer: a
+# "which" in the middle of a script's own comment is not the model asking the reader anything.
+CHOICE_QUESTION = re.compile(
+    r"(?is)\bwhich\b[^.?!\n]{0,120}?\b(?:prefer|preferred|choose|pick|like|want|"
+    r"should i (?:use|pick|choose|go with|proceed with|ship|keep))\b")
+
+# "Option 1:", "Choice B -", "**Version 2**": how the scripts get labelled when they are not
+# wrapped in fences.
+OPTION_HEAD = re.compile(
+    r"(?im)^\s*(?:[-*>]\s*)?(?:#+\s*)?(?:\*\*)?(?:option|choice|version|script|alternative)\s*"
+    r"([0-9]{1,2}|[A-Fa-f])\b\s*(?:\*\*)?\s*[:.\-\u2013)]*")
+
+ORDINALS = ("first", "second", "third", "fourth", "fifth")
+
+
+def code_line_count(code: str) -> int:
+    """Lines with something on them -- what "the code with the most lines" is measured in."""
+    return sum(1 for line in (code or "").splitlines() if line.strip())
+
+
+def code_options(text: str) -> list:
+    """The scripts an answer is offering, when it ends by asking which one is preferred.
+
+    Empty unless the answer really is a choice: the question has to be there and at least two
+    of the blocks have to look like code. Fenced blocks are read first, since that is how two
+    scripts are usually offered; an answer that labels them instead is read from the labels.
+    """
+    body = text or ""
+    if not CHOICE_QUESTION.search(body[-1500:]):
+        return []
+    blocks = [match.group(1)
+              for match in re.finditer(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", body, re.S)]
+    if len(blocks) < 2:
+        heads = list(OPTION_HEAD.finditer(body))
+        blocks = ([body[heads[i].end():heads[i + 1].start() if i + 1 < len(heads) else len(body)]
+                   for i in range(len(heads))] if len(heads) >= 2 else [])
+    options = []
+    for index, block in enumerate(blocks):
+        code = strip_fences(block)
+        ordinal = ORDINALS[index] if index < len(ORDINALS) else str(index + 1)
+        options.append({"label": f"option {index + 1} (the {ordinal} one)",
+                        "code": code, "lines": code_line_count(code)})
+    if sum(1 for option in options if looks_like_code(option["code"])) < 2:
+        return []
+    return options
+
+
+def longest_option(options: list) -> dict:
+    """The option with the most lines. A tie goes to the one offered first."""
+    return max(options, key=lambda option: option["lines"])
+
+
+def choice_instruction(pick: dict, options: list, notes: list) -> str:
+    """What is said back to the writer: which one, and why that one."""
+    prefix = f"{GREETING} " if GREETING else ""
+    others = ", ".join(f"{option['label']} has {option['lines']}"
+                       for option in options if option is not pick)
+    extra = ("\n\nThis service's own checks flagged:\n"
+             + "\n".join(f"- {n}" for n in notes)) if notes else ""
+    return f"""{prefix}I prefer {pick['label']} — it has the most code ({pick['lines']} lines; \
+{others}).{extra}
+
+Ship exactly that one: the complete script, nothing before it, no markdown code fences, no \
+notes, no alternatives, and no questions. Do not ask me which one I prefer again."""
+
+
+def settle_choice(job: Job, script: str, notes: list) -> tuple:
+    """Answer the writer's "which choice do you prefer?" instead of shipping the question.
+
+    Returns the script to ship and whether a choice had to be settled. The option with the most
+    lines is what the answer asks for, and it is also the fallback: if the follow-up call cannot
+    be made, or does not come back with a script, that option is what ships as it stands.
+    """
+    settled = False
+    for _ in range(max(0, CHOICE_ROUNDS)):
+        options = code_options(script)
+        if not options:
+            break
+        pick = longest_option(options)
+        settled = True
+        print(f"[job] {job.id} choose: {QWEN.model} offered {len(options)} script(s) "
+              f"({', '.join(str(o['lines']) for o in options)} lines) and asked which; "
+              f"answering with {pick['label']}", flush=True)
+        job.finish(phase="choose", note=f"{QWEN.model} asked which one; taking {pick['label']}")
+        # The question has already been streamed into the answer, so it is thrown away before the
+        # chosen script replaces it -- the same rule a merged script that came back unusable gets.
+        job.reset_channel("answer")
+        turns = list(job.messages) + [
+            {"role": "assistant", "content": script},
+            {"role": "user", "content": choice_instruction(pick, options, notes)},
+        ]
+        try:
+            picked, record = run_phase(job, turns, job.temperature, QWEN, DRAFT_TOKENS,
+                                       "answer", "choose",
+                                       f"{QWEN.model} shipping {pick['label']}")
+        except HTTPException as e:
+            print(f"[job] {job.id} choose: {e.detail}; shipping {pick['label']} as it stands",
+                  flush=True)
+            job.reset_channel("answer")
+            job.add("answer", pick["code"])
+            return pick["code"], settled
+        picked = strip_fences(picked)
+        _, usable = structural_notes(picked, record["finish"])
+        if not (usable and looks_like_code(picked)):
+            print(f"[job] {job.id} choose: the reply was not a script ({len(picked)} chars); "
+                  f"shipping {pick['label']} as it stands", flush=True)
+            job.reset_channel("answer")
+            job.add("answer", pick["code"])
+            return pick["code"], settled
+        if job.channel("answer").strip() != picked:
+            job.reset_channel("answer")
+            job.add("answer", picked)
+        script = picked
+    return script, settled
+
+
 def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list) -> tuple:
     """The reviewer's own script, then the writer's merge, until the reviewer would ship it.
 
@@ -871,6 +994,8 @@ def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list) -> tuple:
 
 def outcome_note(outcome: str, calls: int) -> str:
     """One sentence for the turn's status line: what the two models settled on."""
+    if outcome == "chosen":
+        return "the option with the most lines ships"
     if outcome == "agreed":
         return f"{REVIEWER.model} agreed with the merged script"
     if outcome == "merged":
@@ -889,7 +1014,9 @@ def run_job(job: Job) -> None:
     The shape is: the writer drafts, the reviewer is briefed and then writes its own version,
     the writer merges the two in the chat it drafted in, and the reviewer says whether it would
     ship that. Nothing here is a suggestion box -- both models produce scripts, and what is sent
-    to the user is the one they settled on.
+    to the user is the one they settled on. A turn never ends on "which one do you prefer?"
+    either: that question is answered here, in the writer's own chat, with the option that has
+    the most lines.
     """
     if not slot_take():
         job.finish(status="error",
@@ -939,10 +1066,18 @@ def run_job(job: Job) -> None:
         # over when the negotiation is off: the draft is the answer, and the answer channel
         # carries it so a reader sees one stream either way.
         if chat is None:
-            job.add("answer", draft)
+            # Even with nothing to compete with, a turn cannot end on "which one do you
+            # prefer?": the writer is answered with the option that has the most code.
+            best, chosen = settle_choice(job, draft, notes)
+            if job.channel("answer").strip() != best.strip():
+                job.reset_channel("answer")
+                job.add("answer", best)
             job.finish(status="done", phase="done",
-                       note=(f"{QWEN.model} answered" if not (job.want_review and review_enabled())
-                             else "the competition is off; the draft ships"))
+                       note=(f"{QWEN.model} asked which one; {outcome_note('chosen', 1)}"
+                             if chosen else
+                             (f"{QWEN.model} answered"
+                              if not (job.want_review and review_enabled())
+                              else "the competition is off; the draft ships")))
             note_error("")
             return
 
@@ -958,8 +1093,13 @@ def run_job(job: Job) -> None:
             note_review_error(detail)
             job.review_text = f"[the review did not happen: {detail}]"
             job.add("review", job.review_text)
-            job.add("answer", best)
-            job.finish(status="done", phase="done", note=f"{QWEN.model} answered; no review")
+            best, chosen = settle_choice(job, best, notes)
+            if job.channel("answer").strip() != best.strip():
+                job.reset_channel("answer")
+                job.add("answer", best)
+            job.finish(status="done", phase="done",
+                       note=(f"{QWEN.model} asked which one; {outcome_note('chosen', 1)}"
+                             if chosen else f"{QWEN.model} answered; no review"))
             return
         note_review_error("")
 
@@ -975,8 +1115,13 @@ def run_job(job: Job) -> None:
             job.add("review", job.review_text)
             outcome = "stopped"
 
-        # What ships is the script the two settled on. If the answer channel is empty, or holds a
-        # merge that was thrown away, it is refilled from the one that stands.
+        # What ships is the script the two settled on, and a question is not one: if the last
+        # answer offers choices and asks which is preferred, that is answered here with the
+        # option that has the most lines. If the answer channel is empty, or holds a merge that
+        # was thrown away, it is refilled from the one that stands.
+        best, chosen = settle_choice(job, best, notes)
+        if chosen:
+            outcome = "chosen"
         if job.channel("answer").strip() != best.strip():
             job.reset_channel("answer")
             job.add("answer", best)
