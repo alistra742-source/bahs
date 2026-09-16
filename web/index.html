@@ -651,9 +651,12 @@ footer a{color:var(--blue);text-decoration:none}
           s.review ? (rev.detail || rev.model || "configured") : "off -- answers are not reviewed");
         // The second reader is a third account, and it is checked the same way.
         var sec = s.second || {};
+        // A failed check shows why even when the stage is off -- a credential that cannot work at
+        // all (a session token, say) must not read as a stage somebody switched off.
         setChip("glm", sec.ok && sec.on,
-          sec.on ? (sec.detail || sec.model || "configured")
-                 : "off -- the chain ends with the first reader");
+          (!sec.ok && sec.detail) ? sec.detail
+            : (sec.on ? (sec.model || "configured")
+                      : "off -- the chain ends with the first reader"));
         // And which briefs are really being sent, so a bubble cannot claim a file that did not
         // go out -- send2.txt falls back to the first reader's brief when it is missing.
         FIRST_BRIEF = briefName(rev.brief) || FIRST_BRIEF;

@@ -7,7 +7,7 @@ for, the writer drafts, the first reader writes its own version of that script, 
 the two in the chat it drafted in and the first reader says whether it would ship the merge;
 then the second reader does all of that over the script the first two settled on.
 """
-import json, os, sys, tempfile, threading, time
+import contextlib, io, json, os, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -699,6 +699,37 @@ check("an API key gets the platform's own words instead",
           401, '{"error": {"code": "1001", "message": "invalid"}}'), False)
 check("and a retired model id is named as that rather than as a bad key",
       "is not a model" in peers.zai_failure(404, '{"error": {"message": "not found"}}'), True)
+
+print("\n-- the z.ai credential: a web session token is not a server credential --")
+# The token chat.z.ai keeps in localStorage: a JWT, which is exactly what the other bridges take.
+reload_with(ZAI_TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InUifQ.c2ln")
+check("a JWT is recognised as the site's session token, not as an API key",
+      [peers.is_session_token(peers.ZAI_TOKEN), peers.looks_like_key(peers.ZAI_TOKEN)],
+      [True, False])
+check("so the stage is off, rather than spending a call per turn to be told so",
+      [server.second_enabled(), server.second_state(True)["on"]], [False, False])
+CALLS.clear()  # the turn above is still in here; this is about what the probe did not send
+check("and nothing was sent anywhere to decide that", second_calls(CALLS), [])
+check("the reason names the captcha as the wall, not the token",
+      ["FRONTEND_CAPTCHA_REQUIRED" in peers.SESSION_TOKEN_NOTE,
+       "API key from z.ai" in peers.SESSION_TOKEN_NOTE,
+       "free models" in peers.SESSION_TOKEN_NOTE], [True, True, True])
+second = client.get("/health").json()["second"]
+check("the chip says which credential it is, and stays red",
+      [second["ok"], second["on"], "chat.z.ai session token" in second["detail"]],
+      [False, False, True])
+out, done, calls, _ = turn()
+check("a turn asks no reader that cannot answer", second_calls(calls), [])
+check("no stage of the chain waits on it either",
+      [p["phase"] for p in done["phases"] if "2" in p["phase"]], [])
+check("and the answer still ships", bool(streamed(out)), True)
+boot = io.StringIO()
+with contextlib.redirect_stdout(boot):
+    with client.__class__(server.app):
+        pass
+check("the boot line names it too",
+      ["[second] ZAI_TOKEN is a chat.z.ai session token" in boot.getvalue(),
+       "FRONTEND_CAPTCHA_REQUIRED" in boot.getvalue()], [True, True])
 reload_with()
 
 print("\n-- the brief is send.txt --")

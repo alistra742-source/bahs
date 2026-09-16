@@ -11,10 +11,23 @@ rounds, the merges -- is in `server.py` next to the first reader's, because it i
 protocol run twice over the same script.
 
 The endpoint is Z.AI's platform API, which is OpenAI-shaped, so there is no custom transport
-here. Note what is deliberately *not* here: chat.z.ai's own chat endpoint now requires a captcha
-parameter and a signed `X-Signature` header produced by the site's own bundle, so a session
-token from that site cannot be driven from a server at all. ZAI_TOKEN is an API key from z.ai
-(Z.AI Open Platform -> API Keys), shaped `id.secret`.
+here, and ZAI_TOKEN is an API key from z.ai (Z.AI Open Platform -> API Keys, shaped
+`id.secret`).
+
+A chat.z.ai *session token* -- the value in that site's `localStorage.token`, as with the other
+bridges in this service -- is deliberately not supported, and it is worth being exact about why,
+because the usual explanation is wrong. It is not the signature: a request to
+`/api/v2/chat/completions` that carries the site's own parameters (version header, timestamp,
+request id, user id) is accepted without one, and the models the account is not entitled to
+answer `Model not available for current user level` rather than complaining about the signature.
+
+What a server cannot get past is the captcha. Every generation asks for a `captcha_verify_param`
+-- the site answers `FRONTEND_CAPTCHA_REQUIRED` (`captcha_error_type: missing_param`) -- and that
+parameter exists only for a browser that solved the challenge for that device. Producing one
+without the browser is not a credential problem to work around, it is defeating a bot check, so
+nothing here fabricates it. The way to run this reader without a browser is a z.ai API key: the
+platform's flash models are free (GLM-4.7-Flash, GLM-4.5-Flash) and GLM-5.3-Flash is
+$0.15/$0.50 per 1M tokens.
 """
 from bridge import *  # noqa: F401,F403 -- env(), Provider, failure_reason, BRIEF, the warning
 
@@ -59,21 +72,40 @@ def zai_dialect() -> dict:
 ZAI = Provider("zai", ZAI_URL, ZAI_TOKEN, ZAI_MODEL, zai_dialect(), ZAI_TIMEOUT, {}, "openai")
 
 
+def looks_like_key(token: str) -> bool:
+    """Whether a credential is an API key rather than a web session token.
+
+    Z.AI's API keys are `id.secret`; the value chat.z.ai keeps in `localStorage.token` is a JWT
+    (three dot-separated segments, starting with the base64 of `{"`).
+    """
+    return bool(token) and (token.startswith("sk-") or ("." in token and not is_session_token(token)))
+
+
+def is_session_token(token: str) -> bool:
+    return bool(token) and token.startswith("eyJ") and token.count(".") == 2
+
+
+# What to say when ZAI_TOKEN is not an API key. The reason is not that the token is broken --
+# it is the wrong kind of credential for a server, and the wall is the captcha rather than the
+# signature (see the module docstring for the measurement).
+SESSION_TOKEN_NOTE = (
+    "an API key from z.ai is required (Z.AI Open Platform -> API Keys, shaped `id.secret`); a "
+    "chat.z.ai session token cannot be driven from here, because the site answers "
+    "FRONTEND_CAPTCHA_REQUIRED for every generation unless its own browser solved the challenge. "
+    "z.ai's API has free models (GLM-4.7-Flash, GLM-4.5-Flash) and GLM-5.3-Flash costs "
+    "$0.15/$0.50 per 1M tokens")
+
+
 def zai_failure(status: int, body: str) -> str:
     """Z.AI's own sentence for a failure, plus the fix that is specific to it.
 
-    The one that matters: a chat.z.ai session token (a JWT) sent as an API key. That token is
-    real, and it is for a site this service cannot drive -- its chat endpoint wants a captcha and
-    a signature from its own bundle -- so the answer has to be "use an API key", not "the token
-    is broken" or "try another endpoint".
+    The one that matters: a chat.z.ai session token sent as an API key. It is a real token, for a
+    site this service cannot drive, so the answer has to be "use an API key" rather than "the
+    token is broken" or "try another endpoint".
     """
     detail = failure_reason(status, body, ZAI)
-    looks_like_key = bool(ZAI_TOKEN) and ("." in ZAI_TOKEN or ZAI_TOKEN.startswith("sk-"))
-    if status in (401, 403) and not looks_like_key:
-        return (f"{ZAI.label()} rejected ZAI_TOKEN ({detail}) -- this has to be an API key from "
-                "z.ai (Z.AI Open Platform -> API Keys), not a chat.z.ai session token: that "
-                "site's own chat endpoint demands a captcha and a signed request, so only the "
-                "platform API is driven from here")
+    if status in (401, 403) and not looks_like_key(ZAI_TOKEN):
+        return f"{ZAI.label()} rejected ZAI_TOKEN ({detail}) -- {SESSION_TOKEN_NOTE}"
     if status == 404:
         return (f"{ZAI_MODEL} is not a model {ZAI.label()} serves ({detail}) -- set ZAI_MODEL to "
                 "one it does (glm-5.3, glm-5.3-flash, glm-4.7-flash, ...); the chip on /health "
@@ -100,8 +132,12 @@ def second_enabled() -> bool:
 
     Same rules as the first reader: a token, a model and a URL, and the pipeline not switched
     off. Rounds of 0 is a valid way to say "two models are enough".
+
+    A session token is not enough either: it cannot generate at all (the captcha gate above), so
+    the chain does not spend a call per turn rediscovering that. The chip and the boot line say
+    which credential is in the variable and what to put there instead.
     """
-    if not ZAI.configured or SECOND_ROUNDS <= 0:
+    if not ZAI.configured or SECOND_ROUNDS <= 0 or is_session_token(ZAI_TOKEN):
         return False
     return PIPELINE not in ("off", "0", "false", "no")
 
@@ -215,6 +251,11 @@ def _probe(force: bool = False) -> dict:
         return cached
     if not ZAI.configured:
         state = {"at": time.time(), "ok": False, "detail": "no ZAI_TOKEN set"}
+    elif is_session_token(ZAI_TOKEN):
+        # Asking the API would only confirm what is known: this token cannot authenticate there,
+        # and the interesting half is that it cannot authenticate at the site either.
+        state = {"at": time.time(), "ok": False,
+                 "detail": f"ZAI_TOKEN is a chat.z.ai session token -- {SESSION_TOKEN_NOTE}"}
     else:
         try:
             with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0),

@@ -76,16 +76,30 @@ Hy kanha`.
 
 ### The second reader (`chat.z.ai` / GLM-5.3 Flash)
 
-`ZAI_TOKEN` has to be a **platform API key**, and that is not a preference: `chat.z.ai`'s own
-chat endpoint now demands a captcha parameter and a signed `X-Signature` header produced by the
-site's own bundle, so a session token from that site cannot be driven by a server at all. The
-key goes to Z.AI's OpenAI-shaped platform API (`https://api.z.ai/api/paas/v4`), under whichever
-name you put it in the variables:
+`ZAI_TOKEN` has to be a **platform API key**. Unlike DeepSeek, the session token from
+`chat.z.ai` cannot be bridged from a server, and the wall is the captcha rather than the token:
+
+- A request to `chat.z.ai`'s `/api/v2/chat/completions` carrying the site's own parameters (its
+  version header, a timestamp, a request id, the user id) is accepted **without** any signature --
+  the site does not require the `X-Signature` its own bundle computes for a request shaped that
+  way. Models the account is not entitled to answer `Model not available for current user level`.
+- Every *generation*, though, asks for a `captcha_verify_param`: the site answers
+  `FRONTEND_CAPTCHA_REQUIRED` (`captcha_error_type: missing_param`), and that parameter exists
+  only for a browser that solved the challenge on that device. Producing one without the browser
+  is defeating a bot check, so nothing in this service fabricates it.
+
+That is why this reader runs on Z.AI's OpenAI-shaped platform API
+(`https://api.z.ai/api/paas/v4`), under whichever name you put the key in the variables. It is
+also cheap enough that the bridge is not worth having: `GLM-4.7-Flash` and `GLM-4.5-Flash` are
+**free**, and `GLM-5.3-Flash` is $0.15/$0.50 per 1M tokens.
 
 | What goes in `ZAI_TOKEN` | What happens |
 | --- | --- |
 | an API key (`id.secret`) from z.ai | the reader runs, with deep think at its strongest setting |
-| a chat.z.ai session token (a JWT) | refused, with the reason and the fix in the chip and in the turn's note |
+| a chat.z.ai session token (a JWT) | recognised as one before anything is sent, refused with the reason, and the chain runs with the two readers it has |
+
+If you would rather drive something else at that stage, `ZAI_URL` already accepts any
+OpenAI-shaped endpoint: point it at your own bridge and the reader uses it unchanged.
 
 It is a third account, so it is a third thing that can run out of credits or be revoked. The
 chip on the page (`glm`) reports the model the key can actually see, and says `not served -- try
@@ -328,7 +342,7 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `DEEPSEEK_TOKEN` | — | the reviewer's credential: a `userToken` or a platform API key |
 | `DEEPSEEK_COOKIE` | — | a `cf_clearance` cookie, if the site ever asks for one |
 | `ZAI_URL` | `https://api.z.ai/api/paas/v4` | Z.AI's OpenAI-shaped platform API. Set it by hand for any other OpenAI-shaped endpoint and it is used as given |
-| `ZAI_TOKEN` | — | the second reader's credential: an API key from [z.ai](https://z.ai). A chat.z.ai session token is refused, with the reason in the chip |
+| `ZAI_TOKEN` | — | the second reader's credential: an API key from [z.ai](https://z.ai). A chat.z.ai session token cannot be used, so it is recognised and refused up front, with the reason in the chip; its flash models are free |
 | `ZAI_MODEL` | `glm-5.3-flash` | the second reader's model. `/health` lists what the key can actually see, and suggests the nearest name when this one is not served |
 | `ZAI_THINKING` | `max` | deep think at the top of its ladder: `max` / `high` / `low`, or `off` for a model that allows it. Sent together with `reasoning_effort` |
 | `SECOND_ROUNDS` | `2` | GLM's own rounds, capped at `5`: one version of its own, then one chance to agree with what came back. `0` (or `PIPELINE=off`) leaves the chain at two models |
@@ -391,9 +405,10 @@ chain itself.
 | `deepseek rejected the token`, `your api key ... is invalid` | a chat `userToken` was sent to the API because `REVIEW_URL` was set by hand — clear it, or set it to `https://chat.deepseek.com` |
 | `deepseek rejected the key` | an API key that is wrong or revoked; make a new one at [platform.deepseek.com](https://platform.deepseek.com) |
 | `deepseek is rate limiting` | free-tier quota; wait, or `REVIEW_MODEL=deepseek-v4-pro` |
-| `zai rejected ZAI_TOKEN`, `glm` chip red | the credential is a chat.z.ai session token, or a revoked key. Put an API key from [z.ai](https://z.ai) in `ZAI_TOKEN`: that site's own chat endpoint wants a captcha and a signed request, so it cannot be bridged |
+| `zai rejected ZAI_TOKEN`, `glm` chip red | the credential is a revoked key, or a chat.z.ai session token. Put an API key from [z.ai](https://z.ai) in `ZAI_TOKEN`: that site's generations are captcha-gated, so a session token cannot be driven from a server |
+| `[second] ZAI_TOKEN is a chat.z.ai session token...` at boot, `glm` chip red | the value is a JWT (the site's `localStorage.token`). No call is wasted on it: it cannot authenticate at the API and cannot generate at the site either. Replace it with an API key from [z.ai](https://z.ai) — its flash models are free |
 | `glm-5.3-flash is not served -- try ...` | the platform does not have that model id under this key. Set `ZAI_MODEL` to the name the chip offers |
-| the second reader never runs | no `ZAI_TOKEN`, `SECOND_ROUNDS=0`, or `PIPELINE=off`. Boot says which — `[second] no ZAI_TOKEN set; the chain runs with one reader` |
+| the second reader never runs | no `ZAI_TOKEN`, a session token in it, `SECOND_ROUNDS=0`, or `PIPELINE=off`. Boot says which — `[second] no ZAI_TOKEN set; the chain runs with one reader`, or the session-token line above |
 | the answer is the first reader's script rather than GLM's merge | GLM was unreachable or proposed nothing usable. The note after the turn says which: `glm-5.3-flash did not read send2.txt (...)`, `glm-5.3-flash stopped early (...)` |
 | reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> seed failed: ...` or `[job] <id> negotiation stopped: ...` |
 | `40300 MISSING_HEADER` | the message went out without its proof-of-work header — see [The proof of work](#the-proof-of-work-pow_solverpy), and the `[deepseek]` lines in the log |

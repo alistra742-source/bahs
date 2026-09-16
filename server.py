@@ -175,6 +175,10 @@ async def lifespan(_app: FastAPI):
               flush=True)
     if not ZAI.configured:
         print("[second] no ZAI_TOKEN set; the chain runs with one reader", flush=True)
+    elif peers.is_session_token(peers.ZAI_TOKEN):
+        # Named exactly, because the tempting fix (paste the site's token) is what produced it.
+        print(f"[second] ZAI_TOKEN is a chat.z.ai session token, which cannot generate from a "
+              f"server: {peers.SESSION_TOKEN_NOTE}", flush=True)
     elif second_enabled():
         where2 = ZAI.web.label if ZAI.web is not None else ZAI.url
         print(f"[second] {where2} -> {ZAI.model} (thinking {ZAI_THINKING}, no search), "
