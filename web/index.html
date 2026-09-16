@@ -36,7 +36,7 @@ button{border:1px solid transparent;border-radius:10px;padding:11px 18px;font:60
 button:disabled{opacity:.55;cursor:default}
 .primary{background:linear-gradient(135deg,#2f81f7,#1f6feb)}
 .ghost{background:#151a23;border-color:var(--line);color:#c9d3e4}
-.mini{background:#151a23;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:2px 8px;font:11px ui-monospace,monospace}
+.mini{background:#151a23;border:1px solid var(--line);color:var(--dim);border-radius:7px;padding:2px 8px;font:11px ui-monospace,monospace;cursor:pointer}
 .log{height:min(58vh,560px);min-height:300px;overflow:auto;background:#0e131b;border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:12px}
 .turn{max-width:90%;border-radius:12px;padding:9px 12px;border:1px solid var(--line);background:#131822}
 .turn .meta{display:flex;gap:10px;align-items:center;margin-bottom:5px;font:11px ui-monospace,monospace;color:var(--dim)}
@@ -48,6 +48,13 @@ button:disabled{opacity:.55;cursor:default}
 .turn.pending .body{color:var(--dim)}
 .turn.err{background:#1d1214;border-color:#8c2b26}
 .turn.err .body{color:#ffb4ae}
+.turn.draft{align-self:flex-start;background:#12131a;border-style:dashed;border-color:#2b3346}
+.turn.draft .body{color:#b9c2d4}
+.turn.rev{align-self:flex-start;background:#1a1512;border-color:#4a3a26}
+.turn.rev .body{color:#e6d3b3}
+details.meta{align-self:flex-start;max-width:100%;background:#12161f;border:1px dashed var(--line);border-radius:10px;padding:6px 12px;font:11px ui-monospace,monospace;color:var(--dim)}
+details.meta summary{cursor:pointer}
+details.meta .body{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;color:#c3cddd;margin-top:6px;max-height:280px;overflow:auto}
 .note{align-self:center;font:11px ui-monospace,monospace;color:var(--dim);background:#12161f;border:1px dashed var(--line);border-radius:999px;padding:4px 12px;max-width:100%}
 .composer{display:flex;gap:10px;align-items:flex-end;margin-top:12px}
 .composer textarea{min-height:56px;max-height:180px}
@@ -56,7 +63,7 @@ footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-key-required="__KEY_REQUIRED__" data-greeting="__GREETING__">
+<body data-model="__MODEL__" data-reviewer="__REVIEWER__" data-review-on="__REVIEW_ON__" data-greeting="__GREETING__">
 <div class="wrap">
 
   <div class="top">
@@ -64,19 +71,11 @@ footer a{color:var(--blue);text-decoration:none}
       <span class="logo">b</span>
       <div>
         <div class="ttl">bahs</div>
-        <div class="sub">Qwen chat &middot; every question goes out as "__GREETING__ ..."</div>
+        <div class="sub" id="flow">Qwen chat</div>
       </div>
     </div>
     <div class="chips" id="chips">__CHIPS__</div>
   </div>
-
-  <section class="panel" id="keyPanel" hidden>
-    <div class="ph"><label for="key">API key</label><span class="hint">kept in this browser only</span></div>
-    <div class="keyrow">
-      <input id="key" type="password" placeholder="the API_KEY value set on the service" autocomplete="off" spellcheck="false">
-      <button class="ghost" id="keySave">save</button>
-    </div>
-  </section>
 
   <section class="panel">
     <div class="ph">
@@ -95,10 +94,11 @@ footer a{color:var(--blue);text-decoration:none}
   </section>
 
   <footer>
-    <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
+    <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
     Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
     Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code> with thinking off.<br>
-    The Qwen token stays in this service's variables; callers use the API key above.
+    __MODEL__ writes a draft, <code>__REVIEWER__</code> reviews it, then <code>__MODEL__</code> rewrites it in the same chat before it is sent to you.<br>
+    The Qwen token and the reviewer key stay in this service's variables; they never reach this page.
   </footer>
 </div>
 
@@ -106,20 +106,22 @@ footer a{color:var(--blue);text-decoration:none}
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var BODY = document.body;
-  var KEY_REQUIRED = BODY.dataset.keyRequired === "true";
   var MODEL = BODY.dataset.model || "";
+  var REVIEWER = BODY.dataset.reviewer || "";
+  var REVIEW_ON = BODY.dataset.reviewOn === "true";
   var GREETING = BODY.dataset.greeting || "";
 
-  var STORE = "bahs-api-key";
-  // The whole conversation lives in the browser: what was asked and what was answered.
+  // The whole conversation lives in the browser: what was asked and what was sent back.
   // Every turn is sent with it, which is what makes the model answer inside the same chat
-  // instead of starting over, and it survives a reload of this page.
+  // instead of starting over, and it survives a reload of this page. What the reviewer said,
+  // and the draft it looked at, are not part of it -- they are shown once and then dropped,
+  // so the next question is not carrying a review of the question before it.
   var CHAT = "bahs-chat";
 
   var chat = loadChat();
-  var sending = false;      // a turn is in flight
-  var pending = null;       // the bubble the arriving answer goes into
-  var jobError = "";        // the job's own failure, the only place the reason is written
+  var sending = false;       // a turn is in flight
+  var bubbles = {};          // channel -> the element its text streams into
+  var jobError = "";         // the job's own failure, the only place the reason is written
   var statusText = "";
   var offset = 0;
   var startedAt = 0;
@@ -137,27 +139,20 @@ footer a{color:var(--blue);text-decoration:none}
   function save() {
     try { localStorage.setItem(CHAT, JSON.stringify(chat)); } catch (e) {}
   }
-  function readKey() { try { return localStorage.getItem(STORE) || ""; } catch (e) { return ""; } }
-  function writeKey(v) { try { v ? localStorage.setItem(STORE, v) : localStorage.removeItem(STORE); } catch (e) {} }
 
-  function keyHeaders() {
-    var headers = { "Content-Type": "application/json" };
-    var key = ($("key").value || readKey()).trim();
-    if (key) headers["X-API-Key"] = key;
-    return headers;
-  }
+  function headers() { return { "Content-Type": "application/json" }; }
 
   function api(path, body, method) {
     return fetch(path, {
       method: method || "POST",
-      headers: keyHeaders(),
+      headers: headers(),
       cache: "no-store",
       body: body === undefined ? undefined : JSON.stringify(body)
     }).then(function (r) {
       return r.text().then(function (text) {
         var data;
         try { data = JSON.parse(text); } catch (e) { data = { detail: text.slice(0, 300) }; }
-        if (!r.ok) throw new Error(data.detail || (r.status === 401 ? "API key rejected" : "HTTP " + r.status));
+        if (!r.ok) throw new Error(data.detail || ("HTTP " + r.status));
         return data;
       });
     });
@@ -169,20 +164,20 @@ footer a{color:var(--blue);text-decoration:none}
     el.textContent = text;
     el.className = bad ? "msg bad" : "msg";
     clearTimeout(msgTimer);
-    // An error stays on screen: it carries the reason, and a few seconds is not enough
-    // to read one on a phone.
+    // An error stays on screen: it carries the reason, and a few seconds is not enough to
+    // read one on a phone.
     if (!sticky) msgTimer = setTimeout(function () { el.textContent = ""; }, 8000);
   }
 
   function bodyOf(el) { return el.querySelector(".body"); }
 
-  function turnEl(role, text) {
+  function turnEl(role, text, label) {
     var el = document.createElement("div");
     el.className = "turn " + (role === "user" ? "user" : "bot");
     var meta = document.createElement("div");
     meta.className = "meta";
     var who = document.createElement("span");
-    who.textContent = role === "user" ? "you" : "kanha";
+    who.textContent = label || (role === "user" ? "you" : "kanha");
     meta.appendChild(who);
     var copy = document.createElement("button");
     copy.className = "mini";
@@ -210,22 +205,68 @@ footer a{color:var(--blue);text-decoration:none}
     return el;
   }
 
+  function metaEl(title, text) {
+    var el = document.createElement("details");
+    el.className = "meta";
+    var summary = document.createElement("summary");
+    summary.textContent = title + " (" + text.length + " chars)";
+    el.appendChild(summary);
+    var body = document.createElement("div");
+    body.className = "body";
+    body.textContent = text;
+    el.appendChild(body);
+    $("log").appendChild(el);
+    return el;
+  }
+
   function scrollDown() {
     var log = $("log");
     log.scrollTop = log.scrollHeight;
   }
 
-  function addPending() {
-    pending = turnEl("bot", "thinking...");
-    pending.classList.add("pending");
-    $("log").appendChild(pending);
+  // --- the transient bubbles: one per stream the chain produces --------------------------
+  //
+  // The draft, the review and the final answer each stream into their own bubble, so the
+  // chain is visible while it runs instead of one silent wait. They are all thrown away when
+  // the job ends and the final answer is rendered from the conversation, which is what keeps
+  // the transcript clean.
+
+  function clearTransient() {
+    Object.keys(bubbles).forEach(function (k) { bubbles[k].remove(); });
+    bubbles = {};
+  }
+
+  function bubble(channel, label) {
+    if (bubbles[channel]) return bubbles[channel];
+    var cls = channel === "draft" ? "draft" : (channel === "review" ? "rev" : "");
+    var el = turnEl("assistant", "", label);
+    if (cls) el.classList.add(cls);
+    el.classList.add("pending");
+    $("log").appendChild(el);
+    bubbles[channel] = el;
     scrollDown();
-    return pending;
+    return el;
+  }
+
+  function labelFor(channel) {
+    if (channel === "review") return "review · " + (REVIEWER || "reviewer");
+    if (channel === "answer") return "final · " + MODEL;
+    return "draft · " + MODEL;
+  }
+
+  function anyText() {
+    var out = "";
+    Object.keys(bubbles).forEach(function (k) {
+      if (k === "review") return;
+      out += bodyOf(bubbles[k]).textContent;
+    });
+    return out;
   }
 
   function render() {
     var log = $("log");
     log.textContent = "";
+    bubbles = {};
     if (!chat.messages.length) {
       log.appendChild(noteEl(GREETING
         ? "ask something below -- it is sent as \"" + GREETING + " your question\""
@@ -272,10 +313,10 @@ footer a{color:var(--blue);text-decoration:none}
       if (statusText) parts.push(statusText);
       // offset keeps the clock honest across a reattach: it is the job's real age.
       parts.push(Math.round((offset + Date.now() - startedAt) / 1000) + "s");
-      if (streamed && pending) parts.push(bodyOf(pending).textContent.length + " chars");
+      if (streamed) parts.push(anyText().length + " chars");
       var el = $("msg");
       el.className = "msg";
-      el.textContent = "waiting... " + parts.join(" \u00b7 ");
+      el.textContent = "waiting... " + parts.join(" · ");
     }, 250);
   }
 
@@ -283,30 +324,40 @@ footer a{color:var(--blue);text-decoration:none}
     return Math.max(1, Math.round((offset + Date.now() - startedAt) / 1000));
   }
 
-  // Returns true once the job is over, so the reader can stop right there instead of
-  // waiting for the socket to close.
+  // Returns true once the job is over, so the reader can stop right there instead of waiting
+  // for the socket to close.
   function handleFrame(line) {
     if (!line.trim()) return false;
     var d;
     try { d = JSON.parse(line); } catch (e) { return false; }
     if (d.replay) {
-      // Every read starts at the job's beginning, so a reattach rebuilds the answer
-      // instead of appending a second copy of it.
-      if (pending) bodyOf(pending).textContent = "";
+      // Every read starts at the job's beginning, so a reattach rebuilds the chain instead of
+      // appending a second copy of it.
+      clearTransient();
       streamed = false;
       offset = (d.elapsed || 0) * 1000;
-      statusText = d.note || d.status || "";
+      statusText = d.note || d.phase || d.status || "";
       return false;
     }
+    if (d.reset) {
+      // The server threw a channel away (a rewrite that came back unusable); clear its bubble
+      // so what is left on screen is what is actually being shipped.
+      var gone = bubbles[d.ch];
+      if (gone) bodyOf(gone).textContent = "";
+      return false;
+    }
+    if (d.phase) { statusText = d.note || d.phase; return false; }
     if (d.beat) { statusText = d.note || d.status || statusText; return false; }
     if (d.t) {
-      if (!pending) addPending();
-      if (!streamed) { bodyOf(pending).textContent = ""; streamed = true; pending.classList.remove("pending"); }
-      bodyOf(pending).textContent += d.t;
+      var ch = d.ch || "answer";
+      var el = bubble(ch, labelFor(ch));
+      el.classList.remove("pending");
+      streamed = true;
+      bodyOf(el).textContent += d.t;
       scrollDown();
     }
     if (d.error) {
-      if (pending) { pending.remove(); pending = null; }
+      clearTransient();
       chat.job = null;
       save();
       showError(d.error);
@@ -314,24 +365,35 @@ footer a{color:var(--blue);text-decoration:none}
     }
     if (d.done) {
       var text = d.text || d.code || "";
-      if (pending) { pending.remove(); pending = null; }
-      // The answer becomes part of the conversation, so the next question is asked in
-      // the same chat the model has been answering in.
+      var draft = d.draft || "";
+      var review = d.review || "";
+      var phases = d.phases || [];
+      clearTransient();
+      // The answer becomes part of the conversation, so the next question is asked in the
+      // same chat the model has been answering in.
       chat.messages.push({ role: "assistant", content: text });
       chat.job = null;
       save();
       render();
-      flash("answered in " + elapsedSeconds() + "s");
+      if (draft && draft !== text) metaEl("draft before the review", draft);
+      if (review) metaEl("review", review);
+      if (phases.length > 1) {
+        metaEl("chain", phases.map(function (p) {
+          return p.phase + ": " + (p.model || p.provider) + " " + p.ms + "ms, " + p.chars +
+                 " chars" + (p.finish ? " (" + p.finish + ")" : "");
+        }).join("\n"));
+      }
+      flash("done in " + elapsedSeconds() + "s");
       return true;
     }
     return false;
   }
 
-  // One read of a job. Resolves when the job finished, rejects when this read did not
-  // manage to see it through -- a dropped connection is not a failed answer.
+  // One read of a job. Resolves when the job finished, rejects when this read did not manage
+  // to see it through -- a dropped connection is not a failed answer.
   function read(job) {
     var finished = false;
-    return fetch("/chat/stream/" + job, { headers: keyHeaders(), cache: "no-store" })
+    return fetch("/chat/stream/" + job, { headers: headers(), cache: "no-store" })
       .then(function (res) {
         if (!res.ok) {
           return res.text().then(function (text) {
@@ -349,9 +411,9 @@ footer a{color:var(--blue);text-decoration:none}
         function pump() {
           return reader.read().then(function (chunk) {
             if (chunk.done) {
-              // Closed without a done or error frame: that is a dropped connection, not
-              // an answer. Rejecting lets watch() reattach and replay instead of
-              // reporting an answer that never arrived.
+              // Closed without a done or error frame: that is a dropped connection, not an
+              // answer. Rejecting lets watch() reattach and replay instead of reporting an
+              // answer that never arrived.
               if (!finished) throw new Error("the stream ended early");
               return;
             }
@@ -367,15 +429,16 @@ footer a{color:var(--blue);text-decoration:none}
       });
   }
 
-  // Follow a job for as long as it takes, reattaching if a read dies part way.
+  // Follow a job for as long as it takes, reattaching if a read dies part way. A chain runs
+  // three model calls, so this is where a long wait is survived.
   async function watch(job) {
     for (var attempt = 1; ; attempt++) {
       try {
         await read(job);
         return;
       } catch (e) {
-        // The job is still running on the server, so the answer is not lost -- only
-        // this read is. Only give up when nothing about it can be retried.
+        // The job is still running on the server, so the answer is not lost -- only this read
+        // is. Only give up when nothing about it can be retried.
         if (e.fatal || attempt >= 8) throw e;
         statusText = "connection dropped, reattaching (try " + attempt + ")";
         await new Promise(function (r) { setTimeout(r, 1000 * attempt); });
@@ -383,8 +446,8 @@ footer a{color:var(--blue);text-decoration:none}
     }
   }
 
-  // What one request carries: the newest turns, so a long chat cannot grow the request
-  // without limit. The oldest turns are dropped first.
+  // What one request carries: the newest turns, so a long chat cannot grow the request without
+  // limit. The oldest turns are dropped first.
   function outbound() {
     var msgs = chat.messages.slice();
     var head = 0;
@@ -403,9 +466,8 @@ footer a{color:var(--blue);text-decoration:none}
     jobError = "";
     streamed = false;
     offset = 0;
-    statusText = "starting";
+    statusText = REVIEW_ON ? "starting the chain" : "starting";
     busy(true);
-    addPending();
     startTimer();
     try {
       var data = await api("/chat/stream", { messages: messages });
@@ -413,12 +475,12 @@ footer a{color:var(--blue);text-decoration:none}
       save();
       await watch(data.job);
     } catch (e) {
-      if (pending) { pending.remove(); pending = null; }
+      clearTransient();
       if (!jobError) {
         var msg = (e && e.message) ? e.message : "request failed";
         if (msg === "Load failed" || msg === "Failed to fetch") {
-          // Safari and Chrome word a dropped connection differently. The answer is still
-          // being written on the server, so this is a reattach, not a lost reply.
+          // Safari and Chrome word a dropped connection differently. The answer is still being
+          // written on the server, so this is a reattach, not a lost reply.
           msg = "the connection dropped before the answer arrived. It is still being written -- reload this page to pick it back up.";
         }
         showError(msg);
@@ -434,8 +496,8 @@ footer a{color:var(--blue);text-decoration:none}
     var text = $("prompt").value.trim();
     if (!text) return;
     $("prompt").value = "";
-    // The greeting is put in front here so the bubble shows exactly what was sent; the
-    // service adds it too, and leaves it alone when it is already there.
+    // The greeting is put in front here so the bubble shows exactly what was sent; the service
+    // adds it too, and leaves it alone when it is already there.
     var outgoing = text;
     if (GREETING && text.toLowerCase().indexOf(GREETING.toLowerCase()) !== 0) {
       outgoing = GREETING + " " + text;
@@ -462,18 +524,23 @@ footer a{color:var(--blue);text-decoration:none}
         setChip("api", true, "online");
         setChip("bridge", s.bridge && !s.last_error, s.last_error ||
           (s.bridge ? (s.provider_label || "configured") : (s.error || "QWEN_TOKEN is not set")));
-        // The Qwen token is the credential this service holds; an expired one is the
-        // failure that otherwise looks like a question that never gets an answer.
+        // The Qwen token is the credential this service holds; an expired one is the failure
+        // that otherwise looks like a question that never gets an answer.
         setChip("token", s.token_ok, s.token_detail || (s.token_ok ? "ok" : "unknown"));
+        // The reviewer is a second account and a second thing that can be switched off, so it
+        // gets its own chip rather than failing silently inside the chain.
+        var rev = s.reviewer || {};
+        setChip("reviewer", rev.ok && s.review,
+          s.review ? (rev.detail || rev.model || "configured") : "off -- answers are not reviewed");
         setChip("model", true, s.model);
-        setChip("mode", true, s.greeting ? s.thinking + " \u00b7 " + s.greeting : s.thinking);
-        if (s.api_key_required) $("keyPanel").hidden = false;
+        setChip("mode", true, s.greeting ? s.thinking + " · " + s.greeting : s.thinking);
       })
       .catch(function () { setChip("api", false, "unreachable"); });
   }
 
-  if (KEY_REQUIRED) $("keyPanel").hidden = false;
-  $("key").value = readKey();
+  $("flow").textContent = REVIEW_ON
+    ? "draft by " + MODEL + ", review by " + REVIEWER + ", rewrite in the same chat"
+    : "Qwen chat · every question goes out as \"" + GREETING + " ...\"";
 
   $("send").onclick = send;
   $("prompt").addEventListener("keydown", function (e) {
@@ -487,22 +554,15 @@ footer a{color:var(--blue);text-decoration:none}
     render();
     flash("new chat");
   };
-  $("keySave").onclick = function () {
-    writeKey($("key").value.trim());
-    flash("key saved in this browser");
-    poll();
-  };
-  $("key").addEventListener("input", function () { writeKey($("key").value.trim()); });
 
   poll();
   setInterval(poll, 8000);
   render();
 
-  // A page that was reloaded mid-answer comes back to the same job: the answer is
-  // replayed into the bubble instead of being asked for again.
+  // A page that was reloaded mid-answer comes back to the same job: the chain is replayed into
+  // the bubbles instead of being asked for again.
   if (chat.job && chat.messages.length && chat.messages[chat.messages.length - 1].role === "user") {
     busy(true);
-    addPending();
     statusText = "reattaching";
     startTimer();
     watch(chat.job)

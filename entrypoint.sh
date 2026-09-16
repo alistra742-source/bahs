@@ -1,6 +1,7 @@
 #!/bin/sh
-# Serves the FastAPI app on $PORT. Qwen is called over HTTP (QWEN_TOKEN, QWEN_URL), so
-# there is nothing to boot, pull or warm first.
+# Serves the FastAPI app on $PORT. Both models are called over HTTP (QWEN_TOKEN + QWEN_URL for
+# the draft, REVIEW_KEY + REVIEW_URL for the review), so there is nothing to boot, pull or warm
+# first.
 set -eu
 
 PORT="${PORT:-8000}"

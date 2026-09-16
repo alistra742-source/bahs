@@ -3,15 +3,22 @@ local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 -- Public domain of the `bahs` service (Railway -> bahs -> Settings -> Networking ->
--- Generate Domain). That service is the bridge: it holds the Qwen token and calls Qwen,
--- so this URL is the only one needed anywhere.
+-- Generate Domain). That service is the bridge: it holds the Qwen token and the reviewer
+-- key, so this URL is the only one needed anywhere.
 local API_URL = "https://bahs-production-d68f.up.railway.app"
--- Paste the API_KEY value from the bahs service here. Leave "" if you never set one.
+-- The key the API requires. That is the API_KEY value from the bahs service if you set one,
+-- and otherwise the QWEN_TOKEN itself -- so this is the one secret to keep straight. Leave
+-- "" only if the service has neither.
 local API_KEY = ""
 
--- The conversation is kept here between asks, so a follow-up ("make it faster") lands in
--- the same chat the model has already been answering in. The service puts "Hy kanha" in
--- front of each question on its way out.
+-- Things that take a while to get right here:
+--   * Roblox reads an HTTP response in one piece, so it cannot follow the NDJSON stream the
+--     page uses. A turn is started with /chat/stream (which returns at once), then polled on
+--     /chat/result until it says done -- that is what makes a chain of three model calls
+--     survivable instead of one request that dies at the executor's timeout.
+--   * The conversation is kept here between asks, so a follow-up ("make it faster") lands in
+--     the same chat the model has already been answering in. The service puts "Hy kanha" in
+--     front of each question on its way out.
 local messages = {}
 
 local function headers()
@@ -20,24 +27,53 @@ local function headers()
     return h
 end
 
-local function ask(question)
-    table.insert(messages, {role = "user", content = question})
+local function post(path, body)
     local r = request({
-        Url = API_URL .. "/v1/chat/completions",
+        Url = API_URL .. path,
         Method = "POST",
         Headers = headers(),
-        Body = HttpService:JSONEncode({messages = messages, stream = false})
+        Body = HttpService:JSONEncode(body)
     })
     if r.StatusCode >= 400 then
-        -- Drop the question that failed, so the next ask is not a broken conversation.
-        table.remove(messages)
         error("API " .. tostring(r.StatusCode) .. ": " .. tostring(r.Body), 0)
     end
-    local data = HttpService:JSONDecode(r.Body)
-    local choice = data.choices and data.choices[1]
-    local text = (choice and choice.message and choice.message.content) or ""
-    table.insert(messages, {role = "assistant", content = text})
-    return text
+    return HttpService:JSONDecode(r.Body)
+end
+
+-- Start the chain and follow it. `onStep` is called with each phase note so the caller can
+-- show "deepseek-v4-flash reviewing the draft (44s)" instead of a silent wait.
+local function ask(question, onStep)
+    table.insert(messages, {role = "user", content = question})
+    local ok, result = pcall(function()
+        local started = post("/chat/stream", {messages = messages})
+        local job = started.job
+        local deadline = os.clock() + 900
+        while os.clock() < deadline do
+            local r = request({
+                Url = API_URL .. "/chat/result/" .. tostring(job),
+                Method = "GET",
+                Headers = headers()
+            })
+            if r.StatusCode >= 400 then
+                error("API " .. tostring(r.StatusCode) .. ": " .. tostring(r.Body), 0)
+            end
+            local d = HttpService:JSONDecode(r.Body)
+            if d.status == "done" then return d end
+            if d.status == "error" then error(d.error or "the chain failed", 0) end
+            if onStep then
+                onStep(tostring(d.note or d.phase or "working"), tonumber(d.elapsed) or 0)
+            end
+            task.wait(1)
+        end
+        error("timed out waiting for the chain", 0)
+    end)
+    if not ok then
+        -- Drop the question that failed, so the next ask is not a broken conversation.
+        table.remove(messages)
+        error(result, 0)
+    end
+    table.insert(messages, {role = "assistant", content = result.text or ""})
+    return result
 end
 
 local gui = Instance.new("ScreenGui")
@@ -107,10 +143,11 @@ outputPad.PaddingLeft = UDim.new(0, 6)
 outputPad.Parent = output
 
 local lastAnswer
+local lastReview
 
 local function makeBtn(text, x, color, callback)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0.24, -4, 0, 28)
+    b.Size = UDim2.new(0.19, -4, 0, 28)
     b.Position = UDim2.new(x, 0, 1, -36)
     b.BackgroundColor3 = color
     b.Text = text
@@ -124,24 +161,29 @@ local function makeBtn(text, x, color, callback)
     b.MouseButton1Click:Connect(callback)
 end
 
-makeBtn("ask", 0.01, Color3.fromRGB(60, 120, 200), function()
+local function showStep(note, elapsed)
+    output.Text = "-- " .. note .. " (" .. tostring(math.floor(elapsed)) .. "s)"
+end
+
+makeBtn("ask", 0.002, Color3.fromRGB(60, 120, 200), function()
     local question = input.Text
     if question == "" then return end
     input.Text = ""
-    output.Text = "-- kanha is thinking..."
-    local ok, text = pcall(ask, question)
+    output.Text = "-- kanha is drafting..."
+    local ok, result = pcall(ask, question, showStep)
     if not ok then
-        output.Text = "-- error: " .. tostring(text)
+        output.Text = "-- error: " .. tostring(result)
         return
     end
-    lastAnswer = text
-    output.Text = text
+    lastAnswer = result.text or ""
+    lastReview = result.review
+    output.Text = lastAnswer
 end)
 
-makeBtn("execute", 0.26, Color3.fromRGB(80, 160, 80), function()
+makeBtn("execute", 0.202, Color3.fromRGB(80, 160, 80), function()
     if not lastAnswer then return end
-    -- The answer is a chat reply, so only run what looks like a script: a fenced block
-    -- if there is one, otherwise the whole answer.
+    -- The answer is a chat reply, so only run what looks like a script: a fenced block if
+    -- there is one, otherwise the whole answer.
     local code = lastAnswer:match("```[%w]*\n(.-)```") or lastAnswer
     local fn, err = loadstring(code)
     if not fn then
@@ -154,13 +196,22 @@ makeBtn("execute", 0.26, Color3.fromRGB(80, 160, 80), function()
     end
 end)
 
-makeBtn("new chat", 0.51, Color3.fromRGB(70, 70, 110), function()
+makeBtn("review", 0.402, Color3.fromRGB(150, 110, 60), function()
+    if lastReview and lastReview ~= "" then
+        output.Text = "-- " .. lastReview
+    else
+        output.Text = "-- the reviewer had nothing to say about the last answer"
+    end
+end)
+
+makeBtn("new chat", 0.602, Color3.fromRGB(70, 70, 110), function()
     messages = {}
     lastAnswer = nil
+    lastReview = nil
     output.Text = "-- new chat: nothing from before is sent"
 end)
 
-makeBtn("copy", 0.76, Color3.fromRGB(40, 110, 140), function()
+makeBtn("copy", 0.802, Color3.fromRGB(40, 110, 140), function()
     if not lastAnswer then return end
     if setclipboard then setclipboard(lastAnswer) end
 end)
