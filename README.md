@@ -32,17 +32,23 @@ conversation lives in the browser and is sent back with every turn.
 | Variable | Value |
 | --- | --- |
 | `QWEN_TOKEN` | Qwen access token: chat.qwen.ai -> F12 -> Console -> `localStorage.token` |
-| `DEEPSEEK_TOKEN` | DeepSeek **API key** (`sk-...`) from [platform.deepseek.com](https://platform.deepseek.com) |
+| `DEEPSEEK_TOKEN` | either the `userToken` from chat.deepseek.com (with `REVIEW_URL=https://chat.deepseek.com`) or an API key (`sk-...`) from [platform.deepseek.com](https://platform.deepseek.com) |
 | `API_KEY` | *optional* — if you set it, the API (`/v1`, `/chat`, `/generate`) requires it. Left unset, the Qwen token is the key. The page never needs one |
 
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
 reviewer key set, model served · model qwen3.8-max · mode fast · Hy kanha`.
 
-### About `chat.deepseek.com`
+### `chat.deepseek.com` with a `userToken`
 
-`DEEPSEEK_TOKEN` has to be an **API key from platform.deepseek.com**, not the `userToken` from
-chat.deepseek.com's localStorage. That is not us being fussy — the endpoints were probed from
-this container to be sure, and here is what they answered:
+`DEEPSEEK_TOKEN` takes either credential, and which one it is decides the transport:
+
+| What goes in `DEEPSEEK_TOKEN` | Transport | What to set |
+| --- | --- | --- |
+| the `userToken` from chat.deepseek.com | the web transport built in here | `REVIEW_URL=https://chat.deepseek.com` — the shape (`deepseek-web`) is picked for you |
+| an API key from platform.deepseek.com | OpenAI-shaped, the default | nothing; `REVIEW_URL` is already `https://api.deepseek.com` |
+
+Same model either way; what differs is which side of your account answers. The site's endpoints
+were probed from this container rather than assumed, and they answered:
 
 | Asked | Answered |
 | --- | --- |
@@ -50,27 +56,33 @@ this container to be sure, and here is what they answered:
 | `POST /api/v0/chat_session/create`, bad token | `200 {"code":40003,"msg":"Authorization Failed (invalid token)"}` |
 | `POST /api/v0/chat/completion`, bad token, with or without a pow header | `200 {"code":40003,"msg":"INVALID_TOKEN"}` |
 
-Good news in there: the API *is* reachable from a server, and it is the token it checks first.
-The blocker is the step after that. Every message to `/chat/completion` must carry an
-`x-ds-pow-response` header — a proof of work computed by running DeepSeek's own
-`sha3_wasm_bg.wasm`, the module the site loads — and the two projects that publish this
-protocol ship a **stale copy of that module**. Both files are byte-identical (26,612 bytes) and
-`wasm_solve` writes nothing for any difficulty, challenge, prefix or return pointer; measured up
-to `difficulty = 1e18`, which cannot come back in `0.000s` if it were searching. A solver built
-on it cannot solve, so this service does not ship one.
+So the token is checked first and everything before the message already works: `/users/current`
+is the token check behind the chip (an expired `userToken` shows up there, not as a hung review),
+`/chat_session/create` makes a fresh chat per review so reviews never read each other, and
+`/chat/create_pow_challenge` is fetched and logged.
 
-What that leaves — both of which work from here:
+**The one open question is the proof of work.** Every message to `/chat/completion` is supposed
+to carry an `x-ds-pow-response` header computed by running DeepSeek's own `sha3_wasm_bg.wasm`,
+and the two projects that publish this protocol ship a **stale copy** of that module — the files
+are byte-identical (26,612 bytes), and `wasm_solve` writes nothing for any difficulty, challenge,
+prefix or return pointer; measured up to `difficulty = 1e18`, which cannot come back in `0.000s`
+if it were actually searching. A solver built on it cannot solve, so none is bundled: the request
+goes out **without** the header, and whatever the API answers is what you see. That is also how
+you find out whether it is enforced for your account at all.
 
-| Route | What to set |
-| --- | --- |
-| DeepSeek's API (same models, one variable) | `DEEPSEEK_TOKEN` = key from platform.deepseek.com |
-| Any bridge that speaks OpenAI | `REVIEW_URL` = the bridge, `DEEPSEEK_TOKEN` = whatever it wants, and `REVIEW_SHAPE=web` for the chat-shaped ones |
+* The review arrives → it is not enforced, and the web transport works as it stands.
+* An error naming the proof of work → that is the only missing piece, and the chip quotes
+  DeepSeek's own words for it.
 
-`REVIEW_SHAPE=web` folds everything into one prompt with the brief first, and sends
-`thinking: false, search: false`. The OpenAI shape (the default) sends
-`thinking: {"type": "disabled"}`. If you point `REVIEW_URL` at chat.deepseek.com itself, the
-reviewer switches itself off and the chip tells you exactly this rather than failing once per
-turn.
+If it is the second case, put a working solver in front of the site and point `REVIEW_URL` at it
+with `REVIEW_SHAPE=web` (that shape folds everything into one prompt, brief first, and sends
+`thinking: false, search: false`). If the site ever answers with a browser check instead, put the
+`cf_clearance` cookie in `DEEPSEEK_COOKIE`.
+
+Requests on this path are made to look like the site's own client — its headers, its
+`x-client-platform: web`, its bearer — and `thinking_enabled` and `search_enabled` are sent
+`false` on every message, always. The site takes no temperature or token ceiling, so those do not
+apply here.
 
 ## Search and thinking are never switched on
 
@@ -163,10 +175,11 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `QWEN_MODEL` | `qwen3.8-max` | the only model used for drafting and rewriting |
 | `QWEN_THINKING` | `fast` | forced onto every Qwen call |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
-| `REVIEW_URL` | `https://api.deepseek.com` | any OpenAI-shaped endpoint, or a web-chat bridge |
-| `DEEPSEEK_TOKEN` | — | the reviewer's key |
-| `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` if you want the slower, stronger one |
-| `REVIEW_SHAPE` | `openai` | `web` for a bridge in front of chat.deepseek.com |
+| `REVIEW_URL` | `https://api.deepseek.com` | `https://chat.deepseek.com` for the userToken transport, or any OpenAI-shaped endpoint / bridge |
+| `DEEPSEEK_TOKEN` | — | the reviewer's credential: a `userToken` or a platform API key |
+| `DEEPSEEK_COOKIE` | — | a `cf_clearance` cookie, if the site ever asks for one |
+| `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` for the slower, stronger one; ignored by the web transport, whose model is whatever your account is set to |
+| `REVIEW_SHAPE` | `openai` | `web` for a bridge, `deepseek-web` for the site itself (chosen for you when `REVIEW_URL` is chat.deepseek.com) |
 | `REVIEW_THINKING` | `off` | anything else turns it back on for the reviewer only |
 | `REVIEW_ITEMS` | `8` | cap on the numbered list |
 | `REVIEW_BRIEF` / `REVIEW_BRIEF_MAX` | `send.txt`, then `Send.txt` / `60000` | the brief, and the ceiling on it |

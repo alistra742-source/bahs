@@ -1,4 +1,4 @@
-"""Check the chain and the chat.deepseek.com guard against stubbed providers.
+"""Check the reviewer against stubbed providers, including chat.deepseek.com's own endpoints.
 
 Run from the project root:  .venv/bin/python verify_chain.py
 """
@@ -6,19 +6,42 @@ import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CALLS = []
+STUB = {"users_code": 0}          # what /users/current should answer
 DRAFT = "```lua\n-- draft\nprint('hi')\n```"
 REVIEW = ("VERDICT: ISSUES\n"
           "1. the loop never ends | where: line 4 | why it fails: it runs forever | fix: add a break")
 REFINED = "```lua\n-- refined\nprint('hi')\n```"
+WEB_HEAD = "VERDICT: ISSUES\n"
+WEB_LIST = ("1. the loop never ends | where: line 4 | why it fails: it runs forever | "
+            "fix: add a break")
+THINKING = "SECRET_THINKING_TEXT"
 
 
-def frame(piece, finish=None):
-    return "data: " + json.dumps({"choices": [{"delta": {"content": piece} if piece else {},
-                                                "finish_reason": finish}]}) + "\n\n"
+def frame(piece, finish=None, kind="RESPONSE"):
+    delta = {"content": piece, "type": kind} if piece else {}
+    return "data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n"
+
+
+def raw_frame(payload):
+    return "data: " + json.dumps(payload) + "\n\n"
 
 
 def stream(text):
     return (frame(text) + frame(None, "stop") + "data: [DONE]\n\n").encode()
+
+
+def ds_stream():
+    """The review split across both frame shapes the site has used.
+
+    A thinking frame and a status frame ride along, and neither may reach the review text.
+    """
+    return "".join([
+        frame(WEB_HEAD),
+        frame(THINKING, kind="thinking"),
+        raw_frame({"v": WEB_LIST}),
+        raw_frame({"p": "response/status", "v": "FINISHED"}),
+        "data: [DONE]\n\n",
+    ]).encode()
 
 
 def content_of(body):
@@ -41,15 +64,32 @@ class Stub(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def do_GET(self):
-        if self.path.endswith("/models"):
+        if self.path.endswith("/v1/models"):
             return self._send(200, {"object": "list", "data": [{"id": "deepseek-v4-flash"}]})
+        if self.path.endswith("/users/current"):
+            if STUB["users_code"]:
+                return self._send(200, {"code": STUB["users_code"],
+                                        "msg": "Authorization Failed (invalid token)"})
+            return self._send(200, {"code": 0, "data": {"biz_data": {"user": {"id": "u1"}}}})
         return self._send(404, {"error": {"message": "no such route"}})
 
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-        if self.path.endswith("/validate"):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = json.loads(raw) if raw else {}
+        if self.path.endswith("/v1/validate"):
             return self._send(200, {"valid": True})
-        CALLS.append({"path": self.path, "body": body})
+        record = {"path": self.path, "body": body,
+                  "headers": {k.lower(): v for k, v in self.headers.items()}}
+        CALLS.append(record)
+        if self.path.endswith("/chat_session/create"):
+            return self._send(200, {"code": 0, "data": {"biz_data": {"id": "sess-1"}}})
+        if self.path.endswith("/chat/create_pow_challenge"):
+            return self._send(200, {"code": 0, "data": {"biz_data": {"challenge": {
+                "algorithm": "DeepSeekHashV1", "challenge": "ch", "salt": "sa",
+                "difficulty": 144000, "expire_at": 1, "signature": "sig",
+                "target_path": "/api/v0/chat/completion"}}}})
+        if self.path.endswith("/chat/completion"):
+            return self._send(200, ds_stream(), "text/event-stream")
         if body.get("model") == "deepseek-v4-flash":
             return self._send(200, stream(REVIEW), "text/event-stream")
         if "A reviewer checked the script you just wrote" in content_of(body):
@@ -58,13 +98,13 @@ class Stub(BaseHTTPRequestHandler):
 
 
 class StubServer(ThreadingHTTPServer):
-    # Without this a handler thread sits in readline() on a pooled keep-alive connection and
-    # the process never exits, which looks exactly like a hung test.
+    # Without this a handler thread sits in readline() on a pooled keep-alive connection and the
+    # process never exits, which looks exactly like a hung test.
     daemon_threads = True
     allow_reuse_address = True
 
 
-PORT = 8141
+PORT = 8143
 stub = StubServer(("127.0.0.1", PORT), Stub)
 threading.Thread(target=stub.serve_forever, daemon=True).start()
 
@@ -74,10 +114,15 @@ os.environ.update({
     "REVIEW_URL": f"http://127.0.0.1:{PORT}/deepseek",
     "DEEPSEEK_TOKEN": "review-test-key",
     "HEARTBEAT": "0.2",
+    # /health remembers a provider's answer for a minute so the page's polling does not turn into
+    # a network call every 8 seconds; the test wants every check to be a fresh one.
+    "TOKEN_CHECK_TTL": "0",
 })
-os.environ.pop("API_KEY", None)
+for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE"):
+    os.environ.pop(name, None)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import importlib  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -106,7 +151,14 @@ def turn(question):
     return out, (done[0] if done else {}), CALLS[:]
 
 
-print("\n-- the chain still runs --")
+def reload_with(**env):
+    global server, client
+    os.environ.update(env)
+    server = importlib.reload(server)
+    client = TestClient(server.app)
+
+
+print("\n-- the chain, reviewer on an OpenAI-shaped endpoint --")
 out, done, calls = turn("make me a walk script")
 reviewer = [c for c in calls if c["body"].get("model") == "deepseek-v4-flash"]
 check("three phases", [p["phase"] for p in done["phases"]], ["draft", "review", "refine"])
@@ -117,21 +169,49 @@ check("thinking is off", reviewer[0]["body"].get("thinking"), {"type": "disabled
 check("no search parameter", [k for k in reviewer[0]["body"] if "search" in k.lower()], [])
 check("the brief is send.txt", server.BRIEF_PATH.name, "send.txt")
 
-print("\n-- pointed at chat.deepseek.com itself --")
-os.environ["REVIEW_URL"] = "https://chat.deepseek.com"
-import importlib  # noqa: E402
-server = importlib.reload(server)
-client = TestClient(server.app)
-check("the chain turns itself off", server.review_enabled(), False)
-out, done, calls = turn("solo please")
-check("no reviewer call is spent", [c for c in calls if "deepseek" in c["path"]], [])
-check("the draft is the answer", done.get("text"), "-- draft\nprint('hi')")
+print("\n-- chat.deepseek.com, driven by the userToken --")
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api/v0", REVIEW_SHAPE="deepseek-web",
+            DEEPSEEK_TOKEN="user-token-xyz")
+check("the web transport is in use", server.REVIEWER.web is not None, True)
+check("and the reviewer is on", server.review_enabled(), True)
+out, done, calls = turn("make me a walk script")
+web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
+check("the site's completion endpoint was used", len(web), 1)
+check("a session was created for the review",
+      len([c for c in calls if c["path"].endswith("/chat_session/create")]), 1)
+check("the challenge was asked for",
+      len([c for c in calls if c["path"].endswith("/chat/create_pow_challenge")]), 1)
+check("no proof of work header was invented", "x-ds-pow-response" in web[0]["headers"], False)
+check("the userToken is the bearer", web[0]["headers"].get("authorization"),
+      "Bearer user-token-xyz")
+check("thinking is switched off in the payload", web[0]["body"].get("thinking_enabled"), False)
+check("search is switched off in the payload", web[0]["body"].get("search_enabled"), False)
+check("the attempt looks like the site's", web[0]["headers"].get("x-client-platform"), "web")
+check("the brief leads the prompt",
+      web[0]["body"]["prompt"].startswith(server.BRIEF[:60]), True)
+check("the request is in the prompt", "make me a walk script" in web[0]["body"]["prompt"], True)
+check("both frame shapes were read",
+      [WEB_HEAD in done["review"], WEB_LIST in done["review"]], [True, True])
+check("a thinking frame never reaches the review", THINKING in done["review"], False)
+check("a status frame never arrives as text", "FINISHED" in done["review"], False)
+check("the rewrite still ran in the same chat", done.get("text"), "-- refined\nprint('hi')")
+health = client.get("/health").json()
+check("the chip says the token works", health["reviewer"]["detail"], "token accepted")
+check("and names the shape", health["reviewer"]["shape"], "deepseek-web")
+
+print("\n-- the userToken is rejected --")
+STUB["users_code"] = 40003
 health = client.get("/health").json()
 check("the chip is red", health["reviewer"]["ok"], False)
-check("and says why", "proof of work" in health["reviewer"]["detail"], True)
-check("health says the review is off", health["review"], False)
-check("the page still renders", "__CHIPS__" in client.get("/").text, False)
-check("no leftover __REVIEWER__", "__REVIEWER__" in client.get("/").text, False)
+check("and says how to get a new one", "userToken" in health["reviewer"]["detail"], True)
+STUB["users_code"] = 0
+
+print("\n-- pointing REVIEW_URL at the site picks the transport --")
+reload_with(REVIEW_URL="https://chat.deepseek.com")
+check("deepseek-web is chosen without being asked", server.REVIEW_SHAPE, "deepseek-web")
+check("the transport is attached", server.REVIEWER.web is not None, True)
+check("the reviewer is on", server.review_enabled(), True)
+check("and labelled as the site", server.REVIEWER.web.label, "chat.deepseek.com")
 
 print(f"\n{count[0]} checks, {len(failures)} failed")
 if failures:

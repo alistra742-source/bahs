@@ -64,7 +64,8 @@ class Provider:
     """
 
     def __init__(self, name: str, url: str, key: str, model: str, dialect: dict,
-                 timeout: float, extra: Optional[dict] = None, shape: str = "openai"):
+                 timeout: float, extra: Optional[dict] = None, shape: str = "openai",
+                 web: Optional["DeepSeekWeb"] = None):
         self.name = name
         self.url = url.rstrip("/")
         self.key = key
@@ -73,6 +74,9 @@ class Provider:
         self.timeout = timeout
         self.extra = extra or {}
         self.shape = shape
+        # Set when this provider is chat.deepseek.com itself: those endpoints are not
+        # OpenAI-shaped, so the request goes through the web transport instead.
+        self.web = web
 
     @property
     def configured(self) -> bool:
@@ -152,6 +156,228 @@ QWEN = Provider(
     {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT,
 )
 
+# --- chat.deepseek.com, driven by the token the site itself stores -----------------------
+#
+# The web app has no public API, but its own endpoints answer a server, so a *userToken* -- the
+# value behind chat.deepseek.com -> F12 -> Console ->
+# JSON.parse(localStorage.getItem("userToken")).value -- is enough to review a script. Three of
+# the four calls need nothing else:
+#
+#   GET  /users/current             is the token still good?
+#   POST /chat_session/create       a session id, {"character_id": null}
+#   POST /chat/create_pow_challenge a challenge for the message about to be sent
+#   POST /chat/completion           the answer -- and this one is gated by a proof of work
+#
+# The proof of work is the one piece that cannot be solved here: it needs DeepSeek's own
+# sha3_wasm_bg.wasm, and the copies published with the two open-source bridges are stale (their
+# wasm_solve writes nothing for any difficulty or input -- the README has the measurement). So the
+# challenge is fetched and logged, no header is invented, and whatever the API answers is what
+# gets reported -- which is how you find out whether it is enforced for your account at all.
+#
+# thinking_enabled and search_enabled are sent false, always. The reviewer reads a script; it does
+# not reason out loud and it does not search the web. The site takes no temperature or token
+# ceiling, so those are ignored on this path.
+
+LOGIN_HINT = ("copy a fresh userToken: chat.deepseek.com -> F12 -> Console -> "
+              "JSON.parse(localStorage.getItem(\"userToken\")).value")
+
+
+def as_prompt(messages: list) -> str:
+    """The turns as one string, in order, system first.
+
+    The web endpoint has no roles: one prompt field. Concatenating in the order the turns were
+    built is what keeps the brief ahead of everything else on this path too.
+    """
+    parts = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            parts.append(content.strip())
+    return "\n\n".join(parts)
+
+
+def read_chunk(chunk: dict, box: Optional[dict] = None) -> str:
+    """One piece of the answer out of a chat.deepseek.com frame, in either shape it uses.
+
+    The site has streamed an OpenAI-like frame and an older one (v, with fragments under p).
+    Both are accepted rather than betting on one. Thinking is dropped -- it is switched off,
+    and the reviewer's answer is what is wanted -- and a status or error frame yields nothing
+    so it cannot arrive as text.
+    """
+    choices = chunk.get("choices") or []
+    if choices:
+        choice = choices[0] or {}
+        delta = choice.get("delta") or {}
+        if box is not None and choice.get("finish_reason"):
+            box["finish"] = choice["finish_reason"]
+        if str(delta.get("type") or "").lower() in ("thinking", "reasoning"):
+            return ""
+        return delta.get("content") or ""
+    path = str(chunk.get("p") or "")
+    value = chunk.get("v")
+    if path == "response/status":
+        if box is not None and str(value).strip().upper() == "FINISHED":
+            box["finish"] = box.get("finish") or "stop"
+        return ""
+    if "thinking" in path.lower():
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(part.get("content") or "" for part in value
+                       if isinstance(part, dict)
+                       and str(part.get("type") or "RESPONSE").upper() == "RESPONSE")
+    return ""
+
+
+class DeepSeekWeb:
+    """chat.deepseek.com as a reviewer, over the endpoints the web app itself calls.
+
+    `base` points at the site by default; it can be pointed somewhere else, which is both how this
+    is tested and how a mirror would be used (a base ending in /api/v0).
+    """
+
+    DEFAULT_BASE = "https://chat.deepseek.com/api/v0"
+
+    def __init__(self, token: str, timeout: float, cookies: str = "", base: str = ""):
+        self.token = token
+        self.timeout = timeout
+        self.cookie = (cookies or "").strip()
+        self.base = (base or self.DEFAULT_BASE).rstrip("/")
+        self.label = self.base.split("//", 1)[-1].split("/", 1)[0]
+        self.model = "deepseek-web"
+
+    def headers(self, pow_value: Optional[str] = None) -> dict:
+        """What the site's own client sends, so the request looks like the site's."""
+        headers = {
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "authorization": f"Bearer {self.token}",
+            "content-type": "application/json",
+            "origin": "https://chat.deepseek.com",
+            "referer": "https://chat.deepseek.com/",
+            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"),
+            "x-app-version": "20241129.1",
+            "x-client-locale": "en_US",
+            "x-client-platform": "web",
+            "x-client-version": "1.0.0-always",
+        }
+        if self.cookie:
+            headers["cookie"] = self.cookie
+        if pow_value:
+            headers["x-ds-pow-response"] = pow_value
+        return headers
+
+    def _client(self) -> httpx.Client:
+        return httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0),
+                            follow_redirects=True)
+
+    def _call(self, method: str, path: str, payload: Optional[dict] = None):
+        try:
+            with self._client() as c:
+                return c.request(method, self.base + path, json=payload, headers=self.headers())
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"cannot reach chat.deepseek.com ({e.__class__.__name__})")
+
+    @staticmethod
+    def _json(response) -> dict:
+        try:
+            body = response.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def _explain(self, body: dict, status: int = 0) -> str:
+        """What chat.deepseek.com said, with the one fix that is not obvious."""
+        code = body.get("code")
+        message = str(body.get("msg") or "").strip()
+        if code == 40002:
+            return "chat.deepseek.com: Missing Token -- DEEPSEEK_TOKEN is not set on this service"
+        if code == 40003:
+            return (f"chat.deepseek.com rejected DEEPSEEK_TOKEN ({message or 'invalid token'}) -- "
+                    + LOGIN_HINT)
+        text = json.dumps(body)[:300] if body else f"HTTP {status}"
+        if "pow" in text.lower() or "proof" in text.lower():
+            return (f"chat.deepseek.com wants a proof of work for this message ({text}) -- none is "
+                    "bundled, because the published sha3_wasm module no longer solves")
+        return f"chat.deepseek.com said {code}: {message}" if code else text
+
+    def validate(self) -> tuple:
+        """Whether the userToken is still good, for the chip."""
+        response = self._call("GET", "/users/current")
+        body = self._json(response)
+        if response.status_code >= 400 and not body:
+            return False, f"chat.deepseek.com answered HTTP {response.status_code}"
+        if body.get("code") not in (None, 0):
+            return False, self._explain(body, response.status_code)
+        return True, "token accepted"
+
+    def create_session(self) -> str:
+        """A fresh chat for this review, so reviews never read each other."""
+        response = self._call("POST", "/chat_session/create", {"character_id": None})
+        body = self._json(response)
+        session = (((body.get("data") or {}).get("biz_data") or {}).get("id"))
+        if not session:
+            raise HTTPException(502, self._explain(body, response.status_code))
+        return str(session)
+
+    def challenge(self):
+        """The proof-of-work challenge for the next message, when it can be had at all."""
+        try:
+            response = self._call("POST", "/chat/create_pow_challenge",
+                                  {"target_path": "/api/v0/chat/completion"})
+        except HTTPException:
+            return None
+        body = self._json(response)
+        return (((body.get("data") or {}).get("biz_data") or {}).get("challenge"))
+
+    def stream(self, prompt: str, box: Optional[dict] = None):
+        """Send one prompt and stream the answer back."""
+        session = self.create_session()
+        challenge = self.challenge() or {}
+        if challenge:
+            print(f"[deepseek] a proof of work is asked for (difficulty "
+                  f"{challenge.get('difficulty')}, expire_at {challenge.get('expire_at')}); "
+                  "no solver is bundled, so this request goes without the header", flush=True)
+        payload = {
+            "chat_session_id": session,
+            "parent_message_id": None,
+            "prompt": prompt,
+            "ref_file_ids": [],
+            "thinking_enabled": False,
+            "search_enabled": False,
+        }
+        with self._client() as c:
+            with c.stream("POST", f"{self.base}/chat/completion", json=payload,
+                          headers=self.headers()) as r:
+                if r.status_code >= 400 or "event-stream" not in r.headers.get("content-type", ""):
+                    raw = r.read().decode("utf-8", "replace")
+                    try:
+                        body = json.loads(raw)
+                    except ValueError:
+                        body = {"msg": raw[:300]}
+                    raise HTTPException(502, self._explain(
+                        body if isinstance(body, dict) else {}, r.status_code))
+                for line in r.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    if not isinstance(chunk, dict):
+                        continue
+                    if chunk.get("code") and chunk.get("msg") and chunk.get("v") is None:
+                        raise HTTPException(502, self._explain(chunk, 200))
+                    piece = read_chunk(chunk, box)
+                    if piece:
+                        yield piece
+
+
 # --- the reviewer ------------------------------------------------------------------------
 #
 # DeepSeek V4 Flash, thinking off, search off. It is only ever sent a script to criticise,
@@ -173,8 +399,19 @@ REVIEW_URL = env("REVIEW_URL", "DEEPSEEK_URL", default="https://api.deepseek.com
 REVIEW_KEY = env("DEEPSEEK_TOKEN", "REVIEW_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_KEY")
 REVIEW_MODEL = env("REVIEW_MODEL", "DEEPSEEK_MODEL", default="deepseek-v4-flash")
 # openai (an OpenAI-shaped endpoint, including api.deepseek.com) | web (a bridge in front of
-# chat.deepseek.com: no system role, and the toggles are plain booleans)
+# chat.deepseek.com: no system role, and the toggles are plain booleans) | deepseek-web (the
+# site's own endpoints, driven by the userToken -- the DeepSeekWeb transport above).
 REVIEW_SHAPE = env("REVIEW_SHAPE", default="openai").lower()
+# A userToken is the site's own token, so pointing REVIEW_URL at the site selects its transport
+# without having to be asked. An API key from platform.deepseek.com keeps the OpenAI shape.
+if "chat.deepseek.com" in REVIEW_URL:
+    REVIEW_SHAPE = "deepseek-web"
+# The cf_clearance cookie, in case chat.deepseek.com ever answers a request with a browser check.
+REVIEW_COOKIE = env("DEEPSEEK_COOKIE", "REVIEW_COOKIE")
+# The web endpoints take no model id: the session's model is whatever the account is set to, so
+# claiming a specific one would be a lie on the chip.
+if REVIEW_SHAPE == "deepseek-web" and not env("REVIEW_MODEL", "DEEPSEEK_MODEL"):
+    REVIEW_MODEL = "deepseek-web"
 # Thinking is enabled by default on DeepSeek V4, so it is switched off explicitly, and search
 # is never switched on anywhere in this service: a review has to be cheap, quick, and about
 # the script in front of it rather than about the web.
@@ -215,37 +452,29 @@ def reviewer_dialect() -> dict:
     return {"thinking": {"type": "enabled" if thinking_on else "disabled"}}
 
 
+REVIEW_TIMEOUT = float(env("REVIEW_TIMEOUT", default="180"))
+
 REVIEWER = Provider(
     "deepseek", REVIEW_URL, REVIEW_KEY, REVIEW_MODEL, reviewer_dialect(),
-    float(env("REVIEW_TIMEOUT", default="180")),
+    REVIEW_TIMEOUT,
     REVIEW_EXTRA,
     REVIEW_SHAPE,
+    (DeepSeekWeb(REVIEW_KEY, REVIEW_TIMEOUT, REVIEW_COOKIE,
+                 REVIEW_URL if "/api/v0" in REVIEW_URL else "")
+     if REVIEW_SHAPE == "deepseek-web" else None),
 )
 
 # on (always) | off (never) | auto (only when a reviewer key is set)
 PIPELINE = env("PIPELINE", default="auto").lower()
 
 
-# The chat site itself, as opposed to the API. Worth recognising by name because pointing the
-# reviewer at it is the mistake this section exists to explain: its internal endpoints answer a
-# server fine, but they want a proof of work solved per message AND a signed-in browser session,
-# so a token alone cannot drive it. Better to say so than to fail once per turn.
-NOT_AN_API = "chat.deepseek.com"
-NOT_AN_API_WHY = ("chat.deepseek.com is the web app, not an API: every message there needs a "
-                  "proof of work solved for it and a signed-in browser session, so a token "
-                  "alone cannot drive it. Put an API key from platform.deepseek.com in "
-                  "DEEPSEEK_TOKEN (same models, one variable), or point REVIEW_URL at a "
-                  "bridge that speaks OpenAI.")
-
-
 def review_enabled() -> bool:
     """Whether a question goes through the reviewer as well.
 
-    A reviewer pointed at chat.deepseek.com itself is not a reviewer -- see NOT_AN_API_WHY --
-    so the chain treats it as unconfigured instead of spending a call per turn on a request
-    that cannot succeed.
+    A reviewer pointed at chat.deepseek.com is a real reviewer: that path is the web transport
+    above, driven by the userToken. It only looks unconfigured when there is no token at all.
     """
-    if not REVIEWER.configured or NOT_AN_API in REVIEWER.url:
+    if not REVIEWER.configured:
         return False
     if PIPELINE in ("off", "0", "false", "no"):
         return False
@@ -688,9 +917,15 @@ def _reviewer_probe(force: bool = False) -> dict:
     if not force and cached["at"] and time.time() - cached["at"] < TOKEN_CHECK_TTL:
         return cached
     if not REVIEWER.configured:
-        state = {"at": time.time(), "ok": False, "detail": "no reviewer key set"}
-    elif NOT_AN_API in REVIEWER.url:
-        state = {"at": time.time(), "ok": False, "detail": NOT_AN_API_WHY}
+        state = {"at": time.time(), "ok": False, "detail": "no reviewer token set"}
+    elif REVIEWER.web is not None:
+        # chat.deepseek.com answers /users/current, which is the same question the Qwen token is
+        # asked, so the chip means the same thing on both sides.
+        try:
+            ok, detail = REVIEWER.web.validate()
+        except HTTPException as e:
+            ok, detail = False, str(e.detail)
+        state = {"at": time.time(), "ok": ok, "detail": detail}
     else:
         try:
             with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
@@ -952,11 +1187,14 @@ async def lifespan(_app: FastAPI):
     else:
         print(f"[bridge] {NOT_CONFIGURED}", flush=True)
     if review_enabled():
-        print(f"[review] {REVIEWER.url} -> {REVIEWER.model} (thinking: {REVIEW_THINKING}, "
+        where = REVIEWER.web.label if REVIEWER.web is not None else REVIEWER.url
+        print(f"[review] {where} -> {REVIEWER.model} (thinking: {REVIEW_THINKING}, "
               f"shape: {REVIEW_SHAPE}), brief {len(BRIEF)} chars from "
               f"{BRIEF_PATH.name if BRIEF else 'the built-in rubric'}", flush=True)
-    elif NOT_AN_API in REVIEWER.url:
-        print(f"[review] off: {NOT_AN_API_WHY}", flush=True)
+        if REVIEWER.web is not None:
+            print("[review] the userToken is the credential; search and thinking are sent false, "
+                  "and a proof of work is asked for per message with no solver bundled",
+                  flush=True)
     else:
         print("[review] no reviewer configured; answers are sent as the model writes them",
               flush=True)
@@ -998,6 +1236,10 @@ def stream_answer(messages: list, temperature: Optional[float], provider: Provid
     `box` gets the finish reason and any token usage, which is how a truncated answer is
     caught instead of being shipped.
     """
+    if provider.web is not None:
+        # chat.deepseek.com: one prompt, the site's own endpoint, its own streamed frames.
+        yield from provider.web.stream(as_prompt(messages), box)
+        return
     body = provider.request(messages, temperature, max_tokens, stream=True)
     try:
         with httpx.Client(timeout=httpx.Timeout(provider.timeout, connect=10.0),
