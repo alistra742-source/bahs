@@ -8,6 +8,8 @@ from pathlib import Path
 from collections import defaultdict, deque
 import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid
 
+import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
+
 # --------------------------------------------------------------------------------------
 # What this service is: two models, in a chain, behind one API.
 #
@@ -22,9 +24,11 @@ import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid
 # (chat.qwen.ai -> DevTools console -> localStorage.token). That token is the key to a
 # whole Qwen account, so it lives here and never in a page or a Roblox script.
 #
-# The reviewer is DeepSeek V4 Flash (the model behind minitoolai.com, which is a web
-# front-end to DeepSeek's own API) -- so this talks to api.deepseek.com directly, with
-# thinking switched off, and it is never the caller's to choose.
+# The reviewer is DeepSeek V4 Flash, with thinking and search switched off and never the
+# caller's to choose. Which DeepSeek it is depends on the credential: an `sk-...` API key
+# reviews through api.deepseek.com, and a chat.deepseek.com `userToken` reviews through the
+# site's own endpoints (see DeepSeekWeb below) -- where the message call needs a proof of work,
+# solved here with DeepSeek's own sha3 module (pow_solver.py).
 #
 #   POST /chat/stream           one turn -> a job id, the whole chain runs in the job
 #   GET  /chat/stream/{job}     NDJSON: replay, text, phase changes, heartbeats, done
@@ -297,10 +301,19 @@ class DeepSeekWeb:
         if code == 40003:
             return (f"chat.deepseek.com rejected DEEPSEEK_TOKEN ({message or 'invalid token'}) -- "
                     + LOGIN_HINT)
+        # The two proof-of-work refusals, told apart rather than pooled: 40300 is the header not
+        # being there (no module, an unknown algorithm, or a challenge that could not be solved),
+        # 40301 is an answer the server rejected -- a different problem with a different fix.
+        if code == 40300:
+            return (f"chat.deepseek.com: MISSING_HEADER ({message or 'no detail'}) -- the message "
+                    "was refused for the proof-of-work header. The [deepseek] lines in this "
+                    "service's log say which half failed: the sha3 module, or the solve")
+        if code == 40301:
+            return (f"chat.deepseek.com: INVALID_POW_RESPONSE ({message or 'no detail'}) -- the "
+                    "proof of work was solved with a module that is not the one the site uses")
         text = json.dumps(body)[:300] if body else f"HTTP {status}"
         if "pow" in text.lower() or "proof" in text.lower():
-            return (f"chat.deepseek.com wants a proof of work for this message ({text}) -- none is "
-                    "bundled, because the published sha3_wasm module no longer solves")
+            return f"chat.deepseek.com refused the proof of work ({text})"
         return f"chat.deepseek.com said {code}: {message}" if code else text
 
     def validate(self) -> tuple:
@@ -336,10 +349,15 @@ class DeepSeekWeb:
         """Send one prompt and stream the answer back."""
         session = self.create_session()
         challenge = self.challenge() or {}
+        pow_value = ""
         if challenge:
-            print(f"[deepseek] a proof of work is asked for (difficulty "
-                  f"{challenge.get('difficulty')}, expire_at {challenge.get('expire_at')}); "
-                  "no solver is bundled, so this request goes without the header", flush=True)
+            # The solve is native and bounded by the challenge's difficulty (~10 ms for the 144000
+            # the site hands out), and solve() returns "" rather than raising when it cannot.
+            pow_value = pow_solver.solve(challenge)
+            if not pow_value:
+                print(f"[deepseek] the challenge (difficulty {challenge.get('difficulty')}) was not "
+                      "solved; this message goes out without the header, which the API answers "
+                      "with 40300 MISSING_HEADER", flush=True)
         payload = {
             "chat_session_id": session,
             "parent_message_id": None,
@@ -350,7 +368,7 @@ class DeepSeekWeb:
         }
         with self._client() as c:
             with c.stream("POST", f"{self.base}/chat/completion", json=payload,
-                          headers=self.headers()) as r:
+                          headers=self.headers(pow_value)) as r:
                 if r.status_code >= 400 or "event-stream" not in r.headers.get("content-type", ""):
                     raw = r.read().decode("utf-8", "replace")
                     try:
@@ -1207,8 +1225,13 @@ async def lifespan(_app: FastAPI):
             print("[review] DEEPSEEK_TOKEN is not an sk-... API key, so the review goes to the "
                   "site instead of the API. Set REVIEW_URL to override that", flush=True)
         if REVIEWER.web is not None:
-            print("[review] the userToken is the credential; search and thinking are sent false, "
-                  "and a proof of work is asked for per message with no solver bundled",
+            print("[review] the userToken is the credential; search and thinking are sent false",
+                  flush=True)
+            # Not loaded here: the first fetch is a network call, and boot should not wait on it.
+            print(f"[deepseek] proof of work: "
+                  + (f"{pow_solver.MODULE_PATH.name} is in the image"
+                     if pow_solver.MODULE_PATH.exists()
+                     else "no sha3 module in the image, so one is fetched on the first review"),
                   flush=True)
     else:
         print("[review] no reviewer configured; answers are sent as the model writes them",

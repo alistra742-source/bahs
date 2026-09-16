@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Fetched by the Docker build (and on first use) from the copies DeepSeek's own site loads; not
+# kept in the repo, but kept out of commits when a local run leaves a copy behind.
+sha3_wasm_bg.wasm

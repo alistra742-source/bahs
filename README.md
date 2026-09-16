@@ -76,25 +76,45 @@ were probed from this container rather than assumed, and they answered:
 So the token is checked first and everything before the message already works: `/users/current`
 is the token check behind the chip (an expired `userToken` shows up there, not as a hung review),
 `/chat_session/create` makes a fresh chat per review so reviews never read each other, and
-`/chat/create_pow_challenge` is fetched and logged.
+`/chat/create_pow_challenge` is fetched and solved (see below).
 
-**The one open question is the proof of work.** Every message to `/chat/completion` is supposed
-to carry an `x-ds-pow-response` header computed by running DeepSeek's own `sha3_wasm_bg.wasm`,
-and the two projects that publish this protocol ship a **stale copy** of that module — the files
-are byte-identical (26,612 bytes), and `wasm_solve` writes nothing for any difficulty, challenge,
-prefix or return pointer; measured up to `difficulty = 1e18`, which cannot come back in `0.000s`
-if it were actually searching. A solver built on it cannot solve, so none is bundled: the request
-goes out **without** the header, and whatever the API answers is what you see. That is also how
-you find out whether it is enforced for your account at all.
+### The proof of work (`pow_solver.py`)
 
-* The review arrives → it is not enforced, and the web transport works as it stands.
-* An error naming the proof of work → that is the only missing piece, and the chip quotes
-  DeepSeek's own words for it.
+Every message to `/chat/completion` has to carry an `x-ds-pow-response` header. Without it the
+API answers `40300 MISSING_HEADER`; with a wrong answer it answers `40301 INVALID_POW_RESPONSE`,
+which is why the header is not something to guess at.
 
-If it is the second case, put a working solver in front of the site and point `REVIEW_URL` at it
-with `REVIEW_SHAPE=web` (that shape folds everything into one prompt, brief first, and sends
-`thinking: false, search: false`). If the site ever answers with a browser check instead, put the
-`cf_clearance` cookie in `DEEPSEEK_COOKIE`.
+The challenge is a hash the server already computed over a small integer, and the work is
+recovering that integer:
+
+```
+challenge == DeepSeekHashV1("{salt}_{expire_at}_" + str(w))   for some w in [0, difficulty)
+```
+
+`difficulty` is how many candidates that takes — the site hands out 144000, which the site's own
+module searches in ~10 ms. **The module is used, not reimplemented.** `DeepSeekHashV1` is neither
+SHA3-256 nor Keccak-256: it is a 256-bit-capacity sponge (168-byte rate, not 136), and its digests
+match neither (both of those were checked against this module, and pycryptodome's Keccak-256
+reproduces the published empty-string vector, so the comparison itself is sound). A sponge that is
+subtly wrong looks exactly like the header being useless, so `sha3_wasm_bg.wasm` — the 26,612-byte
+copy the site itself loads — is fetched by the Dockerfile and, if the image does not carry it, on
+the first review. `wasmtime` (in `requirements.txt`) runs it, and is imported lazily so a platform
+without a wheel still serves the API.
+
+The solver was verified without a token: a challenge built from a known `w` comes back as exactly
+that `w`, `w = difficulty` comes back unsolved (the range is half open), and an unsolvable
+challenge sends **no** header rather than a made-up one.
+
+If a review does fail, the codes say which half went wrong:
+
+| Error | What it means |
+| --- | --- |
+| `40300 MISSING_HEADER` | no header went out — the module was unavailable, the algorithm was not `DeepSeekHashV1`, or the challenge was not solved. The `[deepseek]` lines in the log say which |
+| `40301 INVALID_POW_RESPONSE` | an answer was sent and rejected — the module is not the build the site is using |
+| `FAIL_SYS_USER_VALIDATE` | the AWS WAF human-check, not the proof of work. Wait a few minutes |
+
+If the site ever answers with a browser check instead, put the `cf_clearance` cookie in
+`DEEPSEEK_COOKIE`.
 
 Requests on this path are made to look like the site's own client — its headers, its
 `x-client-platform: web`, its bearer — and `thinking_enabled` and `search_enabled` are sent
@@ -192,9 +212,11 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `QWEN_MODEL` | `qwen3.8-max` | the only model used for drafting and rewriting |
 | `QWEN_THINKING` | `fast` | forced onto every Qwen call |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
-| `REVIEW_URL` | `https://api.deepseek.com` | `https://chat.deepseek.com` for the userToken transport, or any OpenAI-shaped endpoint / bridge |
+| `REVIEW_URL` | follows `DEEPSEEK_TOKEN` | a `userToken` goes to `https://chat.deepseek.com`, an `sk-...` key to `https://api.deepseek.com`; set it by hand for any OpenAI-shaped endpoint / bridge and it is used as given |
 | `DEEPSEEK_TOKEN` | — | the reviewer's credential: a `userToken` or a platform API key |
 | `DEEPSEEK_COOKIE` | — | a `cf_clearance` cookie, if the site ever asks for one |
+| `POW_WASM` | `sha3_wasm_bg.wasm` beside the code | where the proof-of-work module is read from |
+| `POW_MAX_TRIES` | `5000000` | the largest `difficulty` this service will solve; past it the message goes out headerless instead of stalling |
 | `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` for the slower, stronger one; ignored by the web transport, whose model is whatever your account is set to |
 | `REVIEW_SHAPE` | `openai` | `web` for a bridge, `deepseek-web` for the site itself (chosen for you when `REVIEW_URL` is chat.deepseek.com) |
 | `REVIEW_THINKING` | `off` | anything else turns it back on for the reviewer only |
@@ -241,6 +263,8 @@ that, which is exactly why the client polls.
 | `deepseek rejected the key` | an API key that is wrong or revoked; make a new one at [platform.deepseek.com](https://platform.deepseek.com) |
 | `deepseek is rate limiting` | free-tier quota; wait, or `REVIEW_MODEL=deepseek-v4-pro` |
 | reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> review failed: ...` |
+| `40300 MISSING_HEADER` | the message went out without its proof-of-work header — see [The proof of work](#the-proof-of-work-pow_solverpy), and the `[deepseek]` lines in the log |
+| `40301 INVALID_POW_RESPONSE` | the proof of work was solved with the wrong module build |
 | the draft is the answer, no rewrite | the reviewer answered `VERDICT: OK`, or a failed review meant there was no list to apply |
 | `the answer was cut off by the token ceiling` | raise `DRAFT_TOKENS` (and `REFINE_TOKENS`), or ask for less at once |
 | a rewrite was thrown away | it came back empty or cut off; the log says so and the draft shipped |

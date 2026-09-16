@@ -6,7 +6,7 @@ import json, os, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CALLS = []
-STUB = {"users_code": 0, "api_code": 0}   # what /users/current and a rejected API key answer
+STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False}
 DRAFT = "```lua\n-- draft\nprint('hi')\n```"
 REVIEW = ("VERDICT: ISSUES\n"
           "1. the loop never ends | where: line 4 | why it fails: it runs forever | fix: add a break")
@@ -89,10 +89,16 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.endswith("/chat_session/create"):
             return self._send(200, {"code": 0, "data": {"biz_data": {"id": "sess-1"}}})
         if self.path.endswith("/chat/create_pow_challenge"):
-            return self._send(200, {"code": 0, "data": {"biz_data": {"challenge": {
-                "algorithm": "DeepSeekHashV1", "challenge": "ch", "salt": "sa",
-                "difficulty": 144000, "expire_at": 1, "signature": "sig",
-                "target_path": "/api/v0/chat/completion"}}}})
+            challenge = {
+                "algorithm": "DeepSeekHashV1",
+                "challenge": POW_CHALLENGE or "cannot-be-solved-here",
+                "salt": POW_SALT, "difficulty": POW_DIFFICULTY, "expire_at": POW_EXPIRE,
+                "signature": "sig", "target_path": "/api/v0/chat/completion"}
+            if STUB["bad_challenge"]:
+                # A challenge with no answer below its difficulty: the solve has to come back
+                # empty rather than the request inventing a header.
+                challenge["challenge"] = "0" * 64
+            return self._send(200, {"code": 0, "data": {"biz_data": {"challenge": challenge}}})
         if self.path.endswith("/chat/completion"):
             return self._send(200, ds_stream(), "text/event-stream")
         if body.get("model") == "deepseek-v4-flash":
@@ -128,8 +134,17 @@ for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE"):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
+import base64  # noqa: E402
+import pow_solver  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+
+# A challenge the site would hand out, made the way the site makes it: a hash of the prefix plus a
+# small integer. The solver has to recover that integer, and the stub answers only when it does.
+POW_W, POW_SALT, POW_EXPIRE, POW_DIFFICULTY = 4242, "9f8e7d6c5b4a39281706f5e4d3c2b1a0", 1789548668, 144000
+_solver = pow_solver.load()
+POW_CHALLENGE = (_solver.digest(pow_solver.prefix_for(POW_SALT, POW_EXPIRE) + str(POW_W))
+                 if _solver is not None else "")
 
 client = TestClient(server.app)
 failures, count = [], [0]
@@ -186,7 +201,16 @@ check("a session was created for the review",
       len([c for c in calls if c["path"].endswith("/chat_session/create")]), 1)
 check("the challenge was asked for",
       len([c for c in calls if c["path"].endswith("/chat/create_pow_challenge")]), 1)
-check("no proof of work header was invented", "x-ds-pow-response" in web[0]["headers"], False)
+pow_header = web[0]["headers"].get("x-ds-pow-response")
+if _solver is None:
+    print("  (the proof-of-work checks are skipped: no sha3 module is available here)")
+else:
+    answered = json.loads(base64.b64decode(pow_header)) if pow_header else {}
+    check("the proof of work is solved and sent", answered.get("answer"), POW_W)
+    check("the challenge goes back with it", answered.get("challenge"), POW_CHALLENGE)
+    check("and the signature that came with it", answered.get("signature"), "sig")
+    check("no state the challenge did not carry", answered.get("target_path"),
+          "/api/v0/chat/completion")
 check("the userToken is the bearer", web[0]["headers"].get("authorization"),
       "Bearer user-token-xyz")
 check("thinking is switched off in the payload", web[0]["body"].get("thinking_enabled"), False)
@@ -203,6 +227,31 @@ check("the rewrite still ran in the same chat", done.get("text"), "-- refined\np
 health = client.get("/health").json()
 check("the chip says the token works", health["reviewer"]["detail"], "token accepted")
 check("and names the shape", health["reviewer"]["shape"], "deepseek-web")
+
+print("\n-- a challenge with no answer below its difficulty sends no header --")
+STUB["bad_challenge"] = True
+out, done, calls = turn("make me a walk script")
+web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
+check("nothing was invented for an unsolvable challenge",
+      "x-ds-pow-response" in (web[0]["headers"] if web else {"x-ds-pow-response": "none"}), False)
+check("and the turn still ran", done.get("text"), "-- refined\nprint('hi')")
+STUB["bad_challenge"] = False
+
+print("\n-- the proof-of-work solver's own rules --")
+check("the prefix spells an integer as an integer",
+      pow_solver.prefix_for("sa", 1789548668), "sa_1789548668_")
+check("and a whole float the same way", pow_solver.prefix_for("sa", 1789548668.0), "sa_1789548668_")
+check("an unknown algorithm is not guessed",
+      pow_solver.solve({"algorithm": "SomethingElse", "challenge": "x", "difficulty": 1000,
+                        "salt": "s", "expire_at": 1}), "")
+check("an absurd difficulty is refused, not stalled",
+      pow_solver.solve({"algorithm": "DeepSeekHashV1", "challenge": "x",
+                        "difficulty": 999999999999, "salt": "s", "expire_at": 1}), "")
+check("no challenge, no header", pow_solver.solve({}), "")
+check("a challenge off the openai path is not solved either",
+      pow_solver.solve({"algorithm": "DeepSeekHashV1", "challenge": "0" * 64,
+                        "difficulty": POW_DIFFICULTY, "salt": POW_SALT,
+                        "expire_at": POW_EXPIRE}), "")
 
 print("\n-- the userToken is rejected --")
 STUB["users_code"] = 40003

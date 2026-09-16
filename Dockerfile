@@ -4,14 +4,17 @@
 #   Railway -> this service -> Settings -> Build   -> Dockerfile Path = Dockerfile (default)
 #   Railway -> this service -> Settings -> Volumes -> none (it holds no state)
 #   Railway -> this service -> Settings -> Variables -> QWEN_TOKEN (Qwen access token)
-#                                                      REVIEW_KEY (DeepSeek key)
+#                                                      DEEPSEEK_TOKEN (userToken or sk- key)
 #                                                      API_KEY (optional, gates the API)
 #
 # There is no model in this image. Drafts go to a qwen-api instance (QWEN_URL), which turns
-# chat.qwen.ai into OpenAI-compatible endpoints; the review goes to DeepSeek (REVIEW_URL,
-# api.deepseek.com by default) with thinking off. So there is no Ollama service, no GPU, no
-# model volume and nothing to pull or warm. There is no database either: the conversation
-# lives in the browser and is sent back with every turn.
+# chat.qwen.ai into OpenAI-compatible endpoints; the review goes to DeepSeek with thinking and
+# search off, through api.deepseek.com for an `sk-...` key or straight through
+# chat.deepseek.com for a `userToken`. That second path needs the proof of work the site asks
+# for on every message, which is solved with the site's own sha3 module (pow_solver.py, fetched
+# below). So there is no Ollama service, no GPU, no model volume and nothing to pull or warm.
+# There is no database either: the conversation lives in the browser and is sent back with
+# every turn.
 #
 # The brief handed to the reviewer before anything else is part of the image. There are two in
 # the repo (send.txt and Send.txt, differing only in case); send.txt is the newer and the one
@@ -28,10 +31,16 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py ./
+COPY pow_solver.py ./
 COPY web ./web
 COPY send.txt ./
 COPY Send.txt ./
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# The sha3 module chat.deepseek.com loads (26 KB of wasm), so the proof of work can be solved from
+# the first review instead of after a fetch. A build without network does not fail: the service
+# fetches the same copy on first use and says so in its log.
+RUN python pow_solver.py || true
 
 EXPOSE 8000
 
