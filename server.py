@@ -226,13 +226,30 @@ REVIEWER = Provider(
 PIPELINE = env("PIPELINE", default="auto").lower()
 
 
+# The chat site itself, as opposed to the API. Worth recognising by name because pointing the
+# reviewer at it is the mistake this section exists to explain: its internal endpoints answer a
+# server fine, but they want a proof of work solved per message AND a signed-in browser session,
+# so a token alone cannot drive it. Better to say so than to fail once per turn.
+NOT_AN_API = "chat.deepseek.com"
+NOT_AN_API_WHY = ("chat.deepseek.com is the web app, not an API: every message there needs a "
+                  "proof of work solved for it and a signed-in browser session, so a token "
+                  "alone cannot drive it. Put an API key from platform.deepseek.com in "
+                  "DEEPSEEK_TOKEN (same models, one variable), or point REVIEW_URL at a "
+                  "bridge that speaks OpenAI.")
+
+
 def review_enabled() -> bool:
-    """Whether a question goes through the reviewer as well."""
+    """Whether a question goes through the reviewer as well.
+
+    A reviewer pointed at chat.deepseek.com itself is not a reviewer -- see NOT_AN_API_WHY --
+    so the chain treats it as unconfigured instead of spending a call per turn on a request
+    that cannot succeed.
+    """
+    if not REVIEWER.configured or NOT_AN_API in REVIEWER.url:
+        return False
     if PIPELINE in ("off", "0", "false", "no"):
         return False
-    if PIPELINE in ("on", "1", "true", "yes", "always"):
-        return REVIEWER.configured
-    return REVIEWER.configured
+    return True
 
 
 # --- the tokens one call may use ---------------------------------------------------------
@@ -672,6 +689,8 @@ def _reviewer_probe(force: bool = False) -> dict:
         return cached
     if not REVIEWER.configured:
         state = {"at": time.time(), "ok": False, "detail": "no reviewer key set"}
+    elif NOT_AN_API in REVIEWER.url:
+        state = {"at": time.time(), "ok": False, "detail": NOT_AN_API_WHY}
     else:
         try:
             with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
@@ -933,9 +952,11 @@ async def lifespan(_app: FastAPI):
     else:
         print(f"[bridge] {NOT_CONFIGURED}", flush=True)
     if review_enabled():
-        print(f"[review] {REVIEWER.url} -> {REVIEWER.model} (thinking: {REVIEW_THINKING}), "
-              f"brief {len(BRIEF)} chars from {BRIEF_PATH if BRIEF else 'the built-in rubric'}",
-              flush=True)
+        print(f"[review] {REVIEWER.url} -> {REVIEWER.model} (thinking: {REVIEW_THINKING}, "
+              f"shape: {REVIEW_SHAPE}), brief {len(BRIEF)} chars from "
+              f"{BRIEF_PATH.name if BRIEF else 'the built-in rubric'}", flush=True)
+    elif NOT_AN_API in REVIEWER.url:
+        print(f"[review] off: {NOT_AN_API_WHY}", flush=True)
     else:
         print("[review] no reviewer configured; answers are sent as the model writes them",
               flush=True)

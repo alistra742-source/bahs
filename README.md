@@ -41,33 +41,36 @@ reviewer key set, model served · model qwen3.8-max · mode fast · Hy kanha`.
 ### About `chat.deepseek.com`
 
 `DEEPSEEK_TOKEN` has to be an **API key from platform.deepseek.com**, not the `userToken` from
-chat.deepseek.com's localStorage. They are different credentials — a chat session token will
-come back as `deepseek rejected the key`.
+chat.deepseek.com's localStorage. That is not us being fussy — the endpoints were probed from
+this container to be sure, and here is what they answered:
 
-That is not an oversight, it is the shape of the site: chat.deepseek.com is a web app with no
-public API, and calling it directly needs
-
-* a signed-in browser session that has already passed its AWS WAF human-check (a
-  `cf_clearance` cookie), and
-* a **proof of work solved per request**, by executing DeepSeek's own `sha3_wasm_bg.wasm`.
-
-The second can be done in code; the first cannot be done from a datacenter IP at all, which is
-what this service runs on. So this service does not pretend to try.
-
-If you want to go through the web chat anyway, it has to be through a bridge that sits in front
-of it and speaks OpenAI —
-[`xtekky/deepseek4free`](https://github.com/xtekky/deepseek4free) and
-[`sums001/Deepseek-API`](https://github.com/sums001/Deepseek-API) both do exactly that, and both
-need a real browser once to get the cookie. Run one of those somewhere that can, then:
-
-| Variable | Value |
+| Asked | Answered |
 | --- | --- |
-| `REVIEW_URL` | that bridge, e.g. `http://your-host:8000/v1` |
-| `DEEPSEEK_TOKEN` | the token/cookie bundle that bridge expects |
-| `REVIEW_SHAPE` | `web` — no system role, and the toggles as plain booleans |
+| `POST /api/v0/chat/create_pow_challenge`, no token | `200 {"code":40002,"msg":"Missing Token"}` — reachable, no WAF challenge |
+| `POST /api/v0/chat_session/create`, bad token | `200 {"code":40003,"msg":"Authorization Failed (invalid token)"}` |
+| `POST /api/v0/chat/completion`, bad token, with or without a pow header | `200 {"code":40003,"msg":"INVALID_TOKEN"}` |
 
-`REVIEW_SHAPE=web` folds everything into one prompt with `Send.txt` first, and sends
-`thinking: false, search: false`. Anything else keeps the OpenAI shape.
+Good news in there: the API *is* reachable from a server, and it is the token it checks first.
+The blocker is the step after that. Every message to `/chat/completion` must carry an
+`x-ds-pow-response` header — a proof of work computed by running DeepSeek's own
+`sha3_wasm_bg.wasm`, the module the site loads — and the two projects that publish this
+protocol ship a **stale copy of that module**. Both files are byte-identical (26,612 bytes) and
+`wasm_solve` writes nothing for any difficulty, challenge, prefix or return pointer; measured up
+to `difficulty = 1e18`, which cannot come back in `0.000s` if it were searching. A solver built
+on it cannot solve, so this service does not ship one.
+
+What that leaves — both of which work from here:
+
+| Route | What to set |
+| --- | --- |
+| DeepSeek's API (same models, one variable) | `DEEPSEEK_TOKEN` = key from platform.deepseek.com |
+| Any bridge that speaks OpenAI | `REVIEW_URL` = the bridge, `DEEPSEEK_TOKEN` = whatever it wants, and `REVIEW_SHAPE=web` for the chat-shaped ones |
+
+`REVIEW_SHAPE=web` folds everything into one prompt with the brief first, and sends
+`thinking: false, search: false`. The OpenAI shape (the default) sends
+`thinking: {"type": "disabled"}`. If you point `REVIEW_URL` at chat.deepseek.com itself, the
+reviewer switches itself off and the chip tells you exactly this rather than failing once per
+turn.
 
 ## Search and thinking are never switched on
 
@@ -227,4 +230,15 @@ curl -sN https://<your-domain>/chat/stream/<job> -H "X-API-Key: $API_KEY"
 curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"make walkspeed 100"}]}'
+```
+
+## Verifying a change
+
+`verify_chain.py` runs the whole chain against stubbed Qwen and DeepSeek endpoints — no keys,
+no network — and covers the brief being first, the thinking/search toggles, the three phases,
+secret masking, the regression guard, the blocking and polling paths, and the chat.deepseek.com
+guard:
+
+```bash
+.venv/bin/python verify_chain.py
 ```
