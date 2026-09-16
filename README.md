@@ -17,7 +17,10 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
 ```
 
 1. **DeepSeek reads `send.txt` first**, alone, and is only asked for anything after it has
-   answered that.
+   answered that. Every message it gets — the brief, the requests, the agreement questions —
+   opens with the same warning, because the one thing that would make its answer wrong is
+   assuming the script is for Studio: `WARNING! THIS IS NOT FOR ROBLOX STUDIO BUT FOR A ROBLOX
+   EXECUTOR SCRIPT`.
 2. **Qwen drafts** an answer to what you asked, in the conversation you are keeping.
 3. **DeepSeek writes its own version** of that script — not a list of complaints: a script you
    could run.
@@ -148,9 +151,9 @@ apply here.
 ## The brief (send.txt / Send.txt)
 
 The brief is read once at boot and sent **on its own, before anything else the reviewer is
-asked**: one message containing nothing but `send.txt` (plus the output contract and one line
-asking for a short acknowledgement), and the answer to it is waited for before the request for a
-script goes out. After that the request arrives in the *same* conversation — on the site path by
+asked**: that message is `send.txt`, the warning that opens every message, and one line asking for
+a short acknowledgement — nothing else, and nothing about the user's request. The answer to it is
+waited for before the request for a script goes out. After that the request arrives in the *same* conversation — on the site path by
 threading the next message onto the id of the one before it — so the reviewer is answering inside
 the chat the brief was read in. The brief goes out on its own thread **while Qwen writes the
 draft**, so waiting for the acknowledgement costs no turn time: the only thing that has to be
@@ -171,9 +174,11 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 * A missing file is not fatal — the built-in rubric still applies — but it is reported rather
   than silently skipped. `Dockerfile` copies both into the image; if you edit either on GitHub,
   the service picks it up on the next deploy.
-* The output contract is always appended after it, because the answer has to come back as a
-  script for the merge step to be able to use it: `VERDICT: BETTER` plus the complete script, or
-  `VERDICT: KEEP` when nothing in the script in front of it can be made more reliable.
+* The output contract no longer rides with the brief — it rides with the first thing that is
+  actually asked of the reviewer (the request after the acknowledgement, or the request itself
+  when the brief is folded in), because the answer has to come back as a script for the merge
+  step to be able to use it: `VERDICT: BETTER` plus the complete script, or `VERDICT: KEEP` when
+  nothing in the script in front of it can be made more reliable.
 * `SEED_BRIEF=off` keeps the brief but folds it into the first request instead of sending it on
   its own, which saves one call and loses the acknowledgement.
 
@@ -183,7 +188,7 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 | --- | --- | --- |
 | draft | Qwen | The turn you asked, plus a ceiling of `DRAFT_TOKENS`. The answer is unwrapped from a single ``` fence |
 | check | this service | Empty, `finish_reason=length`, `content_filter`, an unterminated fence. A cut-off draft is **refused**, not shipped |
-| seed | DeepSeek | `send.txt` and the output contract, alone, with the acknowledgement waited for. Runs on its own thread alongside the draft, so it adds no waiting. Ceiling `SEED_TOKENS`, because it is only an acknowledgement |
+| seed | DeepSeek | `send.txt`, alone, with the acknowledgement waited for. Runs on its own thread alongside the draft, so it adds no waiting, and the page puts its bubble up first. Ceiling `SEED_TOKENS`, because it is only an acknowledgement |
 | peer | DeepSeek | Round 1: your request, the target runtime, Qwen's draft (secrets masked) and what the check found — answered with a complete script of its own. Ceiling `PEER_TOKENS` |
 | merge | Qwen | The *same conversation the draft was written in*, plus the draft as its own assistant turn, plus the other version pasted in whole. Asked for the single best script and nothing else |
 | agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` (5, so at most 12 model calls in a turn) |
@@ -264,7 +269,8 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `DRAFT_TOKENS` / `REFINE_TOKENS` | `8192` / `16384` | ceilings on the two Qwen calls. A whole script is the point of both, and 4096 tokens is roughly 200 lines of Luau; an answer that reaches its ceiling is refused rather than shipped, so a ceiling that is too low shows up as a failed turn |
 | `MAX_TOKENS` | `4096` | ceiling on the `/v1` passthrough |
 | `PIPELINE` | `auto` | `on` / `off` / `auto` (on whenever a reviewer key is set) |
-| `TARGET_RUNTIME` | Roblox Luau | what the reviewer judges the script against |
+| `TARGET_RUNTIME` | a Roblox **executor** script, not a Studio one | what the reviewer judges the script against, named in the rubric |
+| `REVIEW_WARNING` | `WARNING! THIS IS NOT FOR ROBLOX STUDIO BUT FOR A ROBLOX EXECUTOR SCRIPT` | put in front of **every** message to the reviewer, so a long conversation cannot bury the fact that the target is an executor rather than Studio |
 | `REVIEW_EXTRA` | `{}` | JSON merged into the reviewer's request body |
 | `RATE_LIMIT` / `MAX_CONCURRENT` | `30` / `4` | per-IP requests per minute, and chains at once |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |

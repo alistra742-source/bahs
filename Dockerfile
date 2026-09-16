@@ -17,7 +17,10 @@
 # every turn.
 #
 # The brief handed to the reviewer before anything else is part of the image. It goes out on its
-# own first, and the request for a script only follows once the reviewer has answered it. There
+# own first -- that message is the brief and nothing else -- and the request for a script only
+# follows once the reviewer has answered it. Every message to the reviewer opens with the warning
+# that the target is a Roblox executor script and not Roblox Studio (REVIEW_WARNING), because
+# that is the one assumption that would make its advice wrong. There
 # are two briefs in the repo (send.txt and Send.txt, differing only in case); send.txt is the
 # newer and the one used, and Send.txt is the fallback. A missing one is not fatal -- the built-in
 # rubric still applies -- but which one was used is reported on /health so it is visible rather

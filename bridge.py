@@ -585,8 +585,21 @@ REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="48000"))
 # ceiling on it, so a stray huge file cannot become the whole prompt.
 REVIEW_BRIEF_MAX = int(env("REVIEW_BRIEF_MAX", default="60000"))
 # What the script is supposed to run in. Handed to the reviewer so its complaints are about
-# this runtime and not about a general-purpose script.
-TARGET_RUNTIME = env("TARGET_RUNTIME", default="Roblox Luau (a Roblox script, run in Studio or an executor)")
+# this runtime and not about a general-purpose script. It is an executor script, not a Studio
+# one: those are different runtimes, and advice that assumes the Studio editor (plugin APIs,
+# edit-mode behaviour, anything that only exists on the server) is advice about a different
+# script.
+TARGET_RUNTIME = env("TARGET_RUNTIME", default=(
+    "a Roblox executor script -- Luau run by a client-side executor, not a Roblox Studio place "
+    "script and not a script for the Studio editor"))
+
+# Every message to the reviewer opens with this, and it is not decoration: the reviewer assuming
+# the script is for Studio is the one thing that would make its answer wrong, and a conversation
+# buries a line said once at the start. So it is said again on every call, and it is the first
+# thing in the message rather than a footnote to it.
+REVIEW_WARNING = env(
+    "REVIEW_WARNING",
+    default="WARNING! THIS IS NOT FOR ROBLOX STUDIO BUT FOR A ROBLOX EXECUTOR SCRIPT")
 
 REVIEW_EXTRA: dict = {}
 try:
@@ -745,6 +758,10 @@ longer runs, server/client confusion, a yield where none can happen, a loop that
 an event connected twice, anything that throws on its first line.
 - Same language, same structure and the same entry points as the version in front of you, so the \
 two can be merged line for line. Never rename anything the request did not name.
+- Every message here opens with the warning that this is a Roblox executor script and not a
+  Roblox Studio one, and it is literally true: no Studio-only service, no plugin API, no editor
+  behaviour, and nothing that assumes the script runs on the server instead of on the client
+  that ran it.
 - Prefer the simplest thing that works over the cleverest thing that might.
 - No praise, no summary, no explanation of your changes. The script is the answer.
 - If the request was conversational rather than a request for a script, answer VERDICT: KEEP."""

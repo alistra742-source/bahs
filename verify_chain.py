@@ -289,6 +289,20 @@ def asked_in(call):
     return "\n".join(m.get("content") or "" for m in call["body"].get("messages") or [])
 
 
+def asked_last(call):
+    """The newest thing in one reviewer call: what the warning has to be on the front of.
+
+    On the API path the earlier turns are carried with it, and those carry a warning of their
+    own, so joining them all would pass even if the newest message had none.
+    """
+    if call["path"].endswith("/chat/completion"):
+        return call["body"].get("prompt") or ""
+    for message in reversed(call["body"].get("messages") or []):
+        if message.get("role") == "user":
+            return message.get("content") or ""
+    return ""
+
+
 print("\n-- the brief goes first, on its own, and the request only after it --")
 out, done, calls, seed_stream = turn()
 review = reviewer_calls(calls)
@@ -299,18 +313,26 @@ check("the draft and the brief are read together, then the negotiation",
       [sorted(phases[:2]), phases[2:]], [["draft", "seed"], ["peer", "merge", "agree"]])
 check("and the reviewer's own first message is the brief",
       review[0]["path"].endswith("/deepseek/chat/completions"), True)
-check("the brief is the whole of that first ask",
-      asked_in(review[0]).startswith(server.BRIEF[:60]), True)
+first = asked_in(review[0])
+check("the first message opens with the executor warning",
+      first.startswith(server.REVIEW_WARNING), True)
+check("and then carries send.txt whole, rather than a part of it",
+      [server.BRIEF in first, len(server.BRIEF) > 1000], [True, True])
+check("with nothing asked of it yet: no request, no contract",
+      [ask in first for ask in ("make me a walk script", PEER_ASK, VERIFY_ASK, "VERDICT")],
+      [False] * 4)
 check("and its answer is waited for: the seed is its own call",
       [p["provider"] for p in done["phases"] if p["phase"] == "seed"], ["deepseek"])
-check("the seed call does not carry the user's request",
-      "make me a walk script" in asked_in(review[0]), False)
 check("the request goes out after it, in the same conversation",
       "make me a walk script" in asked_in(review[1]), True)
 check("with the draft it is asking about", DRAFT_CODE in asked_in(review[1]), True)
 check("the reviewer's acknowledgement is streamed to the reader", seed_stream, SEED_ACK)
 check("what the reviewer is asked for is a script, not a list of complaints",
       "VERDICT: BETTER" in asked_in(review[1]), True)
+check("every message to the reviewer opens with the warning",
+      [asked_last(c).startswith(server.REVIEW_WARNING) for c in review], [True] * len(review))
+check("and the target is named as an executor, not as Studio",
+      ["Studio" in server.TARGET_RUNTIME, "executor" in server.TARGET_RUNTIME], [True, True])
 check("and the version it wrote is shown as its own channel", done.get("peer"), PEER_CODE)
 check("the writer merged the two in the chat it drafted in",
       [p["phase"] for p in done["phases"]].count("merge"), 1)
@@ -372,8 +394,9 @@ out, done, calls, _ = turn()
 check("no seed phase", [p["phase"] for p in done["phases"]], ["draft", "peer", "merge", "agree"])
 check("and one call fewer", len(done["phases"]), 4)
 check("the brief is still in front of the first request",
-      reviewer_calls(calls)[0] and asked_in(reviewer_calls(calls)[0]).startswith(
-          server.BRIEF[:60]), True)
+      server.BRIEF[:60] in asked_in(reviewer_calls(calls)[0]), True)
+check("and the warning is in front of the brief",
+      asked_in(reviewer_calls(calls)[0]).startswith(server.REVIEW_WARNING), True)
 check("and the contract rides with it",
       "VERDICT: BETTER" in asked_in(reviewer_calls(calls)[0]), True)
 reload_with()
@@ -395,10 +418,16 @@ check("and one session was opened for them",
       len([c for c in calls if c["path"].endswith("/chat_session/create")]), 1)
 check("the site's message id threads the second onto the first",
       [c["body"]["parent_message_id"] for c in web], [None, "msg-1", "msg-2"])
-check("the brief leads the first message",
-      web[0]["body"]["prompt"].startswith(server.BRIEF[:60]), True)
+check("the warning leads the first message, and then the whole brief",
+      [web[0]["body"]["prompt"].startswith(server.REVIEW_WARNING),
+       server.BRIEF in web[0]["body"]["prompt"]], [True, True])
 check("the brief is not resent with the request that follows it",
       server.BRIEF[:60] in web[1]["body"]["prompt"], False)
+check("and the contract rides with that request instead",
+      "VERDICT: BETTER" in web[1]["body"]["prompt"], True)
+check("the warning is on every message, not just the first",
+      [c["body"]["prompt"].startswith(server.REVIEW_WARNING) for c in web],
+      [True] * len(web))
 check("the request is in that second message", "make me a walk script" in web[1]["body"]["prompt"],
       True)
 check("each message asks for its own challenge",
@@ -563,6 +592,17 @@ started = client.post("/chat/stream", json={"messages": [{"role": "user",
 job = started.json()["job"]
 check("the page can poll", client.get(f"/chat/poll/{job}").status_code, 200)
 check("while the API result stays gated", client.get(f"/chat/result/{job}").status_code, 401)
+reload_with()
+
+print("\n-- the page shows the brief going out first --")
+reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
+page = client.get("/")
+check("the page renders", page.status_code, 200)
+html = page.text
+check("with every placeholder filled",
+      [token for token in ("__CHIPS__", "__MODEL__", "__REVIEWER__", "__REVIEW_ON__",
+                           "__SEED_ON__", "__GREETING__") if token in html], [])
+check("and the brief marked as going out on its own", 'data-seed="true"' in html, True)
 reload_with()
 
 print(f"\n{count[0]} checks, {len(failures)} failed")

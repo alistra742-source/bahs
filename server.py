@@ -745,21 +745,35 @@ class ReviewerChat:
         # continuation rather than a new branch of the same chat.
         self.web = REVIEWER.web.new_session() if REVIEWER.web is not None else None
 
-    def _turns_for(self, text: str) -> list:
-        if not self.turns and not self.contract_sent:
-            # No seeding turn was asked for, so the brief and the contract both ride in front of
-            # the first request: the reviewer still reads Send.txt, and still knows the shape it
-            # has to answer in, without the extra call that waiting for an acknowledgement costs.
-            head = f"{BRIEF}\n\n" if BRIEF else ""
-            text = f"{head}{RUBRIC}\n\n{text}"
-        self.turns.append({"role": "user", "content": text})
+    def _turns_for(self, text: str, contract: bool = True) -> list:
+        """One message to the reviewer: the warning, then the brief if it is the first one.
+
+        The brief leads the very first message and is never repeated, so what the reviewer reads
+        first is Send.txt. The answer contract rides with the first thing actually *asked* of it
+        instead -- which is the request after the acknowledgement when the brief is seeded, and
+        the request itself when it is not -- so the brief goes out alone.
+        """
+        parts = []
+        if REVIEW_WARNING:
+            # On every message, not just the first: the target runtime is the one thing the
+            # reviewer must not lose track of, and a long conversation is where it gets lost.
+            parts.append(REVIEW_WARNING)
+        if not self.turns and BRIEF:
+            parts.append(BRIEF)
+        if contract and not self.contract_sent:
+            self.contract_sent = True
+            parts.append(RUBRIC)
+        parts.append(text)
+        self.turns.append({"role": "user",
+                           "content": "\n\n".join(part for part in parts if part.strip())})
         # The API path sends the whole conversation; the site path sends only the new message,
         # because the session itself is holding the earlier ones.
         return [self.turns[-1]] if self.web is not None else list(self.turns)
 
-    def say(self, text: str, channel: str, phase: str, note: str, max_tokens: int) -> str:
-        answer, _ = run_phase(self.job, self._turns_for(text), REVIEW_TEMPERATURE, REVIEWER,
-                              max_tokens, channel, phase, note, self.web)
+    def say(self, text: str, channel: str, phase: str, note: str, max_tokens: int,
+            contract: bool = True) -> str:
+        answer, _ = run_phase(self.job, self._turns_for(text, contract), REVIEW_TEMPERATURE,
+                              REVIEWER, max_tokens, channel, phase, note, self.web)
         self.turns.append({"role": "assistant", "content": answer})
         self.last_answer = answer
         return answer
@@ -767,19 +781,22 @@ class ReviewerChat:
     def seed(self) -> bool:
         """Send the brief on its own, and wait for the answer to it, before anything is asked.
 
-        The brief alone means the reply is an acknowledgement rather than work: what comes back
-        here is thrown away on purpose. It is the *reading* of Send.txt that is wanted, and the
-        request that follows rides on it.
+        This message is Send.txt (and the warning) plus one line asking for an acknowledgement --
+        nothing else, and nothing about the user's request. The reply is an acknowledgement
+        rather than work, so what comes back here is thrown away on purpose: it is the *reading*
+        of Send.txt that is wanted, and the request that follows rides on it.
         """
         if not SEED_BRIEF:
             return False
-        head = f"{BRIEF}\n\n" if BRIEF else ""
         which = BRIEF_PATH.name if BRIEF else "the built-in rubric"
-        self.contract_sent = True
-        answer = self.say(f"{head}{RUBRIC}\n\n{SEED_NOTE}", "seed", "seed",
-                          f"{REVIEWER.model} reading {which}", SEED_TOKENS)
-        print(f"[job] {self.job.id} seed: {REVIEWER.model} read {which} ({len(BRIEF)} chars in, "
-              f"{len(answer)} back); the request goes out next", flush=True)
+        answer = self.say(SEED_NOTE, "seed", "seed", f"{REVIEWER.model} reading {which}",
+                          SEED_TOKENS, contract=False)
+        sent = self.turns[0]["content"] if self.turns else ""
+        whole = ("; the whole brief is in it" if BRIEF and BRIEF in sent
+                 else "; WARNING: the brief did not fit the message" if BRIEF else "")
+        print(f"[job] {self.job.id} seed: {which} went out first and on its own "
+              f"({len(sent)} chars sent, {len(answer)} back{whole}); the request goes next",
+              flush=True)
         return True
 
 
@@ -897,6 +914,12 @@ def run_job(job: Job) -> None:
 
         seeder = threading.Thread(target=seed_reviewer, daemon=True)
         if chat is not None:
+            # Announced before the draft's own call starts, because the brief really is read
+            # first: the page puts the brief's bubble up on this frame, so it lands above the
+            # draft rather than wherever the reader happened to attach.
+            job.finish(phase="seed",
+                       note=f"{REVIEWER.model} reading "
+                            f"{BRIEF_PATH.name if BRIEF else 'the brief'}")
             seeder.start()
 
         draft, _ = run_phase(job, job.messages, job.temperature, QWEN, DRAFT_TOKENS,
@@ -1303,6 +1326,9 @@ async def root():
             .replace("__REVIEWER__", html.escape(state["reviewer"]["model"] if state["reviewer"]
                                                  and state["reviewer"].get("model") else "reviewer"))
             .replace("__REVIEW_ON__", "true" if state["review"] else "false")
+            # The brief goes out on its own before anything is asked, so the page can put its
+            # bubble up first instead of waiting for it to appear after the draft's.
+            .replace("__SEED_ON__", "true" if state["reviewer"].get("seed") else "false")
             .replace("__GREETING__", html.escape(GREETING))
     )
 
