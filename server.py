@@ -241,10 +241,18 @@ class Job:
             self.cond.notify_all()
 
     def wait(self, timeout: float) -> None:
-        """Block until the job ends; the blocking endpoints are the only callers."""
-        deadline = time.time() + timeout
+        """Block until the job ends; the blocking endpoints are the only callers.
+
+        A `timeout` of 0 or less means wait however long the chain takes, which is the default:
+        the negotiation has rounds and each round has two model calls, so there is no honest
+        number of seconds to cut it off at. A caller that does want a ceiling passes one.
+        """
+        deadline = time.time() + timeout if timeout and timeout > 0 else 0.0
         with self.cond:
             while self.status not in ("done", "error"):
+                if not deadline:
+                    self.cond.wait()
+                    continue
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     raise HTTPException(504, f"timed out after {timeout:g}s waiting on the chain")
@@ -477,7 +485,7 @@ def stream_answer(messages: list, temperature: Optional[float], provider: Provid
         return
     body = provider.request(messages, temperature, max_tokens, stream=True)
     try:
-        with httpx.Client(timeout=httpx.Timeout(provider.timeout, connect=10.0),
+        with httpx.Client(timeout=client_timeout(provider.timeout),
                           follow_redirects=True) as c:
             with c.stream("POST", provider.endpoint(), json=body, headers=provider.headers()) as r:
                 if r.status_code >= 400:
@@ -525,9 +533,16 @@ def stream_answer(messages: list, temperature: Optional[float], provider: Provid
 
 
 def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
-    """Map an httpx failure onto a status the caller can act on."""
+    """Map an httpx failure onto a status the caller can act on.
+
+    With no per-call ceiling (the default) the only way to time out is connecting, so the
+    report says what actually happened rather than claiming a limit that is not in force.
+    """
     if isinstance(e, httpx.TimeoutException):
-        return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
+        if provider.timeout and provider.timeout > 0:
+            return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
+        return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
+                                  f"({e.__class__.__name__})")
     return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")
 
 
@@ -535,7 +550,7 @@ def call_once(messages: list, temperature: Optional[float], provider: Provider,
               max_tokens: int) -> str:
     """One non-streamed call, for the small internal jobs (the token checks)."""
     body = provider.request(messages, temperature, max_tokens, stream=False)
-    with httpx.Client(timeout=httpx.Timeout(provider.timeout, connect=10.0),
+    with httpx.Client(timeout=client_timeout(provider.timeout),
                       follow_redirects=True) as c:
         r = c.post(provider.endpoint(), json=body, headers=provider.headers())
     if r.status_code >= 400:
@@ -1035,7 +1050,9 @@ def chat_stream(req: ChatReq, request: Request):
     messages = clean_messages(req.messages)
     job = start_job(messages, req.temperature, req.review, request)
     return {"job": job.id, "model": QWEN_MODEL, "reviewer": REVIEWER.model if job.want_review else "",
-            "thinking": QWEN_THINKING, "turns": len(job.messages), "timeout": CHAT_TIMEOUT}
+            "thinking": QWEN_THINKING, "turns": len(job.messages),
+            # null rather than 0: there is no ceiling on this turn unless one is configured.
+            "timeout": CHAT_TIMEOUT or None}
 
 
 @app.post("/chat")
@@ -1135,16 +1152,18 @@ def job_result(job_id: str, _: None = Depends(require_key)):
 
 
 def job_wait() -> float:
-    """How long a blocking caller waits: a draft, then a seeded and negotiating review.
+    """How long a blocking caller waits: no limit by default, like every call in the chain.
 
-    The chain is longer than it was -- the brief is read first, and every round is a version
-    from the reviewer plus a merge from the writer -- so the window is counted in calls rather
-    than in the old fixed three.
+    `CHAT_TIMEOUT` is the per-call ceiling, and 0 (the default) means there isn't one -- so there
+    is nothing to multiply out into a total either, and a blocking caller waits for the whole
+    negotiation. Set `CHAT_TIMEOUT` to a number and the total becomes a draft plus two calls per
+    round plus the brief, with a little slack on top.
     """
+    if CHAT_TIMEOUT <= 0:
+        return 0.0
     if not review_enabled() or NEGOTIATE_ROUNDS <= 0:
         return CHAT_TIMEOUT + 30
-    rounds = max(1, min(NEGOTIATE_ROUNDS, 4))
-    return CHAT_TIMEOUT * (2 + 2 * rounds) + 30
+    return CHAT_TIMEOUT * (2 + 2 * NEGOTIATE_ROUNDS) + 30
 
 
 @app.post("/generate")
@@ -1161,7 +1180,7 @@ def generate(req: GenReq, _: None = Depends(require_key)):
 def start_stream(req: GenReq, _: None = Depends(require_key)):
     """The one-shot flow as a job, for callers that stream but keep no history."""
     job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.review)
-    return {"job": job.id, "model": QWEN_MODEL, "timeout": CHAT_TIMEOUT}
+    return {"job": job.id, "model": QWEN_MODEL, "timeout": CHAT_TIMEOUT or None}
 
 
 # --- the OpenAI-compatible surface -----------------------------------------------------
@@ -1175,7 +1194,7 @@ def relay_stream(body: dict):
     working exactly as it would against Qwen itself. No reviewer runs here: this surface is a
     passthrough, and a caller that wants the chain uses /chat.
     """
-    with httpx.Client(timeout=httpx.Timeout(CHAT_TIMEOUT, connect=10.0),
+    with httpx.Client(timeout=client_timeout(CHAT_TIMEOUT),
                       follow_redirects=True) as c:
         with c.stream("POST", QWEN.endpoint(), json=body, headers=QWEN.headers()) as r:
             if r.status_code >= 400:
@@ -1221,7 +1240,7 @@ def chat_completions(payload: dict = Body(...), _: None = Depends(require_key)):
         return StreamingResponse(relay_stream(body), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
     try:
-        with httpx.Client(timeout=httpx.Timeout(CHAT_TIMEOUT, connect=10.0),
+        with httpx.Client(timeout=client_timeout(CHAT_TIMEOUT),
                           follow_redirects=True) as c:
             r = c.post(QWEN.endpoint(), json=body, headers=QWEN.headers())
     except httpx.HTTPError as e:

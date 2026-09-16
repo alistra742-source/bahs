@@ -47,8 +47,12 @@ local function ask(question, onStep)
     local ok, result = pcall(function()
         local started = post("/chat/stream", {messages = messages})
         local job = started.job
-        local deadline = os.clock() + 900
-        while os.clock() < deadline do
+        -- Wall clock, not os.clock(): that one counts the CPU this script has used, which barely
+        -- moves while it waits, so it would never actually reach the deadline. The chain is a
+        -- draft plus up to two calls per negotiation round, and the server puts no ceiling on
+        -- any of them, so this is a courtesy so a person is not left staring at nothing.
+        local deadline = os.time() + 3600
+        while os.time() < deadline do
             local r = request({
                 Url = API_URL .. "/chat/result/" .. tostring(job),
                 Method = "GET",

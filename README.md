@@ -24,7 +24,7 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
 4. **Qwen merges the two** in the *same conversation the draft was written in*, keeping whatever
    is genuinely more reliable from each.
 5. **DeepSeek says whether it would ship the merge.** If it would not, it writes another version
-   and Qwen merges again — up to `NEGOTIATE_ROUNDS` rounds, and it stops the moment they agree.
+   and Qwen merges again — up to `NEGOTIATE_ROUNDS` rounds (5), and it stops the moment they agree.
    The script they settled on is what you get; the draft, the other version and the verdict stay
    under the answer (collapsed) and none of them is carried into your next question.
 
@@ -186,11 +186,18 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 | seed | DeepSeek | `send.txt` and the output contract, alone, with the acknowledgement waited for. Runs on its own thread alongside the draft, so it adds no waiting. Ceiling `SEED_TOKENS`, because it is only an acknowledgement |
 | peer | DeepSeek | Round 1: your request, the target runtime, Qwen's draft (secrets masked) and what the check found — answered with a complete script of its own. Ceiling `PEER_TOKENS` |
 | merge | Qwen | The *same conversation the draft was written in*, plus the draft as its own assistant turn, plus the other version pasted in whole. Asked for the single best script and nothing else |
-| agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` |
+| agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` (5, so at most 12 model calls in a turn) |
 | guard | this service | A merge that comes back empty or cut off is discarded, and the script it was editing is what stands |
 
 A few properties worth knowing:
 
+* **Nothing is cut off for being slow.** There is no ceiling on a model call by default — not on
+  the draft, not on a reviewer version, not on a merge — and a blocking caller (`/chat`,
+  `/generate`) waits for the whole negotiation rather than for a fixed number of seconds.
+  Connecting is still bounded to 10s, so an unreachable host fails in seconds instead of looking
+  like a model that is thinking. The one clock left is the page's: it treats *silence* on the
+  stream as a dead connection and reattaches, and the server beats every `HEARTBEAT` seconds, so
+  that never fires while the chain is working.
 * **Neither model is a verifier.** DeepSeek reading code cannot know it runs either, so what this
   chain buys you is a second complete attempt at the script plus a second opinion on the merge —
   not proof. The only machine evidence in play is the local structural check.
@@ -214,7 +221,7 @@ A few properties worth knowing:
 
 | Endpoint | What it is |
 | --- | --- |
-| `POST /chat/stream` | `{messages:[{role,content},...], review?: bool}` -> `{job, model, reviewer, turns}`. Starts the chain, returns at once |
+| `POST /chat/stream` | `{messages:[{role,content},...], review?: bool}` -> `{job, model, reviewer, turns, timeout}`. Starts the chain, returns at once. `timeout` is `null` unless you set a ceiling, because there is none |
 | `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`seed` / `draft` / `peer` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, peer, review, phases}` or `{error}` |
 | `POST /chat` | The same chain, blocking. `{text, draft, peer, review, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
@@ -248,7 +255,7 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` for the slower, stronger one; ignored by the web transport, whose model is whatever your account is set to |
 | `REVIEW_SHAPE` | `openai` | `web` for a bridge, `deepseek-web` for the site itself (chosen for you when `REVIEW_URL` is chat.deepseek.com) |
 | `REVIEW_THINKING` | `off` | anything else turns it back on for the reviewer only |
-| `NEGOTIATE_ROUNDS` | `2` | how many rounds of "DeepSeek writes a version, Qwen merges" may run. Round 1 is the competition; each round after it is DeepSeek agreeing with the merge or proposing another version. `0` ships the draft alone |
+| `NEGOTIATE_ROUNDS` | `5` | how many rounds of "DeepSeek writes a version, Qwen merges" may run, capped at `5`. Round 1 is the competition; each round after it is DeepSeek agreeing with the merge or proposing another version. `0` ships the draft alone. A round is two model calls, so 5 is up to 12 calls in a turn — lower it if you want turns to finish sooner |
 | `SEED_BRIEF` | `on` | send `send.txt` on its own and wait for the answer before the request. `off` folds it into the first request and saves a call |
 | `PEER_TOKENS` / `SEED_TOKENS` | `8192` / `512` | ceilings on the API path for DeepSeek writing a script, and for it acknowledging the brief |
 | `MERGE_PASTE_MAX` | `48000` | how much of the other version is pasted into a merge instruction |
@@ -261,7 +268,8 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `REVIEW_EXTRA` | `{}` | JSON merged into the reviewer's request body |
 | `RATE_LIMIT` / `MAX_CONCURRENT` | `30` / `4` | per-IP requests per minute, and chains at once |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |
-| `HEARTBEAT` / `JOB_TTL` / `CHAT_TIMEOUT` | `5` / `3600` / `300` | stream keepalive, how long a finished job stays readable, provider backstop |
+| `CHAT_TIMEOUT` / `REVIEW_TIMEOUT` | `0` / `0` | **no ceiling by default**: a model may take as long as it needs, because a long negotiation is not an error. `0` or less means no limit; set a number of seconds to put one back |
+| `HEARTBEAT` / `JOB_TTL` | `5` / `3600` | stream keepalive, and how long a finished job stays readable |
 
 ## The page needs no login
 
@@ -282,8 +290,10 @@ Paste your domain and key at the top. The key is `API_KEY` if you set one, other
 token itself — and remember that a Roblox script is not a private place, so `API_KEY` is the
 better option if other people can read the script.
 
-A chain is five model calls and up to two more per extra round, so allow for it: Roblox gives up
-on a single request well before that, which is exactly why the client polls.
+A chain is up to twelve model calls, so allow for it: Roblox gives up on a single request well
+before that, which is exactly why the client polls. Its own deadline is an hour of wall clock
+(`os.time()`, not `os.clock()` — see the comment there), and the server puts no ceiling on the
+chain itself.
 
 ## Troubleshooting
 
@@ -302,6 +312,8 @@ on a single request well before that, which is exactly why the client polls.
 | a version was thrown away | it came back empty or cut off; the log says so and the script it was editing is what stands |
 | the answer stops mid-sentence | the phone dropped the connection; the job is still running, and the page reattaches and replays it -- and after three drops it collects the answer with `GET /chat/poll/{job}` instead, one short request at a time |
 | `the stream ended early` | the read was cut before the turn finished, which the page now treats as a reattach rather than a failure. It should no longer be the thing you see; if it is, the log line `[job] <id> ...` for that turn says how far it got |
+| a turn takes minutes | up to 12 model calls, and none of them is cut off. `NEGOTIATE_ROUNDS=1` for one version and one merge, or `REVIEW_MODEL=deepseek-v4-pro` for a stronger but slower reviewer |
+| a turn never ends at all | the model itself is hanging, and nothing on this side will cut it off (that is the point). Set `REVIEW_TIMEOUT=300` and `CHAT_TIMEOUT=300` to bring a ceiling back |
 | `429 too many requests from ...` | `RATE_LIMIT` per IP, or `MAX_CONCURRENT` chains already running |
 
 ## Curl

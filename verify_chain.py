@@ -205,6 +205,12 @@ os.environ.update({
 for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS"):
     os.environ.pop(name, None)
 
+# How the test starts, so a section that sets a variable cannot leak it into the next one: every
+# reload begins from this, not from whatever the section before it happened to leave behind.
+BASE_ENV = {name: os.environ.get(name) for name in (
+    "QWEN_URL", "QWEN_TOKEN", "REVIEW_URL", "DEEPSEEK_TOKEN", "REVIEW_SHAPE", "API_KEY",
+    "SEED_BRIEF", "NEGOTIATE_ROUNDS", "CHAT_TIMEOUT", "TOKEN_CHECK_TTL")}
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
 import base64  # noqa: E402
@@ -246,9 +252,23 @@ def turn(question="make me a walk script"):
     return out, (done[0] if done else {}), CALLS[:], channels
 
 
+# `reload_with(REVIEW_URL=UNSET)` is how a section asks for a variable to be *absent*, which is
+# not the same as setting it to the value the test normally starts with.
+UNSET = object()
+
+
 def reload_with(**env):
     global server, client
-    os.environ.update(env)
+    for name, value in BASE_ENV.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    for name, value in env.items():
+        if value is UNSET:
+            os.environ.pop(name, None)
+        elif value is not None:
+            os.environ[name] = value
     # The config and the providers live in bridge, and server binds its names at import, so both
     # are reloaded -- otherwise a reloaded server would still hold the previous providers.
     importlib.reload(bridge)
@@ -317,10 +337,26 @@ print("\n-- a reviewer that never agrees is bounded by the rounds --")
 STUB["always_better"] = True
 out, done, calls, _ = turn()
 phases = [p["phase"] for p in done["phases"]]
-check("two rounds, so two merges", [sorted(phases[:2]), phases[2:]],
-      [["draft", "seed"], ["peer", "merge", "agree", "merge"]])
+# Round one is the reviewer writing its own version; every round after it is an agreement
+# question that came back with another version, and every one of them is followed by a merge.
+check("five rounds: a version and a merge each, then it stops anyway",
+      [sorted(phases[:2]), phases.count("peer"), phases.count("agree"), phases.count("merge")],
+      [["draft", "seed"], 1, 4, 5])
+check("the draft is not counted as a round",
+      [p["phase"] for p in done["phases"]].count("draft"), 1)
 check("and the last merged script is what ships", done.get("text"), MERGED_CODE)
+check("the turn still ends", done.get("status"), "done")
+check("no more calls than the rounds allow", len(done["phases"]), 12)
 STUB["always_better"] = False
+
+print("\n-- five is the ceiling, however the variable is set --")
+reload_with(NEGOTIATE_ROUNDS="50")
+check("a value past the ceiling is clamped", server.NEGOTIATE_ROUNDS, server.MAX_NEGOTIATE_ROUNDS)
+reload_with(NEGOTIATE_ROUNDS="-3")
+check("and a negative one means none", server.NEGOTIATE_ROUNDS, 0)
+reload_with()
+check("the default is five", server.NEGOTIATE_ROUNDS, 5)
+check("and the ceiling is five as well", server.MAX_NEGOTIATE_ROUNDS, 5)
 
 print("\n-- the competition can be switched off --")
 reload_with(NEGOTIATE_ROUNDS="0")
@@ -328,7 +364,7 @@ out, done, calls, _ = turn()
 check("only the draft runs", [p["phase"] for p in done["phases"]], ["draft"])
 check("and it is the answer", done.get("text"), DRAFT_CODE)
 check("no reviewer call at all", len(reviewer_calls(calls)), 0)
-reload_with(NEGOTIATE_ROUNDS="2")
+reload_with()
 
 print("\n-- SEED_BRIEF=off keeps the brief, and drops only the extra call --")
 reload_with(SEED_BRIEF="off")
@@ -340,7 +376,6 @@ check("the brief is still in front of the first request",
           server.BRIEF[:60]), True)
 check("and the contract rides with it",
       "VERDICT: BETTER" in asked_in(reviewer_calls(calls)[0]), True)
-os.environ.pop("SEED_BRIEF", None)
 reload_with()
 
 print("\n-- the brief is send.txt --")
@@ -395,7 +430,7 @@ check("every message carries the proof of work",
 health = client.get("/health").json()
 check("the chip says the token works", health["reviewer"]["detail"], "token accepted")
 check("and names the shape", health["reviewer"]["shape"], "deepseek-web")
-check("and how many rounds it may run", health["reviewer"]["rounds"], 2)
+check("and how many rounds it may run", health["reviewer"]["rounds"], 5)
 
 print("\n-- a challenge with no answer below its difficulty sends no header --")
 STUB["bad_challenge"] = True
@@ -449,9 +484,7 @@ check("the reviewer is on", server.review_enabled(), True)
 check("and labelled as the site", server.REVIEWER.web.label, "chat.deepseek.com")
 
 print("\n-- a session token with no endpoint chosen goes to the site, not the API --")
-os.environ.pop("REVIEW_URL", None)
-os.environ.pop("REVIEW_SHAPE", None)
-reload_with(DEEPSEEK_TOKEN="user-token-xyz")
+reload_with(DEEPSEEK_TOKEN="user-token-xyz", REVIEW_URL=UNSET, REVIEW_SHAPE=UNSET)
 check("the endpoint follows the credential", server.REVIEW_URL, "https://chat.deepseek.com")
 check("and it was not asked for", server.REVIEW_URL_AUTO, True)
 check("so the shape is the site's", server.REVIEW_SHAPE, "deepseek-web")
@@ -488,6 +521,21 @@ check("and says which credential it is", "session token, not an API key" in revi
 check("the api's own words are kept", "Authentication Fails" in review, True)
 STUB["api_code"] = 0
 
+print("\n-- nothing cuts a call off --")
+check("the draft has no ceiling", server.CHAT_TIMEOUT, 0)
+check("and neither does the reviewer", server.REVIEW_TIMEOUT, 0)
+check("unless one is asked for", bridge.client_timeout(300).read, 300)
+check("no ceiling means no ceiling on the answer", bridge.client_timeout(0).read, None)
+check("a negative one means the same", bridge.client_timeout(-1).read, None)
+check("connecting is still bounded, so a dead host is not a slow model",
+      bridge.client_timeout(0).connect, 10.0)
+check("a blocking caller waits for the whole negotiation", server.job_wait(), 0.0)
+reload_with(CHAT_TIMEOUT="60")
+check("and with a ceiling set it multiplies out over the rounds", server.job_wait(),
+      60 * (2 + 2 * 5) + 30)
+reload_with()
+check("so the default is back to no ceiling", (server.CHAT_TIMEOUT, server.job_wait()), (0, 0.0))
+
 print("\n-- a page whose stream keeps being cut collects the answer by polling --")
 reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
 started = client.post("/chat/stream", json={"messages": [{"role": "user",
@@ -504,6 +552,7 @@ check("with the draft, the other version and the review as well",
       [bool(polled.get("draft")), bool(polled.get("peer")), bool(polled.get("review"))],
       [True, True, True])
 check("and the record of what each phase cost", len(polled.get("phases") or []), 5)
+check("the poll reports no ceiling on the turn", "timeout" in polled, False)
 check("an unknown job is a 404, so the page can stop",
       client.get("/chat/poll/nope").status_code, 404)
 
@@ -514,7 +563,7 @@ started = client.post("/chat/stream", json={"messages": [{"role": "user",
 job = started.json()["job"]
 check("the page can poll", client.get(f"/chat/poll/{job}").status_code, 200)
 check("while the API result stays gated", client.get(f"/chat/result/{job}").status_code, 401)
-os.environ.pop("API_KEY", None)
+reload_with()
 
 print(f"\n{count[0]} checks, {len(failures)} failed")
 if failures:

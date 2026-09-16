@@ -57,6 +57,18 @@ import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 # --------------------------------------------------------------------------------------
 
 
+def client_timeout(seconds: float) -> httpx.Timeout:
+    """How long a call may take: as long as the model needs, by default.
+
+    `seconds` of 0 or less means no limit on the answer. Connecting is always bounded, so a host
+    that cannot be reached still fails in seconds rather than sitting there looking like a model
+    that is thinking.
+    """
+    if seconds and seconds > 0:
+        return httpx.Timeout(seconds, connect=10.0)
+    return httpx.Timeout(None, connect=10.0)
+
+
 def env(*names: str, default: str = "") -> str:
     """The first of these variables that is set, so an old name keeps working."""
     for name in names:
@@ -169,7 +181,11 @@ QWEN_MODEL = env("QWEN_MODEL", default="qwen3.8-max")
 # tokens are billed against max_tokens and the answer is what is wanted, not the thinking.
 QWEN_THINKING = env("QWEN_THINKING", default="fast")
 # Qwen answers in seconds; this is a backstop for a provider that hangs.
-CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="300"))
+# No ceiling on a generation, by default: a long negotiation is not an error, so nothing here
+# cuts a model off for taking its time. 0 (or less) means no limit at all -- connecting is still
+# bounded to 10s, so an unreachable host fails in seconds instead of looking like a slow model.
+# Set a number to put a ceiling back.
+CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="0"))
 
 QWEN = Provider(
     "qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
@@ -314,8 +330,7 @@ class DeepSeekWeb:
         return headers
 
     def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=httpx.Timeout(self.timeout, connect=10.0),
-                            follow_redirects=True)
+        return httpx.Client(timeout=client_timeout(self.timeout), follow_redirects=True)
 
     def _call(self, method: str, path: str, payload: Optional[dict] = None):
         try:
@@ -550,13 +565,18 @@ REVIEW_TEMPERATURE = float(env("REVIEW_TEMPERATURE", default="0.2"))
 # The reviewer writes a whole script of its own now rather than a list, so its call gets the room
 # a script needs on the API path (the site path takes no ceiling at all).
 PEER_TOKENS = int(env("PEER_TOKENS", "REVIEW_MAX_TOKENS", default="8192"))
+# The ceiling on NEGOTIATE_ROUNDS. Five rounds is five versions and five merges on top of the
+# draft; more than that is a turn nobody would sit through.
+MAX_NEGOTIATE_ROUNDS = 5
 # Reading the brief is one short acknowledgement, so it is capped separately: a brief that invites
 # an essay must not spend the turn on the acknowledgement.
 SEED_TOKENS = int(env("SEED_TOKENS", default="512"))  # the acknowledgement only
 # How many times the two models go back and forth over the same script. Every round is one
 # version from the reviewer and one merge from the writer, and the rounds after the first are the
 # reviewer agreeing with the merged script or proposing another one. 0 ships the draft alone.
-NEGOTIATE_ROUNDS = int(env("NEGOTIATE_ROUNDS", default="2"))
+# A round costs two model calls, so five is the most that is worth waiting for; the value is
+# clamped rather than trusted, because a typo here is a turn that never ends.
+NEGOTIATE_ROUNDS = max(0, min(int(env("NEGOTIATE_ROUNDS", default="5")), MAX_NEGOTIATE_ROUNDS))
 # Whether the brief goes out on its own first, with the request only after the answer to it.
 SEED_BRIEF = env("SEED_BRIEF", default="on").lower() not in ("off", "0", "false", "no")
 # The script sent for review is bounded too: a 1M-token context is not a reason to use it.
@@ -589,7 +609,9 @@ def reviewer_dialect() -> dict:
     return {"thinking": {"type": "enabled" if thinking_on else "disabled"}}
 
 
-REVIEW_TIMEOUT = float(env("REVIEW_TIMEOUT", default="180"))
+# The reviewer gets the same treatment: no limit, because the site's own generation is the
+# slowest thing in the chain and cutting it off mid-script is worse than waiting for it.
+REVIEW_TIMEOUT = float(env("REVIEW_TIMEOUT", default="0"))
 
 REVIEWER = Provider(
     "deepseek", REVIEW_URL, REVIEW_KEY, REVIEW_MODEL, reviewer_dialect(),
