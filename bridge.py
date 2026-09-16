@@ -11,7 +11,7 @@ import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid
 import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 
 # --------------------------------------------------------------------------------------
-# What this service is: two models, competing over one script, behind one API.
+# What this service is: one writer and two readers, competing over one script, behind one API.
 #
 #   you -- ask --> bahs -- brief, on its own -->         DeepSeek  (V4 Flash, thinking off)
 #                      \
@@ -22,10 +22,17 @@ import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 #                                  `- merge, same chat as the draft --> Qwen
 #                                       \
 #                                        `- agree? no -> another version (NEGOTIATE_ROUNDS)
+#                                             \
+#                                              `- send2.txt, on its own --> GLM-5.3 Flash
+#                                                   \
+#                                                    `- the same protocol over the script
+#                                                       the first two settled on (SECOND_ROUNDS)
 #
-# Neither model is asked what is wrong. Each is asked for the script it would ship, and the
-# writer merges the two in the chat it wrote the draft in; the reviewer is then asked whether
-# it would ship the merge, and the turn ends when it says yes or the rounds run out.
+# No model is asked what is wrong. Each is asked for the script it would ship, the writer merges
+# the two in the chat it wrote the draft in, and each reader is then asked whether it would ship
+# the merge; the turn ends when they say yes or the rounds run out. The second reader (GLM, and
+# its own brief) is configured in peers.py, which is where the other half of this file's job for
+# it lives.
 #
 # chat.qwen.ai has no public API. github.com/encryptarun/qwen-api turns it into
 # OpenAI-compatible endpoints using the Qwen *access token* from the browser
@@ -52,9 +59,10 @@ import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 # "which choice do you prefer?" are internal turns -- they are never part of what the user's
 # next question carries.
 #
-# Nothing is pulled, loaded or warmed: no weights, no GPU, no volume, no database. The one
-# file this service reads is Send.txt, the brief handed to the reviewer before anything
-# else (REVIEW_BRIEF).
+# Nothing is pulled, loaded or warmed: no weights, no GPU, no volume, no database. The only
+# files this service reads are the briefs: Send.txt/send.txt, handed to the first reader before
+# anything else (REVIEW_BRIEF), and send2.txt for the second reader, which falls back to the
+# first reader's brief when it is not in the image (see peers.py).
 # --------------------------------------------------------------------------------------
 
 
@@ -79,7 +87,7 @@ def env(*names: str, default: str = "") -> str:
     return default
 
 
-# --- the two providers ------------------------------------------------------------------
+# --- the providers ----------------------------------------------------------------------
 
 class Provider:
     """One OpenAI-compatible endpoint, plus whatever it calls "answer without thinking".
@@ -574,9 +582,10 @@ MAX_NEGOTIATE_ROUNDS = 5
 # Reading the brief is one short acknowledgement, so it is capped separately: a brief that invites
 # an essay must not spend the turn on the acknowledgement.
 SEED_TOKENS = int(env("SEED_TOKENS", default="512"))  # the acknowledgement only
-# How many times the two models go back and forth over the same script. Every round is one
-# version from the reviewer and one merge from the writer, and the rounds after the first are the
-# reviewer agreeing with the merged script or proposing another one. 0 ships the draft alone.
+# How many times the first reader and the writer go back and forth over the same script. Every
+# round is one version from that reader and one merge from the writer, and the rounds after the
+# first are the reader agreeing with the merged script or proposing another one. 0 ships the
+# draft alone. The second reader has its own ceiling, in peers.py (SECOND_ROUNDS).
 # A round costs two model calls, so five is the most that is worth waiting for; the value is
 # clamped rather than trusted, because a typo here is a turn that never ends.
 NEGOTIATE_ROUNDS = max(0, min(int(env("NEGOTIATE_ROUNDS", default="5")), MAX_NEGOTIATE_ROUNDS))
@@ -742,9 +751,10 @@ BRIEF = load_brief()
 # Sent with the brief (or on its own when there is no brief), before anything is asked of the
 # reviewer. The contract is a script, not a list of complaints: the reviewer's answer is put in
 # front of the writer to be merged with theirs, and prose cannot be merged.
-RUBRIC = f"""You are one of two models working on the same script. The other model writes a \
-version; you write the version you would ship. You are not a commenter -- you are the other \
-author, and everything you write is put in front of the writer to be merged with theirs.
+RUBRIC = f"""You are one of the models working on the same script, and another model wrote the \
+version in front of you. You write the version you would ship. You are not a commenter -- you \
+are one of the authors, and everything you write is put in front of the writer to be merged \
+with what it has.
 
 Judge everything by one question: will it actually run in {TARGET_RUNTIME}? Ignore style, \
 naming, formatting and taste.
@@ -1023,5 +1033,88 @@ def message_text(body: str) -> str:
         return ""
     message = choices[0].get("message") or {}
     return message.get("content") or ""
+
+
+# --- the call itself, and its stream -----------------------------------------------------
+#
+# One request per call, and the answer read back piece by piece. This lives here rather than in
+# server.py because it is the same thing for every provider: the chain decides *what* to ask and
+# *when*, and neither side of that cares how the bytes arrive.
+
+def stream_answer(messages: list, temperature: Optional[float], provider: Provider,
+                  max_tokens: int, box: Optional[dict] = None,
+                  web_session: Optional[object] = None):
+    """Stream an answer, piece by piece, out of a provider's /chat/completions.
+
+    `box` gets the finish reason and any token usage, which is how a truncated answer is caught
+    instead of being shipped. `web_session` is the chat on chat.deepseek.com this message belongs
+    to when the caller holds one open; without it, a site call is a chat of its own.
+    """
+    if provider.web is not None:
+        # chat.deepseek.com: the site's own endpoint and its own streamed frames -- either the
+        # first message of a review or the next one in the chat the brief opened.
+        yield from provider.web.stream(as_prompt(messages), box, web_session)
+        return
+    body = provider.request(messages, temperature, max_tokens, stream=True)
+    try:
+        with httpx.Client(timeout=client_timeout(provider.timeout),
+                          follow_redirects=True) as c:
+            with c.stream("POST", provider.endpoint(), json=body, headers=provider.headers()) as r:
+                if r.status_code >= 400:
+                    detail = r.read().decode("utf-8", "replace")
+                    raise HTTPException(502, failure_reason(r.status_code, detail, provider))
+                if "event-stream" not in r.headers.get("content-type", ""):
+                    # Not a stream: either the endpoint rejected the request with a 200, or it
+                    # ignored stream=true and answered in one piece. Reading the body tells us
+                    # which; reporting an empty answer would hide the reason.
+                    raw = r.read().decode("utf-8", "replace")
+                    text = message_text(raw)
+                    if not text:
+                        raise HTTPException(502, failure_reason(200, raw, provider))
+                    print(f"[{provider.name}] answered in one piece instead of streaming", flush=True)
+                    if box is not None:
+                        box["finish"] = box.get("finish") or "stop"
+                    yield text
+                    return
+                for line in r.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        return
+                    if not data:
+                        continue
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        continue
+                    if box is not None and isinstance(chunk, dict) and chunk.get("usage"):
+                        box["usage"] = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0] or {}
+                    if box is not None and choice.get("finish_reason"):
+                        box["finish"] = choice["finish_reason"]
+                    # reasoning_content is deliberately skipped: the answer is what is wanted.
+                    piece = (choice.get("delta") or {}).get("content") or ""
+                    if piece:
+                        yield piece
+    except httpx.HTTPError as e:
+        raise upstream_error(e, provider)
+
+
+def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
+    """Map an httpx failure onto a status the caller can act on.
+
+    With no per-call ceiling (the default) the only way to time out is connecting, so the
+    report says what actually happened rather than claiming a limit that is not in force.
+    """
+    if isinstance(e, httpx.TimeoutException):
+        if provider.timeout and provider.timeout > 0:
+            return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
+        return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
+                                  f"({e.__class__.__name__})")
+    return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")
 
 

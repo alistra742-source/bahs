@@ -1,6 +1,6 @@
 # bahs
 
-Two models competing over one script, behind one API, with a chat page on top.
+One writer and two readers competing over one script, behind one API, with a chat page on top.
 
 ```
 you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking off, search off)
@@ -14,6 +14,14 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
                   +-- merge the two, same chat ---> Qwen
                   |
                   +-- "would you ship it?" -------> DeepSeek: AGREE, or another version
+                  |
+                  +-- send2.txt, on its own ------> GLM-5.3 Flash (deep think, max)
+                  |                                    |
+                  +-- "write your version" -------> GLM, in the brief's chat
+                  |
+                  +-- merge the two, same chat ---> Qwen
+                  |
+                  +-- "would you ship it?" -------> GLM: AGREE, or another version
                   |
                   +-- "which do you prefer?" ------> answered here: the longest script
 ```
@@ -32,7 +40,14 @@ you -- ask --> bahs -- send.txt, on its own ----> DeepSeek V4 Flash (thinking of
    and Qwen merges again — up to `NEGOTIATE_ROUNDS` rounds (5), and it stops the moment they agree.
    The script they settled on is what you get; the draft, the other version and the verdict stay
    under the answer (collapsed) and none of them is carried into your next question.
-6. **If Qwen offers two scripts and asks which one you prefer, that question is answered for
+6. **GLM then reads `send2.txt` the same way** (alone, on its own thread, before it is asked
+   anything) and repeats the whole protocol over the script the first two settled on: its own
+   complete version, Qwen merging that into the script in the draft's chat, and then one more
+   question — would it ship the merge? Up to `SECOND_ROUNDS` (2) of its own rounds.
+7. **Two readers, two chances to disagree**, and what ships is the script they both signed off
+   on. Neither is a verifier — reading code cannot prove it runs — so what this buys you is two
+   complete attempts at the script plus two opinions on the merge, not proof.
+8. **If Qwen offers two scripts and asks which one you prefer, that question is answered for
    you** — the option with the most lines — in the same chat, and its answer is what ships. A
    turn never ends on "Which choice do you prefer?"
 
@@ -52,10 +67,30 @@ conversation lives in the browser and is sent back with every turn.
 | --- | --- |
 | `QWEN_TOKEN` | Qwen access token: chat.qwen.ai -> F12 -> Console -> `localStorage.token` |
 | `DEEPSEEK_TOKEN` | either the `userToken` from chat.deepseek.com or an API key (`sk-...`) from [platform.deepseek.com](https://platform.deepseek.com) -- the endpoint follows the credential, see below |
+| `ZAI_TOKEN` | an API key from [z.ai](https://z.ai) (Z.AI Open Platform -> API Keys, shaped `id.secret`) for the second reader, GLM-5.3 Flash. **A chat.z.ai session token will not work** — see below |
 | `API_KEY` | *optional* — if you set it, the API (`/v1`, `/chat`, `/generate`) requires it. Left unset, the Qwen token is the key. The page never needs one |
 
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
-reviewer key set, model served · model qwen3.8-max · mode thinking · Hy kanha`.
+reviewer key set, model served · glm key set, model served · model qwen3.8-max · mode thinking ·
+Hy kanha`.
+
+### The second reader (`chat.z.ai` / GLM-5.3 Flash)
+
+`ZAI_TOKEN` has to be a **platform API key**, and that is not a preference: `chat.z.ai`'s own
+chat endpoint now demands a captcha parameter and a signed `X-Signature` header produced by the
+site's own bundle, so a session token from that site cannot be driven by a server at all. The
+key goes to Z.AI's OpenAI-shaped platform API (`https://api.z.ai/api/paas/v4`), under whichever
+name you put it in the variables:
+
+| What goes in `ZAI_TOKEN` | What happens |
+| --- | --- |
+| an API key (`id.secret`) from z.ai | the reader runs, with deep think at its strongest setting |
+| a chat.z.ai session token (a JWT) | refused, with the reason and the fix in the chip and in the turn's note |
+
+It is a third account, so it is a third thing that can run out of credits or be revoked. The
+chip on the page (`glm`) reports the model the key can actually see, and says `not served -- try
+<name>` when `ZAI_MODEL` is a name the platform has retired. A reader that is unreachable never
+costs you the script: the rounds of the reader before it still ship.
 
 ### `chat.deepseek.com` with a `userToken`
 
@@ -153,6 +188,12 @@ apply here.
   and **search is set to false there and cannot be set true anywhere**. Thinking is off unless
   you explicitly set `REVIEW_THINKING=on`. No `tools`, `web_search_options` or search parameter
   is ever attached to a review.
+* The second reader is the other way round: GLM is sent `thinking: {"type": "enabled"}` with
+  `reasoning_effort: "max"` (`ZAI_THINKING`, one of `max` / `high` / `low`, or `off`) — deep
+  think at the top of its ladder, which is what GLM-5.3 Flash has (it cannot be told *not* to
+  think, only how hard). It is built in one place too (`zai_dialect()`), no `tools` are ever
+  attached to it, so it cannot search, and its thinking is dropped from the answer exactly like
+  the writer's.
 * The `/v1/chat/completions` passthrough is the one place a caller can pass its own
   `web_search_options` / `tools` through — that endpoint is a passthrough to Qwen and does not
   run the chain, so it cannot affect a review.
@@ -191,6 +232,22 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 * `SEED_BRIEF=off` keeps the brief but folds it into the first request instead of sending it on
   its own, which saves one call and loses the acknowledgement.
 
+### The second reader's brief (`send2.txt`)
+
+GLM gets the same treatment, from its own file: `send2.txt` is read once at boot and sent **on
+its own** (with the warning, and one line asking for an acknowledgement) before anything is
+asked of it, on its own thread alongside the draft and the first reader's brief, so it costs no
+turn time either. Its request for a script only goes out after that answer lands, in the same
+chat.
+
+* Name it `send2.txt` or `Send2.txt`; `ZAI_BRIEF=/app/Send2.txt` forces a path.
+* **If it is not there, the first reader's brief is sent instead** (the same standing
+  instructions are worth more than none), and `/health` says which one went out:
+  `second.brief` reads `send.txt (send2.txt is not in the image)`. Add the file and redeploy to
+  give GLM its own.
+* `Dockerfile` copies `send*.txt`, so adding `send2.txt` **does not** need a Dockerfile change —
+  the glob matches one file or two and the build never depends on which.
+
 ## The flow in detail
 
 | Step | Who | What happens |
@@ -198,9 +255,13 @@ filesystem (macOS, Windows) can only hold one of them, and whichever lands secon
 | draft | Qwen | The turn you asked, plus a ceiling of `DRAFT_TOKENS`. The answer is unwrapped from a single ``` fence |
 | check | this service | Empty, `finish_reason=length`, `content_filter`, an unterminated fence. A cut-off draft is **refused**, not shipped |
 | seed | DeepSeek | `send.txt`, alone, with the acknowledgement waited for. Runs on its own thread alongside the draft, so it adds no waiting, and the page puts its bubble up first. Ceiling `SEED_TOKENS`, because it is only an acknowledgement |
+| seed2 | GLM | `send2.txt` (or the first brief as a fallback), alone, the same way and on its own thread — so `send2.txt` really is the first thing this reader is ever sent. Ceiling `ZAI_SEED_TOKENS` |
 | peer | DeepSeek | Round 1: your request, the target runtime, Qwen's draft (secrets masked) and what the check found — answered with a complete script of its own. Ceiling `PEER_TOKENS` |
 | merge | Qwen | The *same conversation the draft was written in*, plus the draft as its own assistant turn, plus the other version pasted in whole. Asked for the single best script and nothing else |
 | agree | DeepSeek | Rounds 2+: the merged script, in the same chat. `VERDICT: AGREE` ends it; another `VERDICT: BETTER` starts another merge, up to `NEGOTIATE_ROUNDS` (5, so at most 12 model calls in a turn) |
+| peer2 | GLM | Round 1 of the second reader: the script the first two settled on, plus the same request, the target runtime and the checks — answered with a complete script of its own. Ceiling `SECOND_TOKENS` |
+| merge2 | Qwen | The same merge over GLM's version, in the same chat as the draft. The merges are numbered in the log (`merging deepseek-v4-flash's version`, `merging glm-5.3-flash's version`) |
+| agree2 | GLM | Rounds 2+: would it ship the merge? `VERDICT: AGREE` ends the second reader's rounds; another `VERDICT: BETTER` starts one more merge, up to `SECOND_ROUNDS` (2, so 3 further model calls) |
 | guard | this service | A merge that comes back empty or cut off is discarded, and the script it was editing is what stands |
 | choose | this service → Qwen | Only when the script that stands ends by offering two scripts and asking which is preferred: the question is answered with the option that has the **most lines**, in the same chat as the draft, and its reply is what ships. Up to `CHOICE_ROUNDS` (2). If the model will not decide, that longest option is shipped as it stands |
 
@@ -237,15 +298,15 @@ A few properties worth knowing:
 | Endpoint | What it is |
 | --- | --- |
 | `POST /chat/stream` | `{messages:[{role,content},...], review?: bool}` -> `{job, model, reviewer, turns, timeout}`. Starts the chain, returns at once. `timeout` is `null` unless you set a ceiling, because there is none |
-| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`seed` / `draft` / `peer` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, peer, review, phases}` or `{error}` |
-| `POST /chat` | The same chain, blocking. `{text, draft, peer, review, phases}` |
+| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`seed` / `seed2` / `draft` / `peer` / `peer2` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, peer, peer2, review, second_review, phases}` or `{error}` |
+| `POST /chat` | The same chain, blocking. `{text, draft, peer, peer2, review, second_review, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
 | `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
 | `POST /generate` | Blocking, one prompt, no history |
 | `POST /generate/stream` | The same as `/chat/stream`, one prompt, no history |
 | `POST /v1/chat/completions` | OpenAI-compatible passthrough to Qwen. The newest user turn gets the greeting and the model is pinned; `tools`, `web_search_options`, `reasoning_effort`, `stream` pass through. No chain |
 | `GET /v1/models` | Both models, then whatever else the proxy serves |
-| `GET /health` | bridge, token, reviewer (key, model, shape, brief size, last failure), limits, last error |
+| `GET /health` | bridge, token, reviewer (key, model, shape, brief size, last failure), second (key, model, thinking, brief, rounds, last failure), limits, last error |
 | `GET /` | the chat page |
 
 An OpenAI client needs two lines changed:
@@ -266,6 +327,16 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `REVIEW_URL` | follows `DEEPSEEK_TOKEN` | a `userToken` goes to `https://chat.deepseek.com`, an `sk-...` key to `https://api.deepseek.com`; set it by hand for any OpenAI-shaped endpoint / bridge and it is used as given |
 | `DEEPSEEK_TOKEN` | — | the reviewer's credential: a `userToken` or a platform API key |
 | `DEEPSEEK_COOKIE` | — | a `cf_clearance` cookie, if the site ever asks for one |
+| `ZAI_URL` | `https://api.z.ai/api/paas/v4` | Z.AI's OpenAI-shaped platform API. Set it by hand for any other OpenAI-shaped endpoint and it is used as given |
+| `ZAI_TOKEN` | — | the second reader's credential: an API key from [z.ai](https://z.ai). A chat.z.ai session token is refused, with the reason in the chip |
+| `ZAI_MODEL` | `glm-5.3-flash` | the second reader's model. `/health` lists what the key can actually see, and suggests the nearest name when this one is not served |
+| `ZAI_THINKING` | `max` | deep think at the top of its ladder: `max` / `high` / `low`, or `off` for a model that allows it. Sent together with `reasoning_effort` |
+| `SECOND_ROUNDS` | `2` | GLM's own rounds, capped at `5`: one version of its own, then one chance to agree with what came back. `0` (or `PIPELINE=off`) leaves the chain at two models |
+| `SECOND_SEED` | `on` | send `send2.txt` on its own and wait for the answer before the request. `off` folds it in and saves a call |
+| `SECOND_TOKENS` / `ZAI_SEED_TOKENS` | `16384` / `512` | ceilings for GLM writing a script, and for it acknowledging its brief |
+| `SECOND_TEMPERATURE` | `0.3` | GLM's sampling temperature (z.ai's range is 0-1) |
+| `SECOND_BRIEF` / `ZAI_BRIEF` / `SECOND_BRIEF_MAX` | `send2.txt`, then `Send2.txt`, then the first brief / `60000` | the second reader's brief, and the ceiling on it |
+| `ZAI_TIMEOUT` | `0` | no ceiling on a GLM call, like the rest of the chain |
 | `POW_WASM` | `sha3_wasm_bg.wasm` beside the code | where the proof-of-work module is read from |
 | `POW_MAX_TRIES` | `5000000` | the largest `difficulty` this service will solve; past it the message goes out headerless instead of stalling |
 | `REVIEW_MODEL` | `deepseek-v4-flash` | `deepseek-v4-pro` for the slower, stronger one; ignored by the web transport, whose model is whatever your account is set to |
@@ -320,6 +391,10 @@ chain itself.
 | `deepseek rejected the token`, `your api key ... is invalid` | a chat `userToken` was sent to the API because `REVIEW_URL` was set by hand — clear it, or set it to `https://chat.deepseek.com` |
 | `deepseek rejected the key` | an API key that is wrong or revoked; make a new one at [platform.deepseek.com](https://platform.deepseek.com) |
 | `deepseek is rate limiting` | free-tier quota; wait, or `REVIEW_MODEL=deepseek-v4-pro` |
+| `zai rejected ZAI_TOKEN`, `glm` chip red | the credential is a chat.z.ai session token, or a revoked key. Put an API key from [z.ai](https://z.ai) in `ZAI_TOKEN`: that site's own chat endpoint wants a captcha and a signed request, so it cannot be bridged |
+| `glm-5.3-flash is not served -- try ...` | the platform does not have that model id under this key. Set `ZAI_MODEL` to the name the chip offers |
+| the second reader never runs | no `ZAI_TOKEN`, `SECOND_ROUNDS=0`, or `PIPELINE=off`. Boot says which — `[second] no ZAI_TOKEN set; the chain runs with one reader` |
+| the answer is the first reader's script rather than GLM's merge | GLM was unreachable or proposed nothing usable. The note after the turn says which: `glm-5.3-flash did not read send2.txt (...)`, `glm-5.3-flash stopped early (...)` |
 | reviewer chip red, answers still arrive | the review failed and the draft shipped. The reason is on the chip and in the log as `[job] <id> seed failed: ...` or `[job] <id> negotiation stopped: ...` |
 | `40300 MISSING_HEADER` | the message went out without its proof-of-work header — see [The proof of work](#the-proof-of-work-pow_solverpy), and the `[deepseek]` lines in the log |
 | `40301 INVALID_POW_RESPONSE` | the proof of work was solved with the wrong module build |
@@ -330,7 +405,7 @@ chain itself.
 | a version was thrown away | it came back empty or cut off; the log says so and the script it was editing is what stands |
 | the answer stops mid-sentence | the phone dropped the connection; the job is still running, and the page reattaches and replays it -- and after three drops it collects the answer with `GET /chat/poll/{job}` instead, one short request at a time |
 | `the stream ended early` | the read was cut before the turn finished, which the page now treats as a reattach rather than a failure. It should no longer be the thing you see; if it is, the log line `[job] <id> ...` for that turn says how far it got |
-| a turn takes minutes | up to 12 model calls, and none of them is cut off. `NEGOTIATE_ROUNDS=1` for one version and one merge, or `REVIEW_MODEL=deepseek-v4-pro` for a stronger but slower reviewer |
+| a turn takes minutes | up to 15 model calls with both readers at their defaults, and none of them is cut off. `NEGOTIATE_ROUNDS=1` and `SECOND_ROUNDS=1` for one version and one merge each, or `REVIEW_MODEL=deepseek-v4-pro` for a stronger but slower reviewer |
 | a turn never ends at all | the model itself is hanging, and nothing on this side will cut it off (that is the point). Set `REVIEW_TIMEOUT=300` and `CHAT_TIMEOUT=300` to bring a ceiling back |
 | `429 too many requests from ...` | `RATE_LIMIT` per IP, or `MAX_CONCURRENT` chains already running |
 
@@ -340,7 +415,7 @@ chain itself.
 curl -s https://<your-domain>/chat/stream \
   -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"make walkspeed 100"}]}'
-# -> {"job":"...","model":"qwen3.8-max","reviewer":"deepseek-v4-flash","turns":1}
+# -> {"job":"...","model":"qwen3.8-max","reviewer":"deepseek-v4-flash","second":"glm-5.3-flash","turns":1}
 
 curl -sN https://<your-domain>/chat/stream/<job> -H "X-API-Key: $API_KEY"
 
@@ -352,20 +427,32 @@ curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
 
 ## Verifying a change
 
-`verify_chain.py` runs the whole chain against stubbed Qwen and DeepSeek endpoints — no keys,
-no network. It covers the brief being sent alone and the request only after its answer, both
-provider shapes, thinking being on and switched off, a reasoning delta never reaching the answer,
-the reviewer's search/thinking toggles being off in every call, the round being bounded so a pair
-that never agrees still finishes, the choice question being answered with the option that has the
-most lines (and the fallbacks when the model will not decide), `CHOICE_ROUNDS=0`, `SEED_BRIEF=off`,
-`NEGOTIATE_ROUNDS=0`, secret masking, the merge guard, a reviewer that dies mid-negotiation, the
-site's message id threading a second message onto the first, the proof of work, and the blocking
-and polling paths:
+`verify_chain.py` runs the whole chain against stubbed Qwen, DeepSeek and GLM endpoints — no
+keys, no network. It covers each brief being sent alone with the request only after its answer
+(both of them), both provider shapes, thinking being on for the writer and off for the reviewer
+and deep-think-max for the second reader, a reasoning delta never reaching the answer, the
+reviewer's search/thinking toggles being off in every call and GLM's calls carrying no tools, the
+rounds being bounded so a pair that never agrees still finishes (both readers), the second reader
+being handed the script the first two settled on and its merge being what ships, either reader
+failing without costing the script, the choice question being answered with the option that has
+the most lines (and the fallbacks when the model will not decide), `CHOICE_ROUNDS=0`,
+`SEED_BRIEF=off`, `SECOND_SEED=off`, `NEGOTIATE_ROUNDS=0`, `SECOND_ROUNDS=0`, secret masking, the
+merge guard, a reader that dies mid-negotiation, the site's message id threading a second message
+onto the first, the proof of work, and the blocking and polling paths:
 
 ```bash
 .venv/bin/python verify_chain.py
 ```
 
-The service is two modules: `bridge.py` is everything that talks to a provider (tokens, config,
-the two transports, the brief, the job record) and `server.py` is the service on top of it (the
-chain, the endpoints, the page).
+The service is four modules, smallest dependency first:
+
+* `bridge.py` — everything that talks to a provider: the tokens, the config, the two transports,
+  the briefs, the job record, one request and its stream.
+* `state.py` — what the service can say about itself (the three credentials, the model lists, the
+  last failure) and the two usage limits.
+* `peers.py` — the second reader: GLM's credential, model, thinking setting, brief and chip.
+* `server.py` — the service on top: the chain, the jobs, the endpoints and the page.
+
+Keeping the provider side, the health side and the second reader out of `server.py` is not only
+layout: those are the parts a new reader has to touch, and this way each of them is a file you can
+change without reading the whole chain.

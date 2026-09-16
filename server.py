@@ -1,175 +1,23 @@
 """The service: the chain, the jobs, the endpoints and the page.
 
-Everything that talks to a provider -- the tokens, the config, the two transports, the brief,
-and the job record a reader attaches to -- lives in `bridge`. This module is what turns that
-into a service: the app, the chain that runs one turn, and the endpoints the page and the
-Roblox client use.
+Everything that talks to a provider -- the tokens, the config, the two transports, the briefs,
+and the job record a reader attaches to -- lives in `bridge`; the second reader (GLM, and the
+brief it reads) lives in `peers`. This module is what turns that into a service: the app, the
+chain that runs one turn, and the endpoints the page and the Roblox client use.
+
+The chain is one writer and two readers: Qwen drafts, DeepSeek reads send.txt and writes the
+version it would ship, Qwen merges the two in the chat it drafted in, then GLM reads send2.txt
+and does the same over the script the first two settled on -- which Qwen merges once more. What
+ships is the script both readers agreed on.
 """
 from bridge import *  # noqa: F401,F403 -- the providers, the config and the job record
-
-
-# --- the model list, and whether the tokens still work ----------------------------------
-
-_models: dict = {"at": 0.0, "ids": []}
-_models_lock = threading.Lock()
-
-
-def list_models(force: bool = False) -> list:
-    """qwen-api's model ids, remembered for a few minutes; empty when unreadable.
-
-    Never raises: it feeds a health chip and documents what else QWEN_MODEL could be, so an
-    unreachable proxy must leave the page usable rather than break it.
-    """
-    with _models_lock:
-        cached = dict(_models)
-    if not force and cached["at"] and time.time() - cached["at"] < 300:
-        return cached["ids"]
-    ids: list = []
-    if CONFIGURED:
-        try:
-            with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
-                r = c.get(f"{QWEN_URL}/models", headers=QWEN.headers())
-            if r.status_code < 400:
-                payload = r.json()
-                for item in (payload.get("data") or payload.get("models") or []):
-                    if isinstance(item, dict) and item.get("id"):
-                        ids.append(str(item["id"]))
-                    elif isinstance(item, str):
-                        ids.append(item)
-        except (httpx.HTTPError, ValueError):
-            ids = []
-    with _models_lock:
-        _models.update({"at": time.time(), "ids": ids})
-    return ids
-
-
-_token: dict = {"at": 0.0, "ok": False, "detail": "not checked"}
-_token_lock = threading.Lock()
-
-
-def token_state(force: bool = False) -> dict:
-    """Ask qwen-api whether QWEN_TOKEN is still good, remembering the answer briefly.
-
-    Qwen access tokens expire, and an expired one is otherwise indistinguishable from a hung
-    generation, so the chip reports it before you send anything.
-    """
-    with _token_lock:
-        cached = dict(_token)
-    if not force and cached["at"] and time.time() - cached["at"] < TOKEN_CHECK_TTL:
-        return cached
-    if not CONFIGURED:
-        state = {"at": time.time(), "ok": False, "detail": "QWEN_TOKEN is not set"}
-    else:
-        try:
-            with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
-                # The token goes in the body (as qwen-api documents) and as a bearer, since
-                # some builds authenticate every route either way.
-                r = c.post(f"{QWEN_ROOT}/validate", json={"token": QWEN_TOKEN},
-                           headers=QWEN.headers())
-            detail = (r.text or "")[:300]
-            if r.status_code == 404:
-                # A qwen-api build without /validate; generations still report for real.
-                state = {"at": time.time(), "ok": True, "detail": "token set"}
-            elif r.status_code >= 400:
-                state = {"at": time.time(), "ok": False,
-                         "detail": failure_reason(r.status_code, detail, QWEN)}
-            else:
-                ok = True
-                try:
-                    payload = r.json()
-                    if isinstance(payload, dict):
-                        for flag in ("valid", "success", "ok"):
-                            if payload.get(flag) is False:
-                                ok = False
-                except ValueError:
-                    pass
-                state = {"at": time.time(), "ok": ok,
-                         "detail": "token accepted" if ok else "token rejected"}
-        except httpx.HTTPError as e:
-            state = {"at": time.time(), "ok": False,
-                     "detail": f"cannot reach {QWEN_ROOT} ({e.__class__.__name__})"}
-    with _token_lock:
-        _token.update(state)
-    return state
-
-
-_reviewer: dict = {"at": 0.0, "ok": False, "detail": "not checked"}
-_reviewer_lock = threading.Lock()
-
-
-def _reviewer_probe(force: bool = False) -> dict:
-    """Whether the reviewer key works and the model exists, remembered briefly.
-
-    A retired model id and a rejected key look exactly alike from the page (the chain just
-    never answers), so the reviewer is checked the same way the Qwen token is.
-    """
-    with _reviewer_lock:
-        cached = dict(_reviewer)
-    if not force and cached["at"] and time.time() - cached["at"] < TOKEN_CHECK_TTL:
-        return cached
-    if not REVIEWER.configured:
-        state = {"at": time.time(), "ok": False, "detail": "no reviewer token set"}
-    elif REVIEWER.web is not None:
-        # chat.deepseek.com answers /users/current, which is the same question the Qwen token is
-        # asked, so the chip means the same thing on both sides.
-        try:
-            ok, detail = REVIEWER.web.validate()
-        except HTTPException as e:
-            ok, detail = False, str(e.detail)
-        state = {"at": time.time(), "ok": ok, "detail": detail}
-    else:
-        try:
-            with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
-                r = c.get(f"{REVIEWER.url}/models", headers=REVIEWER.headers())
-            if r.status_code == 404:
-                state = {"at": time.time(), "ok": True, "detail": "key set"}
-            elif r.status_code >= 400:
-                state = {"at": time.time(), "ok": False,
-                         "detail": failure_reason(r.status_code, r.text[:300], REVIEWER)}
-            else:
-                seen: list = []
-                try:
-                    payload = r.json()
-                    for item in (payload.get("data") or []):
-                        if isinstance(item, dict) and item.get("id"):
-                            seen.append(str(item["id"]))
-                        elif isinstance(item, str):
-                            seen.append(item)
-                except ValueError:
-                    pass
-                if not seen:
-                    state = {"at": time.time(), "ok": True, "detail": "key set"}
-                elif REVIEWER.model in seen:
-                    state = {"at": time.time(), "ok": True, "detail": "key set, model served"}
-                else:
-                    near = [m for m in seen if "flash" in m.lower() or REVIEWER.model.split("-")[0] in m]
-                    hint = near[0] if near else (seen[0] if seen else "")
-                    state = {"at": time.time(), "ok": False,
-                             "detail": (f"{REVIEWER.model} is not served"
-                                        + (f" -- try {hint}" if hint else ""))}
-        except httpx.HTTPError as e:
-            state = {"at": time.time(), "ok": False,
-                     "detail": f"cannot reach {REVIEWER.url} ({e.__class__.__name__})"}
-    with _reviewer_lock:
-        _reviewer.update(state)
-    return state
-
-
-def reviewer_state(force: bool = False) -> dict:
-    """Whether the reviewer can be relied on right now.
-
-    The key working is only half of it: a review that just failed (down, rate limited, out of
-    credits) is the more useful answer, and it is the failure that would otherwise look like a
-    reviewer with nothing to say -- the chain still ships the draft either way. Keeping it
-    here rather than in the caller means every report of the reviewer's state carries it.
-    """
-    state = _reviewer_probe(force)
-    note = review_note()
-    if note and state["ok"]:
-        state = {"at": state["at"], "ok": False, "detail": note}
-    return {**state, "shape": REVIEW_SHAPE, "search": not SEARCH_OFF,
-            "last_note": note, "brief_chars": len(BRIEF), "brief": BRIEF_PATH.name,
-            "rounds": NEGOTIATE_ROUNDS, "seed": SEED_BRIEF, "choices": CHOICE_ROUNDS}
+from peers import (MAX_SECOND_ROUNDS, SECOND_BRIEF, SECOND_BRIEF_NAME, SECOND_ROUNDS,
+                   SECOND_SEED, SECOND_SEED_TOKENS, SECOND_TEMPERATURE, SECOND_TOKENS, ZAI,
+                   second_enabled, second_state)  # noqa: F401 -- the second reader
+from state import (client_ip, last_error, list_models, note_error, note_review_error,
+                   rate_ok, reviewer_state, running_now, slot_give, slot_take,
+                   token_state)  # noqa: F401 -- the checks behind the page's chips
+import peers  # the second reader's own failure note, read through the module
 
 
 # --- jobs ------------------------------------------------------------------------------
@@ -183,10 +31,11 @@ class Job:
     readers can attach to it -- including one that comes back after the connection dropped,
     which replays the output from the start and follows along.
 
-    Text arrives on five channels, because there are five things to show: the reviewer reading
-    the brief, the draft, the reviewer's own version of the script, what the reviewer said about
-    the merged one, and the answer that comes out of it -- which is also where the script chosen
-    for the writer's "which one do you prefer?" streams in, because that is the answer.
+    Text arrives on seven channels, because there are seven things to show: each reader reading
+    its own brief (send.txt for the first, send2.txt for the second), the draft, each reader's own
+    version of the script, what the first reader said about the merged one, and the answer that
+    comes out of it -- which is also where the script chosen for the writer's "which one do you
+    prefer?" streams in, because that is the answer.
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, review: bool):
@@ -196,12 +45,16 @@ class Job:
         self.note = note
         self.want_review = review
         self.pieces: list = []          # (channel, piece)
-        self.buffers: dict = {"seed": [], "draft": [], "peer": [], "review": [], "answer": []}
+        self.buffers: dict = {"seed": [], "seed2": [], "draft": [], "peer": [], "peer2": [],
+                              "review": [], "answer": []}
         self.error = ""
         self.status = "queued"          # queued -> running -> done | error
-        self.phase = "queued"           # queued | draft | seed | peer | merge | agree | choose | done
+        self.phase = ("queued"          # queued | seed | seed2 | draft | peer | merge | agree
+                      " | peer2 | agree2 | choose | done")
         self.phases: list = []          # one record per model call
         self.review_text = ""
+        # The second reader's last answer (its verdict), kept beside the first reader's.
+        self.second_text = ""
         self.started = time.time()
         self.finished = 0.0
         self.cond = threading.Condition()
@@ -276,41 +129,6 @@ class Job:
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
-# The last thing that went wrong, so /health (and the page's chip) can report it long after
-# the error frame has scrolled by. Cleared by the next turn that succeeds.
-_last_error = ""
-_last_error_lock = threading.Lock()
-
-
-def note_error(text: str) -> None:
-    global _last_error
-    with _last_error_lock:
-        _last_error = text[:300]
-
-
-def last_error() -> str:
-    with _last_error_lock:
-        return _last_error
-
-
-# A reviewer that fails is not a failed turn -- the draft still goes out -- but it is not
-# nothing either: the review silently not happening looks exactly like a reviewer with
-# nothing to say. So it gets its own note, shown on the reviewer chip until a review works.
-_review_note = ""
-_review_note_lock = threading.Lock()
-
-
-def note_review_error(text: str) -> None:
-    global _review_note
-    with _review_note_lock:
-        _review_note = text[:300]
-
-
-def review_note() -> str:
-    with _review_note_lock:
-        return _review_note
-
-
 def register(job: Job) -> None:
     """Remember the job so a reader that comes back can still find its own."""
     with _jobs_lock:
@@ -326,58 +144,6 @@ def lookup(job_id: str) -> Job:
     if job is None:
         raise HTTPException(404, "unknown or expired job; send the turn again")
     return job
-
-
-# --- how many people can do this at once -------------------------------------------------
-#
-# The page needs no login, so the URL is the only thing standing between a stranger and your
-# Qwen account plus your DeepSeek credits. A key was the other option; this is what has to
-# carry it instead: a per-IP window, and a ceiling on chains running at the same time.
-
-_hits: dict = defaultdict(deque)
-_hits_lock = threading.Lock()
-_running = {"now": 0}
-_running_lock = threading.Lock()
-
-
-def client_ip(request: Optional[Request]) -> str:
-    if request is None:
-        return "?"
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "?"
-
-
-def rate_ok(ip: str) -> bool:  # per IP, per minute
-    """A sliding window per IP; RATE_LIMIT per minute, 0 disables it."""
-    if RATE_LIMIT <= 0:
-        return True
-    now = time.time()
-    with _hits_lock:
-        window = _hits[ip]
-        while window and now - window[0] > 60:
-            window.popleft()
-        if len(window) >= RATE_LIMIT:
-            return False
-        window.append(now)
-        if len(_hits) > 5000:  # never let the bookkeeping itself become the leak
-            for key in [k for k, v in _hits.items() if not v][:1000]:
-                _hits.pop(key, None)
-    return True
-
-
-def slot_take() -> bool:
-    with _running_lock:
-        if _running["now"] >= MAX_CONCURRENT:
-            return False
-        _running["now"] += 1
-        return True
-
-
-def slot_give() -> None:
-    with _running_lock:
-        _running["now"] = max(0, _running["now"] - 1)
 
 
 @asynccontextmanager
@@ -406,6 +172,16 @@ async def lifespan(_app: FastAPI):
                   flush=True)
     else:
         print("[review] no reviewer configured; answers are sent as the model writes them",
+              flush=True)
+    if not ZAI.configured:
+        print("[second] no ZAI_TOKEN set; the chain runs with one reader", flush=True)
+    elif second_enabled():
+        where2 = ZAI.web.label if ZAI.web is not None else ZAI.url
+        print(f"[second] {where2} -> {ZAI.model} (thinking {ZAI_THINKING}, no search), "
+              f"brief {len(SECOND_BRIEF)} chars from {SECOND_BRIEF_NAME}, "
+              f"up to {SECOND_ROUNDS} round(s)", flush=True)
+    else:
+        print("[second] ZAI_TOKEN is set but the stage is off (rounds 0, or PIPELINE=off)",
               flush=True)
     if GREETING:
         print(f"[chat] every question is sent as {GREETING} <your question>", flush=True)
@@ -436,9 +212,12 @@ def poll_job(job_id: str):
         "text": job.text(),
         "draft": job.channel("draft"),
         "peer": job.channel("peer"),
+        "peer2": job.channel("peer2"),
         "review": job.review_text,
+        "second_review": job.second_text,
         "model": QWEN_MODEL,
         "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
+        "second": ZAI.model if job.want_review and second_enabled() else "",
         "phases": job.phases,
         "done": job.status == "done",
     }
@@ -468,98 +247,11 @@ def require_key(x_api_key: Optional[str] = Header(None),
         raise HTTPException(401, "missing or invalid API key (send it as the X-API-Key header)")
 
 
-# --- talking to a provider --------------------------------------------------------------
-
-def stream_answer(messages: list, temperature: Optional[float], provider: Provider,
-                  max_tokens: int, box: Optional[dict] = None,
-                  web_session: Optional[object] = None):
-    """Stream an answer, piece by piece, out of a provider's /chat/completions.
-
-    `box` gets the finish reason and any token usage, which is how a truncated answer is caught
-    instead of being shipped. `web_session` is the chat on chat.deepseek.com this message belongs
-    to when the caller holds one open; without it, a site call is a chat of its own.
-    """
-    if provider.web is not None:
-        # chat.deepseek.com: the site's own endpoint and its own streamed frames -- either the
-        # first message of a review or the next one in the chat the brief opened.
-        yield from provider.web.stream(as_prompt(messages), box, web_session)
-        return
-    body = provider.request(messages, temperature, max_tokens, stream=True)
-    try:
-        with httpx.Client(timeout=client_timeout(provider.timeout),
-                          follow_redirects=True) as c:
-            with c.stream("POST", provider.endpoint(), json=body, headers=provider.headers()) as r:
-                if r.status_code >= 400:
-                    detail = r.read().decode("utf-8", "replace")
-                    raise HTTPException(502, failure_reason(r.status_code, detail, provider))
-                if "event-stream" not in r.headers.get("content-type", ""):
-                    # Not a stream: either the endpoint rejected the request with a 200, or it
-                    # ignored stream=true and answered in one piece. Reading the body tells us
-                    # which; reporting an empty answer would hide the reason.
-                    raw = r.read().decode("utf-8", "replace")
-                    text = message_text(raw)
-                    if not text:
-                        raise HTTPException(502, failure_reason(200, raw, provider))
-                    print(f"[{provider.name}] answered in one piece instead of streaming", flush=True)
-                    if box is not None:
-                        box["finish"] = box.get("finish") or "stop"
-                    yield text
-                    return
-                for line in r.iter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        return
-                    if not data:
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    if box is not None and isinstance(chunk, dict) and chunk.get("usage"):
-                        box["usage"] = chunk["usage"]
-                    choices = chunk.get("choices") or []
-                    if not choices:
-                        continue
-                    choice = choices[0] or {}
-                    if box is not None and choice.get("finish_reason"):
-                        box["finish"] = choice["finish_reason"]
-                    # reasoning_content is deliberately skipped: the answer is what is wanted.
-                    piece = (choice.get("delta") or {}).get("content") or ""
-                    if piece:
-                        yield piece
-    except httpx.HTTPError as e:
-        raise upstream_error(e, provider)
-
-
-def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
-    """Map an httpx failure onto a status the caller can act on.
-
-    With no per-call ceiling (the default) the only way to time out is connecting, so the
-    report says what actually happened rather than claiming a limit that is not in force.
-    """
-    if isinstance(e, httpx.TimeoutException):
-        if provider.timeout and provider.timeout > 0:
-            return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
-        return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
-                                  f"({e.__class__.__name__})")
-    return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")
-
-
-def call_once(messages: list, temperature: Optional[float], provider: Provider,
-              max_tokens: int) -> str:
-    """One non-streamed call, for the small internal jobs (the token checks)."""
-    body = provider.request(messages, temperature, max_tokens, stream=False)
-    with httpx.Client(timeout=client_timeout(provider.timeout),
-                      follow_redirects=True) as c:
-        r = c.post(provider.endpoint(), json=body, headers=provider.headers())
-    if r.status_code >= 400:
-        raise HTTPException(502, failure_reason(r.status_code, r.text, provider))
-    return message_text(r.text)
-
-
 # --- the chain itself --------------------------------------------------------------------
+#
+# The provider side of this -- one request, its stream, and what a failure means -- is in
+# bridge.py, next to the providers themselves. What is left here is the chain: who asks whom,
+# and what the answer is worth.
 
 def run_phase(job: Job, messages: list, temperature: Optional[float], provider: Provider,
               max_tokens: int, channel: str, phase: str, note: str,
@@ -636,8 +328,8 @@ made more reliable."""
 def verify_request(job: Job, code: str, from_model: str, notes: list) -> str:
     """The later rounds: would you ship the merged script, or does it need another version?
 
-    This is the question that ends the negotiation. An answer of AGREE is the two models
-    agreeing on one script, and the writer is left with it.
+    This is the question that ends those rounds. An answer of AGREE is that reader and the
+    writer agreeing on one script, and the writer is left with it.
     """
     body = request_body(job, code, notes, "the merged script")
     return f"""The script below is what came out of the last merge: {from_model} took your last \
@@ -727,24 +419,39 @@ markdown code fences."""
 
 
 class ReviewerChat:
-    """The reviewer's conversation: the brief first, and every question after it in one chat.
+    """One reader's conversation: its brief first, and every question after it in one chat.
 
     Two things matter here and nowhere else. The brief is sent on its own and its answer is
-    waited for before any request goes out, so Send.txt has been read before the reviewer is
-    asked to do anything. And every later question lands in the conversation the brief opened --
+    waited for before any request goes out, so the reader has read its instructions before it is
+    asked to do anything. And every later question lands in the conversation that brief opened --
     on the API path by carrying the turns, on the site path by holding one chat session open --
-    so the reviewer answers about the script it was shown instead of starting over.
+    so the reader answers about the script it was shown instead of starting over.
+
+    One of these drives each reader in the chain: DeepSeek with send.txt, then GLM with send2.txt.
+    The defaults are the first reader's, so a reader configured the same way needs no arguments.
     """
 
-    def __init__(self, job: Job):
+    def __init__(self, job: Job, provider: Optional[Provider] = None,
+                 brief: Optional[str] = None, brief_name: str = "",
+                 seed_on: Optional[bool] = None, seed_tokens: int = 0,
+                 warning: Optional[str] = None, temperature: Optional[float] = None,
+                 seed_channel: str = "seed"):
         self.job = job
+        self.provider = provider or REVIEWER
+        self.brief = BRIEF if brief is None else brief
+        self.brief_name = brief_name or (BRIEF_PATH.name if BRIEF else "the built-in rubric")
+        self.seed_on = SEED_BRIEF if seed_on is None else seed_on
+        self.seed_tokens = seed_tokens or SEED_TOKENS
+        self.warning = REVIEW_WARNING if warning is None else warning
+        self.temperature = REVIEW_TEMPERATURE if temperature is None else temperature
+        self.seed_channel = seed_channel
         self.turns: list = []
         self.last_answer = ""
         self.contract_sent = False
         # A live chat on chat.deepseek.com, when that is the transport: the site threads a
         # conversation by message id, so the session is what makes the second message a
         # continuation rather than a new branch of the same chat.
-        self.web = REVIEWER.web.new_session() if REVIEWER.web is not None else None
+        self.web = self.provider.web.new_session() if self.provider.web is not None else None
 
     def _turns_for(self, text: str, contract: bool = True) -> list:
         """One message to the reviewer: the warning, then the brief if it is the first one.
@@ -755,12 +462,12 @@ class ReviewerChat:
         the request itself when it is not -- so the brief goes out alone.
         """
         parts = []
-        if REVIEW_WARNING:
-            # On every message, not just the first: the target runtime is the one thing the
-            # reviewer must not lose track of, and a long conversation is where it gets lost.
-            parts.append(REVIEW_WARNING)
-        if not self.turns and BRIEF:
-            parts.append(BRIEF)
+        if self.warning:
+            # On every message, not just the first: the target runtime is the one thing a reader
+            # must not lose track of, and a long conversation is where it gets lost.
+            parts.append(self.warning)
+        if not self.turns and self.brief:
+            parts.append(self.brief)
         if contract and not self.contract_sent:
             self.contract_sent = True
             parts.append(RUBRIC)
@@ -773,8 +480,8 @@ class ReviewerChat:
 
     def say(self, text: str, channel: str, phase: str, note: str, max_tokens: int,
             contract: bool = True) -> str:
-        answer, _ = run_phase(self.job, self._turns_for(text, contract), REVIEW_TEMPERATURE,
-                              REVIEWER, max_tokens, channel, phase, note, self.web)
+        answer, _ = run_phase(self.job, self._turns_for(text, contract), self.temperature,
+                              self.provider, max_tokens, channel, phase, note, self.web)
         self.turns.append({"role": "assistant", "content": answer})
         self.last_answer = answer
         return answer
@@ -787,33 +494,35 @@ class ReviewerChat:
         rather than work, so what comes back here is thrown away on purpose: it is the *reading*
         of Send.txt that is wanted, and the request that follows rides on it.
         """
-        if not SEED_BRIEF:
+        if not self.seed_on:
             return False
-        which = BRIEF_PATH.name if BRIEF else "the built-in rubric"
-        answer = self.say(SEED_NOTE, "seed", "seed", f"{REVIEWER.model} reading {which}",
-                          SEED_TOKENS, contract=False)
+        which = self.brief_name
+        answer = self.say(SEED_NOTE, self.seed_channel, self.seed_channel,
+                          f"{self.provider.model} reading {which}", self.seed_tokens,
+                          contract=False)
         sent = self.turns[0]["content"] if self.turns else ""
-        whole = ("; the whole brief is in it" if BRIEF and BRIEF in sent
-                 else "; WARNING: the brief did not fit the message" if BRIEF else "")
-        print(f"[job] {self.job.id} seed: {which} went out first and on its own "
+        whole = ("; the whole brief is in it" if self.brief and self.brief in sent
+                 else "; WARNING: the brief did not fit the message" if self.brief else "")
+        print(f"[job] {self.job.id} {self.seed_channel}: {which} went out first and on its own "
               f"({len(sent)} chars sent, {len(answer)} back{whole}); the request goes next",
               flush=True)
         return True
 
 
-def merge_versions(job: Job, current: str, proposed: str, notes: list) -> str:
+def merge_versions(job: Job, current: str, proposed: str, notes: list, reader: str = "") -> str:
     """The writer's turn: one script out of its own version and the reviewer's.
 
     It happens in the chat that wrote the draft, so the model is editing its own work with the
     other version in front of it. A merge that comes back unusable is discarded -- the same
     guard the draft went through -- and the version being edited is what stands instead.
     """
+    who = reader or REVIEWER.model
     turns = list(job.messages) + [
         {"role": "assistant", "content": current},
-        {"role": "user", "content": merge_instruction(proposed, REVIEWER.model, notes)},
+        {"role": "user", "content": merge_instruction(proposed, who, notes)},
     ]
     merged, record = run_phase(job, turns, job.temperature, QWEN, REFINE_TOKENS, "answer",
-                               "merge", f"{QWEN.model} merging both versions")
+                               "merge", f"{QWEN.model} merging {who}'s version")
     merged = strip_fences(merged)
     if job.channel("answer").strip() != merged:
         job.reset_channel("answer")
@@ -948,42 +657,46 @@ def settle_choice(job: Job, script: str, notes: list) -> tuple:
     return script, settled
 
 
-def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list) -> tuple:
-    """The reviewer's own script, then the writer's merge, until the reviewer would ship it.
+def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list,
+              rounds: int = NEGOTIATE_ROUNDS, version_channel: str = "peer",
+              agree_channel: str = "agree", tokens: int = PEER_TOKENS) -> tuple:
+    """One reader's rounds: its own script, then the writer's merge, until it would ship it.
 
-    Round one is the reviewer writing the script itself instead of complaining about the other
-    one. Every round after that is the reviewer reading the merged script: AGREE ends the
-    negotiation, another version starts the next merge. Bounded by NEGOTIATE_ROUNDS, so a pair
-    that never agrees still finishes -- and the last script that stands is what ships either way.
+    Round one is the reader writing the script itself instead of complaining about the other one.
+    Every round after that is the reader reading the merged script: AGREE ends those rounds,
+    another version starts the next merge. Bounded by `rounds`, so a pair that never agrees still
+    finishes -- and the last script that stands is what ships either way. The second reader runs
+    through this same loop, over the script the first one settled on, in its own channels.
     """
     best = draft
     outcome = "draft"
-    for index in range(max(0, NEGOTIATE_ROUNDS)):
+    reader = chat.provider.model
+    for index in range(max(0, rounds)):
         opening = index == 0
-        phase = "peer" if opening else "agree"
-        note = (f"{REVIEWER.model} writing its own version" if opening
-                else f"{REVIEWER.model} reading the merged script")
+        phase = version_channel if opening else agree_channel
+        note = (f"{reader} writing its own version" if opening
+                else f"{reader} reading the merged script")
         request = (peer_request(job, best, QWEN_MODEL, notes) if opening
                    else verify_request(job, best, QWEN_MODEL, notes))
-        answer = chat.say(request, phase, phase, note, PEER_TOKENS)
+        answer = chat.say(request, phase, phase, note, tokens)
         verdict, proposed = parse_verdict(answer)
         if verdict == "AGREE":
             outcome = "draft" if opening else "agreed"
             who = "the draft" if opening else "the merged script"
-            print(f"[job] {job.id} {phase}: {REVIEWER.model} agreed with {who}", flush=True)
+            print(f"[job] {job.id} {phase}: {reader} agreed with {who}", flush=True)
             break
         if verdict != "BETTER" or not proposed:
             outcome = "draft" if opening else "kept"
-            print(f"[job] {job.id} {phase}: {REVIEWER.model} proposed nothing usable "
+            print(f"[job] {job.id} {phase}: {reader} proposed nothing usable "
                   f"({len(answer)} chars back); {QWEN_MODEL}'s version stands", flush=True)
             break
-        print(f"[job] {job.id} {phase}: {REVIEWER.model} proposed a version "
+        print(f"[job] {job.id} {phase}: {reader} proposed a version "
               f"({len(proposed)} chars of script)", flush=True)
         # The bubble shows the script, not the verdict line in front of it.
         if job.channel(phase).strip() != proposed:
             job.reset_channel(phase)
             job.add(phase, proposed)
-        merged = merge_versions(job, best, proposed, notes)
+        merged = merge_versions(job, best, proposed, notes, reader)
         if not merged:
             outcome = "kept"
             break
@@ -993,7 +706,7 @@ def negotiate(job: Job, chat: "ReviewerChat", draft: str, notes: list) -> tuple:
 
 
 def outcome_note(outcome: str, calls: int) -> str:
-    """One sentence for the turn's status line: what the two models settled on."""
+    """One sentence for the turn's status line: what the models settled on."""
     if outcome == "chosen":
         return "the option with the most lines ships"
     if outcome == "agreed":
@@ -1008,46 +721,89 @@ def outcome_note(outcome: str, calls: int) -> str:
     return f"{REVIEWER.model} had nothing better; {QWEN.model}'s draft ships"
 
 
-def run_job(job: Job) -> None:
-    """Draft, then two models competing on the same script, on a thread of its own.
+def script_that_stands(job: Job, fallback: str) -> str:
+    """The last script a completed call put in the answer channel, or `fallback`.
 
-    The shape is: the writer drafts, the reviewer is briefed and then writes its own version,
-    the writer merges the two in the chat it drafted in, and the reviewer says whether it would
-    ship that. Nothing here is a suggestion box -- both models produce scripts, and what is sent
-    to the user is the one they settled on. A turn never ends on "which one do you prefer?"
-    either: that question is answered here, in the writer's own chat, with the option that has
-    the most lines.
+    Used when a reader dies in the middle of its rounds: the rounds' own variable went with the
+    failure, but a merge that finished is in the channel. A call that failed part-way is not a
+    completed call -- run_phase records one only after its stream ends -- so this can never hand
+    back half a script.
+    """
+    if job.phases and job.phases[-1]["phase"] == "merge":
+        return job.channel("answer").strip() or fallback
+    return fallback
+
+
+def second_outcome_note(outcome: str) -> str:
+    """One sentence for the second reader's rounds, in the same vocabulary as the first's."""
+    if outcome == "agreed":
+        return f"{ZAI.model} agreed with the script both writers settled on"
+    if outcome == "merged":
+        return (f"{ZAI.model} proposed changes and {QWEN.model} merged them; the merged "
+                "script ships")
+    if outcome == "draft":
+        return f"{ZAI.model} had nothing better than the script it read"
+    return f"{ZAI.model} proposed nothing usable; the script in front of it stands"
+
+
+def run_job(job: Job) -> None:
+    """Draft, then both readers competing on the same script, on a thread of its own.
+
+    The shape is: the writer drafts; the first reader is briefed, writes its own version, the
+    writer merges the two in the chat it drafted in, and the reader says whether it would ship
+    that; then the second reader does the same over the script the first two settled on. Nothing
+    here is a suggestion box -- every model produces scripts, and what is sent to the user is the
+    one they settled on. A turn never ends on "which one do you prefer?" either: that question is
+    answered here, in the writer's own chat, with the option that has the most lines.
     """
     if not slot_take():
         job.finish(status="error",
                    error=f"{MAX_CONCURRENT} chains are already running; try again shortly")
         return
     try:
-        # The reviewer reads the brief on its own thread, while the writer drafts. The two are
-        # different providers and neither waits on the other, so the acknowledgement costs no
+        # Each reader reads its brief on its own thread, while the writer drafts. They are three
+        # different providers and none of them waits on another, so the acknowledgements cost no
         # turn time at all -- the only thing that has to be ordered is the request for a script,
-        # which cannot go until both the draft and the reading are done.
+        # which cannot go until the draft and that reader's reading are both done.
         chat = (ReviewerChat(job) if (job.want_review and review_enabled() and NEGOTIATE_ROUNDS > 0)
                 else None)
+        # The second reader only runs when the first one does: the chain is draft -> DeepSeek ->
+        # merge -> GLM -> merge, so GLM reads what the first two already settled on.
+        chat2 = (ReviewerChat(job, ZAI, SECOND_BRIEF, SECOND_BRIEF_NAME, SECOND_SEED,
+                              SECOND_SEED_TOKENS, temperature=SECOND_TEMPERATURE,
+                              seed_channel="seed2")
+                 if (chat is not None and second_enabled()) else None)
         seed_error: dict = {}
+        seed2_error: dict = {}
 
-        def seed_reviewer() -> None:
+        def seed_reader(reader: "ReviewerChat", box: dict) -> None:
+            """Read one reader's brief, recording a failure rather than raising it.
+
+            A reader that is down, rate limited or out of credits must not cost the user the
+            draft that is already written, so the reason is kept and shown on that reader's chip.
+            """
             try:
-                chat.seed()
+                reader.seed()
             except HTTPException as e:
-                seed_error["detail"] = str(e.detail)
-            except Exception as e:  # never let a broken reviewer thread take the turn down
-                seed_error["detail"] = f"{e.__class__.__name__}: {e}"
+                box["detail"] = str(e.detail)
+            except Exception as e:  # never let a broken reader thread take the turn down
+                box["detail"] = f"{e.__class__.__name__}: {e}"
 
-        seeder = threading.Thread(target=seed_reviewer, daemon=True)
+        seeder = threading.Thread(target=seed_reader, args=(chat, seed_error), daemon=True)
+        seeder2 = threading.Thread(target=seed_reader, args=(chat2, seed2_error), daemon=True)
         if chat is not None:
-            # Announced before the draft's own call starts, because the brief really is read
-            # first: the page puts the brief's bubble up on this frame, so it lands above the
-            # draft rather than wherever the reader happened to attach.
+            # Announced before the draft's own call starts, because each brief really is read
+            # first: the page puts a brief's bubble up on this frame, so it lands above the draft
+            # rather than wherever the reader happened to attach.
             job.finish(phase="seed",
                        note=f"{REVIEWER.model} reading "
                             f"{BRIEF_PATH.name if BRIEF else 'the brief'}")
             seeder.start()
+        if chat2 is not None:
+            # send2.txt goes out on its own, before anything is asked of the second reader, and
+            # in parallel with the draft and the first brief, so it costs no turn time.
+            job.finish(phase="seed2", note=f"{ZAI.model} reading {SECOND_BRIEF_NAME}")
+            seeder2.start()
 
         draft, _ = run_phase(job, job.messages, job.temperature, QWEN, DRAFT_TOKENS,
                              "draft", "draft", f"{QWEN.model} writing a draft")
@@ -1093,13 +849,19 @@ def run_job(job: Job) -> None:
             note_review_error(detail)
             job.review_text = f"[the review did not happen: {detail}]"
             job.add("review", job.review_text)
+            # The second reader is not asked either: the chain is draft -> first reader -> merge
+            # -> second reader, so there is nothing for it to read when the first one never got
+            # through its own brief. Said out loud rather than passed off as a chain that ran.
+            second_note = ((f"{ZAI.model} was not asked: the first reader could not read its own "
+                            "brief") if chat2 is not None else "")
             best, chosen = settle_choice(job, best, notes)
             if job.channel("answer").strip() != best.strip():
                 job.reset_channel("answer")
                 job.add("answer", best)
+            first_line = (f"{QWEN.model} asked which one; {outcome_note('chosen', 1)}"
+                          if chosen else f"{QWEN.model} answered; no review")
             job.finish(status="done", phase="done",
-                       note=(f"{QWEN.model} asked which one; {outcome_note('chosen', 1)}"
-                             if chosen else f"{QWEN.model} answered; no review"))
+                       note=f"{first_line}; {second_note}" if second_note else first_line)
             return
         note_review_error("")
 
@@ -1114,6 +876,37 @@ def run_job(job: Job) -> None:
             job.review_text = f"[the review stopped early: {e.detail}]"
             job.add("review", job.review_text)
             outcome = "stopped"
+            best = script_that_stands(job, best)
+
+        # The second reader's rounds: the same protocol, over the script the first two settled
+        # on. Its brief was already read (that thread started with the draft). A reader that
+        # cannot be reached at all leaves the script that stands untouched -- said out loud
+        # rather than passed off as a chain that ran.
+        second_note = ""
+        if chat2 is not None:
+            seeder2.join()
+            if seed2_error:
+                detail = seed2_error["detail"]
+                print(f"[job] {job.id} seed2 failed: {detail}", flush=True)
+                peers.note_failure(detail)
+                second_note = f"{ZAI.model} did not read {SECOND_BRIEF_NAME} ({detail})"
+            else:
+                try:
+                    best, second_outcome = negotiate(job, chat2, best, notes, SECOND_ROUNDS,
+                                                     "peer2", "agree2", SECOND_TOKENS)
+                    job.second_text = chat2.last_answer[:MERGE_PASTE_MAX]
+                    second_note = second_outcome_note(second_outcome)
+                    print(f"[job] {job.id} second reader: {second_note}", flush=True)
+                    peers.note_failure("")
+                except HTTPException as e:
+                    # A reader that dies half-way through leaves the script that stood, which is
+                    # the last merged one rather than nothing.
+                    print(f"[job] {job.id} the second reader stopped: {e.detail}", flush=True)
+                    peers.note_failure(str(e.detail))
+                    best = script_that_stands(job, best)
+                    job.second_text = f"[the second reader stopped early: {e.detail}]"
+                    second_note = (f"{ZAI.model} stopped early ({e.detail}); the script that "
+                                   "stood before it ships")
 
         # What ships is the script the two settled on, and a question is not one: if the last
         # answer offers choices and asks which is preferred, that is answered here with the
@@ -1126,7 +919,9 @@ def run_job(job: Job) -> None:
             job.reset_channel("answer")
             job.add("answer", best)
         note_error("")
-        job.finish(status="done", phase="done", note=outcome_note(outcome, len(job.phases)))
+        settled = outcome_note(outcome, len(job.phases))
+        job.finish(status="done", phase="done",
+                   note=f"{settled}; {second_note}" if second_note else settled)
         print(f"[job] {job.id} done in {job.report()['elapsed']:g}s, {len(best)} chars, "
               f"{len(job.phases)} model call(s)", flush=True)
     except HTTPException as e:
@@ -1160,8 +955,12 @@ def start_job(messages: list, temperature: Optional[float], review: Optional[boo
     note = f"{QWEN.model} drafting"
     job = Job(turns, temperature, note, want)
     register(job)
-    print(f"[job] {job.id} on {QWEN_MODEL}"
-          f"{' + ' + REVIEWER.model if want else ''}: {len(turns)} turns, asking about "
+    chain = [QWEN_MODEL]
+    if want:
+        chain.append(REVIEWER.model)
+        if second_enabled():
+            chain.append(ZAI.model)
+    print(f"[job] {job.id} on {' + '.join(chain)}: {len(turns)} turns, asking about "
           f"{last_user_text(turns).strip()[:60]!r}", flush=True)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
@@ -1198,9 +997,12 @@ def job_summary(job: Job) -> dict:
         "code": job.text(),
         "draft": job.channel("draft"),
         "peer": job.channel("peer"),
+        "peer2": job.channel("peer2"),
         "review": job.review_text,
+        "second_review": job.second_text,
         "model": QWEN_MODEL,
         "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
+        "second": ZAI.model if job.want_review and second_enabled() else "",
         "thinking": QWEN_THINKING,
         "phases": job.phases,
         "elapsed": job.report()["elapsed"],
@@ -1217,7 +1019,10 @@ def chat_stream(req: ChatReq, request: Request):
     """
     messages = clean_messages(req.messages)
     job = start_job(messages, req.temperature, req.review, request)
-    return {"job": job.id, "model": QWEN_MODEL, "reviewer": REVIEWER.model if job.want_review else "",
+    return {"job": job.id, "model": QWEN_MODEL,
+            # Both readers, so a caller can see what the chain will be before watching it.
+            "reviewer": REVIEWER.model if job.want_review else "",
+            "second": ZAI.model if (job.want_review and second_enabled()) else "",
             "thinking": QWEN_THINKING, "turns": len(job.messages),
             # null rather than 0: there is no ceiling on this turn unless one is configured.
             "timeout": CHAT_TIMEOUT or None}
@@ -1273,7 +1078,10 @@ def job_frames(job: Job):
         if status == "done":
             yield frame({"done": True, "text": job.text(), "code": job.text(),
                          "draft": job.channel("draft"), "peer": job.channel("peer"),
-                         "review": job.review_text, "phases": job.phases, **report})
+                         "peer2": job.channel("peer2"), "review": job.review_text,
+                         "second_review": job.second_text,
+                         "second": ZAI.model if (job.want_review and second_enabled()) else "",
+                         "phases": job.phases, **report})
             return
         if not pieces:
             yield frame({"beat": True, **report})
@@ -1424,13 +1232,16 @@ def models(_: None = Depends(require_key)):
     ids = [QWEN_MODEL]
     if review_enabled():
         ids.append(REVIEWER.model)
+    if second_enabled():
+        ids.append(ZAI.model)
     for mid in list_models():
         if mid not in ids:
             ids.append(mid)
+    owners = {REVIEWER.model: "deepseek", ZAI.model: "zai"}
     now = int(time.time())
     return {"object": "list", "data": [
         {"id": mid, "object": "model", "created": now,
-         "owned_by": "deepseek" if mid == REVIEWER.model else "qwen"} for mid in ids
+         "owned_by": owners.get(mid, "qwen")} for mid in ids
     ]}
 
 
@@ -1456,6 +1267,10 @@ async def root():
         chip(state["token_ok"], "token", state["token_detail"]),
         chip(state["reviewer"]["ok"], "reviewer",
              state["reviewer"]["detail"] or state["reviewer"]["model"]),
+        # The second reader is a third account with a third thing that can be switched off, so it
+        # gets its own chip rather than failing silently inside the chain.
+        chip(state["second"]["ok"], "glm",
+             state["second"]["detail"] or state["second"]["model"]),
         chip(True, "model", state["model"]),
         chip(True, "mode", f"{state['thinking']} · {state['greeting']}" if state["greeting"]
              else state["thinking"]),
@@ -1470,6 +1285,8 @@ async def root():
             .replace("__MODEL__", html.escape(state["model"]))
             .replace("__REVIEWER__", html.escape(state["reviewer"]["model"] if state["reviewer"]
                                                  and state["reviewer"].get("model") else "reviewer"))
+            .replace("__SECOND__", html.escape(state["second"]["model"] or "the second reader"))
+            .replace("__SECOND_ON__", "true" if state["second"].get("on") else "false")
             .replace("__REVIEW_ON__", "true" if state["review"] else "false")
             # The brief goes out on its own before anything is asked, so the page can put its
             # bubble up first instead of waiting for it to appear after the draft's.
@@ -1483,8 +1300,9 @@ async def snapshot() -> dict:
     # being up; token, reviewer and model readiness come back in the body. The checks are
     # network calls, so they run off the event loop: /health is polled every few seconds and
     # must never hold up a turn.
-    state, rev = await asyncio.gather(asyncio.to_thread(token_state),
-                                      asyncio.to_thread(reviewer_state))
+    state, rev, second = await asyncio.gather(asyncio.to_thread(token_state),
+                                             asyncio.to_thread(reviewer_state),
+                                             asyncio.to_thread(second_state))
     body = {
         "status": "ok",
         "bridge": CONFIGURED,
@@ -1500,8 +1318,9 @@ async def snapshot() -> dict:
                      "configured": REVIEWER.configured, "thinking": REVIEW_THINKING,
                      "brief_chars": len(BRIEF), "rounds": NEGOTIATE_ROUNDS,
                      "seed": SEED_BRIEF},
+        "second": second,
         "limits": {"per_minute": RATE_LIMIT, "concurrent": MAX_CONCURRENT,
-                   "running": _running["now"]},
+                   "running": running_now()},
         "last_error": last_error(),
         "api_key_required": bool(CALLER_KEY),
     }

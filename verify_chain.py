@@ -2,16 +2,19 @@
 
 Run from the project root:  .venv/bin/python verify_chain.py
 
-What the chain is now: the reviewer is sent Send.txt on its own and its answer is waited for,
-then the writer drafts, the reviewer writes its own version of that script, the writer merges
-the two in the chat it drafted in, and the reviewer says whether it would ship the merge.
+What the chain is now: each reader is sent its own brief on its own and its answer is waited
+for, the writer drafts, the first reader writes its own version of that script, the writer merges
+the two in the chat it drafted in and the first reader says whether it would ship the merge;
+then the second reader does all of that over the script the first two settled on.
 """
-import json, os, sys, threading, time
+import json, os, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 CALLS = []
 STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False, "always_better": False,
-        "message_seq": 0, "choice_draft": False, "choice_merge": False, "choice_dud": False}
+        "message_seq": 0, "choice_draft": False, "choice_merge": False, "choice_dud": False,
+        "merges": 0, "zai_calls": 0, "zai_fail_after": 9999}
 
 # The three things a model can be asked for in this chain, and what each one gets back. The
 # scripts are small but real: a merge is only ever attempted on something that looks like code.
@@ -43,6 +46,32 @@ MERGED_CODE = ("-- walk script, merged\n"
                "    end)\n"
                "end\n"
                "Players.PlayerAdded:Connect(speed)")
+# The second reader's own version of that script, and the merge that comes out of it. Two
+# different scripts, so "which merge is what shipped" is answerable rather than assumed.
+ZAI_CODE = ("-- walk script, second reader\n"
+            "local Players = game:GetService(\"Players\")\n"
+            "local SPEED = 16\n"
+            "local function apply(character)\n"
+            "    local humanoid = character:FindFirstChildOfClass(\"Humanoid\")\n"
+            "    if humanoid then humanoid.WalkSpeed = SPEED end\n"
+            "end\n"
+            "local function onPlayer(plr)\n"
+            "    if plr.Character then apply(plr.Character) end\n"
+            "    plr.CharacterAdded:Connect(apply)\n"
+            "end\n"
+            "Players.PlayerAdded:Connect(onPlayer)")
+MERGED2_CODE = ("-- walk script, merged twice\n"
+                "local Players = game:GetService(\"Players\")\n"
+                "local SPEED = 16\n"
+                "local function apply(character)\n"
+                "    local humanoid = character:WaitForChild(\"Humanoid\", 10)\n"
+                "    if humanoid then humanoid.WalkSpeed = SPEED end\n"
+                "end\n"
+                "local function onPlayer(plr)\n"
+                "    if plr.Character then apply(plr.Character) end\n"
+                "    plr.CharacterAdded:Connect(apply)\n"
+                "end\n"
+                "Players.PlayerAdded:Connect(onPlayer)")
 
 
 def fenced(code):
@@ -81,7 +110,11 @@ SEED_ACK = "kanha:ready"
 DRAFT = fenced(DRAFT_CODE)
 PEER = "VERDICT: BETTER\n" + fenced(PEER_CODE)
 MERGED = fenced(MERGED_CODE)
+MERGED2 = fenced(MERGED2_CODE)
 AGREE = "VERDICT: AGREE"
+# The second reader's two answers. The same asks carry the same words, so its answers are routed
+# by the endpoint they arrive at (/zai/...) rather than by anything in the prompt.
+ZAI_PEER = "VERDICT: BETTER\n" + fenced(ZAI_CODE)
 # The sentence that only a peer request carries, and the one only an agreement question carries.
 PEER_ASK = "Write the version of this script you would ship"
 VERIFY_ASK = "Would you ship this exactly as it is?"
@@ -125,8 +158,28 @@ def reply_to(prompt):
     if VERIFY_ASK in prompt:
         return AGREE
     if MERGE_ASK in prompt:
-        return CHOICE_DRAFT if STUB["choice_merge"] else MERGED
+        if STUB["choice_merge"]:
+            return CHOICE_DRAFT
+        # There is a merge per reader, and they are told apart by the script they came out of:
+        # the second one is over the second reader's version, and it is what should ship.
+        STUB["merges"] += 1
+        return MERGED if STUB["merges"] == 1 else MERGED2
     return CHOICE_DRAFT if STUB["choice_draft"] else DRAFT
+
+
+def reply_to_second(prompt):
+    """What the second reader answers: its own script, then its verdict on the merge.
+
+    Routed by endpoint, not by the prompt: both readers are asked for a version of a script in
+    exactly the same words, so there is nothing in the text to tell them apart.
+    """
+    if SEED_ASK in prompt:
+        return SEED_ACK
+    if PEER_ASK in prompt:
+        return ZAI_PEER
+    if VERIFY_ASK in prompt:
+        return AGREE
+    return AGREE
 
 
 def ds_stream(piece):
@@ -181,6 +234,12 @@ class Stub(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.endswith("/models"):
+            # Each reader's own model list, so a chip that says "model served" is checking the
+            # endpoint it will actually call.
+            if "/zai/" in self.path:
+                return self._send(200, {"object": "list",
+                                        "data": [{"id": "glm-5.3-flash"},
+                                                 {"id": "glm-5.3"}]})
             return self._send(200, {"object": "list", "data": [{"id": "deepseek-v4-flash"}]})
         if self.path.endswith("/users/current"):
             if STUB["users_code"]:
@@ -219,6 +278,13 @@ class Stub(BaseHTTPRequestHandler):
             # The site takes one prompt, so one string is both the ask and the answer's routing.
             return self._send(200, ds_stream(reply_to(body.get("prompt") or "")),
                               "text/event-stream")
+        if "/zai/" in self.path:
+            # The second reader's calls are counted, so a failure can be planted at a chosen
+            # point in its rounds rather than only before the first one.
+            STUB["zai_calls"] += 1
+            if STUB["zai_calls"] > STUB["zai_fail_after"]:
+                return self._send(500, {"error": {"code": "1301", "message": "internal error"}})
+            return self._send(200, stream(reply_to_second(latest_ask(body))), "text/event-stream")
         return self._send(200, stream(reply_to(latest_ask(body))), "text/event-stream")
 
 
@@ -233,18 +299,28 @@ PORT = 8143
 stub = StubServer(("127.0.0.1", PORT), Stub)
 threading.Thread(target=stub.serve_forever, daemon=True).start()
 
+# The second reader's brief is a real file, so those checks are about *its* brief rather than
+# about the fallback. It is written outside the repo, so a test run leaves nothing behind.
+BRIEF2_FIXTURE = Path(tempfile.gettempdir()) / "bahs-second-brief.txt"
+BRIEF2_FIXTURE.write_text("SECOND READER BRIEF (fixture)\n"
+                         + "Standing instructions for the second reader. " * 40, encoding="utf-8")
+
 os.environ.update({
     "QWEN_URL": f"http://127.0.0.1:{PORT}/v1",
     "QWEN_TOKEN": "qwen-test-token",
     "REVIEW_URL": f"http://127.0.0.1:{PORT}/deepseek",
     "DEEPSEEK_TOKEN": "review-test-key",
+    "ZAI_URL": f"http://127.0.0.1:{PORT}/zai",
+    "ZAI_TOKEN": "zai-test-key",
+    "ZAI_MODEL": "glm-5.3-flash",
+    "SECOND_BRIEF": str(BRIEF2_FIXTURE),
     "HEARTBEAT": "0.2",
     # /health remembers a provider's answer for a minute so the page's polling does not turn into
     # a network call every 8 seconds; the test wants every check to be a fresh one.
     "TOKEN_CHECK_TTL": "0",
 })
 for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS",
-             "QWEN_THINKING", "CHOICE_ROUNDS"):
+             "QWEN_THINKING", "CHOICE_ROUNDS", "SECOND_ROUNDS", "SECOND_SEED", "ZAI_THINKING"):
     os.environ.pop(name, None)
 
 # How the test starts, so a section that sets a variable cannot leak it into the next one: every
@@ -252,13 +328,16 @@ for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTI
 BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "REVIEW_URL", "DEEPSEEK_TOKEN", "REVIEW_SHAPE", "API_KEY",
     "SEED_BRIEF", "NEGOTIATE_ROUNDS", "CHAT_TIMEOUT", "TOKEN_CHECK_TTL", "QWEN_THINKING",
-    "CHOICE_ROUNDS")}
+    "CHOICE_ROUNDS", "ZAI_URL", "ZAI_TOKEN", "ZAI_MODEL", "ZAI_THINKING", "SECOND_ROUNDS",
+    "SECOND_SEED", "SECOND_BRIEF", "ZAI_BRIEF")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
 import base64  # noqa: E402
 import pow_solver  # noqa: E402
 import bridge  # noqa: E402
+import state  # noqa: E402
+import peers  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -284,6 +363,8 @@ def check(name, got, want):
 
 def turn(question="make me a walk script"):
     CALLS.clear()
+    STUB["merges"] = 0
+    STUB["zai_calls"] = 0
     start = client.post("/chat/stream", json={"messages": [{"role": "user", "content": question}]})
     out = []
     with client.stream("GET", f"/chat/stream/{start.json()['job']}") as r:
@@ -312,9 +393,12 @@ def reload_with(**env):
             os.environ.pop(name, None)
         elif value is not None:
             os.environ[name] = value
-    # The config and the providers live in bridge, and server binds its names at import, so both
-    # are reloaded -- otherwise a reloaded server would still hold the previous providers.
+    # The config and the providers live in bridge, the checks in state, the second reader in
+    # peers, and server binds all of their names at import -- so every one of them is reloaded,
+    # lowest first, or a reloaded server would still hold the previous providers.
     importlib.reload(bridge)
+    importlib.reload(state)
+    importlib.reload(peers)
     server = importlib.reload(server)
     client = TestClient(server.app)
 
@@ -328,6 +412,23 @@ def reviewer_calls(calls):
 def writer_calls(calls):
     """Only the writer's calls, in order -- the draft, a merge, the answer to a choice."""
     return [c for c in calls if c["body"].get("model") == "qwen3.8-max"]
+
+
+def second_calls(calls):
+    """Only the second reader's calls, in order, whichever shape its endpoint takes."""
+    return [c for c in calls if c["body"].get("model") == "glm-5.3-flash"
+            or "/zai/" in c["path"]]
+
+
+def phases_of(done, parallel=("draft", "seed", "seed2")):
+    """The chain's phases, with the ones that run in parallel sorted first.
+
+    Each brief is read on its own thread while the writer drafts, so those three can be recorded
+    in any order. Everything after them is strictly ordered, which is what these checks are for.
+    """
+    got = [p["phase"] for p in done["phases"]]
+    return [sorted(p for p in got if p in parallel),
+            [p for p in got if p not in parallel]]
 
 
 def streamed(out, channel="answer"):
@@ -370,8 +471,9 @@ review = reviewer_calls(calls)
 # The brief is read on its own thread while the draft is written, so those two may be recorded
 # in either order; everything after them is strictly ordered.
 phases = [p["phase"] for p in done["phases"]]
-check("the draft and the brief are read together, then the negotiation",
-      [sorted(phases[:2]), phases[2:]], [["draft", "seed"], ["peer", "merge", "agree"]])
+check("the draft and both briefs are read together, then the first reader's rounds",
+      phases_of(done), [["draft", "seed", "seed2"],
+                        ["peer", "merge", "agree", "peer2", "merge", "agree2"]])
 check("and the reviewer's own first message is the brief",
       review[0]["path"].endswith("/deepseek/chat/completions"), True)
 first = asked_in(review[0])
@@ -395,9 +497,9 @@ check("every message to the reviewer opens with the warning",
 check("and the target is named as an executor, not as Studio",
       ["Studio" in server.TARGET_RUNTIME, "executor" in server.TARGET_RUNTIME], [True, True])
 check("and the version it wrote is shown as its own channel", done.get("peer"), PEER_CODE)
-check("the writer merged the two in the chat it drafted in",
-      [p["phase"] for p in done["phases"]].count("merge"), 1)
-check("the answer is the merged script", done.get("text"), MERGED_CODE)
+check("the writer merged, once per reader, in the chat it drafted in",
+      [p["phase"] for p in done["phases"]].count("merge"), 2)
+check("and the answer is the merge both readers settled on", done.get("text"), MERGED2_CODE)
 check("the reviewer was asked whether it would ship the merge",
       "Would you ship this exactly as it is?" in asked_in(review[2]), True)
 check("and its verdict is kept", done.get("review"), AGREE)
@@ -406,13 +508,19 @@ check("thinking is off in every reviewer call",
 check("no search parameter is ever sent",
       sorted(k for c in review for k in c["body"] if "search" in k.lower()), [])
 
-print("\n-- the merge is a call, and it carries the other version --")
+print("\n-- each merge is a call, and it carries that reader's version --")
 merge_calls = [c for c in calls if MERGE_ASK in content_of(c["body"])]
-check("the merge happened once", len(merge_calls), 1)
-check("the merged script is asked for in that same chat",
+check("a merge per reader", len(merge_calls), 2)
+check("the first merge is asked for in the chat the draft was written in",
       merge_calls[0]["body"]["messages"][-2]["content"], DRAFT_CODE)
-check("the other model's version is in the instruction",
+check("and carries the first reader's version",
       PEER_CODE in merge_calls[0]["body"]["messages"][-1]["content"], True)
+check("the second merge edits the script the first two settled on",
+      merge_calls[1]["body"]["messages"][-2]["content"], MERGED_CODE)
+check("and carries the second reader's version",
+      ZAI_CODE in merge_calls[1]["body"]["messages"][-1]["content"], True)
+check("naming the reader it came from, so the instruction is about the right model",
+      "glm-5.3-flash" in merge_calls[1]["body"]["messages"][-1]["content"], True)
 check("the writer's own script was not resent as history",
       len([m for m in merge_calls[0]["body"]["messages"] if m["role"] == "user"]), 2)
 
@@ -422,14 +530,17 @@ out, done, calls, _ = turn()
 phases = [p["phase"] for p in done["phases"]]
 # Round one is the reviewer writing its own version; every round after it is an agreement
 # question that came back with another version, and every one of them is followed by a merge.
-check("five rounds: a version and a merge each, then it stops anyway",
-      [sorted(phases[:2]), phases.count("peer"), phases.count("agree"), phases.count("merge")],
-      [["draft", "seed"], 1, 4, 5])
+check("five rounds for the first reader: a version and a merge each, then it stops anyway",
+      [sorted(p for p in phases if p in ("draft", "seed", "seed2")),
+       phases.count("peer"), phases.count("agree"), phases.count("merge")],
+      [["draft", "seed", "seed2"], 1, 4, 6])
+check("and the second reader's own rounds are still just its two",
+      [phases.count("peer2"), phases.count("agree2")], [1, 1])
 check("the draft is not counted as a round",
       [p["phase"] for p in done["phases"]].count("draft"), 1)
-check("and the last merged script is what ships", done.get("text"), MERGED_CODE)
+check("and the last merged script is what ships", done.get("text"), MERGED2_CODE)
 check("the turn still ends", done.get("status"), "done")
-check("no more calls than the rounds allow", len(done["phases"]), 12)
+check("no more calls than both ceilings allow", len(done["phases"]), 16)
 STUB["always_better"] = False
 
 print("\n-- five is the ceiling, however the variable is set --")
@@ -452,14 +563,142 @@ reload_with()
 print("\n-- SEED_BRIEF=off keeps the brief, and drops only the extra call --")
 reload_with(SEED_BRIEF="off")
 out, done, calls, _ = turn()
-check("no seed phase", [p["phase"] for p in done["phases"]], ["draft", "peer", "merge", "agree"])
-check("and one call fewer", len(done["phases"]), 4)
+check("no seed phase for the first reader", phases_of(done, ("draft", "seed2")),
+      [["draft", "seed2"], ["peer", "merge", "agree", "peer2", "merge", "agree2"]])
+check("and one call fewer than the default turn", len(done["phases"]), 8)
 check("the brief is still in front of the first request",
       server.BRIEF[:60] in asked_in(reviewer_calls(calls)[0]), True)
 check("and the warning is in front of the brief",
       asked_in(reviewer_calls(calls)[0]).startswith(server.REVIEW_WARNING), True)
 check("and the contract rides with it",
       "VERDICT: BETTER" in asked_in(reviewer_calls(calls)[0]), True)
+reload_with()
+
+print("\n-- the second reader: its own brief first, then its own rounds --")
+reload_with()
+out, done, calls, seed2_stream = turn()
+second = second_calls(calls)
+check("the second reader is in the chain", server.second_enabled(), True)
+check("and is named", done.get("second"), "glm-5.3-flash")
+first2 = asked_in(second[0])
+check("its first message opens with the executor warning",
+      first2.startswith(server.REVIEW_WARNING), True)
+check("and then carries send2.txt whole",
+      [server.SECOND_BRIEF in first2, len(server.SECOND_BRIEF) > 1000], [True, True])
+check("with nothing asked of it yet: no request, no contract",
+      [ask in first2 for ask in ("make me a walk script", PEER_ASK, VERIFY_ASK, "VERDICT")],
+      [False] * 4)
+check("its answer is waited for before the request",
+      [p["provider"] for p in done["phases"] if p["phase"] == "seed2"], ["zai"])
+check("which the page streams as the second brief's own channel",
+      streamed(out, "seed2"), SEED_ACK)
+check("the request goes out after it, in the same conversation",
+      "make me a walk script" in asked_in(second[1]), True)
+check("and it is the script the first two settled on",
+      MERGED_CODE in asked_in(second[1]), True)
+check("with the contract riding on that request",
+      "VERDICT: BETTER" in asked_in(second[1]), True)
+check("every message to it opens with the warning",
+      [asked_last(c).startswith(server.REVIEW_WARNING) for c in second], [True] * len(second))
+check("the version it wrote is its own channel", done.get("peer2"), ZAI_CODE)
+check("its verdict is kept with the turn", done.get("second_review"), AGREE)
+check("and its merge is what ships", done.get("text"), MERGED2_CODE)
+check("deep think is on, at the top of its ladder",
+      [peers.zai_dialect().get("reasoning_effort"), peers.ZAI_THINKING], ["max", "max"])
+check("thinking is enabled in every call to it",
+      [c["body"].get("thinking") for c in second],
+      [{"type": "enabled", "clear_thinking": True}] * len(second))
+check("and no tools, so no search, in any of them",
+      [k for c in second for k in c["body"]
+       if k in ("tools", "tool_choice", "web_search", "web_search_options")], [])
+check("what it is asked names the runtime and the checks, like the first reader's requests",
+      ["TARGET:" in asked_in(second[1]), "CHECKS THIS SERVICE ALREADY RAN:" in asked_in(second[1])],
+      [True, True])
+check("and nothing of its thinking reaches the answer",
+      [REASONING in (done.get("peer2") or ""), THINKING in (done.get("peer2") or "")],
+      [False, False])
+check("the page can see it before the turn starts",
+      client.post("/chat/stream", json={"messages": [{"role": "user",
+                                                      "content": "hi"}]}).json()["second"],
+      "glm-5.3-flash")
+
+print("\n-- the second reader's rounds are bounded, and clamped --")
+reload_with(SECOND_ROUNDS="1")
+out, done, calls, _ = turn()
+check("one round: its own version and the merge, then it stops", phases_of(done)[1],
+      ["peer", "merge", "agree", "peer2", "merge"])
+reload_with(SECOND_ROUNDS="50")
+check("a value past the ceiling is clamped", server.SECOND_ROUNDS, server.MAX_SECOND_ROUNDS)
+reload_with(SECOND_ROUNDS="-3")
+check("and a negative one means none", server.SECOND_ROUNDS, 0)
+reload_with(SECOND_ROUNDS="0")
+out, done, calls, _ = turn()
+check("with it off the chain ends with the first reader", phases_of(done)[1],
+      ["peer", "merge", "agree"])
+check("the first reader's script is what ships", done.get("text"), MERGED_CODE)
+check("nothing was sent to the second reader at all", len(second_calls(calls)), 0)
+check("and no second reader is named", done.get("second"), "")
+reload_with()
+check("the default is two", server.SECOND_ROUNDS, 2)
+
+print("\n-- SECOND_SEED=off keeps its brief and drops only the extra call --")
+reload_with(SECOND_SEED="off")
+out, done, calls, _ = turn()
+check("no seed2 phase", "seed2" in [p["phase"] for p in done["phases"]], False)
+check("but the brief is still in front of its first request",
+      server.SECOND_BRIEF[:60] in asked_in(second_calls(calls)[0]), True)
+check("and the contract rides with that request",
+      "VERDICT: BETTER" in asked_in(second_calls(calls)[0]), True)
+reload_with()
+
+print("\n-- a second reader that cannot be reached leaves the agreed script --")
+reload_with(ZAI_URL="http://127.0.0.1:9/zai")
+out, done, calls, _ = turn()
+check("the first reader's script still ships", done.get("text"), MERGED_CODE)
+check("the turn is not an error", done.get("status"), "done")
+check("and the reason is said out loud", "did not read" in (done.get("note") or ""), True)
+check("the chip reports it", client.get("/health").json()["second"]["ok"], False)
+reload_with()
+
+print("\n-- a second reader that dies half-way leaves the last script as well --")
+# Its first two calls land (the brief, then its version and the merge they started) and the
+# verdict question is the one that fails, which is the case the guard exists for.
+STUB["zai_fail_after"] = 2
+out, done, calls, _ = turn()
+STUB["zai_fail_after"] = 9999
+check("the merge it already proposed ships", done.get("text"), MERGED2_CODE)
+check("the failure is recorded", "stopped early" in (done.get("note") or ""), True)
+check("and the turn is still done", done.get("status"), "done")
+
+print("\n-- without send2.txt the first brief stands in, and says so --")
+reload_with(SECOND_BRIEF=UNSET)
+check("the fallback is the first reader's brief", server.SECOND_BRIEF, server.BRIEF)
+health = client.get("/health").json()
+check("and /health names the file that actually goes out", health["second"]["brief"],
+      peers.FALLBACK_BRIEF_NAME)
+check("marked as a fallback rather than passed off as send2.txt",
+      health["second"]["brief_fallback"], True)
+reload_with()
+check("with a brief of its own, nothing is marked as a fallback",
+      client.get("/health").json()["second"]["brief"], BRIEF2_FIXTURE.name)
+
+print("\n-- the z.ai credential: a bad key and a wrong kind of token read differently --")
+out, done, calls, _ = turn()
+check("its model is what the chip looked for", client.get("/health").json()["second"]["model"],
+      "glm-5.3-flash")
+check("and the key is reported as good, model served",
+      client.get("/health").json()["second"]["detail"], "key set, model served")
+reload_with(ZAI_TOKEN="user-token-xyz")
+refused = peers.zai_failure(401, '{"error": {"code": "1001", "message": "invalid"}}')
+check("a chat.z.ai session token is refused with the fix named",
+      ["chat.z.ai session token" in refused, "API key from" in refused, "invalid" in refused],
+      [True, True, True])
+reload_with(ZAI_TOKEN="abc.def")
+check("an API key gets the platform's own words instead",
+      "chat.z.ai session token" in peers.zai_failure(
+          401, '{"error": {"code": "1001", "message": "invalid"}}'), False)
+check("and a retired model id is named as that rather than as a bad key",
+      "is not a model" in peers.zai_failure(404, '{"error": {"message": "not found"}}'), True)
 reload_with()
 
 print("\n-- the brief is send.txt --")
@@ -504,7 +743,7 @@ check("both frame shapes were read", done.get("peer"), PEER_CODE)
 check("a thinking frame never reaches the text",
       [THINKING in asked_in(c) or THINKING in (done.get("peer") or "") for c in web], [False] * 3)
 check("a status frame never arrives as text", "FINISHED" in (done.get("peer") or ""), False)
-check("the merge still happened, in the writer's chat", done.get("text"), MERGED_CODE)
+check("the merge still happened, in the writer's chat", done.get("text"), MERGED2_CODE)
 pow_header = web[0]["headers"].get("x-ds-pow-response")
 if _solver is None:
     print("  (the proof-of-work checks are skipped: no sha3 module is available here)")
@@ -528,7 +767,7 @@ out, done, calls, _ = turn()
 web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
 check("nothing was invented for an unsolvable challenge",
       [("x-ds-pow-response" in c["headers"]) for c in web], [False, False, False])
-check("and the turn still ran", done.get("text"), MERGED_CODE)
+check("and the turn still ran", done.get("text"), MERGED2_CODE)
 STUB["bad_challenge"] = False
 
 print("\n-- a reviewer that is down costs the draft, never the turn --")
@@ -539,6 +778,8 @@ out, done, calls, _ = turn()
 check("the draft still ships", done.get("text"), DRAFT_CODE)
 check("the failure is recorded rather than silence", "did not happen" in (
     done.get("review") or ""), True)
+check("and the second reader was not asked to review nothing",
+      done.get("second_review"), "")
 check("and the turn is not an error", done.get("status"), "done")
 check("the chip reports it", client.get("/health").json()["reviewer"]["ok"], False)
 reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
@@ -637,11 +878,12 @@ for _ in range(400):
         break
     time.sleep(0.02)
 check("the poll says the turn is over", polled.get("done"), True)
-check("and carries the answer", polled.get("text"), MERGED_CODE)
-check("with the draft, the other version and the review as well",
-      [bool(polled.get("draft")), bool(polled.get("peer")), bool(polled.get("review"))],
-      [True, True, True])
-check("and the record of what each phase cost", len(polled.get("phases") or []), 5)
+check("and carries the answer", polled.get("text"), MERGED2_CODE)
+check("with the draft, both other versions and both reviews as well",
+      [bool(polled.get("draft")), bool(polled.get("peer")), bool(polled.get("peer2")),
+       bool(polled.get("review")), bool(polled.get("second_review"))],
+      [True, True, True, True, True])
+check("and the record of what each phase cost", len(polled.get("phases") or []), 9)
 check("the poll reports no ceiling on the turn", "timeout" in polled, False)
 check("an unknown job is a 404, so the page can stop",
       client.get("/chat/poll/nope").status_code, 404)
@@ -664,7 +906,7 @@ check("and every writer call asks for it", [c["body"].get("thinking_mode") for c
       ["thinking"] * len(wrote))
 check("a reasoning delta never reaches the answer", REASONING in (done.get("text") or ""), False)
 check("nor the draft the reader is shown", REASONING in (done.get("draft") or ""), False)
-check("and the answer is still the merged script", done.get("text"), MERGED_CODE)
+check("and the answer is still the merged script", done.get("text"), MERGED2_CODE)
 reload_with(QWEN_THINKING="fast")
 check("it can be turned off as well", bridge.QWEN_THINKING, "fast")
 reload_with()
@@ -724,9 +966,10 @@ STUB["choice_merge"] = True
 out, done, calls, _ = turn()
 STUB["choice_merge"] = False
 phases = [p["phase"] for p in done["phases"]]
-check("the competition ran and then the question was settled",
-      [sorted(phases[:2]), phases[2:]], [["draft", "seed"], ["peer", "merge", "agree", "choose"]])
-check("the writer was asked to choose after merging", len(writer_calls(calls)), 3)
+check("both readers ran and then the question was settled",
+      phases_of(done), [["draft", "seed", "seed2"],
+                        ["peer", "merge", "agree", "peer2", "merge", "agree2", "choose"]])
+check("the writer was asked to choose after the merges", len(writer_calls(calls)), 4)
 check("and the longest option is what ships", done.get("text"), CHOICE_LONG)
 check("the merge's question is not shipped",
       CHOICE_QUESTION_TEXT in (done.get("text") or ""), False)
@@ -751,9 +994,11 @@ page = client.get("/")
 check("the page renders", page.status_code, 200)
 html = page.text
 check("with every placeholder filled",
-      [token for token in ("__CHIPS__", "__MODEL__", "__REVIEWER__", "__REVIEW_ON__",
-                           "__SEED_ON__", "__GREETING__") if token in html], [])
-check("and the brief marked as going out on its own", 'data-seed="true"' in html, True)
+      [token for token in ("__CHIPS__", "__MODEL__", "__REVIEWER__", "__SECOND__", "__SECOND_ON__",
+                           "__REVIEW_ON__", "__SEED_ON__", "__GREETING__") if token in html], [])
+check("and each brief marked as going out on its own",
+      ['data-seed="true"' in html, 'data-second-on="true"' in html, 'send2.txt' in html],
+      [True, True, True])
 reload_with()
 
 print(f"\n{count[0]} checks, {len(failures)} failed")

@@ -52,8 +52,12 @@ button:disabled{opacity:.55;cursor:default}
 .turn.draft .body{color:#b9c2d4}
 .turn.peer{align-self:flex-start;background:#0f1a1b;border-style:dashed;border-color:#26494a}
 .turn.peer .body{color:#bcd6d6}
+.turn.peer2{align-self:flex-start;background:#121722;border-style:dashed;border-color:#2f3f5e}
+.turn.peer2 .body{color:#c3cfe6}
 .turn.seed{align-self:flex-start;background:#12161f;border-style:dashed;border-color:#242c3a;opacity:.85}
 .turn.seed .body{color:#8e99ad}
+.turn.seed2{align-self:flex-start;background:#12161f;border-style:dashed;border-color:#242c3a;opacity:.85}
+.turn.seed2 .body{color:#8e99ad}
 .turn.rev{align-self:flex-start;background:#1a1512;border-color:#4a3a26}
 .turn.rev .body{color:#e6d3b3}
 details.meta{align-self:flex-start;max-width:100%;background:#12161f;border:1px dashed var(--line);border-radius:10px;padding:6px 12px;font:11px ui-monospace,monospace;color:var(--dim)}
@@ -67,7 +71,7 @@ footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-reviewer="__REVIEWER__" data-review-on="__REVIEW_ON__" data-seed="__SEED_ON__" data-greeting="__GREETING__">
+<body data-model="__MODEL__" data-reviewer="__REVIEWER__" data-second="__SECOND__" data-review-on="__REVIEW_ON__" data-seed="__SEED_ON__" data-second-on="__SECOND_ON__" data-greeting="__GREETING__">
 <div class="wrap">
 
   <div class="top">
@@ -101,9 +105,12 @@ footer a{color:var(--blue);text-decoration:none}
     <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
     Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
     Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code>, with thinking on.<br>
-    <code>__REVIEWER__</code> reads <code>send.txt</code> first, on its own, and is only asked after it answers.<br>
-    Every message to <code>__REVIEWER__</code> opens with the warning that the target is a Roblox executor script, not Roblox Studio.<br>
-    __MODEL__ writes a draft, <code>__REVIEWER__</code> writes its own version of it, __MODEL__ merges the two in the same chat, and <code>__REVIEWER__</code> says whether it would ship that.<br>
+    <code>__REVIEWER__</code> reads <code>send.txt</code> first, on its own, and is only asked after it answers;
+    <code>__SECOND__</code> reads its own brief (<code>send2.txt</code>, or the first brief when that file is not in the image)
+    the same way, before anything is asked of it; <code>/health</code> names the file that went out.<br>
+    Every message to either reader opens with the warning that the target is a Roblox executor script, not Roblox Studio.<br>
+    __MODEL__ writes a draft, <code>__REVIEWER__</code> writes its own version of it, __MODEL__ merges the two in the same chat,
+    then <code>__SECOND__</code> does the same over that script and __MODEL__ merges once more.<br>
     When __MODEL__ offers two scripts and asks which one is preferred, that question is answered here: the option with the most lines ships.<br>
     The Qwen token and the reviewer key stay in this service's variables; they never reach this page.
   </footer>
@@ -115,8 +122,15 @@ footer a{color:var(--blue);text-decoration:none}
   var BODY = document.body;
   var MODEL = BODY.dataset.model || "";
   var REVIEWER = BODY.dataset.reviewer || "";
+  var SECOND = BODY.dataset.second || "";
   var REVIEW_ON = BODY.dataset.reviewOn === "true";
   var SEED_ON = BODY.dataset.seed === "true";
+  var SECOND_ON = BODY.dataset.secondOn === "true";
+  // Which brief each reader is actually sent. The server's /health is what knows -- send2.txt
+  // falls back to the first reader's brief when it is not in the image -- so these are the
+  // names as configured, and they are corrected from /health as soon as it answers.
+  var FIRST_BRIEF = "send.txt";
+  var SECOND_BRIEF = "send2.txt";
   var GREETING = BODY.dataset.greeting || "";
 
   // The whole conversation lives in the browser: what was asked and what was sent back.
@@ -246,7 +260,8 @@ footer a{color:var(--blue);text-decoration:none}
 
   function bubble(channel, label) {
     if (bubbles[channel]) return bubbles[channel];
-    var cls = (channel === "draft" || channel === "peer" || channel === "seed") ? channel
+    var cls = (channel === "draft" || channel === "peer" || channel === "peer2" ||
+               channel === "seed" || channel === "seed2") ? channel
       : (channel === "review" ? "rev" : "");
     var el = turnEl("assistant", "", label);
     if (cls) el.classList.add(cls);
@@ -257,13 +272,19 @@ footer a{color:var(--blue);text-decoration:none}
     return el;
   }
 
-  // The brief's bubble, put up the moment the server says the reviewer is reading it -- which is
-  // before the draft -- so what the page shows first is send.txt going out first. The text is a
-  // placeholder: the reviewer's acknowledgement replaces it as soon as it streams in.
-  function markBrief() {
-    var el = bubble("seed", labelFor("seed"));
+  // The file name out of what /health reports, which may be "send.txt (send2.txt is not in the
+  // image)" when the second reader fell back to the first brief.
+  function briefName(named) {
+    return (named || "").split(" ")[0];
+  }
+
+  // A brief's bubble, put up the moment the server says that reader is reading it -- which is
+  // before the draft -- so what the page shows first is the briefs going out first. The text is
+  // a placeholder: the reader's acknowledgement replaces it as soon as it streams in.
+  function markBrief(channel, file, who) {
+    var el = bubble(channel, labelFor(channel));
     if (!bodyOf(el).textContent) {
-      bodyOf(el).textContent = "send.txt goes out first, on its own; waiting for the reviewer";
+      bodyOf(el).textContent = file + " goes out first, on its own; waiting for " + who;
       el.dataset.placeholder = "1";
     }
     return el;
@@ -282,7 +303,9 @@ footer a{color:var(--blue);text-decoration:none}
     if (channel === "review") return "review · " + (REVIEWER || "reviewer");
     if (channel === "answer") return "agreed · " + MODEL;
     if (channel === "peer") return "also · " + (REVIEWER || "reviewer");
+    if (channel === "peer2") return "also · " + (SECOND || "the second reader");
     if (channel === "seed") return "brief · " + (REVIEWER || "reviewer");
+    if (channel === "seed2") return "brief · " + (SECOND || "the second reader");
     return "draft · " + MODEL;
   }
 
@@ -382,7 +405,8 @@ footer a{color:var(--blue);text-decoration:none}
       statusText = d.note || d.phase;
       // The seed phase is announced before the draft starts, so its bubble is created here
       // rather than when its text arrives -- otherwise the draft would appear above the brief.
-      if (d.phase === "seed") markBrief();
+      if (d.phase === "seed") markBrief("seed", FIRST_BRIEF, REVIEWER || "the first reader");
+      if (d.phase === "seed2") markBrief("seed2", SECOND_BRIEF, SECOND || "the second reader");
       return false;
     }
     if (d.beat) { statusText = d.note || d.status || statusText; return false; }
@@ -420,7 +444,9 @@ footer a{color:var(--blue);text-decoration:none}
       render();
       if (draft && draft !== text) metaEl("draft by " + MODEL, draft);
       if (d.peer) metaEl("the other version, by " + (REVIEWER || "reviewer"), d.peer);
-      if (review) metaEl("the reviewer", review);
+      if (d.peer2) metaEl("the second version, by " + (SECOND || "the second reader"), d.peer2);
+      if (review) metaEl("the first reader", review);
+      if (d.second_review) metaEl("the second reader", d.second_review);
       if (phases.length > 1) {
         metaEl("chain", phases.map(function (p) {
           return p.phase + ": " + (p.model || p.provider) + " " + p.ms + "ms, " + p.chars +
@@ -528,6 +554,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
     if (d.draft) setTransient("draft", d.draft);
     if (d.peer) setTransient("peer", d.peer);
+    if (d.peer2) setTransient("peer2", d.peer2);
     if (d.text) setTransient("answer", d.text);
     return false;
   }
@@ -555,9 +582,10 @@ footer a{color:var(--blue);text-decoration:none}
     statusText = REVIEW_ON ? "starting the chain" : "starting";
     busy(true);
     startTimer();
-    // send.txt goes out first and on its own, so its bubble is put up before anything the draft
-    // could put up: the chain is shown in the order it happens, not the order text arrives.
-    if (REVIEW_ON && SEED_ON) markBrief();
+    // The briefs go out first and on their own, so their bubbles are put up before anything the
+    // draft could put up: the chain is shown in the order it happens, not the order text arrives.
+    if (REVIEW_ON && SEED_ON) markBrief("seed", FIRST_BRIEF, REVIEWER || "the first reader");
+    if (SECOND_ON) markBrief("seed2", SECOND_BRIEF, SECOND || "the second reader");
     try {
       var data = await api("/chat/stream", { messages: messages });
       chat.job = data.job;
@@ -621,6 +649,15 @@ footer a{color:var(--blue);text-decoration:none}
         var rev = s.reviewer || {};
         setChip("reviewer", rev.ok && s.review,
           s.review ? (rev.detail || rev.model || "configured") : "off -- answers are not reviewed");
+        // The second reader is a third account, and it is checked the same way.
+        var sec = s.second || {};
+        setChip("glm", sec.ok && sec.on,
+          sec.on ? (sec.detail || sec.model || "configured")
+                 : "off -- the chain ends with the first reader");
+        // And which briefs are really being sent, so a bubble cannot claim a file that did not
+        // go out -- send2.txt falls back to the first reader's brief when it is missing.
+        FIRST_BRIEF = briefName(rev.brief) || FIRST_BRIEF;
+        SECOND_BRIEF = briefName(sec.brief) || SECOND_BRIEF;
         setChip("model", true, s.model);
         setChip("mode", true, s.greeting ? s.thinking + " · " + s.greeting : s.thinking);
       })
@@ -628,7 +665,8 @@ footer a{color:var(--blue);text-decoration:none}
   }
 
   $("flow").textContent = REVIEW_ON
-    ? MODEL + " drafts · " + REVIEWER + " writes its own version · they merge in the same chat"
+    ? MODEL + " drafts · " + REVIEWER + " and " + (SECOND || "the second reader") +
+      " each write their own version · each is merged in the same chat"
     : "Qwen chat · every question goes out as \"" + GREETING + " ...\"";
 
   $("send").onclick = send;

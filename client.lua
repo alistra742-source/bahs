@@ -49,8 +49,9 @@ local function ask(question, onStep)
         local job = started.job
         -- Wall clock, not os.clock(): that one counts the CPU this script has used, which barely
         -- moves while it waits, so it would never actually reach the deadline. The chain is a
-        -- draft plus up to two calls per negotiation round, and the server puts no ceiling on
-        -- any of them, so this is a courtesy so a person is not left staring at nothing.
+        -- draft, then two calls per round for each of the two readers, and the server puts no
+        -- ceiling on any of them, so this is a courtesy so a person is not left staring at
+        -- nothing.
         local deadline = os.time() + 3600
         while os.time() < deadline do
             local r = request({
@@ -148,6 +149,7 @@ outputPad.Parent = output
 
 local lastAnswer
 local lastReview
+local lastSecondReview
 
 local function makeBtn(text, x, color, callback)
     local b = Instance.new("TextButton")
@@ -181,6 +183,7 @@ makeBtn("ask", 0.002, Color3.fromRGB(60, 120, 200), function()
     end
     lastAnswer = result.text or ""
     lastReview = result.review
+    lastSecondReview = result.second_review
     output.Text = lastAnswer
 end)
 
@@ -201,10 +204,19 @@ makeBtn("execute", 0.202, Color3.fromRGB(80, 160, 80), function()
 end)
 
 makeBtn("review", 0.402, Color3.fromRGB(150, 110, 60), function()
+    -- Both readers, in the order the chain ran them, so the second one's verdict is as visible
+    -- as the first one's.
+    local parts = {}
     if lastReview and lastReview ~= "" then
-        output.Text = "-- " .. lastReview
+        table.insert(parts, "[first reader]\n" .. lastReview)
+    end
+    if lastSecondReview and lastSecondReview ~= "" then
+        table.insert(parts, "[second reader]\n" .. lastSecondReview)
+    end
+    if #parts > 0 then
+        output.Text = "-- " .. table.concat(parts, "\n\n")
     else
-        output.Text = "-- no reviewer answered for the last turn"
+        output.Text = "-- no reader answered for the last turn"
     end
 end)
 
@@ -212,6 +224,7 @@ makeBtn("new chat", 0.602, Color3.fromRGB(70, 70, 110), function()
     messages = {}
     lastAnswer = nil
     lastReview = nil
+    lastSecondReview = nil
     output.Text = "-- new chat: nothing from before is sent"
 end)
 
