@@ -308,6 +308,32 @@ check("and says which credential it is", "session token, not an API key" in revi
 check("the api's own words are kept", "Authentication Fails" in review, True)
 STUB["api_code"] = 0
 
+print("\n-- a page whose stream keeps being cut collects the answer by polling --")
+started = client.post("/chat/stream", json={"messages": [{"role": "user",
+                                                          "content": "make me a walk script"}]})
+polled = {}
+for _ in range(200):
+    polled = client.get(f"/chat/poll/{started.json()['job']}").json()
+    if polled.get("done") or polled.get("status") == "error":
+        break
+    time.sleep(0.02)
+check("the poll says the turn is over", polled.get("done"), True)
+check("and carries the answer", polled.get("text"), "-- refined\nprint('hi')")
+check("with the draft and the review as well",
+      [bool(polled.get("draft")), bool(polled.get("review"))], [True, True])
+check("and the record of what each phase cost", len(polled.get("phases") or []), 3)
+check("an unknown job is a 404, so the page can stop",
+      client.get("/chat/poll/nope").status_code, 404)
+
+print("\n-- polling needs no key, exactly like the stream --")
+reload_with(API_KEY="a-key-the-page-never-has")
+started = client.post("/chat/stream", json={"messages": [{"role": "user",
+                                                          "content": "make me a walk script"}]})
+job = started.json()["job"]
+check("the page can poll", client.get(f"/chat/poll/{job}").status_code, 200)
+check("while the API result stays gated", client.get(f"/chat/result/{job}").status_code, 401)
+os.environ.pop("API_KEY", None)
+
 print(f"\n{count[0]} checks, {len(failures)} failed")
 if failures:
     print("  - " + "\n  - ".join(failures))

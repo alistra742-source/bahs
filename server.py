@@ -116,6 +116,14 @@ class Provider:
             body["temperature"] = temperature
         if max_tokens > 0:
             body["max_tokens"] = max_tokens
+        # What goes out is logged with what comes back: without it, a short answer, a request that
+        # never carried the brief, and a provider that stopped early all look the same afterwards.
+        # The token checks do not come through here (stream=False), so this is one line per call.
+        if stream and env("LOG_REQUESTS", default="1") != "0":
+            asked = sum(len(m.get("content") or "") for m in body["messages"]
+                        if isinstance(m, dict))
+            print(f"[upstream] {self.name} -> {self.model}: {len(body['messages'])} message(s), "
+                  f"{asked} chars, max_tokens {body.get('max_tokens', 'unset')}", flush=True)
         return body
 
 
@@ -358,6 +366,15 @@ class DeepSeekWeb:
                 print(f"[deepseek] the challenge (difficulty {challenge.get('difficulty')}) was not "
                       "solved; this message goes out without the header, which the API answers "
                       "with 40300 MISSING_HEADER", flush=True)
+        # The prompt's size and whether the brief survived into it, in one line: this is the answer
+        # to "is the whole send.txt being sent", and it is checkable in the service's own log.
+        if BRIEF:
+            print(f"[deepseek] sending {len(prompt)} chars (brief {len(BRIEF)} chars from "
+                  f"{BRIEF_PATH.name}: {'whole' if BRIEF in prompt else 'NOT COMPLETE'}), "
+                  "thinking off, search off", flush=True)
+        else:
+            print(f"[deepseek] sending {len(prompt)} chars (no brief loaded), thinking off, "
+                  "search off", flush=True)
         payload = {
             "chat_session_id": session,
             "parent_message_id": None,
@@ -394,6 +411,12 @@ class DeepSeekWeb:
                     piece = read_chunk(chunk, box)
                     if piece:
                         yield piece
+                if box is not None and not box.get("finish"):
+                    # The site never said it had finished writing, so this review is whatever
+                    # arrived before the stream stopped -- said out loud rather than passed off as
+                    # the whole answer.
+                    print("[deepseek] the site's stream ended without a finished status: the "
+                          "review may be only the part it managed to write", flush=True)
 
 
 # --- the reviewer ------------------------------------------------------------------------
@@ -446,7 +469,7 @@ REVIEW_MAX_TOKENS = int(env("REVIEW_MAX_TOKENS", default="2048"))
 # applying it — bounded.
 REVIEW_ITEMS = int(env("REVIEW_ITEMS", default="8"))
 # The script sent for review is bounded too: a 1M-token context is not a reason to use it.
-REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="24000"))
+REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="48000"))
 # How much of the brief in front of the review is sent. Send.txt is yours; this is the
 # ceiling on it, so a stray huge file cannot become the whole prompt.
 REVIEW_BRIEF_MAX = int(env("REVIEW_BRIEF_MAX", default="60000"))
@@ -510,9 +533,12 @@ def review_enabled() -> bool:
 # room; the review produces a list, so it does not. A draft that stops at its ceiling is
 # reported as a failure instead of being shipped, because everything after it would be built
 # on a cut-off script.
+# Both Qwen calls exist to produce a whole script, and 4096 tokens is roughly 200 lines of Luau.
+# An answer that stops at its ceiling is refused rather than shipped, so a ceiling that is too low
+# shows up as a failed turn -- the rewrite can be long as well, so it gets the larger room.
 MAX_TOKENS = int(env("MAX_TOKENS", default="4096"))
-DRAFT_TOKENS = int(env("DRAFT_TOKENS", default=str(MAX_TOKENS)))
-REFINE_TOKENS = int(env("REFINE_TOKENS", default="8192"))
+DRAFT_TOKENS = int(env("DRAFT_TOKENS", default="8192"))
+REFINE_TOKENS = int(env("REFINE_TOKENS", default="16384"))
 # How much of a review is pasted into the refine instruction when it came back as prose.
 REVIEW_PASTE_MAX = int(env("REVIEW_PASTE_MAX", default="4000"))
 
@@ -1243,6 +1269,37 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.get("/chat/poll/{job_id}")
+def poll_job(job_id: str):
+    """Where a turn stands, as one short JSON object.
+
+    The page reads a turn through /chat/stream/{job}, which is one long-lived response -- and a
+    phone network or a proxy is entitled to cut those. When that keeps happening, this is what the
+    page falls back to: the same information in a response that closes at once. Not key-gated, for
+    the same reason the stream is not (the page holds no key), and it reveals nothing a reader of
+    that stream could not already see -- a job id is 12 random hex characters, and only the reader
+    that started the turn has it. `done` is what a poller waits for; `text` is the answer.
+    """
+    job = lookup(job_id)
+    body = {
+        "job": job.id,
+        "status": job.status,
+        "phase": job.phase,
+        "note": job.note,
+        "text": job.text(),
+        "draft": job.channel("draft"),
+        "review": job.review_text,
+        "model": QWEN_MODEL,
+        "reviewer": REVIEWER.model if job.want_review and review_enabled() else "",
+        "phases": job.phases,
+        "done": job.status == "done",
+    }
+    body.update(job.report())
+    if job.status == "error":
+        body["error"] = job.error
+    return body
 
 
 def require_key(x_api_key: Optional[str] = Header(None),

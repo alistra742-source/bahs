@@ -248,6 +248,15 @@ footer a{color:var(--blue);text-decoration:none}
     return el;
   }
 
+  // A poll returns the text so far, not the next piece, so it replaces the bubble's contents
+  // instead of appending to them.
+  function setTransient(channel, text) {
+    var el = bubble(channel, labelFor(channel));
+    el.classList.remove("pending");
+    bodyOf(el).textContent = text;
+    scrollDown();
+  }
+
   function labelFor(channel) {
     if (channel === "review") return "review · " + (REVIEWER || "reviewer");
     if (channel === "answer") return "final · " + MODEL;
@@ -393,7 +402,18 @@ footer a{color:var(--blue);text-decoration:none}
   // to see it through -- a dropped connection is not a failed answer.
   function read(job) {
     var finished = false;
-    return fetch("/chat/stream/" + job, { headers: headers(), cache: "no-store" })
+    var lastFrame = Date.now();
+    var controller = new AbortController();
+    // A proxy that stops forwarding without closing the socket would hold this read open for as
+    // long as the browser allows, with nothing on screen and no error to retry on. The server
+    // beats every few seconds, so silence means the connection is dead: abort it and let watch()
+    // reattach, which replays the turn from the start.
+    var watchdog = setInterval(function () {
+      if (Date.now() - lastFrame > 25000) controller.abort();
+    }, 5000);
+    return fetch("/chat/stream/" + job, { headers: headers(), cache: "no-store",
+                                          signal: controller.signal })
+      .finally(function () { clearInterval(watchdog); })
       .then(function (res) {
         if (!res.ok) {
           return res.text().then(function (text) {
@@ -417,6 +437,7 @@ footer a{color:var(--blue);text-decoration:none}
               if (!finished) throw new Error("the stream ended early");
               return;
             }
+            lastFrame = Date.now();
             buffer += decoder.decode(chunk.value, { stream: true });
             var lines = buffer.split("\n");
             buffer = lines.pop();
@@ -429,21 +450,50 @@ footer a{color:var(--blue);text-decoration:none}
       });
   }
 
-  // Follow a job for as long as it takes, reattaching if a read dies part way. A chain runs
-  // three model calls, so this is where a long wait is survived.
+  // Follow a job for as long as it takes, reattaching if a read dies part way. A chain is three
+  // model calls, and a phone network will not hold one response open that long -- so a dropped
+  // read is expected rather than a failure: the turn keeps running on the server, and every
+  // reattach replays it from the start. After a couple of drops the answer is collected by
+  // polling instead -- one short request at a time, which survives what a long one cannot.
   async function watch(job) {
-    for (var attempt = 1; ; attempt++) {
+    var drops = 0;
+    for (;;) {
       try {
         await read(job);
         return;
       } catch (e) {
-        // The job is still running on the server, so the answer is not lost -- only this read
-        // is. Only give up when nothing about it can be retried.
-        if (e.fatal || attempt >= 8) throw e;
-        statusText = "connection dropped, reattaching (try " + attempt + ")";
-        await new Promise(function (r) { setTimeout(r, 1000 * attempt); });
+        if (e && (e.gone || e.fatal)) throw e;   // nothing about this job can be retried
+        drops++;
+        if (drops >= 3 && await poll(job)) return;
+        statusText = "connection dropped, picking it back up (try " + drops + ")";
+        await new Promise(function (r) { setTimeout(r, Math.min(1000 * drops, 5000)); });
       }
     }
+  }
+
+  // One short request: has the turn finished, and what did it say? Returns true once it is over
+  // and rendered, which is what lets watch() stop. While it runs, the draft and the answer so far
+  // are shown from the poll as well, so a turn that only works this way still shows progress.
+  async function poll(job) {
+    var res;
+    try {
+      res = await fetch("/chat/poll/" + job, { headers: headers(), cache: "no-store" });
+    } catch (e) {
+      return false;              // this attempt had no network either; try again in a moment
+    }
+    if (res.status === 404) {
+      throw Object.assign(
+        new Error("that turn is no longer on the server; send it again"), { gone: true });
+    }
+    if (!res.ok) return false;
+    var d = await res.json();
+    offset = (d.elapsed || 0) * 1000;
+    statusText = d.note || d.phase || statusText;
+    if (d.status === "error") return handleFrame(JSON.stringify({ error: d.error || "the turn failed" }));
+    if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
+    if (d.draft) setTransient("draft", d.draft);
+    if (d.text) setTransient("answer", d.text);
+    return false;
   }
 
   // What one request carries: the newest turns, so a long chat cannot grow the request without

@@ -182,6 +182,13 @@ A few properties worth knowing:
   sees. Your script is untouched.
 * **Everything is measured.** Every call is logged and returned as `phases`: model, milliseconds,
   characters, finish reason, token usage.
+* **What was *sent* is logged too, not just what came back.** `[upstream] qwen -> qwen3.8-max: 3
+  message(s), 529 chars, max_tokens 16384` before each OpenAI-shaped call, and on the site path
+  `[deepseek] sending 46819 chars (brief 45212 chars from send.txt: whole)`. That is what makes
+  "it only sent part of the brief" answerable from the service's own log: the line says `whole`,
+  or it says `NOT COMPLETE` with the size next to it. A site stream that stops without a finished
+  status is logged as well, so a review that is only the part it managed to write is never passed
+  off as the whole answer.
 
 ## Endpoints
 
@@ -190,7 +197,8 @@ A few properties worth knowing:
 | `POST /chat/stream` | `{messages:[{role,content},...], review?: bool}` -> `{job, model, reviewer, turns}`. Starts the chain, returns at once |
 | `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`draft` / `review` / `answer`), `{reset, ch}`, `{phase, note}`, `{beat}` heartbeats, then `{done, text, draft, review, phases}` or `{error}` |
 | `POST /chat` | The same chain, blocking. `{text, draft, review, phases}` |
-| `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox) |
+| `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
+| `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
 | `POST /generate` | Blocking, one prompt, no history |
 | `POST /generate/stream` | The same as `/chat/stream`, one prompt, no history |
 | `POST /v1/chat/completions` | OpenAI-compatible passthrough to Qwen. The newest user turn gets the greeting and the model is pinned; `tools`, `web_search_options`, `reasoning_effort`, `stream` pass through. No chain |
@@ -222,8 +230,8 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 | `REVIEW_THINKING` | `off` | anything else turns it back on for the reviewer only |
 | `REVIEW_ITEMS` | `8` | cap on the numbered list |
 | `REVIEW_BRIEF` / `REVIEW_BRIEF_MAX` | `send.txt`, then `Send.txt` / `60000` | the brief, and the ceiling on it |
-| `REVIEW_SCRIPT_MAX` | `24000` | how much of the draft is sent for review |
-| `DRAFT_TOKENS` / `REFINE_TOKENS` | `4096` / `8192` | ceilings on the two Qwen calls |
+| `REVIEW_SCRIPT_MAX` | `48000` | how much of the draft is sent for review; past this the reviewer is told the script is truncated |
+| `DRAFT_TOKENS` / `REFINE_TOKENS` | `8192` / `16384` | ceilings on the two Qwen calls. A whole script is the point of both, and 4096 tokens is roughly 200 lines of Luau; an answer that reaches its ceiling is refused rather than shipped, so a ceiling that is too low shows up as a failed turn |
 | `MAX_TOKENS` | `4096` | ceiling on the `/v1` passthrough |
 | `PIPELINE` | `auto` | `on` / `off` / `auto` (on whenever a reviewer key is set) |
 | `TARGET_RUNTIME` | Roblox Luau | what the reviewer judges the script against |
@@ -268,7 +276,8 @@ that, which is exactly why the client polls.
 | the draft is the answer, no rewrite | the reviewer answered `VERDICT: OK`, or a failed review meant there was no list to apply |
 | `the answer was cut off by the token ceiling` | raise `DRAFT_TOKENS` (and `REFINE_TOKENS`), or ask for less at once |
 | a rewrite was thrown away | it came back empty or cut off; the log says so and the draft shipped |
-| the answer stops mid-sentence | the phone dropped the connection; the job is still running, reload and it replays |
+| the answer stops mid-sentence | the phone dropped the connection; the job is still running, and the page reattaches and replays it -- and after three drops it collects the answer with `GET /chat/poll/{job}` instead, one short request at a time |
+| `the stream ended early` | the read was cut before the turn finished, which the page now treats as a reattach rather than a failure. It should no longer be the thing you see; if it is, the log line `[job] <id> ...` for that turn says how far it got |
 | `429 too many requests from ...` | `RATE_LIMIT` per IP, or `MAX_CONCURRENT` chains already running |
 
 ## Curl
