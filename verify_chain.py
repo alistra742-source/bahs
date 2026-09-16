@@ -1,221 +1,84 @@
-"""Check the chain against stubbed providers, including chat.deepseek.com's own endpoints.
+"""Check the chain against a stubbed Qwen, and the toolbox against itself.
 
 Run from the project root:  .venv/bin/python verify_chain.py
 
-What the chain is now: each reader is sent its own brief on its own and its answer is waited
-for, the writer drafts, the first reader writes its own version of that script, the writer merges
-the two in the chat it drafted in and the first reader says whether it would ship the merge;
-then the second reader does all of that over the script the first two settled on.
+What is being checked, in order: one call to one model with thinking on; the tool round trip
+(the model asks, the tool runs, the model is asked again with the result in front of it); the
+answer having no tool XML and no continuation metadata in it; the session keeping *one* chat (the
+marker the provider needs is remembered and put back on the next turn of the same session and on
+no other); the executor round trip behind `run_script`; and the toolbox's own units.
+
+No keys and no network: the provider is a local stub, and the Roblox API dump is a fixture.
 """
-import contextlib, io, json, os, sys, tempfile, threading, time
+import contextlib, io, json, os, re, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CALLS = []
-STUB = {"users_code": 0, "api_code": 0, "bad_challenge": False, "always_better": False,
-        "message_seq": 0, "choice_draft": False, "choice_merge": False, "choice_dud": False,
-        "merges": 0, "zai_calls": 0, "zai_fail_after": 9999}
+STUB = {"mode": "plain", "tool": "luau_check", "arguments": None, "openai_tool": False,
+        "finish": "stop", "script": "", "finite": 0, "prose": "Let me check that first.\n",
+        "meta": '<!-- qwen_metadata: {"response_id":"r1"} -->'}
 
-# The three things a model can be asked for in this chain, and what each one gets back. The
-# scripts are small but real: a merge is only ever attempted on something that looks like code.
-DRAFT_CODE = ("-- walk script\n"
-              "local Players = game:GetService(\"Players\")\n"
-              "local speed = 16\n"
-              "local function speedUp(plr)\n"
-              "    local humanoid = plr.Character and "
-              "plr.Character:FindFirstChildOfClass(\"Humanoid\")\n"
-              "    if humanoid then humanoid.WalkSpeed = speed end\n"
-              "end\n"
-              "Players.PlayerAdded:Connect(speedUp)")
-PEER_CODE = ("-- walk script\n"
-             "local Players = game:GetService(\"Players\")\n"
-             "local SPEED = 16\n"
-             "local function onPlayer(plr)\n"
-             "    plr.CharacterAdded:Connect(function(char)\n"
-             "        local humanoid = char:WaitForChild(\"Humanoid\")\n"
-             "        humanoid.WalkSpeed = SPEED\n"
-             "    end)\n"
-             "end\n"
-             "Players.PlayerAdded:Connect(onPlayer)")
-MERGED_CODE = ("-- walk script, merged\n"
-               "local Players = game:GetService(\"Players\")\n"
-               "local SPEED = 16\n"
-               "local function speed(plr)\n"
-               "    plr.CharacterAdded:Connect(function(char)\n"
-               "        char:WaitForChild(\"Humanoid\").WalkSpeed = SPEED\n"
-               "    end)\n"
-               "end\n"
-               "Players.PlayerAdded:Connect(speed)")
-# The second reader's own version of that script, and the merge that comes out of it. Two
-# different scripts, so "which merge is what shipped" is answerable rather than assumed.
-ZAI_CODE = ("-- walk script, second reader\n"
-            "local Players = game:GetService(\"Players\")\n"
-            "local SPEED = 16\n"
-            "local function apply(character)\n"
-            "    local humanoid = character:FindFirstChildOfClass(\"Humanoid\")\n"
-            "    if humanoid then humanoid.WalkSpeed = SPEED end\n"
-            "end\n"
-            "local function onPlayer(plr)\n"
-            "    if plr.Character then apply(plr.Character) end\n"
-            "    plr.CharacterAdded:Connect(apply)\n"
-            "end\n"
-            "Players.PlayerAdded:Connect(onPlayer)")
-MERGED2_CODE = ("-- walk script, merged twice\n"
-                "local Players = game:GetService(\"Players\")\n"
-                "local SPEED = 16\n"
-                "local function apply(character)\n"
-                "    local humanoid = character:WaitForChild(\"Humanoid\", 10)\n"
-                "    if humanoid then humanoid.WalkSpeed = SPEED end\n"
-                "end\n"
-                "local function onPlayer(plr)\n"
-                "    if plr.Character then apply(plr.Character) end\n"
-                "    plr.CharacterAdded:Connect(apply)\n"
-                "end\n"
-                "Players.PlayerAdded:Connect(onPlayer)")
+SIMPLE_SCRIPT = """local Players = game:GetService("Players")
+local SPEED = 16
+local function apply(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    if humanoid then
+        humanoid.WalkSpeed = SPEED
+    end
+end
+Players.PlayerAdded:Connect(function(plr)
+    if plr.Character then apply(plr.Character) end
+    plr.CharacterAdded:Connect(apply)
+end)"""
 
-
-def fenced(code):
-    return "```lua\n" + code + "\n```"
-
-
-# Two scripts of very different lengths, offered with the question the writer asks when it cannot
-# decide. The bridge answers that question itself, and the longer one is what has to ship.
-CHOICE_SHORT = ("-- walk script, simple\n"
-                "local p = game:GetService(\"Players\")\n"
-                "p.PlayerAdded:Connect(function(plr) plr.CharacterAdded:Connect(function(c)\n"
-                "    c:WaitForChild(\"Humanoid\").WalkSpeed = 16\n"
-                "end) end)")
-CHOICE_LONG = ("-- walk script, robust\n"
-               "local Players = game:GetService(\"Players\")\n"
-               "local SPEED = 16\n"
-               "local function apply(character)\n"
-               "    local humanoid = character:WaitForChild(\"Humanoid\", 10)\n"
-               "    if not humanoid then return end\n"
-               "    humanoid.WalkSpeed = SPEED\n"
-               "end\n"
-               "local function onPlayer(plr)\n"
-               "    if plr.Character then apply(plr.Character) end\n"
-               "    plr.CharacterAdded:Connect(apply)\n"
-               "end\n"
-               "Players.PlayerAdded:Connect(onPlayer)\n"
-               "for _, plr in ipairs(Players:GetPlayers()) do onPlayer(plr) end")
-CHOICE_QUESTION_TEXT = "Which choice do you prefer?"
-CHOICE_DRAFT = ("Here are two ways to do it.\n\nOption 1 (simple):\n" + fenced(CHOICE_SHORT)
-                + "\n\nOption 2 (robust):\n" + fenced(CHOICE_LONG)
-                + "\n\n" + CHOICE_QUESTION_TEXT)
-# The sentence only the reply to that question carries, which is how the stub routes it.
-CHOICE_ASK = "I prefer option"
-
-SEED_ACK = "kanha:ready"
-DRAFT = fenced(DRAFT_CODE)
-PEER = "VERDICT: BETTER\n" + fenced(PEER_CODE)
-MERGED = fenced(MERGED_CODE)
-MERGED2 = fenced(MERGED2_CODE)
-AGREE = "VERDICT: AGREE"
-# The second reader's two answers. The same asks carry the same words, so its answers are routed
-# by the endpoint they arrive at (/zai/...) rather than by anything in the prompt.
-ZAI_PEER = "VERDICT: BETTER\n" + fenced(ZAI_CODE)
-# The sentence that only a peer request carries, and the one only an agreement question carries.
-PEER_ASK = "Write the version of this script you would ship"
-VERIFY_ASK = "Would you ship this exactly as it is?"
-SEED_ASK = "That is your standing instruction set"
-MERGE_ASK = "and wrote its own version of it"
-THINKING = "SECRET_THINKING_TEXT"
+BROKEN_SCRIPT = SIMPLE_SCRIPT + "\nif true then\nprint(\"never closed\")\n"
+FINAL = "```lua\n" + SIMPLE_SCRIPT + "\n```"
 REASONING = "SECRET_REASONING_TEXT"
 
 
-def frame(piece, finish=None, kind="RESPONSE"):
-    delta = {"content": piece, "type": kind} if piece else {}
-    return "data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": finish}]}) + "\n\n"
+# --- the stub provider --------------------------------------------------------------------
+
+def sse(payload) -> bytes:
+    return ("data: " + json.dumps(payload) + "\n\n").encode()
 
 
-def raw_frame(payload):
-    return "data: " + json.dumps(payload) + "\n\n"
+def delta_frame(delta, finish=None) -> bytes:
+    return sse({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 
 
-def reasoning_frame(text):
-    """A thinking token on the writer's own stream, which is what thinking mode adds."""
-    return "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": text}}]}) + "\n\n"
+def answer_stream(text, finish="stop", reasoning=REASONING) -> bytes:
+    """One answer, with the thinking that precedes it on the same stream."""
+    out = b""
+    if reasoning:
+        out += delta_frame({"reasoning_content": reasoning})
+    out += delta_frame({"content": text}) + delta_frame({}, finish) + b"data: [DONE]\n\n"
+    return out
 
 
-def stream(text, reasoning=REASONING):
-    """An OpenAI-shaped answer, with the thinking that precedes it on the same stream."""
-    return ((reasoning_frame(reasoning) if reasoning else "") + frame(text)
-            + frame(None, "stop") + "data: [DONE]\n\n").encode()
+def tool_stream(call_id="call_1", name="", arguments="", openai=False, xml="") -> bytes:
+    """One answer that asks for a tool, in whichever shape the proxy uses."""
+    out = delta_frame({"reasoning_content": REASONING})
+    if openai and not xml:
+        # OpenAI streams a tool call in fragments: the name first, then pieces of the arguments.
+        out += delta_frame({"tool_calls": [{"index": 0, "id": call_id, "type": "function",
+                                            "function": {"name": name}}]})
+        for piece in [arguments[i:i + 12] for i in range(0, len(arguments), 12)]:
+            out += delta_frame({"tool_calls": [{"index": 0, "function": {"arguments": piece}}]})
+        out += delta_frame({}, "tool_calls")
+    else:
+        out += delta_frame({"content": xml}) + delta_frame({}, "tool_calls")
+    return out + b"data: [DONE]\n\n"
 
 
-def reply_to(prompt):
-    """What a provider answers, decided by what it was asked -- the ask is the whole contract."""
-    if CHOICE_ASK in prompt:
-        # The bridge has just named the option it wants; the writer hands it over. `choice_dud`
-        # is a writer that will not decide even when told which one, which must still end in a
-        # script rather than in the question again.
-        return "I cannot decide for you." if STUB["choice_dud"] else fenced(CHOICE_LONG)
-    if SEED_ASK in prompt:
-        return SEED_ACK
-    if PEER_ASK in prompt or (VERIFY_ASK in prompt and STUB["always_better"]):
-        return PEER
-    if VERIFY_ASK in prompt:
-        return AGREE
-    if MERGE_ASK in prompt:
-        if STUB["choice_merge"]:
-            return CHOICE_DRAFT
-        # There is a merge per reader, and they are told apart by the script they came out of:
-        # the second one is over the second reader's version, and it is what should ship.
-        STUB["merges"] += 1
-        return MERGED if STUB["merges"] == 1 else MERGED2
-    return CHOICE_DRAFT if STUB["choice_draft"] else DRAFT
-
-
-def reply_to_second(prompt):
-    """What the second reader answers: its own script, then its verdict on the merge.
-
-    Routed by endpoint, not by the prompt: both readers are asked for a version of a script in
-    exactly the same words, so there is nothing in the text to tell them apart.
-    """
-    if SEED_ASK in prompt:
-        return SEED_ACK
-    if PEER_ASK in prompt:
-        return ZAI_PEER
-    if VERIFY_ASK in prompt:
-        return AGREE
-    return AGREE
-
-
-def ds_stream(piece):
-    """A chat.deepseek.com answer split across both frame shapes the site has used.
-
-    A thinking frame, a status frame and the id of the message being written ride along: the
-    first two must never reach the text, and the id is what threads the next message onto this
-    one in the same chat.
-    """
-    STUB["message_seq"] += 1
-    message_id = f"msg-{STUB['message_seq']}"
-    return "".join([
-        frame(piece),
-        frame(THINKING, kind="thinking"),
-        raw_frame({"p": "response/message_id", "v": message_id}),
-        raw_frame({"p": "response/status", "v": "FINISHED"}),
-        "data: [DONE]\n\n",
-    ]).encode()
-
-
-def content_of(body):
-    return "\n".join(m["content"] for m in body.get("messages", [])
-                     if isinstance(m.get("content"), str))
-
-
-def latest_ask(body):
-    """The newest thing asked, which is what a real provider would be answering.
-
-    The stub decides from this rather than from the whole conversation: on the API path the
-    turns before it are still there (the brief, the acknowledgement), so matching against all of
-    them would answer the question that was asked three calls ago.
-    """
-    for message in reversed(body.get("messages") or []):
+def requests_body(body):
+    """The last user turn, and whether a tool result is already in the conversation."""
+    asked = ""
+    for message in body.get("messages") or []:
         if message.get("role") == "user" and isinstance(message.get("content"), str):
-            return message["content"]
-    return ""
+            asked = message["content"]
+    has_tool = any(m.get("role") == "tool" for m in body.get("messages") or [])
+    return asked, has_tool
 
 
 class Stub(BaseHTTPRequestHandler):
@@ -234,58 +97,35 @@ class Stub(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.endswith("/models"):
-            # Each reader's own model list, so a chip that says "model served" is checking the
-            # endpoint it will actually call.
-            if "/zai/" in self.path:
-                return self._send(200, {"object": "list",
-                                        "data": [{"id": "glm-5.3-flash"},
-                                                 {"id": "glm-5.3"}]})
-            return self._send(200, {"object": "list", "data": [{"id": "deepseek-v4-flash"}]})
-        if self.path.endswith("/users/current"):
-            if STUB["users_code"]:
-                return self._send(200, {"code": STUB["users_code"],
-                                        "msg": "Authorization Failed (invalid token)"})
-            return self._send(200, {"code": 0, "data": {"biz_data": {"user": {"id": "u1"}}}})
+            return self._send(200, {"object": "list", "data": [{"id": "qwen3.8-max"},
+                                                               {"id": "qwen3.7-plus"}]})
         return self._send(404, {"error": {"message": "no such route"}})
 
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         body = json.loads(raw) if raw else {}
-        if self.path.endswith("/v1/validate"):
+        if self.path.endswith("/validate"):
             return self._send(200, {"valid": True})
-        record = {"path": self.path, "body": body,
-                  "headers": {k.lower(): v for k, v in self.headers.items()}}
-        CALLS.append(record)
-        if STUB["api_code"] and self.path.endswith("/api-reject/chat/completions"):
-            # The API's own wording when a chat.deepseek.com session token is presented as a key.
-            return self._send(STUB["api_code"],
-                              {"error": {"message": "Authentication Fails, Your api key: "
-                                                        "****VEFK is invalid"}})
-        if self.path.endswith("/chat_session/create"):
-            return self._send(200, {"code": 0, "data": {"biz_data": {"id": "sess-1"}}})
-        if self.path.endswith("/chat/create_pow_challenge"):
-            challenge = {
-                "algorithm": "DeepSeekHashV1",
-                "challenge": POW_CHALLENGE or "cannot-be-solved-here",
-                "salt": POW_SALT, "difficulty": POW_DIFFICULTY, "expire_at": POW_EXPIRE,
-                "signature": "sig", "target_path": "/api/v0/chat/completion"}
-            if STUB["bad_challenge"]:
-                # A challenge with no answer below its difficulty: the solve has to come back
-                # empty rather than the request inventing a header.
-                challenge["challenge"] = "0" * 64
-            return self._send(200, {"code": 0, "data": {"biz_data": {"challenge": challenge}}})
-        if self.path.endswith("/chat/completion"):
-            # The site takes one prompt, so one string is both the ask and the answer's routing.
-            return self._send(200, ds_stream(reply_to(body.get("prompt") or "")),
+        CALLS.append({"path": self.path, "body": body})
+        asked, has_tool = requests_body(body)
+        args = json.dumps(STUB["arguments"] or {})
+        call = ("<tool_calls>" + json.dumps([{"name": STUB["tool"],
+                                            "arguments": STUB["arguments"] or {}}])
+                + "</tool_calls>")
+        if STUB["mode"] == "always_tool":
+            # The model that will not stop asking: the round limit is what ends it.
+            return self._send(200, tool_stream(xml=STUB["prose"] + call), "text/event-stream")
+        # A conversation that already carries a tool result is the follow-up: the model has been
+        # given the result and answers. Otherwise the mode decides what this call asks for.
+        if STUB["mode"] == "tool" and not has_tool:
+            if STUB["openai_tool"]:
+                return self._send(200, tool_stream(name=STUB["tool"], arguments=args, openai=True),
+                                  "text/event-stream")
+            # Prose around the call, which must not end up in the answer either.
+            return self._send(200, tool_stream(xml=STUB["prose"] + call),
                               "text/event-stream")
-        if "/zai/" in self.path:
-            # The second reader's calls are counted, so a failure can be planted at a chosen
-            # point in its rounds rather than only before the first one.
-            STUB["zai_calls"] += 1
-            if STUB["zai_calls"] > STUB["zai_fail_after"]:
-                return self._send(500, {"error": {"code": "1301", "message": "internal error"}})
-            return self._send(200, stream(reply_to_second(latest_ask(body))), "text/event-stream")
-        return self._send(200, stream(reply_to(latest_ask(body))), "text/event-stream")
+        text = (STUB["script"] or FINAL) + (("\n" + STUB["meta"]) if STUB["meta"] else "")
+        return self._send(200, answer_stream(text, STUB["finish"]), "text/event-stream")
 
 
 class StubServer(ThreadingHTTPServer):
@@ -299,57 +139,64 @@ PORT = 8143
 stub = StubServer(("127.0.0.1", PORT), Stub)
 threading.Thread(target=stub.serve_forever, daemon=True).start()
 
-# The second reader's brief is a real file, so those checks are about *its* brief rather than
-# about the fallback. It is written outside the repo, so a test run leaves nothing behind.
-BRIEF2_FIXTURE = Path(tempfile.gettempdir()) / "bahs-second-brief.txt"
-BRIEF2_FIXTURE.write_text("SECOND READER BRIEF (fixture)\n"
-                         + "Standing instructions for the second reader. " * 40, encoding="utf-8")
+# The API dump the tool reads, written outside the repo so a test run leaves nothing behind.
+DUMP_FIXTURE = Path(tempfile.gettempdir()) / "bahs-api-dump.json"
+DUMP_FIXTURE.write_text(json.dumps({"Classes": [
+    {"Name": "Instance", "Superclass": "<<<ROOT>>>", "Members": [
+        {"MemberType": "Property", "Name": "ClassName",
+         "ValueType": {"Category": "Primitive", "Name": "string"}, "Tags": ["ReadOnly"]},
+        {"MemberType": "Function", "Name": "FindFirstChild",
+         "Parameters": [{"Name": "name", "Type": {"Category": "Primitive", "Name": "string"}}],
+         "ReturnType": {"Category": "Class", "Name": "Instance"}, "Tags": []},
+        {"MemberType": "Event", "Name": "Changed",
+         "Parameters": [{"Name": "property", "Type": {"Category": "Primitive",
+                                                      "Name": "string"}}]},
+    ]},
+    {"Name": "RemoteEvent", "Superclass": "Instance", "Members": [
+        {"MemberType": "Function", "Name": "FireServer",
+         "Parameters": [{"Name": "arguments", "Type": {"Category": "Group", "Name": "Tuple"}}],
+         "ReturnType": {"Category": "Primitive", "Name": "null"}, "Tags": []},
+        {"MemberType": "Function", "Name": "FireClient",
+         "Parameters": [{"Name": "player", "Type": {"Category": "Class", "Name": "Player"}},
+                        {"Name": "arguments", "Type": {"Category": "Group", "Name": "Tuple"}}],
+         "ReturnType": {"Category": "Primitive", "Name": "null"}, "Tags": []},
+    ]},
+]}, indent=0), encoding="utf-8")
 
 os.environ.update({
     "QWEN_URL": f"http://127.0.0.1:{PORT}/v1",
     "QWEN_TOKEN": "qwen-test-token",
-    "REVIEW_URL": f"http://127.0.0.1:{PORT}/deepseek",
-    "DEEPSEEK_TOKEN": "review-test-key",
-    "ZAI_URL": f"http://127.0.0.1:{PORT}/zai",
-    "ZAI_TOKEN": "zai-test-key",
-    "ZAI_MODEL": "glm-5.3-flash",
-    "SECOND_BRIEF": str(BRIEF2_FIXTURE),
+    "ROBLOX_API_DUMP": str(DUMP_FIXTURE),
     "HEARTBEAT": "0.2",
     # /health remembers a provider's answer for a minute so the page's polling does not turn into
     # a network call every 8 seconds; the test wants every check to be a fresh one.
     "TOKEN_CHECK_TTL": "0",
+    "AGENT_RUN": "on",
+    # A tool that waits for an executor is bounded by this; the fake executor answers in well
+    # under a second, so a short one keeps the test quick.
+    "RUN_TIMEOUT": "10",
+    "EXECUTOR_IDLE": "30",
 })
-for name in ("REVIEW_SHAPE", "API_KEY", "DEEPSEEK_COOKIE", "SEED_BRIEF", "NEGOTIATE_ROUNDS",
-             "QWEN_THINKING", "CHOICE_ROUNDS", "SECOND_ROUNDS", "SECOND_SEED", "ZAI_THINKING"):
+for name in ("QWEN_THINKING", "API_KEY", "AGENT_ROUNDS", "AGENT_TOOLS"):
     os.environ.pop(name, None)
 
 # How the test starts, so a section that sets a variable cannot leak it into the next one: every
 # reload begins from this, not from whatever the section before it happened to leave behind.
 BASE_ENV = {name: os.environ.get(name) for name in (
-    "QWEN_URL", "QWEN_TOKEN", "REVIEW_URL", "DEEPSEEK_TOKEN", "REVIEW_SHAPE", "API_KEY",
-    "SEED_BRIEF", "NEGOTIATE_ROUNDS", "CHAT_TIMEOUT", "TOKEN_CHECK_TTL", "QWEN_THINKING",
-    "CHOICE_ROUNDS", "ZAI_URL", "ZAI_TOKEN", "ZAI_MODEL", "ZAI_THINKING", "SECOND_ROUNDS",
-    "SECOND_SEED", "SECOND_BRIEF", "ZAI_BRIEF")}
+    "QWEN_URL", "QWEN_TOKEN", "QWEN_THINKING", "AGENT_ROUNDS", "AGENT_TOOLS", "AGENT_RUN",
+    "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
-import base64  # noqa: E402
-import pow_solver  # noqa: E402
 import bridge  # noqa: E402
+import luau  # noqa: E402
 import state  # noqa: E402
-import peers  # noqa: E402
 import server  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-# A challenge the site would hand out, made the way the site makes it: a hash of the prefix plus a
-# small integer. The solver has to recover that integer, and the stub answers only when it does.
-POW_W, POW_SALT, POW_EXPIRE, POW_DIFFICULTY = 4242, "9f8e7d6c5b4a39281706f5e4d3c2b1a0", 1789548668, 144000
-_solver = pow_solver.load()
-POW_CHALLENGE = (_solver.digest(pow_solver.prefix_for(POW_SALT, POW_EXPIRE) + str(POW_W))
-                 if _solver is not None else "")
-
 client = TestClient(server.app)
 failures, count = [], [0]
+UNSET = object()
 
 
 def check(name, got, want):
@@ -361,27 +208,12 @@ def check(name, got, want):
         print(f"  ok   {name}")
 
 
-def turn(question="make me a walk script"):
-    CALLS.clear()
-    STUB["merges"] = 0
-    STUB["zai_calls"] = 0
-    start = client.post("/chat/stream", json={"messages": [{"role": "user", "content": question}]})
-    out = []
-    with client.stream("GET", f"/chat/stream/{start.json()['job']}") as r:
-        for line in r.iter_lines():
-            if line.strip():
-                out.append(json.loads(line))
-    done = [f for f in out if f.get("done")]
-    channels = "".join(f.get("t", "") for f in out if f.get("ch") == "seed")
-    return out, (done[0] if done else {}), CALLS[:], channels
-
-
-# `reload_with(REVIEW_URL=UNSET)` is how a section asks for a variable to be *absent*, which is
-# not the same as setting it to the value the test normally starts with.
-UNSET = object()
+def check_true(name, got):
+    check(name, bool(got), True)
 
 
 def reload_with(**env):
+    """Reload the modules with these variables set (UNSET removes one)."""
     global server, client
     for name, value in BASE_ENV.items():
         if value is None:
@@ -393,657 +225,312 @@ def reload_with(**env):
             os.environ.pop(name, None)
         elif value is not None:
             os.environ[name] = value
-    # The config and the providers live in bridge, the checks in state, the second reader in
-    # peers, and server binds all of their names at import -- so every one of them is reloaded,
-    # lowest first, or a reloaded server would still hold the previous providers.
+    # The config and the provider live in bridge, the limits in state, the toolbox in luau, and
+    # server binds all of their names at import -- so every one of them is reloaded, lowest first.
     importlib.reload(bridge)
+    importlib.reload(luau)
     importlib.reload(state)
-    importlib.reload(peers)
     server = importlib.reload(server)
     client = TestClient(server.app)
 
 
-def reviewer_calls(calls):
-    """Only the reviewer's calls, in order, whichever shape its endpoint takes."""
-    return [c for c in calls if c["body"].get("model") == "deepseek-v4-flash"
-            or c["path"].endswith("/chat/completion")]
+def fresh_toolbox():
+    """Forget which executor clients were seen, so one test cannot look like another's."""
+    luau._clients.clear()
+    luau._queue.clear()
+    luau._runs.clear()
+
+
+def turn(question="make me a walk script", session="s-test", mode="plain", tool="luau_check",
+         arguments=None, openai_tool=False, script=None, meta=None, finish="stop",
+         messages=None, prose=":ASK:"):
+    """One turn, watched to the end, with the provider stub configured for it."""
+    CALLS.clear()
+    STUB.update({"mode": mode, "tool": tool, "arguments": arguments, "openai_tool": openai_tool,
+                 "script": script, "finish": finish,
+                 "prose": ("Let me check that first.\n" if prose == ":ASK:" else prose),
+                 "meta": STUB["meta"] if meta is None else meta})
+    started = client.post("/chat/stream",
+                          json={"messages": messages or [{"role": "user", "content": question}],
+                                "session": session})
+    assert started.status_code == 200, started.text
+    frames = []
+    with client.stream("GET", f"/chat/stream/{started.json()['job']}") as r:
+        for line in r.iter_lines():
+            if line.strip():
+                frames.append(json.loads(line))
+    done = [f for f in frames if f.get("done")]
+    return frames, (done[0] if done else {}), started.json(), CALLS[:]
 
 
 def writer_calls(calls):
-    """Only the writer's calls, in order -- the draft, a merge, the answer to a choice."""
     return [c for c in calls if c["body"].get("model") == "qwen3.8-max"]
 
 
-def second_calls(calls):
-    """Only the second reader's calls, in order, whichever shape its endpoint takes."""
-    return [c for c in calls if c["body"].get("model") == "glm-5.3-flash"
-            or "/zai/" in c["path"]]
+def messages_of(call):
+    return call["body"].get("messages") or []
 
 
-def phases_of(done, parallel=("draft", "seed", "seed2")):
-    """The chain's phases, with the ones that run in parallel sorted first.
-
-    Each brief is read on its own thread while the writer drafts, so those three can be recorded
-    in any order. Everything after them is strictly ordered, which is what these checks are for.
-    """
-    got = [p["phase"] for p in done["phases"]]
-    return [sorted(p for p in got if p in parallel),
-            [p for p in got if p not in parallel]]
+def tool_messages(call):
+    return [m for m in messages_of(call) if m.get("role") == "tool"]
 
 
-def streamed(out, channel="answer"):
-    """What one channel ends up holding, resets included -- which is what a reader replays."""
-    text = ""
-    for item in out:
-        if item.get("ch") != channel:
-            continue
-        if item.get("reset"):
-            text = ""
-        else:
-            text += item.get("t", "")
-    return text
+# --- the toolbox on its own --------------------------------------------------------------
+
+def toolbox_checks():
+    print("\nthe toolbox")
+    clean = luau.check(SIMPLE_SCRIPT)
+    check("a real script has no structural error", clean["errors"], [])
+    check_true("and it is reported clean", clean["ok"])
+    broken = luau.check(BROKEN_SCRIPT)
+    check_true("an unclosed if is an error", any("never closed" in e for e in broken["errors"]))
+    check_true("an extra end is an error",
+               any("never opened" in e for e in luau.check("print(1)\nend\n")["errors"]))
+    check_true("an unterminated string is an error",
+               any("never closed" in e for e in luau.check('local s = "oops\n')["errors"]))
+    check_true("an unbalanced bracket is an error",
+               any("never closed" in e for e in luau.check("local t = {\n1,\n")["errors"]))
+    check("a comment is not code", luau.check("-- end \" (\nprint('ok')\n")["errors"], [])
+    check("a long string is not code",
+          luau.check("local s = [[\nend end end\n]]\n")["errors"], [])
+    check_true("wait() is flagged",
+               any("wait()" in w for w in luau.check("wait(1)\n")["warnings"]))
+    check_true("a Studio-only service is flagged",
+               any("Studio-only" in w for w in
+                   luau.check('game:GetService("ChangeHistoryService")\n')["warnings"]))
+    check_true("a server-only service is flagged",
+               any("server-only" in w for w in
+                   luau.check('game:GetService("ServerStorage")\n')["warnings"]))
+    check("a balanced loop is not an error",
+          luau.check("for i = 1, 3 do\nif i == 2 then continue end\nprint(i)\nend\n")["errors"],
+          [])
+    formatted = luau.format_script("local function f(a)\nif a then\nprint(\"x\")\n"
+                                   "local t = {\n1,\n}\nreturn t\nelse\nreturn nil\nend\nend\n")
+    check("format_script indents by block depth", formatted.splitlines()[1], "    if a then")
+    check("format_script lines up the else", formatted.splitlines()[7], "    else")
+    check("format_script closes at column zero", formatted.splitlines()[-1], "end")
+    edit = luau.run("apply_edit", {"script": SIMPLE_SCRIPT, "find": "SPEED = 16",
+                                   "replace": "SPEED = 100"})
+    check_true("apply_edit replaces one occurrence", edit["ok"] and "SPEED = 100" in edit["output"])
+    check("apply_edit refuses a find that is not there",
+          luau.run("apply_edit", {"script": SIMPLE_SCRIPT, "find": "nope"})["ok"], False)
+    check("apply_edit refuses an ambiguous find",
+          luau.run("apply_edit", {"script": "a\na\n", "find": "a"})["ok"], False)
+    scan = luau.run("secret_scan", {
+        "script": 'local hook = "https://discord.com/api/webhooks/123456789/abcdefghijkl"\n'})
+    check_true("secret_scan finds a webhook and does not echo it",
+               "1 credential" in scan["summary"] and "discord.com" in scan["output"])
+    api = luau.run("roblox_api", {"class_name": "RemoteEvent"})
+    check_true("roblox_api lists the real members", "FireServer" in api["output"]
+               and "FireClient(player: Player, arguments: tuple)" in api["output"])
+    search = luau.run("roblox_api", {"query": "FindFirstChild"})
+    check_true("roblox_api searches members", "Instance:FindFirstChild" in search["output"])
+    check("roblox_api says when a class does not exist",
+          "is not a Roblox class" in luau.run("roblox_api", {"class_name": "Nonsense"})["output"],
+          True)
+    check_true("there is a tool for each name", all(callable(luau.run) for _ in luau.TOOL_NAMES))
+    check("an unknown tool is a result, not a crash",
+          luau.run("nope", {})["output"], "there is no tool 'nope'")
 
 
-def asked_in(call):
-    """What one reviewer call was actually asked, as one string."""
-    if call["path"].endswith("/chat/completion"):
-        return call["body"].get("prompt") or ""
-    return "\n".join(m.get("content") or "" for m in call["body"].get("messages") or [])
+# --- the chain ---------------------------------------------------------------------------
+
+def chain_checks():
+    print("\nplain answer")
+    frames, done, started, calls = turn()
+    said = writer_calls(calls)
+    check("one model call for a plain answer", len(said), 1)
+    check("the model is pinned", said[0]["body"]["model"], "qwen3.8-max")
+    check("thinking is on", said[0]["body"].get("thinking_mode"), "thinking")
+    check("the tool schemas are attached", len(said[0]["body"].get("tools") or []),
+          len(luau.TOOL_NAMES))
+    check("the answer is the script, unwrapped", done.get("text"), SIMPLE_SCRIPT)
+    check("the answer carries no metadata", "qwen_metadata" in (done.get("text") or ""), False)
+    check("the reasoning is dropped",
+          any(REASONING in (f.get("t") or "") for f in frames), False)
+    check("the session is reported", started.get("session"), "s-test")
+    check("no tool call is recorded", done["phases"][0]["tools"], [])
+    check("the turn is a call and a phase", len(done["phases"]), 1)
+
+    print("\nthe tool round trip (XML shape)")
+    frames, done, started, calls = turn(mode="tool", tool="luau_check",
+                                        arguments={"script": BROKEN_SCRIPT})
+    said = writer_calls(calls)
+    check("the model is asked twice", len(said), 2)
+    check("the first call found a tool", done["phases"][0]["tools"], ["luau_check"])
+    check("the tool result went back to the model", len(tool_messages(said[1])), 1)
+    check_true("and it is the tool's own output",
+               "never closed" in tool_messages(said[1])[0]["content"])
+    asked_for = [c for m in messages_of(said[1]) if m.get("role") == "assistant"
+                 for c in (m.get("tool_calls") or [])]
+    check_true("the tool result is matched to the call it answers",
+               bool(asked_for)
+               and tool_messages(said[1])[0].get("tool_call_id") == asked_for[-1].get("id"))
+    check("the interim prose is not the answer", done.get("text"), SIMPLE_SCRIPT)
+    check("the tool XML never reached the reader",
+          any("<tool_calls>" in (f.get("t") or "") for f in frames), False)
+    check("the tool's own prose is not in the answer",
+          "Let me check that first." in (done.get("text") or ""), False)
+    check_true("the trace says what happened", "luau_check" in (done.get("tool") or ""))
+    check_true("and it carries the result", "never closed" in (done.get("tool") or ""))
+
+    print("\nthe tool round trip (OpenAI shape, fragmented)")
+    frames, done, started, calls = turn(mode="tool", tool="luau_format", openai_tool=True,
+                                        arguments={"script": SIMPLE_SCRIPT})
+    said = writer_calls(calls)
+    check("a fragmented tool call is reassembled", len(said), 2)
+    check("the tool that ran is the one asked for", done["phases"][0]["tools"], ["luau_format"])
+    check_true("a re-indented script came back",
+               "    local humanoid" in tool_messages(said[1])[0]["content"])
+
+    print("\nthe same chat, not a new one per question")
+    bridge.session_remember("s-chat", "")
+    _, done, _, calls = turn(session="s-chat")
+    check_true("the marker was kept for the session",
+               "qwen_metadata" in bridge.session_meta("s-chat"))
+    # The follow-up, with the conversation the page would be keeping: the answer it streamed, and
+    # then the next question.
+    history = [{"role": "user", "content": "make me a walk script"},
+               {"role": "assistant", "content": SIMPLE_SCRIPT},
+               {"role": "user", "content": "now make it 100"}]
+    _, done, _, calls = turn(session="s-chat", messages=history)
+    carried = [m for m in messages_of(writer_calls(calls)[0])
+               if m.get("role") == "assistant" and "qwen_metadata" in (m.get("content") or "")]
+    check("the next turn of the session continues the chat", len(carried), 1)
+    check_true("and it is the marker that was remembered",
+               bridge.session_meta("s-chat") in carried[0]["content"])
+    check_true("the question is still the last turn the model sees",
+               messages_of(writer_calls(calls)[0])[-1]["role"] == "user")
+    check("the reader never saw the marker in the answer",
+          "qwen_metadata" in (done.get("text") or ""), False)
+    fresh = [{"role": "assistant", "content": SIMPLE_SCRIPT},
+             {"role": "user", "content": "and another thing"}]
+    _, _, _, calls = turn(session="s-other", messages=fresh)
+    other = [m for m in messages_of(writer_calls(calls)[0])
+             if m.get("role") == "assistant" and "qwen_metadata" in (m.get("content") or "")]
+    check("another session does not get it", len(other), 0)
+    check_true("the session store is what /health reports", server.session_count() >= 2)
+
+    print("\nrunning the script in the executor")
+    fresh_toolbox()
+    frames, done, started, calls = turn(mode="tool", tool="run_script", openai_tool=True,
+                                        arguments={"script": "print('hello')"})
+    said = writer_calls(calls)
+    check("the model is asked again after the refusal", len(said), 2)
+    check_true("with no executor the tool says so instead of waiting",
+               "no Roblox client is polling" in tool_messages(said[1])[0]["content"])
+    check_true("the turn still ended with a script", bool(done.get("text")))
+
+    fresh_toolbox()
+    # A listening executor: it polls /agent/pull the way client.lua does, runs what it is given,
+    # and posts the result back. It has to be polling before the tool call, because a client that
+    # was never seen is a client that cannot be waited for.
+    seen = {"script": "", "answered": False}
+    listening = {"on": True}
+
+    key = {"X-API-Key": "qwen-test-token"}
+
+    def fake_executor():
+        while listening["on"]:
+            try:
+                pulled = client.get("/agent/pull", params={"client": "test-client"},
+                                   headers=key)
+                task = pulled.json() if pulled.status_code == 200 else {}
+                if task.get("run"):
+                    seen["script"] = task["script"]
+                    client.post("/agent/push", json={"run": task["run"], "ok": True,
+                                                      "output": "hello from roblox"},
+                                headers=key)
+                    seen["answered"] = True
+            except Exception:  # the server may be closing a connection under it
+                pass
+            time.sleep(0.1)
+
+    executor = threading.Thread(target=fake_executor, daemon=True)
+    executor.start()
+    time.sleep(0.3)                     # one poll, so the client is live before the turn starts
+    frames, done, started, calls = turn(mode="tool", tool="run_script", openai_tool=True,
+                                        arguments={"script": "print('hello')"},
+                                        session="s-exec", prose="Let me run it first.\n")
+    listening["on"] = False
+    check("the model's script was handed to the executor", seen["script"], "print('hello')")
+    check_true("the executor answered", seen["answered"])
+    check_true("the executor's output is in the tool trace",
+               "hello from roblox" in (done.get("tool") or ""))
+    said = writer_calls(calls)
+    check("the model is asked again with the run in front of it", len(said), 2)
+    check_true("and the output was given back to it",
+               any("hello from roblox" in m["content"] for m in tool_messages(said[1])))
+    check_true("the run is reported as clean", "ran the script without error" in
+               tool_messages(said[1])[0]["content"])
+    fresh_toolbox()
+
+    print("\nthe end of the tool rounds")
+    frames, done, started, calls = turn(
+        mode="always_tool", tool="luau_check", arguments={"script": BROKEN_SCRIPT},
+        prose="Here is the script:\n```lua\n" + SIMPLE_SCRIPT + "\n```\n")
+    check("a model that will not stop still ships the script", done.get("text"), SIMPLE_SCRIPT)
+    check("and it is not carrying a tool call or a fence", "<tool_calls>" in
+          (done.get("text") or "") or "```" in (done.get("text") or ""), False)
+    check("it did not run more rounds than it is allowed",
+          len(writer_calls(calls)), bridge.AGENT_ROUNDS + 1)
+
+    print("\nthe guard rails")
+    frames, done, started, calls = turn(finish="length")
+    error = [f for f in frames if f.get("error")]
+    check_true("a cut-off answer is refused, not shipped", bool(error))
+    # And the same refusal through the blocking endpoint.
+    CALLS.clear()
+    STUB.update({"mode": "plain", "finish": "length", "script": None, "meta": ""})
+    blocked = client.post("/chat", json={"messages": [{"role": "user", "content": "hi"}],
+                                        "session": "s-len"},
+                          headers={"X-API-Key": "qwen-test-token"})
+    check("the blocking endpoint reports it too", blocked.status_code, 502)
+    check_true("and says why", "token ceiling" in blocked.text)
+
+    print("\nno tools, when they are switched off")
+    reload_with(AGENT_TOOLS="off")
+    frames, done, started, calls = turn()
+    check("one call, no schemas", len(writer_calls(calls)[0]["body"].get("tools") or []), 0)
+    check("and the answer still arrives", done.get("text"), SIMPLE_SCRIPT)
+    reload_with()
 
 
-def asked_last(call):
-    """The newest thing in one reviewer call: what the warning has to be on the front of.
+def surface_checks():
+    print("\nthe surface")
+    body = client.get("/health").json()
+    check("health names the one model", body["model"], "qwen3.8-max")
+    check("health has no reviewer", "reviewer" in body, False)
+    check("health has no second reader", "second" in body, False)
+    check("health lists the toolbox", sorted(body["tools"]["names"]), sorted(luau.TOOL_NAMES))
+    check("the dump state is reported without fetching it", "dump_classes" in body["tools"], True)
+    check("the tool rounds are reported", body["rounds"], bridge.AGENT_ROUNDS)
+    models = client.get("/v1/models", headers={"X-API-Key": "qwen-test-token"}).json()
+    ids = [m["id"] for m in models["data"]]
+    check("only qwen models are listed", ids[0], "qwen3.8-max")
+    check("no deepseek or glm anywhere", [i for i in ids if "deepseek" in i or "glm" in i], [])
+    page = client.get("/").text
+    check("the page has no reviewer chip", 'data-chip="reviewer"' in page, False)
+    check("every placeholder was replaced", sorted(set(re.findall(r"__[A-Z_]+__", page))), [])
+    check("the page has the chips it needs", sorted(re.findall(r'data-chip="(\w+)"', page)),
+          ["api", "bridge", "executor", "mode", "model", "roblox", "token", "tools"])
+    check("the page is wired for a session", 'localStorage.getItem(SESSION_KEY)' in page, True)
+    check("an unknown job is a 404", client.get("/chat/poll/nope").status_code, 404)
+    check("a key is required when one is set",
+          client.get("/agent/pull").status_code, 401)
 
-    On the API path the earlier turns are carried with it, and those carry a warning of their
-    own, so joining them all would pass even if the newest message had none.
-    """
-    if call["path"].endswith("/chat/completion"):
-        return call["body"].get("prompt") or ""
-    for message in reversed(call["body"].get("messages") or []):
-        if message.get("role") == "user":
-            return message.get("content") or ""
-    return ""
+
+def main():
+    toolbox_checks()
+    reload_with()
+    chain_checks()
+    surface_checks()
+    print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
+    if failures:
+        print("failed: " + ", ".join(failures))
+        return 1
+    return 0
 
 
-print("\n-- the brief goes first, on its own, and the request only after it --")
-out, done, calls, seed_stream = turn()
-review = reviewer_calls(calls)
-# The brief is read on its own thread while the draft is written, so those two may be recorded
-# in either order; everything after them is strictly ordered.
-phases = [p["phase"] for p in done["phases"]]
-check("the draft and both briefs are read together, then the first reader's rounds",
-      phases_of(done), [["draft", "seed", "seed2"],
-                        ["peer", "merge", "agree", "peer2", "merge", "agree2"]])
-check("and the reviewer's own first message is the brief",
-      review[0]["path"].endswith("/deepseek/chat/completions"), True)
-first = asked_in(review[0])
-check("the first message opens with the executor warning",
-      first.startswith(server.REVIEW_WARNING), True)
-check("and then carries send.txt whole, rather than a part of it",
-      [server.BRIEF in first, len(server.BRIEF) > 1000], [True, True])
-check("with nothing asked of it yet: no request, no contract",
-      [ask in first for ask in ("make me a walk script", PEER_ASK, VERIFY_ASK, "VERDICT")],
-      [False] * 4)
-check("and its answer is waited for: the seed is its own call",
-      [p["provider"] for p in done["phases"] if p["phase"] == "seed"], ["deepseek"])
-check("the request goes out after it, in the same conversation",
-      "make me a walk script" in asked_in(review[1]), True)
-check("with the draft it is asking about", DRAFT_CODE in asked_in(review[1]), True)
-check("the reviewer's acknowledgement is streamed to the reader", seed_stream, SEED_ACK)
-check("what the reviewer is asked for is a script, not a list of complaints",
-      "VERDICT: BETTER" in asked_in(review[1]), True)
-check("every message to the reviewer opens with the warning",
-      [asked_last(c).startswith(server.REVIEW_WARNING) for c in review], [True] * len(review))
-check("and the target is named as an executor, not as Studio",
-      ["Studio" in server.TARGET_RUNTIME, "executor" in server.TARGET_RUNTIME], [True, True])
-check("and the version it wrote is shown as its own channel", done.get("peer"), PEER_CODE)
-check("the writer merged, once per reader, in the chat it drafted in",
-      [p["phase"] for p in done["phases"]].count("merge"), 2)
-check("and the answer is the merge both readers settled on", done.get("text"), MERGED2_CODE)
-check("the reviewer was asked whether it would ship the merge",
-      "Would you ship this exactly as it is?" in asked_in(review[2]), True)
-check("and its verdict is kept", done.get("review"), AGREE)
-check("thinking is off in every reviewer call",
-      [c["body"].get("thinking") for c in review], [{"type": "disabled"}] * 3)
-check("no search parameter is ever sent",
-      sorted(k for c in review for k in c["body"] if "search" in k.lower()), [])
-
-print("\n-- each merge is a call, and it carries that reader's version --")
-merge_calls = [c for c in calls if MERGE_ASK in content_of(c["body"])]
-check("a merge per reader", len(merge_calls), 2)
-check("the first merge is asked for in the chat the draft was written in",
-      merge_calls[0]["body"]["messages"][-2]["content"], DRAFT_CODE)
-check("and carries the first reader's version",
-      PEER_CODE in merge_calls[0]["body"]["messages"][-1]["content"], True)
-check("the second merge edits the script the first two settled on",
-      merge_calls[1]["body"]["messages"][-2]["content"], MERGED_CODE)
-check("and carries the second reader's version",
-      ZAI_CODE in merge_calls[1]["body"]["messages"][-1]["content"], True)
-check("naming the reader it came from, so the instruction is about the right model",
-      "glm-5.3-flash" in merge_calls[1]["body"]["messages"][-1]["content"], True)
-check("the writer's own script was not resent as history",
-      len([m for m in merge_calls[0]["body"]["messages"] if m["role"] == "user"]), 2)
-
-print("\n-- a reviewer that never agrees is bounded by the rounds --")
-STUB["always_better"] = True
-out, done, calls, _ = turn()
-phases = [p["phase"] for p in done["phases"]]
-# Round one is the reviewer writing its own version; every round after it is an agreement
-# question that came back with another version, and every one of them is followed by a merge.
-check("five rounds for the first reader: a version and a merge each, then it stops anyway",
-      [sorted(p for p in phases if p in ("draft", "seed", "seed2")),
-       phases.count("peer"), phases.count("agree"), phases.count("merge")],
-      [["draft", "seed", "seed2"], 1, 4, 6])
-check("and the second reader's own rounds are still just its two",
-      [phases.count("peer2"), phases.count("agree2")], [1, 1])
-check("the draft is not counted as a round",
-      [p["phase"] for p in done["phases"]].count("draft"), 1)
-check("and the last merged script is what ships", done.get("text"), MERGED2_CODE)
-check("the turn still ends", done.get("status"), "done")
-check("no more calls than both ceilings allow", len(done["phases"]), 16)
-STUB["always_better"] = False
-
-print("\n-- five is the ceiling, however the variable is set --")
-reload_with(NEGOTIATE_ROUNDS="50")
-check("a value past the ceiling is clamped", server.NEGOTIATE_ROUNDS, server.MAX_NEGOTIATE_ROUNDS)
-reload_with(NEGOTIATE_ROUNDS="-3")
-check("and a negative one means none", server.NEGOTIATE_ROUNDS, 0)
-reload_with()
-check("the default is five", server.NEGOTIATE_ROUNDS, 5)
-check("and the ceiling is five as well", server.MAX_NEGOTIATE_ROUNDS, 5)
-
-print("\n-- the competition can be switched off --")
-reload_with(NEGOTIATE_ROUNDS="0")
-out, done, calls, _ = turn()
-check("only the draft runs", [p["phase"] for p in done["phases"]], ["draft"])
-check("and it is the answer", done.get("text"), DRAFT_CODE)
-check("no reviewer call at all", len(reviewer_calls(calls)), 0)
-reload_with()
-
-print("\n-- SEED_BRIEF=off keeps the brief, and drops only the extra call --")
-reload_with(SEED_BRIEF="off")
-out, done, calls, _ = turn()
-check("no seed phase for the first reader", phases_of(done, ("draft", "seed2")),
-      [["draft", "seed2"], ["peer", "merge", "agree", "peer2", "merge", "agree2"]])
-check("and one call fewer than the default turn", len(done["phases"]), 8)
-check("the brief is still in front of the first request",
-      server.BRIEF[:60] in asked_in(reviewer_calls(calls)[0]), True)
-check("and the warning is in front of the brief",
-      asked_in(reviewer_calls(calls)[0]).startswith(server.REVIEW_WARNING), True)
-check("and the contract rides with it",
-      "VERDICT: BETTER" in asked_in(reviewer_calls(calls)[0]), True)
-reload_with()
-
-print("\n-- the second reader: its own brief first, then its own rounds --")
-reload_with()
-out, done, calls, seed2_stream = turn()
-second = second_calls(calls)
-check("the second reader is in the chain", server.second_enabled(), True)
-check("and is named", done.get("second"), "glm-5.3-flash")
-first2 = asked_in(second[0])
-check("its first message opens with the executor warning",
-      first2.startswith(server.REVIEW_WARNING), True)
-check("and then carries send2.txt whole",
-      [server.SECOND_BRIEF in first2, len(server.SECOND_BRIEF) > 1000], [True, True])
-check("with nothing asked of it yet: no request, no contract",
-      [ask in first2 for ask in ("make me a walk script", PEER_ASK, VERIFY_ASK, "VERDICT")],
-      [False] * 4)
-check("its answer is waited for before the request",
-      [p["provider"] for p in done["phases"] if p["phase"] == "seed2"], ["zai"])
-check("which the page streams as the second brief's own channel",
-      streamed(out, "seed2"), SEED_ACK)
-check("the request goes out after it, in the same conversation",
-      "make me a walk script" in asked_in(second[1]), True)
-check("and it is the script the first two settled on",
-      MERGED_CODE in asked_in(second[1]), True)
-check("with the contract riding on that request",
-      "VERDICT: BETTER" in asked_in(second[1]), True)
-check("every message to it opens with the warning",
-      [asked_last(c).startswith(server.REVIEW_WARNING) for c in second], [True] * len(second))
-check("the version it wrote is its own channel", done.get("peer2"), ZAI_CODE)
-check("its verdict is kept with the turn", done.get("second_review"), AGREE)
-check("and its merge is what ships", done.get("text"), MERGED2_CODE)
-check("deep think is on, at the top of its ladder",
-      [peers.zai_dialect().get("reasoning_effort"), peers.ZAI_THINKING], ["max", "max"])
-check("thinking is enabled in every call to it",
-      [c["body"].get("thinking") for c in second],
-      [{"type": "enabled", "clear_thinking": True}] * len(second))
-check("and no tools, so no search, in any of them",
-      [k for c in second for k in c["body"]
-       if k in ("tools", "tool_choice", "web_search", "web_search_options")], [])
-check("what it is asked names the runtime and the checks, like the first reader's requests",
-      ["TARGET:" in asked_in(second[1]), "CHECKS THIS SERVICE ALREADY RAN:" in asked_in(second[1])],
-      [True, True])
-check("and nothing of its thinking reaches the answer",
-      [REASONING in (done.get("peer2") or ""), THINKING in (done.get("peer2") or "")],
-      [False, False])
-check("the page can see it before the turn starts",
-      client.post("/chat/stream", json={"messages": [{"role": "user",
-                                                      "content": "hi"}]}).json()["second"],
-      "glm-5.3-flash")
-
-print("\n-- the second reader's rounds are bounded, and clamped --")
-reload_with(SECOND_ROUNDS="1")
-out, done, calls, _ = turn()
-check("one round: its own version and the merge, then it stops", phases_of(done)[1],
-      ["peer", "merge", "agree", "peer2", "merge"])
-reload_with(SECOND_ROUNDS="50")
-check("a value past the ceiling is clamped", server.SECOND_ROUNDS, server.MAX_SECOND_ROUNDS)
-reload_with(SECOND_ROUNDS="-3")
-check("and a negative one means none", server.SECOND_ROUNDS, 0)
-reload_with(SECOND_ROUNDS="0")
-out, done, calls, _ = turn()
-check("with it off the chain ends with the first reader", phases_of(done)[1],
-      ["peer", "merge", "agree"])
-check("the first reader's script is what ships", done.get("text"), MERGED_CODE)
-check("nothing was sent to the second reader at all", len(second_calls(calls)), 0)
-check("and no second reader is named", done.get("second"), "")
-reload_with()
-check("the default is two", server.SECOND_ROUNDS, 2)
-
-print("\n-- SECOND_SEED=off keeps its brief and drops only the extra call --")
-reload_with(SECOND_SEED="off")
-out, done, calls, _ = turn()
-check("no seed2 phase", "seed2" in [p["phase"] for p in done["phases"]], False)
-check("but the brief is still in front of its first request",
-      server.SECOND_BRIEF[:60] in asked_in(second_calls(calls)[0]), True)
-check("and the contract rides with that request",
-      "VERDICT: BETTER" in asked_in(second_calls(calls)[0]), True)
-reload_with()
-
-print("\n-- a second reader that cannot be reached leaves the agreed script --")
-reload_with(ZAI_URL="http://127.0.0.1:9/zai")
-out, done, calls, _ = turn()
-check("the first reader's script still ships", done.get("text"), MERGED_CODE)
-check("the turn is not an error", done.get("status"), "done")
-check("and the reason is said out loud", "did not read" in (done.get("note") or ""), True)
-check("the chip reports it", client.get("/health").json()["second"]["ok"], False)
-reload_with()
-
-print("\n-- a second reader that dies half-way leaves the last script as well --")
-# Its first two calls land (the brief, then its version and the merge they started) and the
-# verdict question is the one that fails, which is the case the guard exists for.
-STUB["zai_fail_after"] = 2
-out, done, calls, _ = turn()
-STUB["zai_fail_after"] = 9999
-check("the merge it already proposed ships", done.get("text"), MERGED2_CODE)
-check("the failure is recorded", "stopped early" in (done.get("note") or ""), True)
-check("and the turn is still done", done.get("status"), "done")
-
-print("\n-- without send2.txt the first brief stands in, and says so --")
-reload_with(SECOND_BRIEF=UNSET)
-# send2.txt is in the repo now, so "it is not there" is said by pointing the search at paths that
-# are not there, rather than by moving the real file around mid-test.
-saved_choices = peers.SECOND_BRIEF_CHOICES
-peers.SECOND_BRIEF_CHOICES = [Path(tempfile.gettempdir()) / "no-send2-here.txt"]
-try:
-    stood_in, stood_in_name, fell_back = peers.pick_second_brief()
-finally:
-    peers.SECOND_BRIEF_CHOICES = saved_choices
-check("the fallback is the first reader's brief", [stood_in == server.BRIEF, fell_back],
-      [True, True])
-check("named as the file that is not in the image", stood_in_name, peers.FALLBACK_BRIEF_NAME)
-health = client.get("/health").json()
-check("and with the real send2.txt in the repo, that is the one named",
-      [health["second"]["brief"], health["second"]["brief_fallback"]], ["send2.txt", False])
-check("so its own text is what /health counts", health["second"]["brief_chars"],
-      len(peers.SECOND_BRIEF))
-reload_with()
-check("with a brief of its own, nothing is marked as a fallback",
-      client.get("/health").json()["second"]["brief"], BRIEF2_FIXTURE.name)
-
-print("\n-- the z.ai credential: a bad key and a wrong kind of token read differently --")
-out, done, calls, _ = turn()
-check("its model is what the chip looked for", client.get("/health").json()["second"]["model"],
-      "glm-5.3-flash")
-check("and the key is reported as good, model served",
-      client.get("/health").json()["second"]["detail"], "key set, model served")
-reload_with(ZAI_TOKEN="user-token-xyz")
-refused = peers.zai_failure(401, '{"error": {"code": "1001", "message": "invalid"}}')
-check("a chat.z.ai session token is refused with the fix named",
-      ["chat.z.ai session token" in refused, "API key from" in refused, "invalid" in refused],
-      [True, True, True])
-reload_with(ZAI_TOKEN="abc.def")
-check("an API key gets the platform's own words instead",
-      "chat.z.ai session token" in peers.zai_failure(
-          401, '{"error": {"code": "1001", "message": "invalid"}}'), False)
-check("and a retired model id is named as that rather than as a bad key",
-      "is not a model" in peers.zai_failure(404, '{"error": {"message": "not found"}}'), True)
-
-print("\n-- the z.ai credential: a web session token is not a server credential --")
-# The token chat.z.ai keeps in localStorage: a JWT, which is exactly what the other bridges take.
-reload_with(ZAI_TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InUifQ.c2ln")
-check("a JWT is recognised as the site's session token, not as an API key",
-      [peers.is_session_token(peers.ZAI_TOKEN), peers.looks_like_key(peers.ZAI_TOKEN)],
-      [True, False])
-check("so the stage is off, rather than spending a call per turn to be told so",
-      [server.second_enabled(), server.second_state(True)["on"]], [False, False])
-CALLS.clear()  # the turn above is still in here; this is about what the probe did not send
-check("and nothing was sent anywhere to decide that", second_calls(CALLS), [])
-check("the reason names the captcha as the wall, not the token",
-      ["FRONTEND_CAPTCHA_REQUIRED" in peers.SESSION_TOKEN_NOTE,
-       "API key from z.ai" in peers.SESSION_TOKEN_NOTE,
-       "free models" in peers.SESSION_TOKEN_NOTE], [True, True, True])
-second = client.get("/health").json()["second"]
-check("the chip says which credential it is, and stays red",
-      [second["ok"], second["on"], "chat.z.ai session token" in second["detail"]],
-      [False, False, True])
-out, done, calls, _ = turn()
-check("a turn asks no reader that cannot answer", second_calls(calls), [])
-check("no stage of the chain waits on it either",
-      [p["phase"] for p in done["phases"] if "2" in p["phase"]], [])
-check("and the answer still ships", bool(streamed(out)), True)
-boot = io.StringIO()
-with contextlib.redirect_stdout(boot):
-    with client.__class__(server.app):
-        pass
-check("the boot line names it too",
-      ["[second] ZAI_TOKEN is a chat.z.ai session token" in boot.getvalue(),
-       "FRONTEND_CAPTCHA_REQUIRED" in boot.getvalue()], [True, True])
-reload_with()
-
-print("\n-- the brief is send.txt --")
-check("send.txt is the one in use", server.BRIEF_PATH.name, "send.txt")
-check("and /health names it", client.get("/health").json()["reviewer"]["brief"], "send.txt")
-
-print("\n-- chat.deepseek.com, driven by the userToken --")
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api/v0", REVIEW_SHAPE="deepseek-web",
-            DEEPSEEK_TOKEN="user-token-xyz")
-check("the web transport is in use", server.REVIEWER.web is not None, True)
-check("and the reviewer is on", server.review_enabled(), True)
-out, done, calls, seed_stream = turn()
-web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
-check("three reviewer messages: the brief, its version, the agreement", len(web), 3)
-check("all three are in one chat", sorted({c["body"]["chat_session_id"] for c in web}), ["sess-1"])
-check("and one session was opened for them",
-      len([c for c in calls if c["path"].endswith("/chat_session/create")]), 1)
-check("the site's message id threads the second onto the first",
-      [c["body"]["parent_message_id"] for c in web], [None, "msg-1", "msg-2"])
-check("the warning leads the first message, and then the whole brief",
-      [web[0]["body"]["prompt"].startswith(server.REVIEW_WARNING),
-       server.BRIEF in web[0]["body"]["prompt"]], [True, True])
-check("the brief is not resent with the request that follows it",
-      server.BRIEF[:60] in web[1]["body"]["prompt"], False)
-check("and the contract rides with that request instead",
-      "VERDICT: BETTER" in web[1]["body"]["prompt"], True)
-check("the warning is on every message, not just the first",
-      [c["body"]["prompt"].startswith(server.REVIEW_WARNING) for c in web],
-      [True] * len(web))
-check("the request is in that second message", "make me a walk script" in web[1]["body"]["prompt"],
-      True)
-check("each message asks for its own challenge",
-      len([c for c in calls if c["path"].endswith("/chat/create_pow_challenge")]), 3)
-check("thinking is switched off in every message",
-      [c["body"]["thinking_enabled"] for c in web], [False, False, False])
-check("search is switched off in every message",
-      [c["body"]["search_enabled"] for c in web], [False, False, False])
-check("the userToken is the bearer", web[0]["headers"].get("authorization"),
-      "Bearer user-token-xyz")
-check("the attempt looks like the site's", web[0]["headers"].get("x-client-platform"), "web")
-check("both frame shapes were read", done.get("peer"), PEER_CODE)
-check("a thinking frame never reaches the text",
-      [THINKING in asked_in(c) or THINKING in (done.get("peer") or "") for c in web], [False] * 3)
-check("a status frame never arrives as text", "FINISHED" in (done.get("peer") or ""), False)
-check("the merge still happened, in the writer's chat", done.get("text"), MERGED2_CODE)
-pow_header = web[0]["headers"].get("x-ds-pow-response")
-if _solver is None:
-    print("  (the proof-of-work checks are skipped: no sha3 module is available here)")
-else:
-    answered = json.loads(base64.b64decode(pow_header)) if pow_header else {}
-    check("the proof of work is solved and sent", answered.get("answer"), POW_W)
-    check("the challenge goes back with it", answered.get("challenge"), POW_CHALLENGE)
-    check("and the signature that came with it", answered.get("signature"), "sig")
-    check("no state the challenge did not carry", answered.get("target_path"),
-          "/api/v0/chat/completion")
-check("every message carries the proof of work",
-      [bool(c["headers"].get("x-ds-pow-response")) for c in web], [True, True, True])
-health = client.get("/health").json()
-check("the chip says the token works", health["reviewer"]["detail"], "token accepted")
-check("and names the shape", health["reviewer"]["shape"], "deepseek-web")
-check("and how many rounds it may run", health["reviewer"]["rounds"], 5)
-
-print("\n-- a challenge with no answer below its difficulty sends no header --")
-STUB["bad_challenge"] = True
-out, done, calls, _ = turn()
-web = [c for c in calls if c["path"].endswith("/api/v0/chat/completion")]
-check("nothing was invented for an unsolvable challenge",
-      [("x-ds-pow-response" in c["headers"]) for c in web], [False, False, False])
-check("and the turn still ran", done.get("text"), MERGED2_CODE)
-STUB["bad_challenge"] = False
-
-print("\n-- a reviewer that is down costs the draft, never the turn --")
-STUB["users_code"] = 0
-reload_with(REVIEW_URL="http://127.0.0.1:9/deepseek", REVIEW_SHAPE="openai",
-            DEEPSEEK_TOKEN="review-test-key")
-out, done, calls, _ = turn()
-check("the draft still ships", done.get("text"), DRAFT_CODE)
-check("the failure is recorded rather than silence", "did not happen" in (
-    done.get("review") or ""), True)
-check("and the second reader was not asked to review nothing",
-      done.get("second_review"), "")
-check("and the turn is not an error", done.get("status"), "done")
-check("the chip reports it", client.get("/health").json()["reviewer"]["ok"], False)
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
-
-print("\n-- the proof-of-work solver's own rules --")
-check("the prefix spells an integer as an integer",
-      pow_solver.prefix_for("sa", 1789548668), "sa_1789548668_")
-check("and a whole float the same way", pow_solver.prefix_for("sa", 1789548668.0), "sa_1789548668_")
-check("an unknown algorithm is not guessed",
-      pow_solver.solve({"algorithm": "SomethingElse", "challenge": "x", "difficulty": 1000,
-                        "salt": "s", "expire_at": 1}), "")
-check("an absurd difficulty is refused, not stalled",
-      pow_solver.solve({"algorithm": "DeepSeekHashV1", "challenge": "x",
-                        "difficulty": 999999999999, "salt": "s", "expire_at": 1}), "")
-check("no challenge, no header", pow_solver.solve({}), "")
-
-print("\n-- the userToken is rejected --")
-STUB["users_code"] = 40003
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api/v0", REVIEW_SHAPE="deepseek-web",
-            DEEPSEEK_TOKEN="user-token-xyz")
-health = client.get("/health").json()
-check("the chip is red", health["reviewer"]["ok"], False)
-check("and says how to get a new one", "userToken" in health["reviewer"]["detail"], True)
-STUB["users_code"] = 0
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
-            DEEPSEEK_TOKEN="review-test-key")
-
-print("\n-- pointing REVIEW_URL at the site picks the transport --")
-reload_with(REVIEW_URL="https://chat.deepseek.com")
-check("deepseek-web is chosen without being asked", server.REVIEW_SHAPE, "deepseek-web")
-check("the transport is attached", server.REVIEWER.web is not None, True)
-check("the reviewer is on", server.review_enabled(), True)
-check("and labelled as the site", server.REVIEWER.web.label, "chat.deepseek.com")
-
-print("\n-- a session token with no endpoint chosen goes to the site, not the API --")
-reload_with(DEEPSEEK_TOKEN="user-token-xyz", REVIEW_URL=UNSET, REVIEW_SHAPE=UNSET)
-check("the endpoint follows the credential", server.REVIEW_URL, "https://chat.deepseek.com")
-check("and it was not asked for", server.REVIEW_URL_AUTO, True)
-check("so the shape is the site's", server.REVIEW_SHAPE, "deepseek-web")
-check("the transport is attached", server.REVIEWER.web is not None, True)
-check("and the reviewer is on", server.review_enabled(), True)
-
-print("\n-- REVIEW_URL left pointing at the API with a session token also goes to the site --")
-reload_with(REVIEW_URL="https://api.deepseek.com", DEEPSEEK_TOKEN="user-token-xyz")
-check("the API is not used with a session token", server.REVIEW_URL, "https://chat.deepseek.com")
-check("and the site's shape comes with it", server.REVIEW_SHAPE, "deepseek-web")
-
-print("\n-- a bridge someone set by hand is left alone --")
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
-            DEEPSEEK_TOKEN="user-token-xyz")
-check("an endpoint that is not the API is respected", server.REVIEW_URL_AUTO, False)
-check("and the endpoint is the one that was set", server.REVIEW_URL,
-      f"http://127.0.0.1:{PORT}/deepseek")
-
-print("\n-- an sk- key still means the API --")
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek", REVIEW_SHAPE="openai",
-            DEEPSEEK_TOKEN="sk-real-api-key")
-check("nothing was switched for an API key", server.REVIEW_URL_AUTO, False)
-check("and the shape stays OpenAI", server.REVIEW_SHAPE, "openai")
-
-print("\n-- a session token the API rejects is blamed on the endpoint, not the token --")
-STUB["api_code"] = 401
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/api-reject", REVIEW_SHAPE="openai",
-            DEEPSEEK_TOKEN="user-token-xyz")
-out, done, calls, _ = turn()
-review = "".join(f.get("t", "") for f in out if f.get("ch") == "review")
-check("the draft still ships", DRAFT_CODE in (done.get("text") or ""), True)
-check("the reason names the fix", "REVIEW_URL=https://chat.deepseek.com" in review, True)
-check("and says which credential it is", "session token, not an API key" in review, True)
-check("the api's own words are kept", "Authentication Fails" in review, True)
-STUB["api_code"] = 0
-
-print("\n-- nothing cuts a call off --")
-check("the draft has no ceiling", server.CHAT_TIMEOUT, 0)
-check("and neither does the reviewer", server.REVIEW_TIMEOUT, 0)
-check("unless one is asked for", bridge.client_timeout(300).read, 300)
-check("no ceiling means no ceiling on the answer", bridge.client_timeout(0).read, None)
-check("a negative one means the same", bridge.client_timeout(-1).read, None)
-check("connecting is still bounded, so a dead host is not a slow model",
-      bridge.client_timeout(0).connect, 10.0)
-check("a blocking caller waits for the whole negotiation", server.job_wait(), 0.0)
-reload_with(CHAT_TIMEOUT="60")
-check("and with a ceiling set it multiplies out over the rounds", server.job_wait(),
-      60 * (2 + 2 * 5) + 30)
-reload_with()
-check("so the default is back to no ceiling", (server.CHAT_TIMEOUT, server.job_wait()), (0, 0.0))
-
-print("\n-- a page whose stream keeps being cut collects the answer by polling --")
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
-started = client.post("/chat/stream", json={"messages": [{"role": "user",
-                                                          "content": "make me a walk script"}]})
-polled = {}
-for _ in range(400):
-    polled = client.get(f"/chat/poll/{started.json()['job']}").json()
-    if polled.get("done") or polled.get("status") == "error":
-        break
-    time.sleep(0.02)
-check("the poll says the turn is over", polled.get("done"), True)
-check("and carries the answer", polled.get("text"), MERGED2_CODE)
-check("with the draft, both other versions and both reviews as well",
-      [bool(polled.get("draft")), bool(polled.get("peer")), bool(polled.get("peer2")),
-       bool(polled.get("review")), bool(polled.get("second_review"))],
-      [True, True, True, True, True])
-check("and the record of what each phase cost", len(polled.get("phases") or []), 9)
-check("the poll reports no ceiling on the turn", "timeout" in polled, False)
-check("an unknown job is a 404, so the page can stop",
-      client.get("/chat/poll/nope").status_code, 404)
-
-print("\n-- polling needs no key, exactly like the stream --")
-reload_with(API_KEY="a-key-the-page-never-has")
-started = client.post("/chat/stream", json={"messages": [{"role": "user",
-                                                          "content": "make me a walk script"}]})
-job = started.json()["job"]
-check("the page can poll", client.get(f"/chat/poll/{job}").status_code, 200)
-check("while the API result stays gated", client.get(f"/chat/result/{job}").status_code, 401)
-reload_with()
-
-print("\n-- the writer thinks, and the thinking is not the answer --")
-reload_with()
-out, done, calls, _ = turn()
-wrote = writer_calls(calls)
-check("thinking is on by default", bridge.QWEN_THINKING, "thinking")
-check("and every writer call asks for it", [c["body"].get("thinking_mode") for c in wrote],
-      ["thinking"] * len(wrote))
-check("a reasoning delta never reaches the answer", REASONING in (done.get("text") or ""), False)
-check("nor the draft the reader is shown", REASONING in (done.get("draft") or ""), False)
-check("and the answer is still the merged script", done.get("text"), MERGED2_CODE)
-reload_with(QWEN_THINKING="fast")
-check("it can be turned off as well", bridge.QWEN_THINKING, "fast")
-reload_with()
-
-print("\n-- the offered scripts are read, and the one with the most lines is the choice --")
-options = server.code_options(CHOICE_DRAFT)
-check("both offered scripts are read as options", len(options), 2)
-check("with their own line counts", [o["lines"] for o in options],
-      [server.code_line_count(CHOICE_SHORT), server.code_line_count(CHOICE_LONG)])
-check("and the one with the most lines is the pick",
-      server.longest_option(options)["code"], CHOICE_LONG)
-check("a single script is not a choice",
-      server.code_options(fenced(CHOICE_LONG) + "\n\n" + CHOICE_QUESTION_TEXT), [])
-check("and neither is an answer with no question in it", server.code_options(
-      fenced(CHOICE_SHORT) + "\n\n" + fenced(CHOICE_LONG) + "\n\nNothing to choose here."), [])
-
-print("\n-- \"Which choice do you prefer?\" is answered, not shipped --")
-reload_with(NEGOTIATE_ROUNDS="0")
-STUB["choice_draft"] = True
-out, done, calls, _ = turn()
-STUB["choice_draft"] = False
-wrote = writer_calls(calls)
-check("the writer offered two scripts and asked which", len(wrote), 2)
-check("the first call is the draft", "make me a walk script" in asked_last(wrote[0]), True)
-check("the question is answered in the same chat",
-      [m["role"] for m in wrote[1]["body"]["messages"]][-2:], ["assistant", "user"])
-check("with the question itself as the turn before it",
-      CHOICE_QUESTION_TEXT in wrote[1]["body"]["messages"][-2]["content"], True)
-check("the option named is the one with the most lines",
-      "option 2 (the second one)" in asked_last(wrote[1]), True)
-check("by the count that decided it",
-      f"{server.code_line_count(CHOICE_LONG)} lines" in asked_last(wrote[1]), True)
-check("and no question is asked back", "no questions" in asked_last(wrote[1]), True)
-check("what ships is the chosen script", done.get("text"), CHOICE_LONG)
-check("the question never reaches the reader",
-      CHOICE_QUESTION_TEXT in (done.get("text") or ""), False)
-check("and the chosen script is what the reader replays as the answer",
-      streamed(out), CHOICE_LONG)
-check("the phase says which one was taken", "choose" in [p["phase"] for p in done["phases"]], True)
-check("and the turn is done", done.get("status"), "done")
-
-print("\n-- a writer that will not decide still ends in a script --")
-reload_with(NEGOTIATE_ROUNDS="0")
-STUB["choice_draft"] = True
-STUB["choice_dud"] = True
-out, done, calls, _ = turn()
-STUB["choice_dud"] = False
-STUB["choice_draft"] = False
-check("the longest option ships as it stands", done.get("text"), CHOICE_LONG)
-check("nothing from the refusal is left in the answer",
-      "cannot decide" in (done.get("text") or ""), False)
-check("and the turn is still done", done.get("status"), "done")
-reload_with()
-
-print("\n-- a merge that asks which one is preferred is answered as well --")
-STUB["choice_merge"] = True
-out, done, calls, _ = turn()
-STUB["choice_merge"] = False
-phases = [p["phase"] for p in done["phases"]]
-check("both readers ran and then the question was settled",
-      phases_of(done), [["draft", "seed", "seed2"],
-                        ["peer", "merge", "agree", "peer2", "merge", "agree2", "choose"]])
-check("the writer was asked to choose after the merges", len(writer_calls(calls)), 4)
-check("and the longest option is what ships", done.get("text"), CHOICE_LONG)
-check("the merge's question is not shipped",
-      CHOICE_QUESTION_TEXT in (done.get("text") or ""), False)
-
-print("\n-- the choice handling can be turned off, and is clamped --")
-reload_with(NEGOTIATE_ROUNDS="0", CHOICE_ROUNDS="0")
-STUB["choice_draft"] = True
-out, done, calls, _ = turn()
-STUB["choice_draft"] = False
-check("with it off the question is what ships", done.get("text"), CHOICE_DRAFT)
-check("and nothing was asked back", len(writer_calls(calls)), 1)
-reload_with(CHOICE_ROUNDS="9")
-check("a value past the ceiling is clamped", server.CHOICE_ROUNDS, server.MAX_CHOICE_ROUNDS)
-reload_with(CHOICE_ROUNDS="-1")
-check("and a negative one means none", server.CHOICE_ROUNDS, 0)
-reload_with()
-check("the default is two", server.CHOICE_ROUNDS, 2)
-
-print("\n-- the page shows the brief going out first --")
-reload_with(REVIEW_URL=f"http://127.0.0.1:{PORT}/deepseek")
-page = client.get("/")
-check("the page renders", page.status_code, 200)
-html = page.text
-check("with every placeholder filled",
-      [token for token in ("__CHIPS__", "__MODEL__", "__REVIEWER__", "__SECOND__", "__SECOND_ON__",
-                           "__REVIEW_ON__", "__SEED_ON__", "__GREETING__") if token in html], [])
-check("and each brief marked as going out on its own",
-      ['data-seed="true"' in html, 'data-second-on="true"' in html, 'send2.txt' in html],
-      [True, True, True])
-reload_with()
-
-print(f"\n{count[0]} checks, {len(failures)} failed")
-if failures:
-    print("  - " + "\n  - ".join(failures))
-    sys.exit(1)
-print("all checks passed")
+if __name__ == "__main__":
+    sys.exit(main())

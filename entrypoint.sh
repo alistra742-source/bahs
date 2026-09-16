@@ -1,7 +1,6 @@
 #!/bin/sh
-# Serves the FastAPI app on $PORT. All three models are called over HTTP (QWEN_TOKEN + QWEN_URL
-# for the draft, REVIEW_KEY + REVIEW_URL for the first reader, ZAI_TOKEN + ZAI_URL for the
-# second), so there is nothing to boot, pull or warm first.
+# Serves the FastAPI app on $PORT. The model is called over HTTP (QWEN_TOKEN + QWEN_URL), so there
+# is nothing to boot, pull or warm first -- and the toolbox (luau.py) runs in this process.
 set -eu
 
 PORT="${PORT:-8000}"

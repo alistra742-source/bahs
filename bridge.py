@@ -1,69 +1,54 @@
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel
+"""Everything that talks to the model: the token, the config, the request, and its stream.
+
+One model, one role. Qwen (qwen3.8-max, thinking on) writes the Luau, and the work a second
+reader used to do -- checking the script, looking up the API, running it, patching it -- is now a
+toolbox the writer calls itself (see luau.py).
+
+    you -- ask --> bahs -- one call, thinking on --> qwen3.8-max
+                     |                                   |
+                     |                                   +-- calls a tool  -> luau.py
+                     |                                   +-- reads the result, on it goes
+                     |
+                     +-- the same upstream chat, always: the proxy's hidden
+                         `<!-- qwen_metadata: ... -->` is kept for the session, so a follow-up
+                         continues the chat the last answer came from instead of opening a new one.
+
+chat.qwen.ai has no public API. github.com/encryptarun/qwen-api turns it into
+OpenAI-compatible endpoints using the Qwen *access token* from the browser
+(chat.qwen.ai -> DevTools console -> localStorage.token). That token is the key to a whole Qwen
+account, so it lives here and never in a page or a Roblox script.
+
+Three things about that proxy shape this file:
+
+  * **Thinking is a request field** (`thinking_mode: "thinking"`), not a hint, and its
+    `reasoning_content` deltas are dropped here: the answer is what is wanted, and a reasoning
+    delta is not the answer.
+  * **Tool calling is prompt-engineered upstream**, but arrives as OpenAI `tool_calls` (and, in
+    some builds, as a `<tool_calls>[...]</tool_calls>` block inside the content). Both are read
+    here, and neither is ever allowed into the text the user sees.
+  * **A chat is continued by the hidden metadata the proxy puts in the assistant content**
+    (`<!-- qwen_metadata: {"response_id":...} -->`). Keeping it, and putting it back on the
+    assistant turn of the next request, is the difference between one chat and a new chat per
+    question. That is what the session store below is for, and why the marker is cut out of
+    everything that is streamed, stored or displayed.
+
+The service's surface (jobs, endpoints, the page) is in server.py; what the service can say about
+itself is in state.py.
+"""
+# The shared imports live here and nowhere else: `state`, `luau` and `server` are written as
+# `from bridge import *`, so these names are the plumbing all four modules are made of. They are
+# not re-exported for convenience -- moving them would break the other three.
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request  # noqa: F401
+from fastapi.middleware.cors import CORSMiddleware  # noqa: F401
+from fastapi.responses import HTMLResponse, Response, StreamingResponse  # noqa: F401
+from pydantic import BaseModel  # noqa: F401
 from typing import Optional
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager  # noqa: F401
 from pathlib import Path
-from collections import defaultdict, deque
-import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid
+from collections import defaultdict, deque  # noqa: F401
+import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid  # noqa: F401
 
-import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
-
-# --------------------------------------------------------------------------------------
-# What this service is: one writer and two readers, competing over one script, behind one API.
-#
-#   you -- ask --> bahs -- brief, on its own -->         DeepSeek  (V4 Flash, thinking off)
-#                      \
-#                       `- draft -->                     Qwen      (qwen-api)
-#                           \
-#                            `- the other version -->    DeepSeek, in the chat the brief opened
-#                                 \
-#                                  `- merge, same chat as the draft --> Qwen
-#                                       \
-#                                        `- agree? no -> another version (NEGOTIATE_ROUNDS)
-#                                             \
-#                                              `- send2.txt, on its own --> GLM-5.3 Flash
-#                                                   \
-#                                                    `- the same protocol over the script
-#                                                       the first two settled on (SECOND_ROUNDS)
-#
-# No model is asked what is wrong. Each is asked for the script it would ship, the writer merges
-# the two in the chat it wrote the draft in, and each reader is then asked whether it would ship
-# the merge; the turn ends when they say yes or the rounds run out. The second reader (GLM, and
-# its own brief) is configured in peers.py, which is where the other half of this file's job for
-# it lives.
-#
-# chat.qwen.ai has no public API. github.com/encryptarun/qwen-api turns it into
-# OpenAI-compatible endpoints using the Qwen *access token* from the browser
-# (chat.qwen.ai -> DevTools console -> localStorage.token). That token is the key to a
-# whole Qwen account, so it lives here and never in a page or a Roblox script.
-#
-# The reviewer is DeepSeek V4 Flash, with thinking and search switched off and never the
-# caller's to choose. Which DeepSeek it is depends on the credential: an `sk-...` API key
-# reviews through api.deepseek.com, and a chat.deepseek.com `userToken` reviews through the
-# site's own endpoints (see DeepSeekWeb below) -- where the message call needs a proof of work,
-# solved here with DeepSeek's own sha3 module (pow_solver.py).
-#
-#   POST /chat/stream           one turn -> a job id, the whole chain runs in the job
-#   GET  /chat/stream/{job}     NDJSON: replay, text, phase changes, heartbeats, done
-#   POST /chat                  the same chain, blocking (client.lua)
-#   POST /generate[...]         one prompt, no history, same chain
-#   POST /v1/chat/completions   OpenAI-compatible passthrough, pinned to Qwen
-#   GET  /v1/models, /health
-#
-# Every question is sent as "Hy kanha <your question>" (GREETING), always to QWEN_MODEL
-# with thinking on (QWEN_THINKING). The conversation belongs to the caller: the turns it sends
-# are the turns the model sees, so a follow-up is answered in the same chat it has been
-# answering in. The brief, the reviewer's version, the merge instruction and the answer to
-# "which choice do you prefer?" are internal turns -- they are never part of what the user's
-# next question carries.
-#
-# Nothing is pulled, loaded or warmed: no weights, no GPU, no volume, no database. The only
-# files this service reads are the briefs: Send.txt/send.txt, handed to the first reader before
-# anything else (REVIEW_BRIEF), and send2.txt for the second reader, which falls back to the
-# first reader's brief when it is not in the image (see peers.py).
-# --------------------------------------------------------------------------------------
+# --- plumbing -------------------------------------------------------------------------
 
 
 def client_timeout(seconds: float) -> httpx.Timeout:
@@ -87,18 +72,13 @@ def env(*names: str, default: str = "") -> str:
     return default
 
 
-# --- the providers ----------------------------------------------------------------------
+# --- the provider -----------------------------------------------------------------------
 
 class Provider:
-    """One OpenAI-compatible endpoint, plus whatever it calls "answer without thinking".
-
-    Both sides speak the same request and response shape, so the only per-provider
-    knowledge is where it lives, what it calls the model, and how it spells "no thinking".
-    """
+    """One OpenAI-compatible endpoint, and how it spells this service's two toggles."""
 
     def __init__(self, name: str, url: str, key: str, model: str, dialect: dict,
-                 timeout: float, extra: Optional[dict] = None, shape: str = "openai",
-                 web: Optional["DeepSeekWeb"] = None):
+                 timeout: float, extra: Optional[dict] = None):
         self.name = name
         self.url = url.rstrip("/")
         self.key = key
@@ -106,10 +86,6 @@ class Provider:
         self.dialect = dialect
         self.timeout = timeout
         self.extra = extra or {}
-        self.shape = shape
-        # Set when this provider is chat.deepseek.com itself: those endpoints are not
-        # OpenAI-shaped, so the request goes through the web transport instead.
-        self.web = web
 
     @property
     def configured(self) -> bool:
@@ -128,50 +104,38 @@ class Provider:
         return {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json"}
 
     def request(self, messages: list, temperature: Optional[float], max_tokens: int,
-                stream: bool = True) -> dict:
+                stream: bool = True, tools: Optional[list] = None,
+                tool_choice: Optional[str] = None) -> dict:
         """An OpenAI-shaped body, pinned to this provider's model and thinking mode.
 
-        The model is not the caller's to choose: one model per role, so a request behaves
+        The model is not the caller's to choose: one model, one behaviour, so a request behaves
         the same whoever sends it.
         """
         body = {
             "model": self.model,
-            "messages": fold(self.shape, messages),
+            "messages": messages,
             "stream": stream,
             **self.dialect,
             **self.extra,
         }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice or "auto"
         if temperature is not None:
             body["temperature"] = temperature
         if max_tokens > 0:
             body["max_tokens"] = max_tokens
         # What goes out is logged with what comes back: without it, a short answer, a request that
-        # never carried the brief, and a provider that stopped early all look the same afterwards.
-        # The token checks do not come through here (stream=False), so this is one line per call.
+        # never carried the conversation, and a provider that stopped early all look the same
+        # afterwards. The token check does not come through here (stream=False), so this is one
+        # line per model call.
         if stream and env("LOG_REQUESTS", default="1") != "0":
             asked = sum(len(m.get("content") or "") for m in body["messages"]
-                        if isinstance(m, dict))
+                        if isinstance(m, dict) and isinstance(m.get("content"), str))
             print(f"[upstream] {self.name} -> {self.model}: {len(body['messages'])} message(s), "
-                  f"{asked} chars, max_tokens {body.get('max_tokens', 'unset')}", flush=True)
+                  f"{asked} chars, max_tokens {body.get('max_tokens', 'unset')}"
+                  + (f", {len(tools)} tool(s)" if tools else ""), flush=True)
         return body
-
-
-def fold(shape: str, messages: list) -> list:
-    """One prompt for an endpoint that has no system role (the web-chat bridges).
-
-    The brief has to come before anything else, so the turns are concatenated in the order
-    they were built -- system first -- rather than being dropped or reordered. An
-    OpenAI-shaped endpoint gets the turns untouched.
-    """
-    if shape != "web":
-        return messages
-    parts = []
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        parts.append(content.strip())
-    return [{"role": "user", "content": "\n\n".join(parts)}]
 
 
 def qwen_token() -> str:
@@ -184,508 +148,145 @@ QWEN_URL = env("QWEN_URL", default="https://qwen.aikit.club/v1")
 QWEN_ROOT = QWEN_URL[: -len("/v1")] if QWEN_URL.endswith("/v1") else QWEN_URL
 
 QWEN_TOKEN = qwen_token()
-# Every generation is sent to this model. There is no picker: one model, one behaviour.
+# Every call goes to this model. There is no picker: one model, one behaviour.
 QWEN_MODEL = env("QWEN_MODEL", default="qwen3.8-max")
-# fast (answer straight away) | auto | thinking. Thinking is the default: the writer is producing
-# a whole script, and the extra reasoning is worth the wait. It costs nothing in the answer --
-# the stream's reasoning_content is dropped, so only the script is read (see stream_answer).
-# Set it to "fast" to have the writer answer without thinking, or "auto" to let the model decide.
+# fast (answer straight away) | auto | thinking. Thinking is the default and stays that way: the
+# writer is producing a whole Luau script and reasoning about an API it cannot see, and it costs
+# nothing in the answer -- the stream's reasoning_content is dropped, so only the script is read.
 QWEN_THINKING = env("QWEN_THINKING", default="thinking")
-# Qwen answers in seconds; this is a backstop for a provider that hangs.
-# No ceiling on a generation, by default: a long negotiation is not an error, so nothing here
-# cuts a model off for taking its time. 0 (or less) means no limit at all -- connecting is still
+# No ceiling on a call by default: a long answer with tools is not an error, so nothing here cuts
+# a model off for taking its time. 0 (or less) means no limit at all -- connecting is still
 # bounded to 10s, so an unreachable host fails in seconds instead of looking like a slow model.
-# Set a number to put a ceiling back.
 CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="0"))
 
-QWEN = Provider(
-    "qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
-    {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT,
-)
+QWEN = Provider("qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
+                {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT)
 
-# --- chat.deepseek.com, driven by the token the site itself stores -----------------------
+# --- one chat, not a new one per question ------------------------------------------------
 #
-# The web app has no public API, but its own endpoints answer a server, so a *userToken* -- the
-# value behind chat.deepseek.com -> F12 -> Console ->
-# JSON.parse(localStorage.getItem("userToken")).value -- is enough to review a script. Three of
-# the four calls need nothing else:
+# qwen-api continues the upstream chat when the request carries the hidden metadata it put in the
+# last assistant answer:
 #
-#   GET  /users/current             is the token still good?
-#   POST /chat_session/create       a session id, {"character_id": null}
-#   POST /chat/create_pow_challenge a challenge for the message about to be sent
-#   POST /chat/completion           the answer -- and this one is gated by a proof of work
+#     <!-- qwen_metadata: {"response_id":"...","request_id":"..."} -->
 #
-# The proof of work is the one piece that cannot be solved here: it needs DeepSeek's own
-# sha3_wasm_bg.wasm, and the copies published with the two open-source bridges are stale (their
-# wasm_solve writes nothing for any difficulty or input -- the README has the measurement). So the
-# challenge is fetched and logged, no header is invented, and whatever the API answers is what
-# gets reported -- which is how you find out whether it is enforced for your account at all.
-#
-# thinking_enabled and search_enabled are sent false, always. The reviewer reads a script; it does
-# not reason out loud and it does not search the web. The site takes no temperature or token
-# ceiling, so those are ignored on this path.
+# So the marker is worth more than the text around it. It is cut out of every stream this service
+# reads (nobody should see it in a chat bubble), remembered against a session, and put back on the
+# assistant turn of the next request in that session -- which is what makes the model answer in
+# the chat it has been answering in rather than in a fresh one every time.
 
-LOGIN_HINT = ("copy a fresh userToken: chat.deepseek.com -> F12 -> Console -> "
-              "JSON.parse(localStorage.getItem(\"userToken\")).value")
+META_RE = re.compile(r"<!--\s*qwen_metadata:.*?-->", re.S)
+TOOL_XML = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.S)
+# The two things that must never reach the text: a tool call in its XML shape, and the metadata.
+MARKERS = (("<tool_calls>", "</tool_calls>"), ("<!--", "-->"))
+
+_sessions: dict = {}
+_sessions_lock = threading.Lock()
 
 
-def as_prompt(messages: list) -> str:
-    """The turns as one string, in order, system first.
+def session_ttl() -> float:
+    return float(env("SESSION_TTL", default="3600") or 3600)
 
-    The web endpoint has no roles: one prompt field. Concatenating in the order the turns were
-    built is what keeps the brief ahead of everything else on this path too.
+
+def session_new() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def session_remember(name: str, meta: str) -> None:
+    """Keep the hidden continuation marker for a session. Empty means 'forget it'."""
+    if not name:
+        return
+    with _sessions_lock:
+        now = time.time()
+        _sessions[name] = {"at": now, "meta": meta or ""}
+        for old in [k for k, v in _sessions.items() if now - v["at"] > session_ttl()]:
+            _sessions.pop(old, None)
+
+
+def session_meta(name: str) -> str:
+    with _sessions_lock:
+        found = _sessions.get(name or "")
+    return found["meta"] if found else ""
+
+
+def session_count() -> int:
+    with _sessions_lock:
+        return len(_sessions)
+
+
+def strip_metadata(text: str) -> str:
+    """The text without the hidden continuation marker."""
+    return META_RE.sub("", text or "").strip()
+
+
+def with_continuation(messages: list, session: str) -> list:
+    """The turns to send, with the session's continuation marker back on the last assistant turn.
+
+    Every marker the caller may be carrying is dropped first (the page keeps what it streamed, and
+    a marker sent twice would be text), and the session's own marker is put on the newest
+    assistant turn -- where the proxy looks for it when it decides whether this is a follow-up.
+    Without a session, or with one nothing is remembered for, the turns go out untouched.
     """
-    parts = []
+    out = []
     for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content.strip())
-    return "\n\n".join(parts)
-
-
-# The leaves of the site's `p` paths that carry state rather than answer text. The message id is
-# the important one here: it arrives on every message, it is what threads the next one onto this
-# one, and reading it as text would put a message id in the middle of the script.
-NON_TEXT_PATHS = ("status", "message_id", "id", "session_id", "conversation_id", "title",
-                  "created_at", "updated_at", "inserted_at", "quota", "finish_reason",
-                  "type", "role", "model")
-
-
-def read_chunk(chunk: dict, box: Optional[dict] = None) -> str:
-    """One piece of the answer out of a chat.deepseek.com frame, in either shape it uses.
-
-    The site has streamed an OpenAI-like frame and an older one (v, with fragments under p).
-    Both are accepted rather than betting on one. Thinking is dropped -- it is switched off,
-    and the reviewer's answer is what is wanted -- and a status, an id or an error frame yields
-    nothing, so none of them can arrive as text in the middle of a script.
-    """
-    choices = chunk.get("choices") or []
-    if choices:
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        if box is not None and choice.get("finish_reason"):
-            box["finish"] = choice["finish_reason"]
-        if str(delta.get("type") or "").lower() in ("thinking", "reasoning"):
-            return ""
-        return delta.get("content") or ""
-    path = str(chunk.get("p") or "")
-    value = chunk.get("v")
-    if path == "response/status":
-        if box is not None and str(value).strip().upper() == "FINISHED":
-            box["finish"] = box.get("finish") or "stop"
-        return ""
-    if "thinking" in path.lower() or path.rsplit("/", 1)[-1].lower() in NON_TEXT_PATHS:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "".join(part.get("content") or "" for part in value
-                       if isinstance(part, dict)
-                       and str(part.get("type") or "RESPONSE").upper() == "RESPONSE")
-    return ""
-
-
-class WebSession:
-    """One chat on chat.deepseek.com, so a second message lands in the same conversation.
-
-    The site threads a chat by `parent_message_id`: each message continues the one before it. The
-    id of the message it just wrote arrives in the stream, and it is kept here -- so the brief,
-    the reviewer's own version of the script and its agreement all sit in one conversation, which
-    is what makes the later questions be about the script the brief was read for.
-    """
-
-    def __init__(self, web: "DeepSeekWeb"):
-        self.web = web
-        self.id = ""
-        self.parent: Optional[str] = None
-        self.messages = 0
-
-
-class DeepSeekWeb:
-    """chat.deepseek.com as a reviewer, over the endpoints the web app itself calls.
-
-    `base` points at the site by default; it can be pointed somewhere else, which is both how this
-    is tested and how a mirror would be used (a base ending in /api/v0).
-    """
-
-    DEFAULT_BASE = "https://chat.deepseek.com/api/v0"
-
-    def __init__(self, token: str, timeout: float, cookies: str = "", base: str = ""):
-        self.token = token
-        self.timeout = timeout
-        self.cookie = (cookies or "").strip()
-        self.base = (base or self.DEFAULT_BASE).rstrip("/")
-        self.label = self.base.split("//", 1)[-1].split("/", 1)[0]
-        self.model = "deepseek-web"
-
-    def headers(self, pow_value: Optional[str] = None) -> dict:
-        """What the site's own client sends, so the request looks like the site's."""
-        headers = {
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {self.token}",
-            "content-type": "application/json",
-            "origin": "https://chat.deepseek.com",
-            "referer": "https://chat.deepseek.com/",
-            "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"),
-            "x-app-version": "20241129.1",
-            "x-client-locale": "en_US",
-            "x-client-platform": "web",
-            "x-client-version": "1.0.0-always",
-        }
-        if self.cookie:
-            headers["cookie"] = self.cookie
-        if pow_value:
-            headers["x-ds-pow-response"] = pow_value
-        return headers
-
-    def _client(self) -> httpx.Client:
-        return httpx.Client(timeout=client_timeout(self.timeout), follow_redirects=True)
-
-    def _call(self, method: str, path: str, payload: Optional[dict] = None):
-        try:
-            with self._client() as c:
-                return c.request(method, self.base + path, json=payload, headers=self.headers())
-        except httpx.HTTPError as e:
-            raise HTTPException(502, f"cannot reach chat.deepseek.com ({e.__class__.__name__})")
-
-    @staticmethod
-    def _json(response) -> dict:
-        try:
-            body = response.json()
-        except ValueError:
-            return {}
-        return body if isinstance(body, dict) else {}
-
-    def _explain(self, body: dict, status: int = 0) -> str:
-        """What chat.deepseek.com said, with the one fix that is not obvious."""
-        code = body.get("code")
-        message = str(body.get("msg") or "").strip()
-        if code == 40002:
-            return "chat.deepseek.com: Missing Token -- DEEPSEEK_TOKEN is not set on this service"
-        if code == 40003:
-            return (f"chat.deepseek.com rejected DEEPSEEK_TOKEN ({message or 'invalid token'}) -- "
-                    + LOGIN_HINT)
-        # The two proof-of-work refusals, told apart rather than pooled: 40300 is the header not
-        # being there (no module, an unknown algorithm, or a challenge that could not be solved),
-        # 40301 is an answer the server rejected -- a different problem with a different fix.
-        if code == 40300:
-            return (f"chat.deepseek.com: MISSING_HEADER ({message or 'no detail'}) -- the message "
-                    "was refused for the proof-of-work header. The [deepseek] lines in this "
-                    "service's log say which half failed: the sha3 module, or the solve")
-        if code == 40301:
-            return (f"chat.deepseek.com: INVALID_POW_RESPONSE ({message or 'no detail'}) -- the "
-                    "proof of work was solved with a module that is not the one the site uses")
-        text = json.dumps(body)[:300] if body else f"HTTP {status}"
-        if "pow" in text.lower() or "proof" in text.lower():
-            return f"chat.deepseek.com refused the proof of work ({text})"
-        return f"chat.deepseek.com said {code}: {message}" if code else text
-
-    def validate(self) -> tuple:
-        """Whether the userToken is still good, for the chip."""
-        response = self._call("GET", "/users/current")
-        body = self._json(response)
-        if response.status_code >= 400 and not body:
-            return False, f"chat.deepseek.com answered HTTP {response.status_code}"
-        if body.get("code") not in (None, 0):
-            return False, self._explain(body, response.status_code)
-        return True, "token accepted"
-
-    def create_session(self) -> str:
-        """A fresh chat for this review, so reviews never read each other."""
-        response = self._call("POST", "/chat_session/create", {"character_id": None})
-        body = self._json(response)
-        session = (((body.get("data") or {}).get("biz_data") or {}).get("id"))
-        if not session:
-            raise HTTPException(502, self._explain(body, response.status_code))
-        return str(session)
-
-    def challenge(self):
-        """The proof-of-work challenge for the next message, when it can be had at all."""
-        try:
-            response = self._call("POST", "/chat/create_pow_challenge",
-                                  {"target_path": "/api/v0/chat/completion"})
-        except HTTPException:
-            return None
-        body = self._json(response)
-        return (((body.get("data") or {}).get("biz_data") or {}).get("challenge"))
-
-    def new_session(self) -> WebSession:
-        """An open chat, for a conversation that will hold more than one message."""
-        return WebSession(self)
-
-    @staticmethod
-    def _message_id(chunk: dict) -> str:
-        """The id of the message the site is writing, when it says so.
-
-        Two shapes have been seen: a `response/message_id` frame, and the id as a field of a
-        frame. Either is used. Neither being there is not an error -- it only means this message
-        cannot be threaded onto the previous one, which the caller says out loud.
-        """
-        if str(chunk.get("p") or "") in ("response/message_id", "message_id"):
-            value = chunk.get("v")
-            if isinstance(value, str) and value:
-                return value
-        value = chunk.get("message_id")
-        if isinstance(value, str) and value:
-            return value
-        data = chunk.get("data")
-        biz = (data or {}).get("biz_data") if isinstance(data, dict) else None
-        for holder in (data, biz):
-            if isinstance(holder, dict):
-                value = holder.get("message_id")
-                if isinstance(value, str) and value:
-                    return value
-        return ""
-
-    def stream(self, prompt: str, box: Optional[dict] = None,
-               session: Optional[WebSession] = None):
-        """Send one prompt and stream the answer back.
-
-        With a session, this is the next message in that chat: the turns before it are already
-        there, so only the new prompt is sent and the reviewer answers about the script it was
-        shown rather than starting over. Without one, the call opens a chat of its own, which is
-        what a one-off review wants.
-        """
-        if session is None:
-            session = self.new_session()
-        if not session.id:
-            session.id = self.create_session()
-        # The site threads a chat by the id of the message before this one. It hands that id over
-        # inside the stream, so it is taken from there; when it does not, the message goes out
-        # with no parent, which starts a new branch of the same chat -- said out loud rather than
-        # passed off as a continuation.
-        parent = session.parent
-        if session.messages and not parent:
-            print("[deepseek] the site gave no message id for the previous message, so this one "
-                  "may start a new branch of the same chat", flush=True)
-        challenge = self.challenge() or {}
-        pow_value = ""
-        if challenge:
-            # The solve is native and bounded by the challenge's difficulty (~10 ms for the 144000
-            # the site hands out), and solve() returns "" rather than raising when it cannot.
-            pow_value = pow_solver.solve(challenge)
-            if not pow_value:
-                print(f"[deepseek] the challenge (difficulty {challenge.get('difficulty')}) was not "
-                      "solved; this message goes out without the header, which the API answers "
-                      "with 40300 MISSING_HEADER", flush=True)
-        # The prompt's size and whether the brief survived into it, in one line: this is the answer
-        # to "is the whole send.txt being sent", and it is checkable in the service's own log.
-        if BRIEF:
-            print(f"[deepseek] sending {len(prompt)} chars (brief {len(BRIEF)} chars from "
-                  f"{BRIEF_PATH.name}: {'whole' if BRIEF in prompt else 'NOT COMPLETE'}), "
-                  "thinking off, search off", flush=True)
+        if message.get("role") == "assistant" and isinstance(message.get("content"), str) \
+                and "qwen_metadata" in message["content"]:
+            out.append({**message, "content": strip_metadata(message["content"])})
         else:
-            print(f"[deepseek] sending {len(prompt)} chars (no brief loaded), thinking off, "
-                  "search off", flush=True)
-        payload = {
-            "chat_session_id": session.id,
-            "parent_message_id": parent,
-            "prompt": prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": False,
-            "search_enabled": False,
-        }
-        with self._client() as c:
-            with c.stream("POST", f"{self.base}/chat/completion", json=payload,
-                          headers=self.headers(pow_value)) as r:
-                if r.status_code >= 400 or "event-stream" not in r.headers.get("content-type", ""):
-                    raw = r.read().decode("utf-8", "replace")
-                    try:
-                        body = json.loads(raw)
-                    except ValueError:
-                        body = {"msg": raw[:300]}
-                    raise HTTPException(502, self._explain(
-                        body if isinstance(body, dict) else {}, r.status_code))
-                session.messages += 1
-                for line in r.iter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except ValueError:
-                        continue
-                    if not isinstance(chunk, dict):
-                        continue
-                    if chunk.get("code") and chunk.get("msg") and chunk.get("v") is None:
-                        raise HTTPException(502, self._explain(chunk, 200))
-                    message_id = self._message_id(chunk)
-                    if message_id:
-                        session.parent = message_id
-                    piece = read_chunk(chunk, box)
-                    if piece:
-                        yield piece
-                if box is not None and not box.get("finish"):
-                    # The site never said it had finished writing, so this review is whatever
-                    # arrived before the stream stopped -- said out loud rather than passed off as
-                    # the whole answer.
-                    print("[deepseek] the site's stream ended without a finished status: the "
-                          "review may be only the part it managed to write", flush=True)
+            out.append(message)
+    meta = session_meta(session)
+    if not meta:
+        return out
+    for index in range(len(out) - 1, -1, -1):
+        if out[index].get("role") == "assistant":
+            content = out[index].get("content")
+            out[index] = {**out[index],
+                          "content": ((content + "\n") if isinstance(content, str) and content
+                                      else "") + meta}
+            return out
+    # A conversation with no assistant turn in it has nothing to continue from, and a marker sent
+    # as a turn of its own would put an assistant message *after* the question being asked. Left
+    # alone: this turn opens the upstream chat, the next one continues it.
+    return out
 
 
-# --- the reviewer ------------------------------------------------------------------------
-#
-# DeepSeek V4 Flash, thinking off, search off. It is never sent the user's conversation: it is
-# sent the brief, then a script, and it answers with a script of its own. It is the second
-# author, not the model the user chose.
-#
-# Two credentials fit in DEEPSEEK_TOKEN, and which one it is decides the endpoint:
-#   * an API key (`sk-...`) from platform.deepseek.com -> the API, OpenAI-shaped.
-#   * the `userToken` chat.deepseek.com keeps in localStorage -> the site's own endpoints,
-#     driven by the DeepSeekWeb transport above, because the API does not take that token.
-# The endpoint follows the credential on its own, so a pasted userToken is not rejected by the
-# API first: that 401 says the token is bad when it is only in the wrong place.
-REVIEW_KEY = env("DEEPSEEK_TOKEN", "REVIEW_KEY", "DEEPSEEK_API_KEY", "DEEPSEEK_KEY")
-# Where the review goes. Left alone it is DeepSeek's API -- unless the credential is not an API key,
-# in which case it is the site. DeepSeek's API keys start with `sk-` and the token chat.deepseek.com
-# keeps in localStorage does not, and sending one of those to the API earns a 401 that reads like
-# the token is broken when the endpoint is. Picking the endpoint from the credential itself means a
-# pasted userToken works without a second variable.
-_review_asked_url = env("REVIEW_URL", "DEEPSEEK_URL")
-_session_token = bool(REVIEW_KEY) and not REVIEW_KEY.startswith("sk-")
-# The API takes only an `sk-` key, so a session token aimed at it (or at nothing) goes to the site
-# instead: that pair cannot authenticate, and the 401 it earns reads like a broken token.
-REVIEW_URL_AUTO = _session_token and (not _review_asked_url or "api.deepseek.com" in _review_asked_url)
-REVIEW_URL = ("https://chat.deepseek.com" if REVIEW_URL_AUTO
-              else (_review_asked_url or "https://api.deepseek.com"))
-REVIEW_MODEL = env("REVIEW_MODEL", "DEEPSEEK_MODEL", default="deepseek-v4-flash")
-# openai (an OpenAI-shaped endpoint, including api.deepseek.com) | web (a bridge in front of
-# chat.deepseek.com: no system role, and the toggles are plain booleans) | deepseek-web (the
-# site's own endpoints, driven by the userToken -- the DeepSeekWeb transport above).
-REVIEW_SHAPE = env("REVIEW_SHAPE", default="openai").lower()
-# A userToken is the site's own token, so pointing REVIEW_URL at the site selects its transport
-# without having to be asked. An API key from platform.deepseek.com keeps the OpenAI shape.
-if "chat.deepseek.com" in REVIEW_URL:
-    REVIEW_SHAPE = "deepseek-web"
-# The cf_clearance cookie, in case chat.deepseek.com ever answers a request with a browser check.
-REVIEW_COOKIE = env("DEEPSEEK_COOKIE", "REVIEW_COOKIE")
-# The web endpoints take no model id: the session's model is whatever the account is set to, so
-# claiming a specific one would be a lie on the chip.
-if REVIEW_SHAPE == "deepseek-web" and not env("REVIEW_MODEL", "DEEPSEEK_MODEL"):
-    REVIEW_MODEL = "deepseek-web"
-# Thinking is enabled by default on DeepSeek V4, so it is switched off explicitly, and search
-# is never switched on anywhere in this service: a review has to be cheap, quick, and about
-# the script in front of it rather than about the web.
-REVIEW_THINKING = env("REVIEW_THINKING", default="off").lower()
-SEARCH_OFF = True
-REVIEW_TEMPERATURE = float(env("REVIEW_TEMPERATURE", default="0.2"))
-# The reviewer writes a whole script of its own now rather than a list, so its call gets the room
-# a script needs on the API path (the site path takes no ceiling at all).
-PEER_TOKENS = int(env("PEER_TOKENS", "REVIEW_MAX_TOKENS", default="8192"))
-# The ceiling on NEGOTIATE_ROUNDS. Five rounds is five versions and five merges on top of the
-# draft; more than that is a turn nobody would sit through.
-MAX_NEGOTIATE_ROUNDS = 5
-# Reading the brief is one short acknowledgement, so it is capped separately: a brief that invites
-# an essay must not spend the turn on the acknowledgement.
-SEED_TOKENS = int(env("SEED_TOKENS", default="512"))  # the acknowledgement only
-# How many times the first reader and the writer go back and forth over the same script. Every
-# round is one version from that reader and one merge from the writer, and the rounds after the
-# first are the reader agreeing with the merged script or proposing another one. 0 ships the
-# draft alone. The second reader has its own ceiling, in peers.py (SECOND_ROUNDS).
-# A round costs two model calls, so five is the most that is worth waiting for; the value is
-# clamped rather than trusted, because a typo here is a turn that never ends.
-NEGOTIATE_ROUNDS = max(0, min(int(env("NEGOTIATE_ROUNDS", default="5")), MAX_NEGOTIATE_ROUNDS))
-# Whether the brief goes out on its own first, with the request only after the answer to it.
-SEED_BRIEF = env("SEED_BRIEF", default="on").lower() not in ("off", "0", "false", "no")
-# How many times the writer may be told to stop asking and hand over a script. It happens when
-# an answer offers two scripts and ends by asking which one is preferred: the bridge answers
-# that question itself -- the option with the most lines -- and the reply is the script that
-# ships. 2 rounds means one retry if the model asks again, and 0 disables it entirely.
-MAX_CHOICE_ROUNDS = 3
-CHOICE_ROUNDS = max(0, min(int(env("CHOICE_ROUNDS", default="2")), MAX_CHOICE_ROUNDS))
-# The script sent for review is bounded too: a 1M-token context is not a reason to use it.
-REVIEW_SCRIPT_MAX = int(env("REVIEW_SCRIPT_MAX", default="48000"))
-# How much of the brief in front of the review is sent. Send.txt is yours; this is the
-# ceiling on it, so a stray huge file cannot become the whole prompt.
-REVIEW_BRIEF_MAX = int(env("REVIEW_BRIEF_MAX", default="60000"))
-# What the script is supposed to run in. Handed to the reviewer so its complaints are about
-# this runtime and not about a general-purpose script. It is an executor script, not a Studio
-# one: those are different runtimes, and advice that assumes the Studio editor (plugin APIs,
-# edit-mode behaviour, anything that only exists on the server) is advice about a different
-# script.
-TARGET_RUNTIME = env("TARGET_RUNTIME", default=(
-    "a Roblox executor script -- Luau run by a client-side executor, not a Roblox Studio place "
-    "script and not a script for the Studio editor"))
+# --- the toolbox ------------------------------------------------------------------------
 
-# Every message to the reviewer opens with this, and it is not decoration: the reviewer assuming
-# the script is for Studio is the one thing that would make its answer wrong, and a conversation
-# buries a line said once at the start. So it is said again on every call, and it is the first
-# thing in the message rather than a footnote to it.
-REVIEW_WARNING = env(
-    "REVIEW_WARNING",
-    default="WARNING! THIS IS NOT FOR ROBLOX STUDIO BUT FOR A ROBLOX EXECUTOR SCRIPT")
+# With tools on, this rides in front of the caller's conversation as the system turn. It is the
+# only standing instruction the writer gets, and it is about the work, not about a persona.
+TOOL_SYSTEM = """You write Luau that runs under a Roblox executor, injected into a live client. \
+It is not a Roblox Studio place script and not a script for the Studio editor: there is no server \
+side, no plugin API and no edit mode, and a script that assumes any of them is wrong.
 
-REVIEW_EXTRA: dict = {}
-try:
-    _extra = json.loads(env("REVIEW_EXTRA", default="{}") or "{}")
-    if isinstance(_extra, dict):
-        REVIEW_EXTRA = _extra
-except ValueError:
-    print("[bridge] REVIEW_EXTRA is not valid JSON; ignoring it", flush=True)
+You have tools, and using them is part of writing the script:
+* `roblox_api` -- check that a class, property, function or event really exists before you rely on it.
+* `luau_check` -- check the whole script for unbalanced blocks, unterminated strings and calls that break in an executor, before you hand it over.
+* `run_script` -- run it in the executor that is listening, when one is, and read what it printed or how it failed. Nothing else can prove a script runs.
+* `apply_edit` -- change one part of a script you already have instead of writing the whole thing again.
+* `luau_format` -- re-indent a script you assembled from pieces.
+* `secret_scan` -- find credentials in the script before it ships.
 
-def reviewer_dialect() -> dict:
-    """DeepSeek's off-switches, in whichever shape the endpoint expects.
+Call a tool when it would change your answer; never describe a call in prose. When you are done, \
+answer with the complete runnable script and nothing else: no commentary, no summary of your \
+changes, no markdown code fences."""
 
-    The API takes `thinking: {"type": "disabled"}`. A bridge in front of the web chat takes
-    booleans. Search is set to false in both, and is never set true anywhere in this file.
-    """
-    thinking_on = REVIEW_THINKING in ("on", "thinking", "enabled", "slow")
-    if REVIEW_SHAPE == "web":
-        return {"thinking": thinking_on, "search": not SEARCH_OFF,
-                "thinking_enabled": thinking_on, "search_enabled": not SEARCH_OFF}
-    return {"thinking": {"type": "enabled" if thinking_on else "disabled"}}
-
-
-# The reviewer gets the same treatment: no limit, because the site's own generation is the
-# slowest thing in the chain and cutting it off mid-script is worse than waiting for it.
-REVIEW_TIMEOUT = float(env("REVIEW_TIMEOUT", default="0"))
-
-REVIEWER = Provider(
-    "deepseek", REVIEW_URL, REVIEW_KEY, REVIEW_MODEL, reviewer_dialect(),
-    REVIEW_TIMEOUT,
-    REVIEW_EXTRA,
-    REVIEW_SHAPE,
-    (DeepSeekWeb(REVIEW_KEY, REVIEW_TIMEOUT, REVIEW_COOKIE,
-                 REVIEW_URL if "/api/v0" in REVIEW_URL else "")
-     if REVIEW_SHAPE == "deepseek-web" else None),
-)
-
-# on (always) | off (never) | auto (only when a reviewer key is set)
-PIPELINE = env("PIPELINE", default="auto").lower()
-
-
-def review_enabled() -> bool:
-    """Whether a question goes through the reviewer as well.
-
-    A reviewer pointed at chat.deepseek.com is a real reviewer: that path is the web transport
-    above, driven by the userToken. It only looks unconfigured when there is no token at all.
-    """
-    if not REVIEWER.configured:
-        return False
-    if PIPELINE in ("off", "0", "false", "no"):
-        return False
-    return True
-
+AGENT_ROUNDS_MAX = 12
+# How many tool rounds one turn may take. A round is one model call plus the tools it asked for;
+# a script that compiles on the second try needs three or four, and a turn nobody would sit
+# through is not worth starting, so this is clamped rather than trusted.
+AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="8")), AGENT_ROUNDS_MAX))
+# The tool that actually runs a script is the one that can hang (an executor stuck in a wait), so
+# it is bounded separately.
+TOOL_RESULT_MAX = int(env("TOOL_RESULT_MAX", default="20000"))
 
 # --- the tokens one call may use ---------------------------------------------------------
 #
-# Three calls, three ceilings. The draft and the rewrite produce whole scripts, so they get
-# room; the review produces a list, so it does not. A draft that stops at its ceiling is
-# reported as a failure instead of being shipped, because everything after it would be built
-# on a cut-off script.
-# Both Qwen calls exist to produce a whole script, and 4096 tokens is roughly 200 lines of Luau.
-# An answer that stops at its ceiling is refused rather than shipped, so a ceiling that is too low
-# shows up as a failed turn -- the rewrite can be long as well, so it gets the larger room.
+# The writer exists to produce a whole script, and 4096 tokens is roughly 200 lines of Luau. An
+# answer that stops at its ceiling is refused rather than shipped, so a ceiling that is too low
+# shows up as a failed turn. The second number is the room a call that is mid-conversation gets,
+# which is larger because it may be rewriting what was already handed to it.
 MAX_TOKENS = int(env("MAX_TOKENS", default="4096"))
-DRAFT_TOKENS = int(env("DRAFT_TOKENS", default="8192"))
+ANSWER_TOKENS = int(env("ANSWER_TOKENS", "DRAFT_TOKENS", default="8192"))
 REFINE_TOKENS = int(env("REFINE_TOKENS", default="16384"))
-# How much of a script may be pasted into one instruction to the writer. The draft is already a
-# turn in that conversation, so this is the ceiling on the *other* version being merged in.
-MERGE_PASTE_MAX = int(env("MERGE_PASTE_MAX", default="48000"))
 
 # --- jobs, history and limits ------------------------------------------------------------
 #
@@ -700,99 +301,19 @@ HEARTBEAT = float(env("HEARTBEAT", default="5"))
 # How long a finished job stays readable, so a browser that comes back late can still collect
 # the answer instead of finding nothing.
 JOB_TTL = float(env("JOB_TTL", default="3600"))
-# How often /health may ask a provider whether its key still works.
+# How often /health may ask the proxy whether its key still works.
 TOKEN_CHECK_TTL = float(env("TOKEN_CHECK_TTL", default="60"))
-# Requests per minute per IP on the endpoints the page uses, and how many chains may run at
-# once. The page has no login by design, so these are what stand between the URL and the two
-# accounts behind it. RATE_LIMIT 0 disables the per-IP window.
+# Requests per minute per IP on the endpoints the page uses, and how many turns may run at once.
+# The page has no login by design, so these are what stand between the URL and the Qwen account
+# behind it. RATE_LIMIT 0 disables the per-IP window.
 RATE_LIMIT = int(env("RATE_LIMIT", default="30"))
 MAX_CONCURRENT = int(env("MAX_CONCURRENT", default="4"))
-# The key callers must send on /v1, /chat and /generate: API_KEY when it is set, otherwise the
-# Qwen token itself -- one secret to keep. "" leaves those endpoints open as well.
+# The key callers must send on /v1, /chat, /generate and the executor endpoints: API_KEY when it
+# is set, otherwise the Qwen token itself -- one secret to keep. "" leaves those open as well.
 API_KEY = env("API_KEY")
 CALLER_KEY = API_KEY or QWEN_TOKEN
 
 INDEX = Path(__file__).parent / "web" / "index.html"
-
-
-# --- the brief handed to the reviewer ----------------------------------------------------
-
-# Which file is the brief. The repo has two -- send.txt and Send.txt -- because they differ
-# only in the case of one letter, which is a trap: a clone on a case-insensitive filesystem
-# can only hold one of them. The lowercase one is the newer, so it is the one used, and the
-# other is the fallback rather than being silently ignored. Either can be forced with
-# REVIEW_BRIEF, and whichever is in use is named on /health as reviewer.brief.
-_BRIEF_HERE = Path(__file__).parent
-BRIEF_CHOICES = [_BRIEF_HERE / name for name in ("send.txt", "Send.txt")]
-_BRIEF_ASKED = env("REVIEW_BRIEF", default="")
-BRIEF_PATH = (Path(_BRIEF_ASKED) if _BRIEF_ASKED
-              else next((p for p in BRIEF_CHOICES if p.exists()), BRIEF_CHOICES[-1]))
-
-
-def load_brief() -> str:
-    """Send.txt: what the reviewer is told before it is asked anything.
-
-    Read once at boot. A missing file is not an error -- the built-in rubric below still
-    makes the review usable -- but it is reported on /health so a file that did not make it
-    into the image is visible rather than silent.
-    """
-    try:
-        text = BRIEF_PATH.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-    text = text.strip()
-    if len(text) > REVIEW_BRIEF_MAX:
-        text = text[:REVIEW_BRIEF_MAX] + "\n\n[... brief truncated ...]"
-    return text
-
-
-BRIEF = load_brief()
-
-# Sent with the brief (or on its own when there is no brief), before anything is asked of the
-# reviewer. The contract is a script, not a list of complaints: the reviewer's answer is put in
-# front of the writer to be merged with theirs, and prose cannot be merged.
-RUBRIC = f"""You are one of the models working on the same script, and another model wrote the \
-version in front of you. You write the version you would ship. You are not a commenter -- you \
-are one of the authors, and everything you write is put in front of the writer to be merged \
-with what it has.
-
-Judge everything by one question: will it actually run in {TARGET_RUNTIME}? Ignore style, \
-naming, formatting and taste.
-
-Answer in exactly this format, and nothing else:
-
-VERDICT: BETTER
-<the complete script>
-
-or, when the script in front of you cannot be made more reliable:
-
-VERDICT: KEEP
-
-Rules for this format:
-- VERDICT: BETTER means a complete script follows immediately: every line of it, nothing left \
-out, no placeholders, no "...", no commentary, and no markdown code fences.
-- Keep what already works. Change only what would break, and only where your version is more \
-reliable: an API name or property that does not exist in Roblox, a deprecated global that no \
-longer runs, server/client confusion, a yield where none can happen, a loop that never ends, \
-an event connected twice, anything that throws on its first line.
-- Same language, same structure and the same entry points as the version in front of you, so the \
-two can be merged line for line. Never rename anything the request did not name.
-- Every message here opens with the warning that this is a Roblox executor script and not a
-  Roblox Studio one, and it is literally true: no Studio-only service, no plugin API, no editor
-  behaviour, and nothing that assumes the script runs on the server instead of on the client
-  that ran it.
-- Prefer the simplest thing that works over the cleverest thing that might.
-- No praise, no summary, no explanation of your changes. The script is the answer.
-- If the request was conversational rather than a request for a script, answer VERDICT: KEEP."""
-
-# The line that follows the brief when the brief is sent on its own: it asks for the \
-# acknowledgement and nothing else, so reading Send.txt does not become an essay that the real \
-# request has to be queued behind.
-SEED_NOTE = ("[the bridge] That is your standing instruction set, and it is the first thing in "
-             "this chat. Nothing has been asked of you yet: reply with one short line saying you "
-             "have read it -- no code, no summary, no questions -- and wait for the request that "
-             "follows here in this same chat.")
-
 
 # --- addressing the model ---------------------------------------------------------------
 
@@ -813,7 +334,7 @@ def greet(messages: list) -> list:
 
     Only the last user turn is touched. The earlier ones already carry the greeting, since it
     was applied when they were sent, and a caller that writes the greeting itself is not
-    prefixed twice. Internal turns (the merge instruction) never go through this.
+    prefixed twice.
     """
     if not GREETING:
         return messages
@@ -836,7 +357,11 @@ ROLES = ("system", "user", "assistant", "tool", "function")
 
 
 def clean_messages(raw) -> list:
-    """The caller's turns, as the provider wants them: a role and some content."""
+    """The caller's turns, as the provider wants them: a role and some content.
+
+    A `tool` turn is kept as well: it is what a caller that manages its own tool calls has to be
+    able to send back.
+    """
     if not isinstance(raw, list):
         raise HTTPException(400, "messages must be a list")
     turns = []
@@ -845,7 +370,7 @@ def clean_messages(raw) -> list:
             continue
         if str(item.get("role") or "").strip() not in ROLES:
             continue
-        if item.get("content") is None:
+        if item.get("content") is None and not item.get("tool_calls"):
             continue
         turns.append(item)
     if not turns:
@@ -856,10 +381,10 @@ def clean_messages(raw) -> list:
 def trim_messages(messages: list) -> list:
     """Keep the newest turns inside the history budget.
 
-    `head` is what is never dropped: the system message a caller put in front. Everything
-    after it is a turn, and the oldest ones go first once the conversation is longer than
-    HISTORY_MESSAGES or fatter than HISTORY_CHARS. The draft and the merge instruction are
-    appended after this, so the turn being worked on is never the one that gets dropped.
+    `head` is what is never dropped: the system messages in front. Everything after them is a
+    turn, and the oldest ones go first once the conversation is longer than HISTORY_MESSAGES or
+    fatter than HISTORY_CHARS. The tool rounds of the turn being worked on are appended after
+    this, so the turn in flight is never the one that gets dropped.
     """
     head = 0
     while head < len(messages) and messages[head].get("role") == "system":
@@ -882,25 +407,14 @@ def last_user_text(messages: list) -> str:
 
 
 def without_greeting(text: str) -> str:
-    """The question as it was typed, without the greeting the model was addressed with.
-
-    Quoting it back to the reviewer with "Hy kanha" in front of it adds nothing and reads like
-    part of the request, so the reviewer is shown the question the user actually asked.
-    """
+    """The question as it was typed, without the greeting the model was addressed with."""
     stripped = (text or "").strip()
     if GREETING and stripped.lower().startswith(GREETING.lower()):
         return stripped[len(GREETING):].lstrip()
     return stripped
 
 
-def asked_for(messages: list, count: int = 3) -> list:
-    """The newest user turns -- the request the draft is being judged against."""
-    out = [m["content"] for m in messages
-           if m.get("role") == "user" and isinstance(m.get("content"), str)]
-    return out[-count:]
-
-
-# --- secrets never leave for the reviewer ------------------------------------------------
+# --- secrets never leave for a provider ---------------------------------------------------
 
 SECRET_PATTERNS = [
     re.compile(r"hf_[A-Za-z0-9]{12,}"),
@@ -914,11 +428,11 @@ SECRET_PATTERNS = [
 
 
 def redact(text: str) -> tuple:
-    """Mask credentials before a script goes to a second company.
+    """Mask credentials, and say how many were masked.
 
-    A generated script often carries a webhook, a token or an asset key. The reviewer does
-    not need any of them to say whether the code works, and the second provider is one more
-    place they would end up. Returns the masked text and how many things were masked.
+    A generated script often carries a webhook, a token or an asset key. Nothing needs them to
+    say whether the code works, and every place they are copied to is one more place they can
+    leak from. Returns the masked text and the count of what was masked.
     """
     count = 0
     for pattern in SECRET_PATTERNS:
@@ -927,7 +441,7 @@ def redact(text: str) -> tuple:
     return text, count
 
 
-# --- reading the draft -------------------------------------------------------------------
+# --- reading the answer --------------------------------------------------------------------
 
 FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*\n(.*?)\n?```\s*$", re.S)
 
@@ -938,13 +452,34 @@ def strip_fences(text: str) -> str:
     return match.group(1).strip() if match else (text or "").strip()
 
 
+def looks_like_code(text: str) -> bool:
+    """Whether what came back is a script rather than a sentence about one.
+
+    Used to decide whether a tool call that carried its script in the content had one at all, so
+    it is deliberately about structure -- most lines have to look like Lua -- rather than about
+    the words in them.
+    """
+    body = (text or "").strip()
+    if len(body) < 40:
+        return False
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return False
+    markers = ("local ", "function", "end", "then", "do ", "else", "return", "print(",
+               "Instance.", "game:", "script.", "require(", "task.", "wait(", "pcall", "--")
+    hits = sum(1 for line in lines
+               if line.startswith("--") or any(marker in line for marker in markers)
+               or (("=" in line or "(" in line) and len(line) > 3))
+    return hits >= max(2, (len(lines) * 2) // 3)
+
+
 def structural_notes(text: str, finish: Optional[str]) -> tuple:
     """What can be checked without running the script, and whether it is worth shipping.
 
-    This is deliberately a *structural* check, not a verdict on correctness: it catches the
-    failures that make everything after it pointless -- an empty answer, one cut off by the
-    token ceiling, an unterminated fence -- and hands the rest to the reviewer as evidence
-    instead of pretending a text model can verify code.
+    This is deliberately *structural*, not a verdict on correctness: it catches the failures that
+    make everything after it pointless -- an empty answer, one cut off by the token ceiling, an
+    unterminated fence -- and hands the rest to `luau_check` and the executor, which are the only
+    things that can say more.
     """
     code = (text or "").strip()
     notes = []
@@ -960,14 +495,10 @@ def structural_notes(text: str, finish: Optional[str]) -> tuple:
     return notes, usable
 
 
-# --- what the provider said, when it said no -------------------------------------------
+# --- what the provider said, when it said no ---------------------------------------------
 
 def failure_reason(status: int, body: str, provider: Provider) -> str:
-    """The provider's own sentence for a failure, plus the one fix that is not obvious.
-
-    Whatever the endpoint rejected the call with is the useful part, so it is passed through
-    verbatim instead of being replaced by a generic message.
-    """
+    """The provider's own sentence for a failure, plus the one fix that is not obvious."""
     text = (body or "").strip()
     message = text
     try:
@@ -983,20 +514,9 @@ def failure_reason(status: int, body: str, provider: Provider) -> str:
         elif payload.get("detail"):
             message = str(payload["detail"])
     message = " ".join(str(message).split())[:300] or "no detail"
-    model = provider.model
     who = provider.name
+    model = provider.model
     if status == 401:
-        if who != "qwen":
-            # A userToken sent to the API reads as a bad key, which is a misleading diagnosis: the
-            # credential is fine, the endpoint is the wrong one. Say which fix is the right one.
-            session_token = bool(provider.key) and not provider.key.startswith("sk-")
-            if session_token and provider.web is None:
-                return (f"{provider.label()} rejected the token ({message}) -- DEEPSEEK_TOKEN holds "
-                        "a chat.deepseek.com session token, not an API key, and the review is "
-                        "still going to the API. Set REVIEW_URL=https://chat.deepseek.com to use "
-                        "the web transport, or put an `sk-...` API key from platform.deepseek.com "
-                        "in DEEPSEEK_TOKEN")
-            return (f"{provider.label()} rejected the key ({message}) -- check DEEPSEEK_TOKEN")
         return (f"QWEN_TOKEN was rejected by qwen-api ({message}) -- copy a fresh token from "
                 "chat.qwen.ai (DevTools console: localStorage.token) and update the variable")
     if status == 403:
@@ -1004,8 +524,8 @@ def failure_reason(status: int, body: str, provider: Provider) -> str:
     if status == 404:
         return f"{model} is not a model {who} serves ({message})"
     if status == 429:
-        return (f"{who} is rate limiting ({message}) -- retry shortly, or point REVIEW_MODEL/"
-                "QWEN_MODEL at another model")
+        return (f"{who} is rate limiting ({message}) -- retry shortly, or point QWEN_MODEL at "
+                "another model")
     if status >= 500:
         return f"{who} is failing ({status}: {message})"
     return f"{who} {status}: {message}"
@@ -1035,27 +555,169 @@ def message_text(body: str) -> str:
     return message.get("content") or ""
 
 
+def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
+    """Map an httpx failure onto a status the caller can act on."""
+    if isinstance(e, httpx.TimeoutException):
+        if provider.timeout and provider.timeout > 0:
+            return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
+        return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
+                                  f"({e.__class__.__name__})")
+    return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")
+
+
 # --- the call itself, and its stream -----------------------------------------------------
-#
-# One request per call, and the answer read back piece by piece. This lives here rather than in
-# server.py because it is the same thing for every provider: the chain decides *what* to ask and
-# *when*, and neither side of that cares how the bytes arrive.
 
-def stream_answer(messages: list, temperature: Optional[float], provider: Provider,
-                  max_tokens: int, box: Optional[dict] = None,
-                  web_session: Optional[object] = None):
-    """Stream an answer, piece by piece, out of a provider's /chat/completions.
+class Cutter:
+    """Streams what the user should see out of a stream that also carries hidden things.
 
-    `box` gets the finish reason and any token usage, which is how a truncated answer is caught
-    instead of being shipped. `web_session` is the chat on chat.deepseek.com this message belongs
-    to when the caller holds one open; without it, a site call is a chat of its own.
+    Two things ride inside the assistant content and neither belongs in a chat bubble: the XML
+    shape of a tool call, and the continuation metadata the proxy puts in every answer. They are
+    cut out here -- including a marker that arrives split across two deltas, which is why the last
+    few characters are always held back until they cannot still become one.
     """
-    if provider.web is not None:
-        # chat.deepseek.com: the site's own endpoint and its own streamed frames -- either the
-        # first message of a review or the next one in the chat the brief opened.
-        yield from provider.web.stream(as_prompt(messages), box, web_session)
-        return
-    body = provider.request(messages, temperature, max_tokens, stream=True)
+
+    def __init__(self) -> None:
+        self.raw = ""            # everything, exactly as it arrived
+        self.emitted = 0         # how much of it has been handed out
+        self.hold = ""           # the opener being held, "" when nothing is
+        self.hold_at = 0
+
+    def block_end(self) -> int:
+        closer = dict(MARKERS)[self.hold]
+        end = self.raw.find(closer, self.hold_at)
+        return -1 if end < 0 else end + len(closer)
+
+    def safe(self) -> int:
+        """How much can be emitted without risking half a marker on screen."""
+        window = max(len(open_) for open_, _ in MARKERS) - 1
+        tail = self.raw[-window:] if window > 0 else ""
+        keep = 0
+        for opener, _ in MARKERS:
+            for size in range(1, len(opener)):
+                if tail.endswith(opener[:size]):
+                    keep = max(keep, size)
+        return max(self.emitted, len(self.raw) - keep)
+
+    def take(self, upto: int) -> str:
+        if upto <= self.emitted:
+            return ""
+        out = self.raw[self.emitted:upto]
+        self.emitted = upto
+        return out
+
+    def feed(self, piece: str) -> str:
+        """Add one delta and get back the text that may be shown."""
+        self.raw += piece
+        out = ""
+        while True:
+            if self.hold:
+                end = self.block_end()
+                if end < 0:
+                    return out
+                self.emitted = end
+                self.hold = ""
+                continue
+            found = -1
+            for opener, _ in MARKERS:
+                at = self.raw.find(opener, self.emitted)
+                if at >= 0 and (found < 0 or at < found):
+                    found = at
+                    self.hold = opener
+            if found >= 0:
+                self.hold_at = found
+                out += self.take(found)
+                continue
+            out += self.take(self.safe())
+            return out
+
+
+def tool_calls_of(raw: str, streamed: list) -> list:
+    """The tool calls in one answer, from whichever shape they arrived in.
+
+    qwen-api answers with OpenAI `tool_calls`, and also instructs the model to emit
+    `<tool_calls>[{"name": ..., "arguments": {...}}]</tool_calls>` in the content. Both are read,
+    the OpenAI one first, and an argument blob that is not JSON is passed through as the single
+    `script` argument rather than being dropped: a model that fumbled the JSON usually still sent
+    the script.
+    """
+    out: list = []
+    for index, call in enumerate(streamed or []):
+        function = call.get("function") or {}
+        name = str(function.get("name") or call.get("name") or "").strip()
+        if not name:
+            continue
+        out.append({"id": str(call.get("id") or f"call_{index}"), "name": name,
+                    "arguments": parse_arguments(function.get("arguments") or call.get("arguments"))})
+    if out:
+        return out
+    for match in TOOL_XML.finditer(raw or ""):
+        try:
+            parsed = json.loads(match.group(1))
+        except ValueError:
+            parsed = _salvage(match.group(1))
+        if isinstance(parsed, dict):
+            parsed = parsed.get("tool_calls") or parsed.get("calls") or [parsed]
+        for index, call in enumerate(parsed if isinstance(parsed, list) else []):
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or (call.get("function") or {}).get("name") or "").strip()
+            if not name:
+                continue
+            args = call.get("arguments")
+            if args is None:
+                args = (call.get("function") or {}).get("arguments")
+            out.append({"id": str(call.get("id") or f"call_{index}"), "name": name,
+                        "arguments": parse_arguments(args)})
+    return out
+
+
+def _salvage(block: str) -> list:
+    """One JSON object per line, for a model that emitted several without an array."""
+    out = []
+    for line in (block or "").splitlines():
+        line = line.strip().rstrip(",")
+        if not line.startswith("{"):
+            continue
+        try:
+            got = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(got, dict):
+            out.append(got)
+    return out
+
+
+def parse_arguments(value) -> dict:
+    """A tool call's arguments as a dict, however badly they were spelled."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        got = json.loads(value)
+    except ValueError:
+        got = None
+    if isinstance(got, dict):
+        return got
+    # Not JSON. A script argument is the common case, so it is taken as one rather than thrown
+    # away -- the tool will complain about anything else it was supposed to get.
+    return {"script": value}
+
+
+def stream_call(messages: list, temperature: Optional[float], provider: Provider,
+                max_tokens: int, box: Optional[dict] = None,
+                tools: Optional[list] = None, tool_choice: Optional[str] = None):
+    """Stream one answer out of the provider's /chat/completions.
+
+    Yields only what the user should see. `box` collects what the job needs to know afterwards:
+    the raw content (tool calls, metadata and all), the finish reason, token usage, the hidden
+    metadata, and the tool calls themselves. reasoning_content is dropped: thinking is on, and
+    the answer is the script rather than the thinking about it.
+    """
+    body = provider.request(messages, temperature, max_tokens, stream=True,
+                           tools=tools, tool_choice=tool_choice)
+    cutter = Cutter()
+    streamed_calls: list = []
     try:
         with httpx.Client(timeout=client_timeout(provider.timeout),
                           follow_redirects=True) as c:
@@ -1074,21 +736,26 @@ def stream_answer(messages: list, temperature: Optional[float], provider: Provid
                     print(f"[{provider.name}] answered in one piece instead of streaming", flush=True)
                     if box is not None:
                         box["finish"] = box.get("finish") or "stop"
-                    yield text
+                    visible = strip_metadata(text)
+                    if box is not None:
+                        box["raw"] = text
+                    yield visible
                     return
                 for line in r.iter_lines():
                     if not line.startswith("data:"):
                         continue
                     data = line[len("data:"):].strip()
                     if data == "[DONE]":
-                        return
+                        break
                     if not data:
                         continue
                     try:
                         chunk = json.loads(data)
                     except ValueError:
                         continue
-                    if box is not None and isinstance(chunk, dict) and chunk.get("usage"):
+                    if not isinstance(chunk, dict):
+                        continue
+                    if box is not None and chunk.get("usage"):
                         box["usage"] = chunk["usage"]
                     choices = chunk.get("choices") or []
                     if not choices:
@@ -1096,25 +763,33 @@ def stream_answer(messages: list, temperature: Optional[float], provider: Provid
                     choice = choices[0] or {}
                     if box is not None and choice.get("finish_reason"):
                         box["finish"] = choice["finish_reason"]
-                    # reasoning_content is deliberately skipped: the answer is what is wanted.
-                    piece = (choice.get("delta") or {}).get("content") or ""
-                    if piece:
-                        yield piece
+                    delta = choice.get("delta") or {}
+                    for call in delta.get("tool_calls") or []:
+                        _merge_call(streamed_calls, call)
+                    piece = delta.get("content")
+                    if isinstance(piece, str) and piece:
+                        shown = cutter.feed(piece)
+                        if shown:
+                            yield shown
     except httpx.HTTPError as e:
         raise upstream_error(e, provider)
+    if box is not None:
+        box["raw"] = cutter.raw
+        box["meta"] = " ".join(META_RE.findall(cutter.raw)).strip()
+        box["tool_calls"] = tool_calls_of(cutter.raw, streamed_calls)
 
 
-def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
-    """Map an httpx failure onto a status the caller can act on.
-
-    With no per-call ceiling (the default) the only way to time out is connecting, so the
-    report says what actually happened rather than claiming a limit that is not in force.
-    """
-    if isinstance(e, httpx.TimeoutException):
-        if provider.timeout and provider.timeout > 0:
-            return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
-        return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
-                                  f"({e.__class__.__name__})")
-    return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")
-
-
+def _merge_call(calls: list, delta: dict) -> None:
+    """OpenAI streams a tool call in fragments: an id and a name first, then pieces of arguments."""
+    index = delta.get("index")
+    index = int(index) if isinstance(index, int) else len(calls)
+    while len(calls) <= index:
+        calls.append({"id": "", "function": {"name": "", "arguments": ""}})
+    slot = calls[index]
+    if delta.get("id"):
+        slot["id"] = str(delta["id"])
+    function = delta.get("function") or {}
+    if function.get("name"):
+        slot["function"]["name"] = str(function["name"])
+    if function.get("arguments"):
+        slot["function"]["arguments"] += str(function["arguments"])

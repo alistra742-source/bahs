@@ -1,28 +1,29 @@
 """What the service can say about itself, and how many people may use it at once.
 
-Three accounts, three things that can be wrong, and each one is invisible from the page when it
-is: an expired Qwen token and a hung generation look the same; a retired reviewer model and a
-rejected key look the same; and a review that silently did not happen looks like a reviewer with
-nothing to say. So each is checked, remembered for a minute (the page polls /health every few
+Two things can be wrong here and both are invisible from the page when they are: an expired Qwen
+token looks exactly like a generation that hung, and both of them look like a question nobody
+answered. So the token is checked, remembered for a minute (the page polls /health every few
 seconds) and reported by name.
 
-The last section is the two limits the page depends on -- a per-IP window and a ceiling on chains
-running at once -- which is the same kind of state: something the endpoints read, never the chain
-itself.
+The rest is what the page depends on but never sees directly: the model list the proxy serves, the
+last thing that went wrong, and the two limits -- a per-IP window and a ceiling on turns running
+at once.
 
-Everything it needs comes from `bridge`, which is where the providers and the ceilings live.
+Everything it needs comes from `bridge`, which is where the provider and the ceilings live. What
+the *toolbox* can say about itself (the API dump, the executor) is in `luau`, next to the tools
+that own it.
 """
-from bridge import *  # noqa: F401,F403 -- env(), httpx, QWEN, REVIEWER, the config
+from bridge import *  # noqa: F401,F403 -- env(), httpx, QWEN, the config
 
 
-# --- the model list, and whether the tokens still work ----------------------------------
+# --- the model list, and whether the token still works ----------------------------------
 
 _models: dict = {"at": 0.0, "ids": []}
 _models_lock = threading.Lock()
 
 
 def list_models(force: bool = False) -> list:
-    """qwen-api's model ids, remembered for a few minutes; empty when unreadable.
+    """The proxy's model ids, remembered for a few minutes; empty when unreadable.
 
     Never raises: it feeds a health chip and documents what else QWEN_MODEL could be, so an
     unreachable proxy must leave the page usable rather than break it.
@@ -100,97 +101,13 @@ def token_state(force: bool = False) -> dict:
     return state
 
 
-_reviewer: dict = {"at": 0.0, "ok": False, "detail": "not checked"}
-_reviewer_lock = threading.Lock()
-
-
-def _reviewer_probe(force: bool = False) -> dict:
-    """Whether the reviewer key works and the model exists, remembered briefly.
-
-    A retired model id and a rejected key look exactly alike from the page (the chain just
-    never answers), so the reviewer is checked the same way the Qwen token is.
-    """
-    with _reviewer_lock:
-        cached = dict(_reviewer)
-    if not force and cached["at"] and time.time() - cached["at"] < TOKEN_CHECK_TTL:
-        return cached
-    if not REVIEWER.configured:
-        state = {"at": time.time(), "ok": False, "detail": "no reviewer token set"}
-    elif REVIEWER.web is not None:
-        # chat.deepseek.com answers /users/current, which is the same question the Qwen token is
-        # asked, so the chip means the same thing on both sides.
-        try:
-            ok, detail = REVIEWER.web.validate()
-        except HTTPException as e:
-            ok, detail = False, str(e.detail)
-        state = {"at": time.time(), "ok": ok, "detail": detail}
-    else:
-        try:
-            with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
-                r = c.get(f"{REVIEWER.url}/models", headers=REVIEWER.headers())
-            if r.status_code == 404:
-                state = {"at": time.time(), "ok": True, "detail": "key set"}
-            elif r.status_code >= 400:
-                state = {"at": time.time(), "ok": False,
-                         "detail": failure_reason(r.status_code, r.text[:300], REVIEWER)}
-            else:
-                seen: list = []
-                try:
-                    payload = r.json()
-                    for item in (payload.get("data") or []):
-                        if isinstance(item, dict) and item.get("id"):
-                            seen.append(str(item["id"]))
-                        elif isinstance(item, str):
-                            seen.append(item)
-                except ValueError:
-                    pass
-                if not seen:
-                    state = {"at": time.time(), "ok": True, "detail": "key set"}
-                elif REVIEWER.model in seen:
-                    state = {"at": time.time(), "ok": True, "detail": "key set, model served"}
-                else:
-                    near = [m for m in seen if "flash" in m.lower() or REVIEWER.model.split("-")[0] in m]
-                    hint = near[0] if near else (seen[0] if seen else "")
-                    state = {"at": time.time(), "ok": False,
-                             "detail": (f"{REVIEWER.model} is not served"
-                                        + (f" -- try {hint}" if hint else ""))}
-        except httpx.HTTPError as e:
-            state = {"at": time.time(), "ok": False,
-                     "detail": f"cannot reach {REVIEWER.url} ({e.__class__.__name__})"}
-    with _reviewer_lock:
-        _reviewer.update(state)
-    return state
-
-
-def reviewer_state(force: bool = False) -> dict:
-    """Whether the reviewer can be relied on right now.
-
-    The key working is only half of it: a review that just failed (down, rate limited, out of
-    credits) is the more useful answer, and it is the failure that would otherwise look like a
-    reviewer with nothing to say -- the chain still ships the draft either way. Keeping it
-    here rather than in the caller means every report of the reviewer's state carries it.
-    """
-    state = _reviewer_probe(force)
-    note = review_note()
-    if note and state["ok"]:
-        state = {"at": state["at"], "ok": False, "detail": note}
-    return {**state, "shape": REVIEW_SHAPE, "search": not SEARCH_OFF,
-            "last_note": note, "brief_chars": len(BRIEF), "brief": BRIEF_PATH.name,
-            "rounds": NEGOTIATE_ROUNDS, "seed": SEED_BRIEF, "choices": CHOICE_ROUNDS}
-
-
-# --- what went wrong, and how long it stays said ----------------------------------------
+# --- what went wrong, and how long it stays said -----------------------------------------
 #
 # The last thing that went wrong, so /health (and the page's chip) can report it long after the
 # error frame has scrolled by. Cleared by the next turn that succeeds.
 
 _last_error = ""
 _last_error_lock = threading.Lock()
-# A reviewer that fails is not a failed turn -- the script that stands still goes out -- but it is
-# not nothing either: a review silently not happening looks exactly like a reviewer with nothing
-# to say. So it gets its own note, shown on the reviewer chip until a review works.
-_review_note = ""
-_review_note_lock = threading.Lock()
 
 
 def note_error(text: str) -> None:
@@ -204,22 +121,11 @@ def last_error() -> str:
         return _last_error
 
 
-def note_review_error(text: str) -> None:
-    global _review_note
-    with _review_note_lock:
-        _review_note = text[:300]
-
-
-def review_note() -> str:
-    with _review_note_lock:
-        return _review_note
-
-
 # --- how many people can do this at once -------------------------------------------------
 #
-# The page needs no login, so the URL is the only thing standing between a stranger and your
-# Qwen account plus your reviewer credits. A key was the other option; this is what has to carry
-# it instead: a per-IP window, and a ceiling on chains running at the same time.
+# The page needs no login, so the URL is the only thing standing between a stranger and the Qwen
+# account behind it. A key was the other option; this is what has to carry it instead: a per-IP
+# window, and a ceiling on turns running at the same time.
 
 _hits: dict = defaultdict(deque)
 _hits_lock = threading.Lock()
@@ -268,6 +174,6 @@ def slot_give() -> None:
 
 
 def running_now() -> int:
-    """How many chains are running, for /health."""
+    """How many turns are running, for /health."""
     with _running_lock:
         return _running["now"]

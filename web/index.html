@@ -48,18 +48,8 @@ button:disabled{opacity:.55;cursor:default}
 .turn.pending .body{color:var(--dim)}
 .turn.err{background:#1d1214;border-color:#8c2b26}
 .turn.err .body{color:#ffb4ae}
-.turn.draft{align-self:flex-start;background:#12131a;border-style:dashed;border-color:#2b3346}
-.turn.draft .body{color:#b9c2d4}
-.turn.peer{align-self:flex-start;background:#0f1a1b;border-style:dashed;border-color:#26494a}
-.turn.peer .body{color:#bcd6d6}
-.turn.peer2{align-self:flex-start;background:#121722;border-style:dashed;border-color:#2f3f5e}
-.turn.peer2 .body{color:#c3cfe6}
-.turn.seed{align-self:flex-start;background:#12161f;border-style:dashed;border-color:#242c3a;opacity:.85}
-.turn.seed .body{color:#8e99ad}
-.turn.seed2{align-self:flex-start;background:#12161f;border-style:dashed;border-color:#242c3a;opacity:.85}
-.turn.seed2 .body{color:#8e99ad}
-.turn.rev{align-self:flex-start;background:#1a1512;border-color:#4a3a26}
-.turn.rev .body{color:#e6d3b3}
+.turn.tool{align-self:flex-start;max-width:100%;background:#12161f;border-style:dashed;border-color:#242c3a}
+.turn.tool .body{color:#a9b4c7;font-size:12px;max-height:340px;overflow:auto}
 details.meta{align-self:flex-start;max-width:100%;background:#12161f;border:1px dashed var(--line);border-radius:10px;padding:6px 12px;font:11px ui-monospace,monospace;color:var(--dim)}
 details.meta summary{cursor:pointer}
 details.meta .body{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;color:#c3cddd;margin-top:6px;max-height:280px;overflow:auto}
@@ -71,7 +61,7 @@ footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-reviewer="__REVIEWER__" data-second="__SECOND__" data-review-on="__REVIEW_ON__" data-seed="__SEED_ON__" data-second-on="__SECOND_ON__" data-greeting="__GREETING__">
+<body data-model="__MODEL__" data-greeting="__GREETING__" data-tools="__TOOLS__" data-tool-count="__TOOL_COUNT__" data-rounds="__ROUNDS__">
 <div class="wrap">
 
   <div class="top">
@@ -102,17 +92,15 @@ footer a{color:var(--blue);text-decoration:none}
   </section>
 
   <footer>
-    <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
-    Every turn is sent with the conversation so far, so the model keeps answering in the same chat.<br>
-    Each question is sent as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code>, with thinking on.<br>
-    <code>__REVIEWER__</code> reads <code>send.txt</code> first, on its own, and is only asked after it answers;
-    <code>__SECOND__</code> reads its own brief (<code>send2.txt</code>, or the first brief when that file is not in the image)
-    the same way, before anything is asked of it; <code>/health</code> names the file that went out.<br>
-    Every message to either reader opens with the warning that the target is a Roblox executor script, not Roblox Studio.<br>
-    __MODEL__ writes a draft, <code>__REVIEWER__</code> writes its own version of it, __MODEL__ merges the two in the same chat,
-    then <code>__SECOND__</code> does the same over that script and __MODEL__ merges once more.<br>
-    When __MODEL__ offers two scripts and asks which one is preferred, that question is answered here: the option with the most lines ships.<br>
-    The Qwen token and the reviewer key stay in this service's variables; they never reach this page.
+    <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /agent/pull</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
+    Every turn is sent with the conversation so far <i>and</i> with this page's session id, so the model keeps
+    answering in <b>one chat</b> instead of a new one every question.<br>
+    Each question goes out as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code>, with thinking on.<br>
+    __MODEL__ uses its own tools while it writes -- <code>__TOOLS__</code> -- up to <code>__ROUNDS__</code> rounds
+    of them in one turn; what it did is under the answer.<br>
+    <code>run_script</code> runs a script in the executor polling <code>/agent/pull</code> (see <code>client.lua</code>),
+    which is the only thing that can actually prove it runs.<br>
+    The Qwen token stays in this service's variables; it never reaches this page.
   </footer>
 </div>
 
@@ -121,23 +109,36 @@ footer a{color:var(--blue);text-decoration:none}
   var $ = function (id) { return document.getElementById(id); };
   var BODY = document.body;
   var MODEL = BODY.dataset.model || "";
-  var REVIEWER = BODY.dataset.reviewer || "";
-  var SECOND = BODY.dataset.second || "";
-  var REVIEW_ON = BODY.dataset.reviewOn === "true";
-  var SEED_ON = BODY.dataset.seed === "true";
-  var SECOND_ON = BODY.dataset.secondOn === "true";
-  // Which brief each reader is actually sent. The server's /health is what knows -- send2.txt
-  // falls back to the first reader's brief when it is not in the image -- so these are the
-  // names as configured, and they are corrected from /health as soon as it answers.
-  var FIRST_BRIEF = "send.txt";
-  var SECOND_BRIEF = "send2.txt";
   var GREETING = BODY.dataset.greeting || "";
+  var TOOLS = BODY.dataset.tools || "";
+  var TOOL_COUNT = parseInt(BODY.dataset.toolCount, 10) || 0;
+  var ROUNDS = parseInt(BODY.dataset.rounds, 10) || 0;
+
+  // The session is what keeps one upstream chat: the same value on every turn is the same chat on
+  // the provider's side, and a new chat is a new value. It lives here so a reload continues the
+  // chat rather than starting a second one on the same conversation.
+  var SESSION_KEY = "bahs-session";
+  function newSession() {
+    var id = "";
+    if (window.crypto && crypto.getRandomValues) {
+      var bytes = new Uint8Array(8);
+      crypto.getRandomValues(bytes);
+      for (var i = 0; i < bytes.length; i++) id += ("0" + bytes[i].toString(16)).slice(-2);
+    }
+    return id || ("s" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8));
+  }
+  var SESSION = "";
+  try { SESSION = localStorage.getItem(SESSION_KEY) || ""; } catch (e) {}
+  if (!SESSION) {
+    SESSION = newSession();
+    try { localStorage.setItem(SESSION_KEY, SESSION); } catch (e) {}
+  }
 
   // The whole conversation lives in the browser: what was asked and what was sent back.
   // Every turn is sent with it, which is what makes the model answer inside the same chat
-  // instead of starting over, and it survives a reload of this page. What the reviewer said,
-  // and the draft it looked at, are not part of it -- they are shown once and then dropped,
-  // so the next question is not carrying a review of the question before it.
+  // instead of starting over, and it survives a reload of this page. What the tools did is not
+  // part of it -- it is shown once and then dropped, so the next question is not carrying the
+  // tool trace of the question before it (the model saw it, and the session remembers the chat).
   var CHAT = "bahs-chat";
 
   var chat = loadChat();
@@ -260,33 +261,13 @@ footer a{color:var(--blue);text-decoration:none}
 
   function bubble(channel, label) {
     if (bubbles[channel]) return bubbles[channel];
-    var cls = (channel === "draft" || channel === "peer" || channel === "peer2" ||
-               channel === "seed" || channel === "seed2") ? channel
-      : (channel === "review" ? "rev" : "");
+    var cls = channel === "tool" ? "tool" : "";
     var el = turnEl("assistant", "", label);
     if (cls) el.classList.add(cls);
     el.classList.add("pending");
     $("log").appendChild(el);
     bubbles[channel] = el;
     scrollDown();
-    return el;
-  }
-
-  // The file name out of what /health reports, which may be "send.txt (send2.txt is not in the
-  // image)" when the second reader fell back to the first brief.
-  function briefName(named) {
-    return (named || "").split(" ")[0];
-  }
-
-  // A brief's bubble, put up the moment the server says that reader is reading it -- which is
-  // before the draft -- so what the page shows first is the briefs going out first. The text is
-  // a placeholder: the reader's acknowledgement replaces it as soon as it streams in.
-  function markBrief(channel, file, who) {
-    var el = bubble(channel, labelFor(channel));
-    if (!bodyOf(el).textContent) {
-      bodyOf(el).textContent = file + " goes out first, on its own; waiting for " + who;
-      el.dataset.placeholder = "1";
-    }
     return el;
   }
 
@@ -300,19 +281,14 @@ footer a{color:var(--blue);text-decoration:none}
   }
 
   function labelFor(channel) {
-    if (channel === "review") return "review · " + (REVIEWER || "reviewer");
-    if (channel === "answer") return "agreed · " + MODEL;
-    if (channel === "peer") return "also · " + (REVIEWER || "reviewer");
-    if (channel === "peer2") return "also · " + (SECOND || "the second reader");
-    if (channel === "seed") return "brief · " + (REVIEWER || "reviewer");
-    if (channel === "seed2") return "brief · " + (SECOND || "the second reader");
-    return "draft · " + MODEL;
+    if (channel === "tool") return "tools";
+    return "script · " + (MODEL || "qwen");
   }
 
   function anyText() {
     var out = "";
     Object.keys(bubbles).forEach(function (k) {
-      if (k === "review") return;
+      if (k === "tool") return;
       out += bodyOf(bubbles[k]).textContent;
     });
     return out;
@@ -330,9 +306,9 @@ footer a{color:var(--blue);text-decoration:none}
     chat.messages.forEach(function (m) {
       log.appendChild(turnEl(m.role, m.content));
     });
-    $("turns").textContent = chat.messages.length
+    $("turns").textContent = (chat.messages.length
       ? chat.messages.length + " turns in this chat"
-      : "one conversation, kept in this browser";
+      : "one conversation, kept in this browser") + " · session " + SESSION.slice(0, 6);
     scrollDown();
   }
 
@@ -403,10 +379,6 @@ footer a{color:var(--blue);text-decoration:none}
     }
     if (d.phase) {
       statusText = d.note || d.phase;
-      // The seed phase is announced before the draft starts, so its bubble is created here
-      // rather than when its text arrives -- otherwise the draft would appear above the brief.
-      if (d.phase === "seed") markBrief("seed", FIRST_BRIEF, REVIEWER || "the first reader");
-      if (d.phase === "seed2") markBrief("seed2", SECOND_BRIEF, SECOND || "the second reader");
       return false;
     }
     if (d.beat) { statusText = d.note || d.status || statusText; return false; }
@@ -432,8 +404,7 @@ footer a{color:var(--blue);text-decoration:none}
     }
     if (d.done) {
       var text = d.text || d.code || "";
-      var draft = d.draft || "";
-      var review = d.review || "";
+      var tool = d.tool || "";
       var phases = d.phases || [];
       clearTransient();
       // The answer becomes part of the conversation, so the next question is asked in the
@@ -442,15 +413,14 @@ footer a{color:var(--blue);text-decoration:none}
       chat.job = null;
       save();
       render();
-      if (draft && draft !== text) metaEl("draft by " + MODEL, draft);
-      if (d.peer) metaEl("the other version, by " + (REVIEWER || "reviewer"), d.peer);
-      if (d.peer2) metaEl("the second version, by " + (SECOND || "the second reader"), d.peer2);
-      if (review) metaEl("the first reader", review);
-      if (d.second_review) metaEl("the second reader", d.second_review);
-      if (phases.length > 1) {
-        metaEl("chain", phases.map(function (p) {
+      // What the model did to its own work is shown once, under the answer, and is not carried
+      // into the next question: the model saw it, and the session remembers the chat.
+      if (tool) metaEl("what the tools did", tool);
+      if (phases.length > 1 || phases.some(function (p) { return (p.tools || []).length; })) {
+        metaEl("calls", phases.map(function (p) {
           return p.phase + ": " + (p.model || p.provider) + " " + p.ms + "ms, " + p.chars +
-                 " chars" + (p.finish ? " (" + p.finish + ")" : "");
+                 " chars" + (p.finish ? " (" + p.finish + ")" : "") +
+                 ((p.tools || []).length ? " -> " + p.tools.join(", ") : "");
         }).join("\n"));
       }
       flash("done in " + elapsedSeconds() + "s");
@@ -552,9 +522,7 @@ footer a{color:var(--blue);text-decoration:none}
     statusText = d.note || d.phase || statusText;
     if (d.status === "error") return handleFrame(JSON.stringify({ error: d.error || "the turn failed" }));
     if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
-    if (d.draft) setTransient("draft", d.draft);
-    if (d.peer) setTransient("peer", d.peer);
-    if (d.peer2) setTransient("peer2", d.peer2);
+    if (d.tool) setTransient("tool", d.tool);
     if (d.text) setTransient("answer", d.text);
     return false;
   }
@@ -579,15 +547,16 @@ footer a{color:var(--blue);text-decoration:none}
     jobError = "";
     streamed = false;
     offset = 0;
-    statusText = REVIEW_ON ? "starting the chain" : "starting";
+    statusText = "starting";
     busy(true);
     startTimer();
-    // The briefs go out first and on their own, so their bubbles are put up before anything the
-    // draft could put up: the chain is shown in the order it happens, not the order text arrives.
-    if (REVIEW_ON && SEED_ON) markBrief("seed", FIRST_BRIEF, REVIEWER || "the first reader");
-    if (SECOND_ON) markBrief("seed2", SECOND_BRIEF, SECOND || "the second reader");
     try {
-      var data = await api("/chat/stream", { messages: messages });
+      // The session goes with every turn: same value, same upstream chat.
+      var data = await api("/chat/stream", { messages: messages, session: SESSION });
+      if (data.session && data.session !== SESSION) {
+        SESSION = data.session;
+        try { localStorage.setItem(SESSION_KEY, SESSION); } catch (e) {}
+      }
       chat.job = data.job;
       save();
       await watch(data.job);
@@ -644,33 +613,27 @@ footer a{color:var(--blue);text-decoration:none}
         // The Qwen token is the credential this service holds; an expired one is the failure
         // that otherwise looks like a question that never gets an answer.
         setChip("token", s.token_ok, s.token_detail || (s.token_ok ? "ok" : "unknown"));
-        // The reviewer is a second account and a second thing that can be switched off, so it
-        // gets its own chip rather than failing silently inside the chain.
-        var rev = s.reviewer || {};
-        setChip("reviewer", rev.ok && s.review,
-          s.review ? (rev.detail || rev.model || "configured") : "off -- answers are not reviewed");
-        // The second reader is a third account, and it is checked the same way.
-        var sec = s.second || {};
-        // A failed check shows why even when the stage is off -- a credential that cannot work at
-        // all (a session token, say) must not read as a stage somebody switched off.
-        setChip("glm", sec.ok && sec.on,
-          (!sec.ok && sec.detail) ? sec.detail
-            : (sec.on ? (sec.model || "configured")
-                      : "off -- the chain ends with the first reader"));
-        // And which briefs are really being sent, so a bubble cannot claim a file that did not
-        // go out -- send2.txt falls back to the first reader's brief when it is missing.
-        FIRST_BRIEF = briefName(rev.brief) || FIRST_BRIEF;
-        SECOND_BRIEF = briefName(sec.brief) || SECOND_BRIEF;
+        // The toolbox: what the model can do to its own work, and the two pieces of state it
+        // depends on -- the API dump, and an executor that is listening.
+        var tools = s.tools || {};
+        var names = tools.names || [];
+        setChip("tools", tools.on, tools.on
+          ? names.length + " on -- " + names.slice(0, 3).join(", ")
+          : "off -- the model answers from what it knows");
+        setChip("roblox", tools.dump_ok, tools.dump_ok
+          ? tools.dump_classes + " classes"
+          : (tools.dump_error || "fetched on the first lookup"));
+        setChip("executor", tools.executor_ok, tools.executor_ok
+          ? (tools.executor_clients || []).join(" · ")
+          : "not listening -- run_script says so instead of waiting");
         setChip("model", true, s.model);
         setChip("mode", true, s.greeting ? s.thinking + " · " + s.greeting : s.thinking);
       })
       .catch(function () { setChip("api", false, "unreachable"); });
   }
 
-  $("flow").textContent = REVIEW_ON
-    ? MODEL + " drafts · " + REVIEWER + " and " + (SECOND || "the second reader") +
-      " each write their own version · each is merged in the same chat"
-    : "Qwen chat · every question goes out as \"" + GREETING + " ...\"";
+  $("flow").textContent = MODEL + " · thinking on" +
+    (TOOL_COUNT ? " · " + TOOL_COUNT + " tools it runs on its own work" : "");
 
   $("send").onclick = send;
   $("prompt").addEventListener("keydown", function (e) {
@@ -679,10 +642,13 @@ footer a{color:var(--blue);text-decoration:none}
   $("newChat").onclick = function () {
     if (sending) { flash("wait for the answer first", true); return; }
     if (chat.messages.length && !confirm("Start a new chat? The history is dropped.")) return;
+    // A new chat is a new session on the server too, so the model is not continuing the old one.
+    SESSION = newSession();
+    try { localStorage.setItem(SESSION_KEY, SESSION); } catch (e) {}
     chat = { messages: [], job: null };
     save();
     render();
-    flash("new chat");
+    flash("new chat · session " + SESSION.slice(0, 6));
   };
 
   poll();
