@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>bahs - Qwen chat</title>
+<title>bahs - luau agent chat</title>
 <style>
 :root{color-scheme:dark;--bg:#0b0d12;--panel:#11151d;--line:#202836;--txt:#e6e8ef;--dim:#9aa4b8;--blue:#79c0ff;--green:#3fb950;--red:#f85149}
 *{box-sizing:border-box}
@@ -30,6 +30,9 @@ label{font-size:13px;font-weight:600;color:#cbd5e5}
 input,textarea{width:100%;background:#0e131b;border:1px solid var(--line);border-radius:10px;color:var(--txt);padding:12px;font:15px/1.5 ui-monospace,monospace;outline:none}
 textarea{resize:vertical}
 input:focus,textarea:focus{border-color:#2f81f7}
+select{background:#0e131b;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px ui-monospace,monospace;outline:none;max-width:250px}
+select:focus{border-color:#2f81f7}
+select:disabled{opacity:.55}
 .keyrow{display:flex;gap:8px}
 .keyrow input{flex:1}
 button{border:1px solid transparent;border-radius:10px;padding:11px 18px;font:600 14px inherit;cursor:pointer;color:#fff}
@@ -61,7 +64,7 @@ footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-greeting="__GREETING__" data-tools="__TOOLS__" data-tool-count="__TOOL_COUNT__" data-rounds="__ROUNDS__">
+<body data-model="__MODEL__" data-mode="__MODE__" data-modes="__MODES__" data-greeting="__GREETING__" data-tools="__TOOLS__" data-tool-count="__TOOL_COUNT__" data-rounds="__ROUNDS__">
 <div class="wrap">
 
   <div class="top">
@@ -78,8 +81,9 @@ footer a{color:var(--blue);text-decoration:none}
   <section class="panel">
     <div class="ph">
       <label>Chat</label>
-      <div style="display:flex;gap:8px;align-items:center">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="hint" id="turns">one conversation, kept in this browser</span>
+        <select id="modePick" title="which chain answers your next question"></select>
         <button class="ghost" id="newChat">new chat</button>
       </div>
     </div>
@@ -93,14 +97,16 @@ footer a{color:var(--blue);text-decoration:none}
 
   <footer>
     <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /agent/pull</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
-    Every turn is sent with the conversation so far <i>and</i> with this page's session id, so the model keeps
+    Three ways to be answered, picked above: <b>agent</b> (DeepSeek plans once, then <code>__MODEL__</code> writes
+    it), <b>qwen</b> (<code>__MODEL__</code> alone) and <b>deepseek</b> (DeepSeek alone).<br>
+    Every turn is sent with the conversation so far <i>and</i> with this page's session id, so a model keeps
     answering in <b>one chat</b> instead of a new one every question.<br>
-    Each question goes out as <code>__GREETING__ your question</code>, always to <code>__MODEL__</code>, with thinking on.<br>
-    __MODEL__ uses its own tools while it writes -- <code>__TOOLS__</code> -- up to <code>__ROUNDS__</code> rounds
-    of them in one turn; what it did is under the answer.<br>
+    Each question goes out as <code>__GREETING__ your question</code>.<br>
+    The writer uses its own tools while it writes -- <code>__TOOLS__</code> -- up to <code>__ROUNDS__</code> rounds
+    of them in one turn; what it did, and the plan it built from in agent mode, are under the answer.<br>
     <code>run_script</code> runs a script in the executor polling <code>/agent/pull</code> (see <code>client.lua</code>),
     which is the only thing that can actually prove it runs.<br>
-    The Qwen token stays in this service's variables; it never reaches this page.
+    Both tokens stay in this service's variables; neither reaches this page.
   </footer>
 </div>
 
@@ -113,6 +119,23 @@ footer a{color:var(--blue);text-decoration:none}
   var TOOLS = BODY.dataset.tools || "";
   var TOOL_COUNT = parseInt(BODY.dataset.toolCount, 10) || 0;
   var ROUNDS = parseInt(BODY.dataset.rounds, 10) || 0;
+
+  // Which chain answers, and it is a per-turn choice: the same conversation can be asked in agent
+  // mode and then in qwen mode, because the mode travels with the request rather than the chat.
+  // Only the modes this service can actually run are selectable -- the others say what they need.
+  var MODES = [];
+  try { MODES = JSON.parse(BODY.dataset.modes || "[]"); } catch (e) { MODES = []; }
+  var MODE_KEY = "bahs-mode";
+  var DEFAULT_MODE = BODY.dataset.mode || "";
+  var MODE = DEFAULT_MODE;
+  try {
+    var remembered = localStorage.getItem(MODE_KEY) || "";
+    if (remembered) MODE = remembered;
+  } catch (e) {}
+  function modeOn(id) {
+    return MODES.some(function (m) { return m.id === id && m.on; });
+  }
+  if (!modeOn(MODE)) MODE = modeOn(DEFAULT_MODE) ? DEFAULT_MODE : ((MODES[0] || {}).id || "");
 
   // The session is what keeps one upstream chat: the same value on every turn is the same chat on
   // the provider's side, and a new chat is a new value. It lives here so a reload continues the
@@ -282,13 +305,16 @@ footer a{color:var(--blue);text-decoration:none}
 
   function labelFor(channel) {
     if (channel === "tool") return "tools";
+    if (channel === "plan") return "plan";
     return "script · " + (MODEL || "qwen");
   }
 
   function anyText() {
+    // The answer only: the plan and the tool trace are shown while they happen and are not what
+    // the character count is counting.
     var out = "";
     Object.keys(bubbles).forEach(function (k) {
-      if (k === "tool") return;
+      if (k === "tool" || k === "plan") return;
       out += bodyOf(bubbles[k]).textContent;
     });
     return out;
@@ -405,6 +431,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (d.done) {
       var text = d.text || d.code || "";
       var tool = d.tool || "";
+      var plan = d.plan || "";
       var phases = d.phases || [];
       clearTransient();
       // The answer becomes part of the conversation, so the next question is asked in the
@@ -416,6 +443,9 @@ footer a{color:var(--blue);text-decoration:none}
       // What the model did to its own work is shown once, under the answer, and is not carried
       // into the next question: the model saw it, and the session remembers the chat.
       if (tool) metaEl("what the tools did", tool);
+      // Agent mode's first call, kept under the answer it produced: it is what the script was
+      // written from, and it is the one part of the turn a reader may want to disagree with.
+      if (plan) metaEl("the plan it built from", plan);
       if (phases.length > 1 || phases.some(function (p) { return (p.tools || []).length; })) {
         metaEl("calls", phases.map(function (p) {
           return p.phase + ": " + (p.model || p.provider) + " " + p.ms + "ms, " + p.chars +
@@ -523,6 +553,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (d.status === "error") return handleFrame(JSON.stringify({ error: d.error || "the turn failed" }));
     if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
     if (d.tool) setTransient("tool", d.tool);
+    if (d.plan) setTransient("plan", d.plan);
     if (d.text) setTransient("answer", d.text);
     return false;
   }
@@ -551,8 +582,9 @@ footer a{color:var(--blue);text-decoration:none}
     busy(true);
     startTimer();
     try {
-      // The session goes with every turn: same value, same upstream chat.
-      var data = await api("/chat/stream", { messages: messages, session: SESSION });
+      // The session goes with every turn -- same value, same upstream chat -- and so does the
+      // mode, so the chain a question takes is decided per turn.
+      var data = await api("/chat/stream", { messages: messages, session: SESSION, mode: MODE });
       if (data.session && data.session !== SESSION) {
         SESSION = data.session;
         try { localStorage.setItem(SESSION_KEY, SESSION); } catch (e) {}
@@ -603,7 +635,9 @@ footer a{color:var(--blue);text-decoration:none}
     if (d) d.textContent = detail;
   }
 
-  function poll() {
+  // Named apart from poll(job) above on purpose: two function declarations called `poll` in one
+  // scope means the later one wins, and the job poller is the one that must not be shadowed.
+  function pollHealth() {
     fetch("/health", { cache: "no-store" })
       .then(function (r) { return r.json(); })
       .then(function (s) {
@@ -613,6 +647,13 @@ footer a{color:var(--blue);text-decoration:none}
         // The Qwen token is the credential this service holds; an expired one is the failure
         // that otherwise looks like a question that never gets an answer.
         setChip("token", s.token_ok, s.token_detail || (s.token_ok ? "ok" : "unknown"));
+        // The second credential: without it, two of the three modes are off and the picker says
+        // so, rather than the question waiting on a chain that cannot run.
+        var deep = s.deepseek || {};
+        setChip("deepseek", deep.configured && deep.ok, deep.configured
+          ? (deep.detail || (deep.model || "deepseek"))
+          : "DEEPSEEK_TOKEN is not set -- agent and deepseek are off");
+        if (s.modes && !MODES.length) { MODES = s.modes; renderModes(); }
         // The toolbox: what the model can do to its own work, and the two pieces of state it
         // depends on -- the API dump, and an executor that is listening.
         var tools = s.tools || {};
@@ -626,14 +667,44 @@ footer a{color:var(--blue);text-decoration:none}
         setChip("executor", tools.executor_ok, tools.executor_ok
           ? (tools.executor_clients || []).join(" · ")
           : "not listening -- run_script says so instead of waiting");
-        setChip("model", true, s.model);
+        setChip("model", true, s.chain || s.model);
         setChip("mode", true, s.greeting ? s.thinking + " · " + s.greeting : s.thinking);
       })
       .catch(function () { setChip("api", false, "unreachable"); });
   }
 
-  $("flow").textContent = MODEL + " · thinking on" +
-    (TOOL_COUNT ? " · " + TOOL_COUNT + " tools it runs on its own work" : "");
+  // The picker: one option per mode, with the ones this service cannot run disabled and saying
+  // what they are missing. What it selects is what the next question is asked in.
+  function renderModes() {
+    var sel = $("modePick");
+    if (!sel) return;
+    sel.textContent = "";
+    MODES.forEach(function (m) {
+      var option = document.createElement("option");
+      option.value = m.id;
+      option.textContent = m.on ? m.id + " · " + m.label
+                                : m.id + " · off (needs " + (m.needs || []).join(", ") + ")";
+      option.disabled = !m.on;
+      sel.appendChild(option);
+    });
+    sel.value = MODE;
+    flow();
+  }
+
+  function flow() {
+    var chosen = MODES.filter(function (m) { return m.id === MODE; })[0];
+    $("flow").textContent = (chosen ? chosen.label : MODEL) +
+      (chosen && chosen.id !== "deepseek" && TOOL_COUNT
+        ? " · " + TOOL_COUNT + " tools on its own work" : "");
+  }
+
+  renderModes();
+  $("modePick").onchange = function () {
+    MODE = $("modePick").value;
+    try { localStorage.setItem(MODE_KEY, MODE); } catch (e) {}
+    flow();
+    flash("mode: " + MODE);
+  };
 
   $("send").onclick = send;
   $("prompt").addEventListener("keydown", function (e) {
@@ -651,8 +722,8 @@ footer a{color:var(--blue);text-decoration:none}
     flash("new chat · session " + SESSION.slice(0, 6));
   };
 
-  poll();
-  setInterval(poll, 8000);
+  pollHealth();
+  setInterval(pollHealth, 8000);
   render();
 
   // A page that was reloaded mid-answer comes back to the same job: the chain is replayed into

@@ -1,9 +1,9 @@
 """What the service can say about itself, and how many people may use it at once.
 
-Two things can be wrong here and both are invisible from the page when they are: an expired Qwen
-token looks exactly like a generation that hung, and both of them look like a question nobody
-answered. So the token is checked, remembered for a minute (the page polls /health every few
-seconds) and reported by name.
+Two credentials, two failures, and both are invisible from the page when they happen: an expired
+Qwen token and an expired DeepSeek one look exactly like a mode that hung, and both of them look
+like a question nobody answered. So each is checked, remembered for a minute (the page polls
+/health every few seconds) and reported by name.
 
 The rest is what the page depends on but never sees directly: the model list the proxy serves, the
 last thing that went wrong, and the two limits -- a per-IP window and a ceiling on turns running
@@ -101,6 +101,70 @@ def token_state(force: bool = False) -> dict:
     return state
 
 
+# --- the second model's credential ---------------------------------------------------------
+#
+# The same question the Qwen token is asked, for the same reason: a DeepSeek credential that has
+# expired (a chat.deepseek.com userToken lasts weeks) and a model name the account is no longer
+# entitled to both look, from the page, exactly like a mode that never answers.
+
+_deepseek: dict = {"at": 0.0, "ok": False, "detail": "not checked"}
+_deepseek_lock = threading.Lock()
+
+
+def deepseek_state(force: bool = False) -> dict:
+    """Whether the DeepSeek credential works, remembered briefly. Never raises."""
+    with _deepseek_lock:
+        cached = dict(_deepseek)
+    if not force and cached["at"] and time.time() - cached["at"] < TOKEN_CHECK_TTL:
+        return cached
+    if not DEEPSEEK.configured:
+        state = {"at": time.time(), "ok": False, "detail": "DEEPSEEK_TOKEN is not set"}
+    elif DEEPSEEK.web is not None:
+        # chat.deepseek.com answers /users/current, which is the same question the Qwen token is
+        # asked, so the chip means the same thing on both sides.
+        try:
+            ok, detail = DEEPSEEK.web.validate()
+        except HTTPException as e:
+            ok, detail = False, str(e.detail)
+        state = {"at": time.time(), "ok": ok, "detail": detail}
+    else:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True) as c:
+                r = c.get(f"{DEEPSEEK.url}/models", headers=DEEPSEEK.headers())
+            if r.status_code == 404:
+                state = {"at": time.time(), "ok": True, "detail": "key set"}
+            elif r.status_code >= 400:
+                state = {"at": time.time(), "ok": False,
+                         "detail": failure_reason(r.status_code, r.text[:300], DEEPSEEK)}
+            else:
+                seen: list = []
+                try:
+                    payload = r.json()
+                    for item in (payload.get("data") or []):
+                        if isinstance(item, dict) and item.get("id"):
+                            seen.append(str(item["id"]))
+                        elif isinstance(item, str):
+                            seen.append(item)
+                except ValueError:
+                    pass
+                if not seen or DEEPSEEK.model in seen:
+                    state = {"at": time.time(), "ok": True,
+                             "detail": "key set, model served" if seen else "key set"}
+                else:
+                    # A retired model id and a rejected key look alike from the page, so the chip
+                    # names the nearest model the key can actually see.
+                    near = [m for m in seen if "deepseek" in m.lower()]
+                    hint = near[0] if near else seen[0]
+                    state = {"at": time.time(), "ok": False,
+                             "detail": f"{DEEPSEEK.model} is not served -- try {hint}"}
+        except httpx.HTTPError as e:
+            state = {"at": time.time(), "ok": False,
+                     "detail": f"cannot reach {DEEPSEEK.url} ({e.__class__.__name__})"}
+    with _deepseek_lock:
+        _deepseek.update(state)
+    return state
+
+
 # --- what went wrong, and how long it stays said -----------------------------------------
 #
 # The last thing that went wrong, so /health (and the page's chip) can report it long after the
@@ -160,7 +224,7 @@ def rate_ok(ip: str) -> bool:  # per IP, per minute
     return True
 
 
-def slot_take() -> bool:
+def slot_take() -> bool:  # a ceiling on turns running at once, so four people cannot exhaust it
     with _running_lock:
         if _running["now"] >= MAX_CONCURRENT:
             return False

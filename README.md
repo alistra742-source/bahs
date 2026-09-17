@@ -1,43 +1,49 @@
 # bahs
 
-One model, one chat, and a toolbox it runs on its own work, behind one API, with a chat page on
-top.
+Two models, three ways to be answered, and a toolbox the writer runs on its own work — behind one
+API, with a chat page on top.
 
 ```
-you -- ask --> bahs -- one call, thinking on ----------> Qwen (qwen3.8-max)
-                 |                                       |
-                 |                                       +-- calls a tool --> luau.py
-                 |                                       |     luau_check   the script's blocks, strings, brackets
-                 |                                       |     roblox_api   does that member exist, and how
-                 |                                       |     run_script   run it in the executor and read the error
-                 |                                       |     apply_edit   change one line, not the whole file
-                 |                                       |     secret_scan  credentials that must not ship
-                 |                                       |     luau_format  re-indent what it assembled
-                 |                                       |
-                 |                                       +-- reads the result, on it goes (AGENT_ROUNDS)
+                    mode: agent
+you -- ask --> bahs ---- deepseek ------------------------> a plan (not the answer)
+                 |                                          |
+                 |        qwen3.8-max (thinking on) <--------+
+                 |          |
+                 |          +-- calls a tool --> luau.py
+                 |          |     luau_check   the script's blocks, strings, brackets
+                 |          |     roblox_api   does that member exist, and how
+                 |          |     run_script   run it in the executor and read the error
+                 |          |     apply_edit   change one line, not the whole file
+                 |          |     secret_scan  credentials that must not ship
+                 |          |     luau_format  re-indent what it assembled
+                 |          |
+                 |          +-- reads the result, on it goes (AGENT_ROUNDS)
                  |
-                 +-- always the same session -------------------> the same upstream chat
+                 +-- always the same session ----------> the same upstream chat, on both sides
 ```
 
-1. **One model.** Qwen 3.8 Max, with `thinking_mode: "thinking"` on every call. There is no
-   reviewer and no second reader any more: where a second opinion used to be, there is a set of
-   checks the writer runs on its own script (`luau.py`), which is worth more than a second model
-   guessing — one of them can actually execute it.
-2. **One chat.** Every turn carries a session id, and the service keeps the hidden
-   `<!-- qwen_metadata: ... -->` the proxy puts in each answer, puts it back on the next request
-   of that session, and cuts it out of everything you see. That is what continues the upstream
-   chat instead of opening a new one per question.
-3. **Tool rounds.** A call that comes back asking for a tool has not answered yet: the tool is
-   run here, its result is appended to the conversation, and the model is asked again — up to
+1. **Three modes, and the choice is per question.**
+   * **agent** — DeepSeek is asked what to build and how (once), then Qwen 3.8 Max writes the
+     script from that plan with its tools. Two models, called once each: there is no negotiation
+     loop, no review of the plan, and no third call to a second opinion. What follows the plan is
+     the writer's own tool work.
+   * **qwen** — Qwen 3.8 Max on its own, with the toolbox.
+   * **deepseek** — DeepSeek on its own. It writes the script itself and no tools are attached.
+2. **One chat, not one per question.** Every turn carries a session id. The service keeps the
+   hidden `<!-- qwen_metadata: ... -->` the proxy puts in each Qwen answer *and* the message id
+   chat.deepseek.com threads its chats with, puts each back on the next request of that session,
+   and cuts the marker out of everything you see.
+3. **Tool rounds.** A call that comes back asking for a tool has not answered yet: the tool is run
+   here, its result is appended to the conversation, and the model is asked again — up to
    `AGENT_ROUNDS` times. What ships is the first answer that asks for nothing.
 4. **The executor makes it real.** `run_script` queues a script, `client.lua` runs it in the
-   Roblox client it is injected into, and the prints and the traceback come back to the model as
-   a tool result. Nothing else can prove a script works.
+   Roblox client it is injected into, and the prints and the traceback come back to the model as a
+   tool result. Nothing else can prove a script works.
 
-chat.qwen.ai has no public API. [`qwen-api`](https://github.com/encryptarun/qwen-api) turns it
-into OpenAI-compatible endpoints (including tool calling and the continuation metadata) using the
-Qwen *access token* from your browser (`localStorage.token`). That token is the key to a whole
-account, so it lives in **this** service's variables and never in a page or a Roblox script.
+chat.qwen.ai has no public API. [`qwen-api`](https://github.com/encryptarun/qwen-api) turns it into
+OpenAI-compatible endpoints (including tool calling and the continuation metadata) using the Qwen
+*access token* from your browser (`localStorage.token`). That token is the key to a whole account,
+so it lives in **this** service's variables and never in a page or a Roblox script.
 
 There is no model here: nothing is pulled, loaded or warmed, and there is no database. The
 conversation lives in the browser (or in `client.lua`) and is sent back with every turn.
@@ -49,17 +55,44 @@ conversation lives in the browser (or in `client.lua`) and is sent back with eve
 | Variable | Value |
 | --- | --- |
 | `QWEN_TOKEN` | Qwen access token: chat.qwen.ai -> F12 -> Console -> `localStorage.token` |
+| `DEEPSEEK_TOKEN` | *optional* — enables the **agent** and **deepseek** modes. Either an API key (`sk-...`, from platform.deepseek.com) or the site's own `userToken`: chat.deepseek.com -> F12 -> Console -> `JSON.parse(localStorage.getItem("userToken")).value`. Which one it is picks the endpoint on its own |
 | `API_KEY` | *optional* — if you set it, the API (`/v1`, `/chat`, `/generate`, `/agent`) requires it. Left unset, the Qwen token is the key. The page never needs one |
 
+Only `QWEN_TOKEN` is needed for **qwen** mode; only `DEEPSEEK_TOKEN` is needed for **deepseek**
+mode; **agent** mode needs both. `CHAIN_MODE` picks which one a caller gets when it does not ask
+for one (default `qwen`), and if that mode cannot run the service falls back to one that can — a
+mode a caller asks for *by name*, on the other hand, is refused rather than swapped for another
+model.
+
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
-tools 6 on -- luau_check, luau_format, roblox_api... · roblox 682 classes · executor not
-listening -- run_script says so instead of waiting · model qwen3.8-max · mode thinking · Hy kanha`.
+deepseek token accepted · tools 6 on -- luau_check, luau_format, roblox_api... · roblox 682
+classes · executor not listening -- run_script says so instead of waiting · model qwen3.8-max,
+thinking on, with the toolbox · mode thinking · Hy kanha`.
+
+### The DeepSeek credential
+
+Both credentials work, and the endpoint follows the one you paste:
+
+* **An API key** (`sk-...`) goes to `https://api.deepseek.com`, OpenAI-shaped. Set
+  `DEEPSEEK_MODEL` if `deepseek-v4-flash` is not what your key serves — the `deepseek` chip says
+  so, and names a nearby model the key *can* see.
+* **The site's `userToken`** is not accepted by that API, so a token that is not an `sk-` key is
+  sent to `chat.deepseek.com` instead, over the endpoints the web app itself calls. Every message
+  there is gated by a proof of work, which is solved with the site's own sha3 module
+  (`pow_solver.py`, `wasmtime`): the algorithm is neither SHA3-256 nor Keccak-256, so a
+  reimplementation that is subtly wrong earns the same refusal as no answer at all. The module is
+  fetched into the image at build time and, if it is not there, on first use.
+
+Thinking is on for DeepSeek (`DEEPSEEK_THINKING`), and its reasoning is *not* the answer: it is
+dropped on both transports exactly like Qwen's, so what comes back is the plan or the script.
+Search is never switched on anywhere in this service.
 
 ## The tools
 
-The schemas are in `luau.py`; the loop that runs them is `run_job` in `server.py`. All six are
-local to this image — no extra service, no extra key — except that `roblox_api` fetches the
-Roblox API dump the first time it is called.
+The schemas are in `luau.py`; the loop that runs them is `tool_loop` in `server.py`. All six are
+local to this image — no extra service, no extra key — except that `roblox_api` fetches the Roblox
+API dump the first time it is called. Only the writer is given them: **deepseek** mode attaches
+none.
 
 | Tool | What it is |
 | --- | --- |
@@ -87,17 +120,31 @@ the model what is structurally wrong; a run tells it what actually happened.
   trust.
 - Without `listen` the model simply cannot run anything, and the tool says so. Everything else
   still works.
-- The other buttons are **ask** (a turn, with the phase shown live), **execute** (run the answer
-  yourself), **tools** (what the model did to its own work), **new chat** (a new session) and
-  **copy**.
+- The other buttons are **ask** (a turn, with the phase shown live), **mode** (which chain the next
+  question takes: agent / qwen / deepseek), **execute** (run the answer yourself), **tools** (what
+  the model did to its own work), **new chat** (a new session) and **copy**. In agent mode the plan
+  is shown above the script.
 
 ## Variables
 
 | Variable | Default | Notes |
 | --- | --- | --- |
+| `CHAIN_MODE` | `qwen` | which mode runs when the caller asks for none: `agent`, `qwen` or `deepseek`. Falls back to one that can run |
 | `QWEN_URL` | `https://qwen.aikit.club/v1` | point it at your own qwen-api deployment if the public one is rate limited |
-| `QWEN_MODEL` | `qwen3.8-max` | the only model used |
-| `QWEN_THINKING` | `thinking` | forced onto every call: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default and the point: a whole script, reasoned, with the `reasoning_content` dropped from the answer |
+| `QWEN_MODEL` | `qwen3.8-max` | the writer |
+| `QWEN_THINKING` | `thinking` | forced onto every Qwen call: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default and the point: a whole script, reasoned, with the `reasoning_content` dropped from the answer |
+| `DEEPSEEK_TOKEN` | — | an `sk-...` API key (aliases `DEEPSEEK_API_KEY`, `DEEPSEEK_KEY`) or the site's `userToken` |
+| `DEEPSEEK_URL` | followed from the credential | `https://api.deepseek.com`, or `https://chat.deepseek.com` when the credential is a site `userToken` |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | the planner and the deepseek-mode writer. `deepseek-web` when the site transport is used and no model was asked for, because the site's model is whatever the account is set to |
+| `DEEPSEEK_THINKING` | `on` | `on`/`thinking`/`enabled` or `off`. Dropped from the answer either way |
+| `DEEPSEEK_SHAPE` | `openai` | `openai`, `web` (a bridge in front of the web chat: no system role, boolean toggles) or `deepseek-web` (the site's own endpoints — chosen automatically from the URL) |
+| `DEEPSEEK_COOKIE` | — | a `cf_clearance` cookie, in case chat.deepseek.com ever answers a request with a browser check |
+| `DEEPSEEK_TEMPERATURE` | `0.3` | a planner and a writer are not asked to be creative |
+| `DEEPSEEK_TOKENS` | `8192` | ceiling on a DeepSeek answer that is a whole script |
+| `DEEPSEEK_PLAN_TOKENS` | `4096` | ceiling on the plan in agent mode: it is prose, not a script |
+| `DEEPSEEK_TIMEOUT` | `0` | no ceiling on a DeepSeek call, like the rest of the chain |
+| `POW_WASM` | `sha3_wasm_bg.wasm` beside the code | where the sha3 module is looked for |
+| `POW_MAX_TRIES` | `5000000` | the largest difficulty the proof of work will attempt |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
 | `AGENT_TOOLS` | `on` | `off` and no tool schemas are attached: the model answers from what it knows |
 | `AGENT_ROUNDS` | `8` | how many tool rounds one turn may take, capped at 12. A round is a model call plus the tools it asked for; `0` disables the toolbox as well |
@@ -110,7 +157,7 @@ the model what is structurally wrong; a run tells it what actually happened.
 | `ANSWER_TOKENS` | `8192` | ceiling on the first call of a turn (alias `DRAFT_TOKENS`). 4096 tokens is roughly 200 lines of Luau, and an answer that stops at its ceiling is refused rather than shipped |
 | `REFINE_TOKENS` | `16384` | ceiling on the calls after a tool round, which may be rewriting a whole script |
 | `TOOL_RESULT_MAX` | `20000` | how much of a tool's output is handed back to the model |
-| `SESSION_TTL` | `3600` | how long one session's continuation marker is kept. `/health` reports how many sessions are held |
+| `SESSION_TTL` | `3600` | how long one session's continuation marker (and its DeepSeek chat) is kept. `/health` reports how many of each are held |
 | `CHAT_TIMEOUT` | `0` | **no ceiling by default**: a turn with tool rounds may take as long as it takes. `0` means no limit; a number puts one back on each call |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |
 | `MAX_TOKENS` | `4096` | ceiling on a `/v1` passthrough the caller did not set one for |
@@ -127,12 +174,13 @@ anywhere.
 
 | Step | Who | What happens |
 | --- | --- | --- |
-| ask | this service | The caller's turns, greeted, with `TOOL_SYSTEM` in front and the session's continuation marker on the newest assistant turn |
-| answer | Qwen | One streaming call with the six tool schemas attached. `reasoning_content` is dropped; the tool XML and the metadata are cut out of what is streamed |
+| ask | this service | The mode is resolved first (an unknown one is a 400, one whose credential is missing a 503 naming it), then the caller's turns are greeted and the session's continuation marker goes on the newest Qwen assistant turn |
+| plan | DeepSeek | *agent mode only, exactly once.* The conversation with `PLAN_SYSTEM` in front of it, streamed to the page's `plan` channel. The answer is a build plan, not a script |
+| answer | Qwen | One streaming call with the six tool schemas attached and the plan as the turn above it. `reasoning_content` is dropped; the tool XML and the metadata are cut out of what is streamed |
 | tool | this service | If the call asked for tools: each is run, one trace line per call goes to the page's `tool` channel, and the results go back as `tool` turns |
 | round | Qwen | Asked again, in the same chat, with the results in front of it — until an answer asks for nothing |
 | guard | this service | An empty answer, one cut off at the token ceiling, or a content filter is refused. A turn that used its last round on a tool call ships the best script it wrote on the way |
-| ship | this service | The script is the answer. The tool trace and the per-call records stay under it and are not carried into the next question |
+| ship | this service | The script is the answer. The plan, the tool trace and the per-call records stay under it and are not carried into the next question |
 
 A few properties worth knowing:
 
@@ -141,31 +189,33 @@ A few properties worth knowing:
   like a model that is thinking.
 * **The model is not a verifier.** `luau_check` reads structure, `roblox_api` reads the dump, and
   only `run_script` runs anything. Without a listening executor, "it works" is still a claim.
-* **Secrets do not leave for the provider.** Webhooks, tokens, `key = "..."` assignments and long
+* **A second model is not an opinion.** In agent mode DeepSeek produces the plan and is never
+  asked again; the plan is context for the writer, not a verdict on its script.
+* **Secrets do not leave for a provider.** Webhooks, tokens, `key = "..."` assignments and long
   hex are replaced with `<redacted>` in the copy sent upstream, and `secret_scan` reports them to
   the model. Your script on the page is untouched.
-* **Everything is measured.** Every call is logged and returned as `phases`: model, milliseconds,
-  characters, finish reason, token usage, and which tools it called.
-* **What was sent is logged too**, not just what came back (`[upstream] qwen -> qwen3.8-max: 4
-  message(s), 2170 chars, max_tokens 16384, 6 tool(s)`), which is what makes "it only sent part of
+* **Everything is measured.** Every call is logged and returned as `phases`: phase, model,
+  milliseconds, characters, finish reason, token usage, and which tools it called.
+* **What was sent is logged too**, not just what came back (`[upstream] qwen -> qwen3.8-max: 3
+  message(s), 1542 chars, max_tokens 8192, 6 tool(s)`), which is what makes "it only sent part of
   the conversation" answerable from the service's own log.
 
 ## Endpoints
 
 | Endpoint | What it is |
 | --- | --- |
-| `POST /chat/stream` | `{messages:[{role,content},...], session?: str}` -> `{job, model, session, tools, turns, timeout}`. Starts the turn, returns at once |
-| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`answer` / `tool`), `{reset, ch}`, `{phase, note}`, `{beat}`, then `{done, text, tool, session, phases}` or `{error}` |
-| `POST /chat` | The same turn, blocking. `{text, tool, session, phases}` |
+| `POST /chat/stream` | `{messages:[{role,content},...], session?: str, mode?: str}` -> `{job, mode, model, session, thinking, tools, turns, timeout}`. Starts the turn, returns at once |
+| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`answer` / `tool` / `plan`), `{reset, ch}`, `{phase, note}`, `{beat}`, then `{done, text, tool, plan, mode, session, phases}` or `{error}` |
+| `POST /chat` | The same turn, blocking. `{text, tool, plan, mode, session, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
 | `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
-| `POST /generate` / `POST /generate/stream` | One prompt, no history. The session still applies |
+| `POST /generate` / `POST /generate/stream` | One prompt, no history. The session and the mode still apply |
 | `GET /agent/pull?client=...` | The next script the model queued for the executor, or nothing. Needs the API key |
 | `POST /agent/push` | `{run, ok, output, error}` — the executor's answer for one run |
 | `POST /v1/chat/completions` | OpenAI-compatible passthrough to Qwen. The newest user turn gets the greeting and the model is pinned; `tools`, `web_search_options`, `reasoning_effort`, `stream` pass through. No tool loop here — a tool call comes back to you, which is what an OpenAI client expects |
-| `GET /v1/models` | The model this bridge uses, then whatever else the proxy serves |
-| `GET /health` | bridge, token, tools (on, names, dump state, executor state), sessions, limits, last error |
-| `GET /` | the chat page |
+| `GET /v1/models` | The writer, then DeepSeek when it is configured, then whatever else the proxy serves |
+| `GET /health` | bridge, the Qwen token, the DeepSeek credential, the three modes and which can run, tools (on, names, dump state, executor state), sessions, limits, last error |
+| `GET /` | the chat page, with the mode picker |
 
 An OpenAI client needs two lines changed:
 
@@ -176,46 +226,57 @@ client = OpenAI(base_url="https://<your-domain>/v1", api_key="<API_KEY>")
 ## The page needs no login
 
 The chat endpoints are deliberately not key-gated, because the page is used without signing in.
-What protects the account behind it is the rate limit and the concurrency ceiling instead. If that
+What protects the accounts behind it is the rate limit and the concurrency ceiling instead. If that
 is not enough for you, raise `API_KEY` and put the page behind something else — the API surfaces
 (`/v1`, `/chat`, `/generate`, `/agent`) are gated, and the page's own endpoints are not.
 
 ## Curl
 
 ```bash
+# qwen mode (the default) -- or add "mode":"agent" / "mode":"deepseek"
 curl -s https://<your-domain>/chat/stream \
-  -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"make walkspeed 100"}],"session":"my-chat-1"}'
-# -> {"job":"...","model":"qwen3.8-max","session":"my-chat-1","tools":[...],"turns":1}
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"make walkspeed 100"}],"session":"my-chat-1","mode":"agent"}'
+# -> {"job":"...","mode":"agent","model":"deepseek-v4-flash plans, then qwen3.8-max writes",
+#     "session":"my-chat-1","thinking":"thinking","tools":[...],"turns":1}
 
 curl -sN https://<your-domain>/chat/stream/<job> -H "X-API-Key: $API_KEY"
 
 # or without a stream at all
 curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"make walkspeed 100"}],"session":"my-chat-1"}'
+  -d '{"messages":[{"role":"user","content":"make walkspeed 100"}],"session":"my-chat-1","mode":"deepseek"}'
 ```
 
 ## Verifying a change
 
-`verify_chain.py` runs the whole chain against a stubbed Qwen and the toolbox against itself — no
-keys, no network (the API dump is a fixture). It covers: one call to one model with thinking on
-and the schemas attached; a tool round trip in both the XML and the OpenAI shape (fragmented
-arguments and all); the tool result going back and being matched to its call; the interim prose
-and the tool XML never reaching the reader; the session keeping one chat and no other session
-getting it; the executor round trip behind `run_script` (including the refusal when nothing is
-listening); the round limit; a cut-off answer being refused; the toolbox's own units; and the
-surface (`/health`, `/v1/models`, the page, the gate).
+`verify_chain.py` runs the three modes against a stubbed pair of models and the toolbox against
+itself — no keys, no network (both models are one local stub, and the API dump is a fixture). It
+covers: one call to one model with thinking on and the schemas attached; a tool round trip in both
+the XML and the OpenAI shape (fragmented arguments and all); the tool result going back and being
+matched to its call; the interim prose and the tool XML never reaching the reader; the session
+keeping one chat and no other session getting it; the executor round trip behind `run_script`
+(including the refusal when nothing is listening); the round limit; a cut-off answer being refused;
+the toolbox's own units. And the modes: agent calling DeepSeek exactly once and Qwen exactly once
+in that order, the plan streaming on its own channel and never into the answer, a second model
+being unable to install or clear the session's Qwen continuation, deepseek mode attaching no tools,
+a mode whose credential is missing being refused by name, the default following `CHAIN_MODE` and
+falling back when it cannot run, and the surface (`/health`, `/v1/models`, the page, the picker,
+the gate).
 
 ```bash
 .venv/bin/python verify_chain.py
 ```
 
-The service is four modules, smallest dependency first:
+The service is five modules, smallest dependency first:
 
-* `bridge.py` — everything that talks to the provider: the token, the config, one request and its
-  stream, the marker cut out of it, and the session store that keeps one chat.
-* `state.py` — what the service can say about itself (the token, the model list, the last failure)
-  and the two usage limits.
+* `bridge.py` — everything that talks to a model: the tokens, the config, one request and its
+  stream, the two transports, the marker cut out of it, and the sessions that keep one chat each
+  (plus the three modes and what each model is told).
+* `pow_solver.py` — the proof of work chat.deepseek.com wants on every message, solved with the
+  site's own sha3 module.
+* `state.py` — what the service can say about itself (both credentials, the model list, the last
+  failure) and the two usage limits.
 * `luau.py` — the toolbox: the six tools, the Roblox API dump, and the queue the executor polls.
-* `server.py` — the service on top: the turn, the tool rounds, the jobs, the endpoints and the page.
+* `server.py` — the service on top: the modes, the turn, the tool rounds, the jobs, the endpoints
+  and the page.

@@ -10,6 +10,14 @@ local API_URL = "https://bahs-production-d68f.up.railway.app"
 -- the service has neither.
 local API_KEY = ""
 
+-- Which chain answers. "agent" sends the question to DeepSeek first, which plans it, and then to
+-- qwen3.8-max, which writes the script with its tools from that plan; "qwen" is qwen3.8-max on its
+-- own; "deepseek" is DeepSeek on its own. The service refuses a mode whose credential it does not
+-- have, so a wrong one here says so instead of being answered by another model. Each ask carries
+-- the mode, so it can change between questions without starting a new chat.
+local MODE = "agent"
+local MODES = { "agent", "qwen", "deepseek" }
+
 -- Three things that take a while to get right here:
 --   * Roblox reads an HTTP response in one piece, so it cannot follow the NDJSON stream the page
 --     uses. A turn is started with /chat/stream (which returns at once), then polled on
@@ -61,7 +69,8 @@ end
 local function ask(question, onStep)
     table.insert(messages, {role = "user", content = question})
     local ok, result = pcall(function()
-        local started = post("/chat/stream", {messages = messages, session = SESSION})
+        local started = post("/chat/stream",
+            {messages = messages, session = SESSION, mode = MODE})
         local job = started.job
         -- Wall clock, not os.clock(): that one counts the CPU this script has used, which barely
         -- moves while it waits, so it would never reach the deadline. Up to AGENT_ROUNDS tool
@@ -188,7 +197,7 @@ local listening = false
 
 local function makeBtn(text, x, color, callback)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0.163, -3, 0, 28)
+    b.Size = UDim2.new(0.139, -3, 0, 28)
     b.Position = UDim2.new(x, 0, 1, -36)
     b.BackgroundColor3 = color
     b.Text = text
@@ -219,10 +228,29 @@ makeBtn("ask", 0.002, Color3.fromRGB(60, 120, 200), function()
     end
     lastAnswer = result.text or ""
     lastTool = result.tool
-    output.Text = lastAnswer
+    -- The plan, when there was one: it is what the script was written from, and it is the part of
+    -- an agent turn a reader may want to disagree with. Shown with the answer, prefixed.
+    if result.plan and result.plan ~= "" then
+        output.Text = "-- plan (" .. MODE .. ")\n" .. result.plan .. "\n\n-- script\n" .. lastAnswer
+    else
+        output.Text = lastAnswer
+    end
 end)
 
-makeBtn("execute", 0.168, Color3.fromRGB(80, 160, 80), function()
+local modeBtn
+modeBtn = makeBtn("mode: " .. MODE, 0.142, Color3.fromRGB(120, 90, 180), function()
+    -- The chain the next question takes. Each press moves to the next mode; the answer says which
+    -- one is now in force, so it is never a guess which model wrote what.
+    local index = 1
+    for i, name in ipairs(MODES) do
+        if name == MODE then index = i end
+    end
+    MODE = MODES[index % #MODES + 1]
+    modeBtn.Text = "mode: " .. MODE
+    output.Text = "-- the next question goes through: " .. MODE
+end)
+
+makeBtn("execute", 0.282, Color3.fromRGB(80, 160, 80), function()
     if not lastAnswer then return end
     -- The answer is a chat reply, so only run what looks like a script: a fenced block if there
     -- is one, otherwise the whole answer.
@@ -238,7 +266,7 @@ makeBtn("execute", 0.168, Color3.fromRGB(80, 160, 80), function()
     end
 end)
 
-makeBtn("tools", 0.334, Color3.fromRGB(150, 110, 60), function()
+makeBtn("tools", 0.422, Color3.fromRGB(150, 110, 60), function()
     -- What the model did to its own work this turn: which tools it called, and what came back.
     if lastTool and lastTool ~= "" then
         output.Text = "-- tools\n" .. lastTool
@@ -247,7 +275,7 @@ makeBtn("tools", 0.334, Color3.fromRGB(150, 110, 60), function()
     end
 end)
 
-makeBtn("listen", 0.500, Color3.fromRGB(90, 70, 150), function()
+makeBtn("listen", 0.562, Color3.fromRGB(90, 130, 180), function()
     if listening then
         listening = false
         output.Text = "-- stopped listening: the model can no longer run scripts here"
@@ -276,7 +304,7 @@ makeBtn("listen", 0.500, Color3.fromRGB(90, 70, 150), function()
     end)
 end)
 
-makeBtn("new chat", 0.666, Color3.fromRGB(70, 70, 110), function()
+makeBtn("new chat", 0.702, Color3.fromRGB(70, 70, 110), function()
     -- A new session, so the model starts a new chat on its side too.
     messages = {}
     SESSION = tostring(math.floor(os.clock() * 1000000)) .. tostring(os.time())
@@ -285,7 +313,7 @@ makeBtn("new chat", 0.666, Color3.fromRGB(70, 70, 110), function()
     output.Text = "-- new chat: nothing from before is sent, and a new session starts"
 end)
 
-makeBtn("copy", 0.832, Color3.fromRGB(40, 110, 140), function()
+makeBtn("copy", 0.842, Color3.fromRGB(40, 110, 140), function()
     if not lastAnswer then return end
     if setclipboard then setclipboard(lastAnswer) end
 end)

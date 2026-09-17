@@ -1,4 +1,4 @@
-"""Check the chain against a stubbed Qwen, and the toolbox against itself.
+"""Check the three modes against a stubbed pair of models, and the toolbox against itself.
 
 Run from the project root:  .venv/bin/python verify_chain.py
 
@@ -8,16 +8,36 @@ answer having no tool XML and no continuation metadata in it; the session keepin
 marker the provider needs is remembered and put back on the next turn of the same session and on
 no other); the executor round trip behind `run_script`; and the toolbox's own units.
 
-No keys and no network: the provider is a local stub, and the Roblox API dump is a fixture.
+And the three modes on top of that: agent mode calling DeepSeek exactly once and Qwen exactly
+once (no negotiation, no review of the plan, no third model), the plan streaming on its own
+channel and never into the answer, DeepSeek answering on its own in deepseek mode with no tools
+attached, and a mode whose credential is missing being refused by name rather than served by the
+other model.
+
+No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
-import contextlib, io, json, os, re, sys, tempfile, threading, time
+import contextlib, html, io, json, os, re, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 CALLS = []
 STUB = {"mode": "plain", "tool": "luau_check", "arguments": None, "openai_tool": False,
         "finish": "stop", "script": "", "finite": 0, "prose": "Let me check that first.\n",
+        "plan": "", "decoy": "",
         "meta": '<!-- qwen_metadata: {"response_id":"r1"} -->'}
+
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+# What the planner answers in agent mode. Prose, so it can be told apart from a script, and
+# specific enough that finding any of it in the answer would be obvious.
+PLAN = """1. Apply the speed from one RenderStepped connection, not once at spawn.
+2. Services: Players. Members: Players.LocalPlayer, Player.Character, Humanoid.WalkSpeed.
+3. Structure: one connection at the top level, and disconnect it when the character dies.
+4. Traps: the character is nil on the first frame, and wait() is not task.wait()."""
+
+# A marker the *second* model should never be able to install or clear: it is not the Qwen
+# metadata, and a session's Qwen chat must survive a call to another model in the same session.
+DECOY = '<!-- qwen_metadata: {"response_id":"from-the-planner"} -->'
 
 SIMPLE_SCRIPT = """local Players = game:GetService("Players")
 local SPEED = 16
@@ -98,6 +118,7 @@ class Stub(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.endswith("/models"):
             return self._send(200, {"object": "list", "data": [{"id": "qwen3.8-max"},
+                                                               {"id": DEEPSEEK_MODEL},
                                                                {"id": "qwen3.7-plus"}]})
         return self._send(404, {"error": {"message": "no such route"}})
 
@@ -107,6 +128,14 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.endswith("/validate"):
             return self._send(200, {"valid": True})
         CALLS.append({"path": self.path, "body": body})
+        if str(body.get("model") or "").startswith("deepseek") and STUB["plan"]:
+            # The second model, in the one place it is used as a planner (agent mode) -- in
+            # deepseek mode it is the writer, so no plan is configured and this call falls through
+            # to the script below. It is never offered a tool and never asks for one, and the decoy
+            # marker is deliberate: nothing about an answer from this model may install or clear
+            # the Qwen continuation the session is holding.
+            text = STUB["plan"] + (("\n" + STUB["decoy"]) if STUB["decoy"] else "")
+            return self._send(200, answer_stream(text, STUB["finish"]), "text/event-stream")
         asked, has_tool = requests_body(body)
         args = json.dumps(STUB["arguments"] or {})
         call = ("<tool_calls>" + json.dumps([{"name": STUB["tool"],
@@ -166,6 +195,11 @@ DUMP_FIXTURE.write_text(json.dumps({"Classes": [
 os.environ.update({
     "QWEN_URL": f"http://127.0.0.1:{PORT}/v1",
     "QWEN_TOKEN": "qwen-test-token",
+    # The second model, on the same stub: an explicit URL, so the credential is not treated as a
+    # chat.deepseek.com site token and the OpenAI-shaped transport is the one exercised.
+    "DEEPSEEK_URL": f"http://127.0.0.1:{PORT}/v1",
+    "DEEPSEEK_TOKEN": "deepseek-test-token",
+    "DEEPSEEK_MODEL": DEEPSEEK_MODEL,
     "ROBLOX_API_DUMP": str(DUMP_FIXTURE),
     "HEARTBEAT": "0.2",
     # /health remembers a provider's answer for a minute so the page's polling does not turn into
@@ -177,14 +211,17 @@ os.environ.update({
     "RUN_TIMEOUT": "10",
     "EXECUTOR_IDLE": "30",
 })
-for name in ("QWEN_THINKING", "API_KEY", "AGENT_ROUNDS", "AGENT_TOOLS"):
+for name in ("QWEN_THINKING", "API_KEY", "AGENT_ROUNDS", "AGENT_TOOLS", "CHAIN_MODE",
+             "DEEPSEEK_THINKING", "DEEPSEEK_SHAPE"):
     os.environ.pop(name, None)
 
 # How the test starts, so a section that sets a variable cannot leak it into the next one: every
 # reload begins from this, not from whatever the section before it happened to leave behind.
 BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "QWEN_THINKING", "AGENT_ROUNDS", "AGENT_TOOLS", "AGENT_RUN",
-    "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL")}
+    "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL",
+    "CHAIN_MODE", "DEEPSEEK_URL", "DEEPSEEK_TOKEN", "DEEPSEEK_MODEL", "DEEPSEEK_THINKING",
+    "DEEPSEEK_SHAPE")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
@@ -243,16 +280,22 @@ def fresh_toolbox():
 
 def turn(question="make me a walk script", session="s-test", mode="plain", tool="luau_check",
          arguments=None, openai_tool=False, script=None, meta=None, finish="stop",
-         messages=None, prose=":ASK:"):
-    """One turn, watched to the end, with the provider stub configured for it."""
+         messages=None, prose=":ASK:", asked_mode=None, plan=None, decoy=""):
+    """One turn, watched to the end, with the model stub configured for it.
+
+    `mode` is what the stub does; `asked_mode` is the mode the request asks for, which is empty
+    (the service's default) unless a test is about a specific chain.
+    """
     CALLS.clear()
     STUB.update({"mode": mode, "tool": tool, "arguments": arguments, "openai_tool": openai_tool,
-                 "script": script, "finish": finish,
+                 "script": script, "finish": finish, "plan": PLAN if plan is None else plan,
+                 "decoy": decoy,
                  "prose": ("Let me check that first.\n" if prose == ":ASK:" else prose),
                  "meta": STUB["meta"] if meta is None else meta})
-    started = client.post("/chat/stream",
-                          json={"messages": messages or [{"role": "user", "content": question}],
-                                "session": session})
+    body = {"messages": messages or [{"role": "user", "content": question}], "session": session}
+    if asked_mode:
+        body["mode"] = asked_mode
+    started = client.post("/chat/stream", json=body)
     assert started.status_code == 200, started.text
     frames = []
     with client.stream("GET", f"/chat/stream/{started.json()['job']}") as r:
@@ -265,6 +308,35 @@ def turn(question="make me a walk script", session="s-test", mode="plain", tool=
 
 def writer_calls(calls):
     return [c for c in calls if c["body"].get("model") == "qwen3.8-max"]
+
+
+def planner_calls(calls):
+    return [c for c in calls if str(c["body"].get("model") or "").startswith("deepseek")]
+
+
+def channel(frames, name):
+    """What a reader ends up seeing on one channel, after every reset it was sent.
+
+    A reset is what the server sends when it throws a channel's text away and replaces it -- as
+    the writer's answer is replaced once its fences are stripped, and as the plan is when the
+    hidden marker after it is cut. A reader clears the bubble at that point, so this does too.
+    """
+    out: list = []
+    for f in frames:
+        if f.get("ch") != name:
+            continue
+        if f.get("reset"):
+            out = []
+        elif f.get("t"):
+            out.append(f["t"])
+    return "".join(out)
+
+
+def system_of(call):
+    for m in messages_of(call):
+        if m.get("role") == "system":
+            return m.get("content") or ""
+    return ""
 
 
 def messages_of(call):
@@ -496,25 +568,129 @@ def chain_checks():
     reload_with()
 
 
+def mode_checks():
+    print("\nthe three modes")
+    reload_with()
+
+    # --- agent: deepseek plans once, qwen writes, and nothing is negotiated
+    frames, done, started, calls = turn(session="s-agent", asked_mode="agent", decoy=DECOY)
+    check("agent mode calls the two models in order", [c["body"]["model"] for c in calls],
+          [DEEPSEEK_MODEL, "qwen3.8-max"])
+    check("and exactly twice -- no negotiation round", len(calls), 2)
+    check("the first call is the planner's", "planner" in system_of(calls[0]), True)
+    check("the planner is told not to write the script", "no full script" in system_of(calls[0]),
+          True)
+    check("the writer is handed the plan",
+          any(PLAN in (m.get("content") or "") for m in messages_of(calls[1])), True)
+    check("the writer still writes", "executor" in system_of(calls[1]), True)
+    check("the plan streams on its own channel", channel(frames, "plan"), PLAN)
+    check("the answer is the script, not the plan", done.get("text"), SIMPLE_SCRIPT)
+    check("the plan is not inside it", PLAN.splitlines()[0] in done.get("text"), False)
+    check("the finished turn reports the plan separately", done.get("plan"), PLAN)
+    check("and the reader's answer channel holds the script", channel(frames, "answer"),
+          SIMPLE_SCRIPT)
+    check("and reports its mode", done.get("mode"), "agent")
+    check("the phase record names both models", [p["model"] for p in done["phases"]],
+          [DEEPSEEK_MODEL, "qwen3.8-max"])
+    check("the answer still went out with thinking on",
+          calls[1]["body"].get("thinking_mode"), "thinking")
+    # The decoy: a second model's answer may not install a continuation marker for Qwen, and may
+    # not clear the one that is there either.
+    check("a second model cannot take over the session's chat",
+          bridge.session_meta("s-agent"), STUB["meta"])
+    check("the decoy never reached the reader", DECOY in channel(frames, "plan"), False)
+
+    # --- agent with tools: still one planner call, and the writer's rounds are its own
+    frames, done, started, calls = turn(session="s-agent-tools", mode="tool", asked_mode="agent",
+                                        tool="luau_check", script=None)
+    check("the planner is asked once even when the writer uses tools", len(planner_calls(calls)), 1)
+    check("and the writer is asked twice", len(writer_calls(calls)), 2)
+    check("the first writer call carries the tool schemas",
+          len(writer_calls(calls)[0]["body"].get("tools") or []), len(luau.TOOL_NAMES))
+    check("the tool result comes back to the writer", len(tool_messages(writer_calls(calls)[1])), 1)
+    check("and the answer is still the script", done.get("text"), SIMPLE_SCRIPT)
+
+    # --- qwen on its own
+    frames, done, started, calls = turn(session="s-qwen", asked_mode="qwen")
+    check("qwen mode calls one model", [c["body"]["model"] for c in calls], ["qwen3.8-max"])
+    check("with no plan asked for", any("planner" in system_of(c) for c in calls), False)
+    check("and no plan on any channel", channel(frames, "plan"), "")
+
+    # --- deepseek on its own. `plan=""` because here the second model is the writer: the stub
+    # answers its call with a script rather than with a plan.
+    frames, done, started, calls = turn(session="s-deepseek", asked_mode="deepseek", plan="")
+    check("deepseek mode calls one model", [c["body"]["model"] for c in calls], [DEEPSEEK_MODEL])
+    check("no tools are attached to it", calls[0]["body"].get("tools"), None)
+    check("it is told nothing will check its answer", "No tool runs your script" in system_of(calls[0]),
+          True)
+    check("its thinking is on", calls[0]["body"].get("thinking"), {"type": "enabled"})
+    check("the answer is still the script", done.get("text"), SIMPLE_SCRIPT)
+    check("and the job says which model wrote it", done.get("mode"), "deepseek")
+    check("the start response offers no tools in this mode", started.get("tools"), [])
+    check("and names the mode", started.get("mode"), "deepseek")
+
+    # --- a mode this service cannot run is refused by name, never served by the other model
+    reload_with(DEEPSEEK_TOKEN=UNSET)
+    body = {"messages": [{"role": "user", "content": "hi"}], "mode": "deepseek"}
+    refused = client.post("/chat/stream", json=body)
+    check("a mode with no credential is refused", refused.status_code, 503)
+    check_true("and says which variable it wants", "DEEPSEEK_TOKEN" in refused.text)
+    refused = client.post("/chat/stream", json={"messages": body["messages"], "mode": "agent"})
+    check("agent mode needs both", refused.status_code, 503)
+    check_true("and names the one that is missing", "DEEPSEEK_TOKEN" in refused.text)
+    unknown = client.post("/chat/stream", json={"messages": body["messages"], "mode": "gpt-5"})
+    check("an unknown mode is a 400", unknown.status_code, 400)
+    check_true("and lists the real ones", "agent, qwen, deepseek" in unknown.text)
+    check("with no mode asked for, qwen is what runs", bridge.resolve_mode(""), "qwen")
+
+    # --- the default follows the service's own setting, and falls back when it cannot run
+    reload_with(CHAIN_MODE="deepseek")
+    check("CHAIN_MODE decides the default", client.get("/health").json()["mode"], "deepseek")
+    reload_with(CHAIN_MODE="agent")
+    check("and it can be the agent", client.get("/health").json()["mode"], "agent")
+    reload_with(CHAIN_MODE="agent", DEEPSEEK_TOKEN=UNSET)
+    state = client.get("/health").json()
+    check("a default that cannot run falls back to one that can", state["mode"], "qwen")
+    check("the picker reports all three", [(m["id"], m["on"]) for m in state["modes"]],
+          [("agent", False), ("qwen", True), ("deepseek", False)])
+    check("and what the off ones need",
+          sorted({n for m in state["modes"] if not m["on"] for n in m["needs"]}),
+          ["DEEPSEEK_TOKEN"])
+    reload_with()
+
+
 def surface_checks():
     print("\nthe surface")
     body = client.get("/health").json()
-    check("health names the one model", body["model"], "qwen3.8-max")
-    check("health has no reviewer", "reviewer" in body, False)
-    check("health has no second reader", "second" in body, False)
+    check("health names the writer", body["model"], "qwen3.8-max")
+    check("health names the chain the default mode runs", body["chain"], bridge.mode_label("qwen"))
+    check("health lists the three modes", [m["id"] for m in body["modes"]],
+          ["agent", "qwen", "deepseek"])
+    check("all three can run here", [m["on"] for m in body["modes"]], [True, True, True])
+    check("health reports the second credential", body["deepseek"]["configured"], True)
+    check("and that its key works, without a reviewer anywhere", body["deepseek"]["ok"], True)
+    check("health has no reviewer", any("reviewer" in body for _ in [0]), False)
+    check("health has no second reader", any("second" in body for _ in [0]), False)
     check("health lists the toolbox", sorted(body["tools"]["names"]), sorted(luau.TOOL_NAMES))
     check("the dump state is reported without fetching it", "dump_classes" in body["tools"], True)
     check("the tool rounds are reported", body["rounds"], bridge.AGENT_ROUNDS)
     models = client.get("/v1/models", headers={"X-API-Key": "qwen-test-token"}).json()
     ids = [m["id"] for m in models["data"]]
-    check("only qwen models are listed", ids[0], "qwen3.8-max")
-    check("no deepseek or glm anywhere", [i for i in ids if "deepseek" in i or "glm" in i], [])
+    check("both models are listed, the writer first", ids[:2], ["qwen3.8-max", DEEPSEEK_MODEL])
+    check("no glm anywhere", [i for i in ids if "glm" in i], [])
     page = client.get("/").text
-    check("the page has no reviewer chip", 'data-chip="reviewer"' in page, False)
     check("every placeholder was replaced", sorted(set(re.findall(r"__[A-Z_]+__", page))), [])
     check("the page has the chips it needs", sorted(re.findall(r'data-chip="(\w+)"', page)),
-          ["api", "bridge", "executor", "mode", "model", "roblox", "token", "tools"])
+          ["api", "bridge", "deepseek", "executor", "mode", "model", "roblox", "token",
+           "tools"])
     check("the page is wired for a session", 'localStorage.getItem(SESSION_KEY)' in page, True)
+    check("the page has a mode picker", 'id="modePick"' in page, True)
+    picker = re.search(r'data-modes="([^"]*)"', page)
+    # The JSON sits in an HTML attribute, so the quotes in it are entities until they are read back.
+    check("and it is fed the three modes",
+          json.loads(html.unescape(picker.group(1))) if picker else None,
+          client.get("/health").json()["modes"])
+    check("the page sends the mode it picked", "mode: MODE" in page, True)
     check("an unknown job is a 404", client.get("/chat/poll/nope").status_code, 404)
     check("a key is required when one is set",
           client.get("/agent/pull").status_code, 401)
@@ -524,6 +700,7 @@ def main():
     toolbox_checks()
     reload_with()
     chain_checks()
+    mode_checks()
     surface_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:

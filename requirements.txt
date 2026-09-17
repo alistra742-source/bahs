@@ -2,3 +2,6 @@ fastapi
 uvicorn[standard]
 httpx
 pydantic
+# Runs DeepSeek's own sha3 module to solve the proof of work chat.deepseek.com requires on every
+# message (pow_solver.py). Imported lazily, so a platform without a wheel still serves the API.
+wasmtime

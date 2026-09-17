@@ -1,27 +1,31 @@
-"""The service: the chain, the jobs, the endpoints and the page.
+"""The service: the modes, the jobs, the endpoints and the page.
 
-Everything that talks to the model -- the token, the config, one request, its stream, and the
-hidden continuation marker that keeps one upstream chat instead of a new one per question -- lives
-in `bridge`. The toolbox the writer calls on itself lives in `luau`. What is left here is the
-service: the job that runs one turn, the agent loop that runs the tools, and the endpoints the
-page and the Roblox client use.
+Everything that talks to a model -- the tokens, the config, one request, its stream, and the two
+kinds of continuation that keep one upstream chat instead of a new one per question -- lives in
+`bridge`. The toolbox the writer calls on itself lives in `luau`. What is left here is the
+service: the job that runs one turn, the loop that runs the tools, and the endpoints the page and
+the Roblox client use.
 
-The chain is one model and a toolbox:
+A turn runs in one of three modes, and which is the caller's to pick:
 
-    the caller's turns
-      -> qwen3.8-max, thinking on, with the tool schemas attached
-      -> if it calls a tool: run it here, hand the result back, and ask again (AGENT_ROUNDS)
-      -> the script it settles on is the answer
+    agent     the caller's turns
+                -> deepseek, once, with the planner's instruction -> a plan
+                -> qwen3.8-max, thinking on, with the plan and the tool schemas attached
+                     -> if it calls a tool: run it here, hand the result back, ask again
+                     -> the script it settles on is the answer
+    qwen      the same writer on its own, no plan in front of it
+    deepseek  deepseek on its own: it writes the script and no tools are attached
 
-Nothing else writes a script. Where a second opinion used to be, there is now a check the model
-can run on its own work: `luau_check` reads the structure, `roblox_api` reads the real API dump,
-and `run_script` runs it in the connected executor and reads the traceback back.
+Agent mode is two models called once each, not a negotiation: the plan is context for the writer
+and is never handed back to the planner or reviewed by it. What follows the plan is the writer's
+own work, which is what `luau_check` (structure), `roblox_api` (the real API dump) and
+`run_script` (the connected executor) are for.
 """
-from bridge import *  # noqa: F401,F403 -- the provider, the config and the session store
+from bridge import *  # noqa: F401,F403 -- the providers, the config and the session stores
 from luau import (TOOLS, TOOL_NAMES, deliver, executor_state, run as run_tool, take_script,
                   tool_state, tools_enabled)  # noqa: F401 -- the toolbox
-from state import (client_ip, last_error, list_models, note_error, rate_ok, running_now,
-                   slot_give, slot_take, token_state)  # noqa: F401 -- the checks behind the chips
+from state import (client_ip, deepseek_state, last_error, list_models, note_error, rate_ok,
+                   running_now, slot_give, slot_take, token_state)  # noqa: F401 -- the chips
 
 
 # --- jobs ------------------------------------------------------------------------------
@@ -35,20 +39,24 @@ class Job:
     readers can attach to it -- including one that comes back after the connection dropped,
     which replays the output from the start and follows along.
 
-    Text arrives on two channels. `answer` is the script the writer is producing -- the pieces
+    Text arrives on three channels. `answer` is the script the writer is producing -- the pieces
     the model streams, with the tool XML and the continuation metadata cut out. `tool` is what
     happened instead of text: one trace line per tool call, so a turn that spends a minute
-    looking up an API is visibly doing that rather than looking stuck.
+    looking up an API is visibly doing that rather than looking stuck. `plan` is the same idea for
+    agent mode's first call, which is a plan rather than an answer and is none of the answer.
     """
 
-    def __init__(self, messages: list, temperature: Optional[float], note: str, session: str):
+    def __init__(self, messages: list, temperature: Optional[float], note: str, session: str,
+                 mode: str):
         self.id = uuid.uuid4().hex[:12]
         self.messages = messages
         self.temperature = temperature
         self.note = note
         self.session = session
+        self.mode = mode
+        self.provider = QWEN          # the provider of the call in flight, for the error it raises
         self.pieces: list = []          # (channel, piece)
-        self.buffers: dict = {"answer": [], "tool": []}
+        self.buffers: dict = {"answer": [], "tool": [], "plan": []}
         self.tool_text = ""             # the same trace as one string, for the poll and the summary
         self.error = ""
         self.status = "queued"          # queued -> running -> done | error
@@ -117,9 +125,12 @@ class Job:
             "status": self.status,
             "phase": self.phase,
             "note": self.note,
-            "model": QWEN_MODEL,
+            "mode": self.mode,
+            "model": mode_label(self.mode),
             "session": self.session,
-            "thinking": QWEN_THINKING,
+            # Agent mode's plan is made by DeepSeek and the script by Qwen; the writer's setting
+            # is the one that describes the answer, so that is what is reported.
+            "thinking": (DEEPSEEK_THINKING if self.mode == MODE_DEEPSEEK else QWEN_THINKING),
             "calls": len(self.phases),
             "tools": len([p for p in self.phases if p["phase"] == "tool"]),
             "elapsed": round((self.finished or time.time()) - self.started, 1),
@@ -156,6 +167,24 @@ async def lifespan(_app: FastAPI):
         print(f"[bridge] {QWEN_URL} -> {QWEN_MODEL} (thinking: {QWEN_THINKING})", flush=True)
     else:
         print(f"[bridge] {NOT_CONFIGURED}", flush=True)
+    # Which of the three modes this service can actually run, said at boot: the picker on the page
+    # reads the same thing from /health, and a mode that is off is off for a named reason.
+    print(f"[modes] default {default_mode()}; on: "
+          f"{', '.join(m['id'] for m in modes_state() if m['on']) or 'none'}", flush=True)
+    if not DEEPSEEK.configured:
+        print("[modes] DEEPSEEK_TOKEN is not set: the agent and deepseek modes are off",
+              flush=True)
+    elif DEEPSEEK.web is not None:
+        # Not loaded here: the first fetch is a network call, and boot should not wait on it.
+        print(f"[deepseek] {DEEPSEEK.web.label} (thinking "
+              f"{'on' if DEEPSEEK.web.thinking else 'off'}, search off), proof of work: "
+              + (f"{pow_solver.MODULE_PATH.name} is in the image"
+                 if pow_solver.MODULE_PATH.exists()
+                 else "no sha3 module in the image, so one is fetched on the first call"),
+              flush=True)
+    else:
+        print(f"[deepseek] {DEEPSEEK.url} -> {DEEPSEEK.model} "
+              f"(thinking {DEEPSEEK_THINKING}, search off)", flush=True)
     if tools_enabled() and AGENT_ROUNDS > 0:
         print(f"[tools] {len(TOOL_NAMES)} tool(s) on, up to {AGENT_ROUNDS} round(s) a turn: "
               f"{', '.join(TOOL_NAMES)}", flush=True)
@@ -194,7 +223,9 @@ def poll_job(job_id: str):
         "note": job.note,
         "text": job.text(),
         "tool": job.tool_text,
-        "model": QWEN_MODEL,
+        "plan": job.channel("plan"),
+        "mode": job.mode,
+        "model": job.report()["model"],
         "session": job.session,
         "phases": job.phases,
         "done": job.status == "done",
@@ -230,35 +261,70 @@ def require_key(x_api_key: Optional[str] = Header(None),
 # One model call, its stream, and the tool rounds around it. The provider side -- the request, the
 # stream, and what a failure means -- is in bridge.py, next to the provider itself.
 
+def stream_any(provider, messages: list, temperature: Optional[float], max_tokens: int, box: dict,
+               tools: Optional[list] = None, web_session: object = None):
+    """One model call, on whichever transport that provider uses.
+
+    Two of the three speak OpenAI-shaped HTTP, and that path is `bridge.stream_call`. The third is
+    chat.deepseek.com: one `prompt` field, the site's own frames, and a proof of work on every
+    message, so it has its own transport -- and it takes no tools, which is why none are offered
+    to it here.
+    """
+    if provider.web is not None:
+        pieces: list = []
+        for piece in provider.web.stream(as_prompt(messages), box, web_session):
+            pieces.append(piece)
+            yield piece
+        if box is not None:
+            box["raw"] = "".join(pieces)
+            box["tool_calls"] = []
+            # None, not "": this answer carries no Qwen continuation marker, and an empty one
+            # would forget the session's -- which, in agent mode, is what would end the Qwen chat
+            # the planner call was made in.
+            box["meta"] = None
+        return
+    yield from stream_call(messages, temperature, provider, max_tokens, box, tools)
+
+
 def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens: int,
-              channel: str, phase: str, note: str, tools: Optional[list] = None) -> tuple:
+              channel: str, phase: str, note: str, tools: Optional[list] = None,
+              provider=None, web_session: object = None) -> tuple:
     """Stream one model call into a channel and record what it cost.
 
     Every call goes through here, so every call ends up in the job's phase record: which model,
     how long, how many characters, whether it stopped early, and which tools it asked for. The
     channel is rebuilt from the raw answer first, so what a reader sees and what is stored never
     contain a tool call's XML or the continuation metadata.
+
+    The Qwen continuation marker only rides on Qwen's turns: a DeepSeek call in the same session
+    must not add it, and must not be allowed to forget it either.
     """
+    provider = provider or QWEN
+    job.provider = provider
     job.finish(phase=phase, note=note)
     box: dict = {"finish": None, "usage": None, "tool_calls": [], "raw": "", "meta": ""}
     started = time.time()
     pieces: list = []
-    for piece in stream_call(messages, temperature, QWEN, max_tokens, box, tools):
+    turns = with_continuation(messages, job.session) if provider is QWEN else messages
+    for piece in stream_any(provider, turns, temperature, max_tokens, box, tools, web_session):
         pieces.append(piece)
         job.add(channel, piece)
     streamed = "".join(pieces)
     # The answer without the hidden parts: the XML shape of a tool call, and the metadata that
     # continues the upstream chat. The metadata is kept for the session before it is dropped.
     visible = strip_metadata(TOOL_XML.sub("", box["raw"])).strip()
-    session_remember(job.session, box.get("meta") or "")
+    # Only a Qwen answer carries this service's continuation marker, so only a Qwen answer may
+    # install or clear it: another model's answer -- and a decoy that looks like a marker -- must
+    # leave the session's chat alone.
+    session_remember(job.session, box.get("meta") if provider is QWEN else None)
     if streamed != visible:
         job.reset_channel(channel)
         job.add(channel, visible)
     calls = box.get("tool_calls") or []
     record = {
         "phase": phase,
-        "provider": QWEN.name,
-        "model": QWEN.model,
+        "provider": provider.name,
+        "model": provider.model,
         "ms": int((time.time() - started) * 1000),
         "chars": len(visible),
         "finish": box["finish"],
@@ -266,7 +332,7 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
         "tools": [call["name"] for call in calls],
     }
     job.phases.append(record)
-    print(f"[job] {job.id} {phase}: {QWEN.model} {record['ms']}ms, {record['chars']} chars, "
+    print(f"[job] {job.id} {phase}: {provider.model} {record['ms']}ms, {record['chars']} chars, "
           f"finish={record['finish']}"
           + (f", calls {record['tools']}" if record["tools"] else ""), flush=True)
     return visible, record, box
@@ -315,67 +381,133 @@ def best_script(seen: list) -> str:
     return ""
 
 
-def run_job(job: Job) -> None:
-    """One turn: the model writes, and the tools it asks for are run until it has an answer.
+def tool_loop(job: Job, turns: list, tools: Optional[list]) -> tuple:
+    """Qwen asked once, then asked again with whatever its tools said, until it answers.
 
-    The loop is the whole point. A call that comes back asking for a tool has not answered yet, so
-    the tool is run, its result is appended to the conversation, and the model is asked again --
-    its own check, its own lookup and its own run, in the chat it is already in. What ships is the
-    first answer that asks for nothing.
+    The loop is the whole point of the toolbox. A call that comes back asking for a tool has not
+    answered yet, so the tool is run, its result is appended to the conversation, and the model is
+    asked again -- its own check, its own lookup and its own run, in the chat it is already in.
+    What comes back is the first answer that asks for nothing.
+
+    Returns the answer, how many tools were called, whether the rounds ran out, and what every
+    call in between wrote (the last of which is where a script is recovered from when the rounds
+    do run out).
+    """
+    answer = ""
+    seen: list = []
+    calls_made = 0
+    out_of_rounds = False
+    rounds = AGENT_ROUNDS + 1
+    for round_index in range(rounds):
+        first = round_index == 0
+        note = (f"{QWEN.model} writing a draft" if first
+                else f"{QWEN.model} answering after its last tool call")
+        answer, record, box = run_phase(
+            job, turns, job.temperature, ANSWER_TOKENS if first else REFINE_TOKENS, "answer",
+            "draft" if first else "tools", note, tools, QWEN)
+        calls = box.get("tool_calls") or []
+        if not calls:
+            break
+        calls_made += len(calls)
+        # Whatever it wrote while calling a tool is not the answer; the turn is not over.
+        job.reset_channel("answer")
+        if box["raw"].strip():
+            seen.append(box["raw"])
+        turns.append({"role": "assistant", "content": box["raw"],
+                      "tool_calls": [{"id": call["id"], "type": "function",
+                                      "function": {"name": call["name"],
+                                                   "arguments": json.dumps(call["arguments"])}}
+                                     for call in calls]})
+        for call in calls:
+            job.finish(phase="tool", note=f"{call['name']} -- running")
+            result = run_tool(call["name"], call["arguments"], job.session)
+            trace = tool_trace(call, result)
+            job.tool_text += trace
+            job.add("tool", trace)
+            output = result["output"]
+            if len(output) > TOOL_RESULT_MAX:
+                output = output[:TOOL_RESULT_MAX] + "\n[the tool output was cut for length]"
+            turns.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+            print(f"[job] {job.id} tool {call['name']}: "
+                  f"{'ok' if result['ok'] else 'failed'} -- {result['summary']}", flush=True)
+        if round_index == rounds - 1:
+            out_of_rounds = True
+            job.finish(phase="tools",
+                       note=f"{QWEN.model} used all {AGENT_ROUNDS} tool round(s)")
+    return answer, calls_made, out_of_rounds, seen
+
+
+def writer_system() -> str:
+    """The writer's standing instruction, and the tools it is told about."""
+    return TOOL_SYSTEM if (tools_enabled() and AGENT_ROUNDS > 0) else EXECUTOR_NOTE + "\n\n" \
+        + ANSWER_RULE
+
+
+def think_turn(job: Job) -> tuple:
+    """qwen mode: the writer on its own, with the toolbox."""
+    tools = TOOLS if (tools_enabled() and AGENT_ROUNDS > 0) else None
+    turns = [{"role": "system", "content": writer_system()}] + list(job.messages)
+    return tool_loop(job, turns, tools)
+
+
+def plan_turn(job: Job) -> tuple:
+    """agent mode: deepseek plans once, then qwen writes the script from the plan.
+
+    Two models, called once each -- there is no round of negotiation between them and no review of
+    the plan. DeepSeek is asked what to build and how, the answer is put in front of the writer as
+    the thing it is building from, and everything after that is the writer's own tool rounds,
+    which are its own work rather than a second model's opinion.
+    """
+    plan, record, box = run_phase(
+        job, [{"role": "system", "content": PLAN_SYSTEM}] + list(job.messages),
+        DEEPSEEK_TEMPERATURE, DEEPSEEK_PLAN_TOKENS, "plan", "plan",
+        f"{DEEPSEEK.model} planning", None, DEEPSEEK, deepseek_chat(job.session))
+    plan = strip_fences(plan)
+    tools = TOOLS if (tools_enabled() and AGENT_ROUNDS > 0) else None
+    turns = [{"role": "system", "content": writer_system()}] + list(job.messages)
+    if plan:
+        # The plan is a turn of its own rather than a line inside the question: it is what the
+        # writer is answering from, and the question is what it is answering.
+        turns.append({"role": "user", "content": f"The plan to build from:\n\n{plan}"})
+    else:
+        # A planner that answered with nothing costs the turn one call and nothing else: the
+        # writer is asked anyway, and the job says which half did not happen.
+        job.finish(phase="plan", note=f"{DEEPSEEK.model} returned no plan; "
+                                       f"{QWEN.model} writes it alone")
+    return tool_loop(job, turns, tools)
+
+
+def solo_turn(job: Job) -> tuple:
+    """deepseek mode: it writes the script itself, and no tools are attached.
+
+    Nothing checks the answer on this path -- the toolbox is Qwen's, and there is no Qwen call
+    here -- so the model is told as much, and the script is taken as it comes.
+    """
+    answer, record, box = run_phase(
+        job, [{"role": "system", "content": WRITE_SYSTEM}] + list(job.messages),
+        DEEPSEEK_TEMPERATURE, DEEPSEEK_TOKENS, "answer", "draft",
+        f"{DEEPSEEK.model} writing", None, DEEPSEEK, deepseek_chat(job.session))
+    return answer, 0, False, []
+
+
+def run_job(job: Job) -> None:
+    """One turn, in the mode the caller picked, around a tail every mode shares.
+
+    The modes differ in who writes and in what is attached to the writer. What follows -- what the
+    answer is checked for, what is refused, and what the job reports -- is the same for all three,
+    so it lives here rather than being spelled out three times.
     """
     if not slot_take():
         job.finish(status="error",
                    error=f"{MAX_CONCURRENT} turns are already running; try again shortly")
         return
-    tools = TOOLS if (tools_enabled() and AGENT_ROUNDS > 0) else None
     try:
-        turns = list(job.messages)
-        if tools:
-            # The only standing instruction the writer gets: what the toolbox is for, and what the
-            # answer has to look like.
-            turns = [{"role": "system", "content": TOOL_SYSTEM}] + turns
-        answer = ""
-        seen: list = []
-        calls_made = 0
-        out_of_rounds = False
-        rounds = AGENT_ROUNDS + 1
-        for round_index in range(rounds):
-            first = round_index == 0
-            note = (f"{QWEN.model} writing a draft" if first
-                    else f"{QWEN.model} answering after its last tool call")
-            answer, record, box = run_phase(
-                job, with_continuation(turns, job.session), job.temperature,
-                ANSWER_TOKENS if first else REFINE_TOKENS, "answer",
-                "draft" if first else "tools", note, tools)
-            calls = box.get("tool_calls") or []
-            if not calls:
-                break
-            calls_made += len(calls)
-            # Whatever it wrote while calling a tool is not the answer; the turn is not over.
-            job.reset_channel("answer")
-            if box["raw"].strip():
-                seen.append(box["raw"])
-            turns.append({"role": "assistant", "content": box["raw"],
-                          "tool_calls": [{"id": call["id"], "type": "function",
-                                          "function": {"name": call["name"],
-                                                       "arguments": json.dumps(call["arguments"])}}
-                                         for call in calls]})
-            for call in calls:
-                job.finish(phase="tool", note=f"{call['name']} -- running")
-                result = run_tool(call["name"], call["arguments"], job.session)
-                trace = tool_trace(call, result)
-                job.tool_text += trace
-                job.add("tool", trace)
-                output = result["output"]
-                if len(output) > TOOL_RESULT_MAX:
-                    output = output[:TOOL_RESULT_MAX] + "\n[the tool output was cut for length]"
-                turns.append({"role": "tool", "tool_call_id": call["id"], "content": output})
-                print(f"[job] {job.id} tool {call['name']}: "
-                      f"{'ok' if result['ok'] else 'failed'} -- {result['summary']}", flush=True)
-            if round_index == rounds - 1:
-                out_of_rounds = True
-                job.finish(phase="tools",
-                           note=f"{QWEN.model} used all {AGENT_ROUNDS} tool round(s)")
+        if job.mode == MODE_DEEPSEEK:
+            answer, calls_made, out_of_rounds, seen = solo_turn(job)
+        elif job.mode == MODE_AGENT:
+            answer, calls_made, out_of_rounds, seen = plan_turn(job)
+        else:
+            answer, calls_made, out_of_rounds, seen = think_turn(job)
         if out_of_rounds or not answer.strip():
             # The last thing it wrote was a message that carried a tool call, not an answer, so the
             # script is taken out of what it wrote on the way: a fenced block if there is one, and
@@ -391,20 +523,22 @@ def run_job(job: Job) -> None:
             job.add("answer", answer)
         note_error("")
         used = sorted({name for phase in job.phases for name in (phase.get("tools") or [])})
-        settled = (f"{QWEN.model} answered after {calls_made} tool call(s)"
-                   if calls_made else f"{QWEN.model} answered")
+        who = {MODE_AGENT: f"{DEEPSEEK.model} planned, {QWEN.model} answered",
+               MODE_DEEPSEEK: f"{DEEPSEEK.model} answered"}.get(job.mode,
+                                                                f"{QWEN.model} answered")
+        settled = f"{who} after {calls_made} tool call(s)" if calls_made else who
         if used:
             settled += f" ({', '.join(used)})"
         job.finish(status="done", phase="done", note=settled)
-        print(f"[job] {job.id} done in {job.report()['elapsed']:g}s, {len(answer)} chars, "
-              f"{len(job.phases)} model call(s), {calls_made} tool call(s)", flush=True)
+        print(f"[job] {job.id} [{job.mode}] done in {job.report()['elapsed']:g}s, {len(answer)} "
+              f"chars, {len(job.phases)} model call(s), {calls_made} tool call(s)", flush=True)
     except HTTPException as e:
         # Printed as well as sent: the page shows it once, the log keeps it.
         print(f"[job] {job.id} failed: {e.detail}", flush=True)
         note_error(str(e.detail))
         job.finish(status="error", phase="error", error=str(e.detail))
     except httpx.HTTPError as e:
-        detail = upstream_error(e, QWEN).detail
+        detail = upstream_error(e, job.provider).detail
         print(f"[job] {job.id} failed: {detail}", flush=True)
         note_error(detail)
         job.finish(status="error", phase="error", error=detail)
@@ -417,10 +551,15 @@ def run_job(job: Job) -> None:
 
 
 def start_job(messages: list, temperature: Optional[float] = None, session: str = "",
-              request: Optional[Request] = None) -> Job:
-    """Address the newest question, then set the work going on its own thread."""
-    if not CONFIGURED:
-        raise HTTPException(503, NOT_CONFIGURED)
+              request: Optional[Request] = None, mode: str = "") -> Job:
+    """Pick the mode, address the newest question, then set the work going on its own thread.
+
+    The mode is resolved before anything else, so a caller who asked for one this service cannot
+    run is told which variable is missing rather than getting an answer from another model. There
+    is no "is it configured" gate in front of this any more: an unconfigured service is exactly a
+    mode whose credential is missing, and that is what resolve_mode names.
+    """
+    chosen = resolve_mode(mode)
     ip = client_ip(request)
     if not rate_ok(ip):
         raise HTTPException(429, f"too many requests from {ip}; {RATE_LIMIT} per minute")
@@ -428,9 +567,9 @@ def start_job(messages: list, temperature: Optional[float] = None, session: str 
     # The session is what keeps one upstream chat: the caller keeps its own id (the page keeps it
     # in localStorage, the Roblox client per chat) and every turn in it continues the last answer.
     name = (session or "").strip()[:64] or session_new()
-    job = Job(turns, temperature, f"{QWEN.model} drafting", name)
+    job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen)
     register(job)
-    print(f"[job] {job.id} session {name}: {len(turns)} turn(s), asking about "
+    print(f"[job] {job.id} [{chosen}] session {name}: {len(turns)} turn(s), asking about "
           f"{last_user_text(turns).strip()[:60]!r}", flush=True)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
@@ -444,6 +583,7 @@ class GenReq(BaseModel):
     prompt: str
     temperature: Optional[float] = 0.7
     session: str = ""
+    mode: str = ""                # agent | qwen | deepseek; empty means the service's default
 
 
 class ChatReq(BaseModel):
@@ -453,23 +593,30 @@ class ChatReq(BaseModel):
     gets the greeting in front of it, and the list is what the model sees, so it answers in the
     same chat it has been answering in. `session` is what makes that literally true upstream: the
     same value across turns is one chat on the provider's side, a new value is a new one.
+
+    `mode` is which chain answers this turn -- agent (deepseek plans, then qwen writes), qwen
+    (qwen alone) or deepseek (deepseek alone). Left empty it is the service's own default, and the
+    mode can change between turns of one conversation.
     """
 
     messages: list
     temperature: Optional[float] = 0.7
     session: str = ""
+    mode: str = ""
 
 
 def job_summary(job: Job) -> dict:
-    """A finished job as one object: the answer, the tool trace, and what the calls cost."""
+    """A finished job as one object: the answer, the plan, the tool trace, and what it cost."""
     return {
         "job": job.id,
         "text": job.text(),
         "code": job.text(),
         "tool": job.tool_text,
-        "model": QWEN_MODEL,
+        "plan": job.channel("plan"),
+        "mode": job.mode,
+        "model": job.report()["model"],
         "session": job.session,
-        "thinking": QWEN_THINKING,
+        "thinking": job.report()["thinking"],
         "phases": job.phases,
         "elapsed": job.report()["elapsed"],
     }
@@ -484,10 +631,14 @@ def chat_stream(req: ChatReq, request: Request):
     uses, so it is not key-gated -- only rate limited.
     """
     messages = clean_messages(req.messages)
-    job = start_job(messages, req.temperature, req.session, request)
-    return {"job": job.id, "model": QWEN_MODEL, "session": job.session,
-            "thinking": QWEN_THINKING, "turns": len(job.messages),
-            "tools": TOOL_NAMES if (tools_enabled() and AGENT_ROUNDS > 0) else [],
+    job = start_job(messages, req.temperature, req.session, request, req.mode)
+    # Only the writer is ever given the toolbox, and only when it is on -- so the list is empty in
+    # deepseek mode, where there is no writer to attach it to.
+    tools = (TOOL_NAMES if (tools_enabled() and AGENT_ROUNDS > 0 and job.mode != MODE_DEEPSEEK)
+             else [])
+    return {"job": job.id, "mode": job.mode, "model": job.report()["model"],
+            "session": job.session, "thinking": job.report()["thinking"],
+            "turns": len(job.messages), "tools": tools,
             # null rather than 0: there is no ceiling on this turn unless one is configured.
             "timeout": CHAT_TIMEOUT or None}
 
@@ -495,7 +646,7 @@ def chat_stream(req: ChatReq, request: Request):
 @app.post("/chat")
 def chat(req: ChatReq, _: None = Depends(require_key)):
     """The same turn, blocking -- for callers that cannot follow a stream."""
-    job = start_job(clean_messages(req.messages), req.temperature, req.session)
+    job = start_job(clean_messages(req.messages), req.temperature, req.session, None, req.mode)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -541,7 +692,8 @@ def job_frames(job: Job):
             return
         if status == "done":
             yield frame({"done": True, "text": job.text(), "code": job.text(),
-                         "tool": job.tool_text, "session": job.session,
+                         "tool": job.tool_text, "plan": job.channel("plan"),
+                         "mode": job.mode, "session": job.session,
                          "phases": job.phases, **report})
             return
         if not pieces:
@@ -577,7 +729,9 @@ def job_result(job_id: str, _: None = Depends(require_key)):
         "note": job.note,
         "text": job.text(),
         "tool": job.tool_text,
-        "model": QWEN_MODEL,
+        "plan": job.channel("plan"),
+        "mode": job.mode,
+        "model": job.report()["model"],
         "session": job.session,
         "phases": job.phases,
     }
@@ -603,7 +757,8 @@ def job_wait() -> float:
 @app.post("/generate")
 def generate(req: GenReq, _: None = Depends(require_key)):
     """Block until the whole turn is done -- this is the path `client.lua` uses."""
-    job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session)
+    job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
+                    None, req.mode)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -613,9 +768,10 @@ def generate(req: GenReq, _: None = Depends(require_key)):
 @app.post("/generate/stream")
 def start_stream(req: GenReq, _: None = Depends(require_key)):
     """The one-shot flow as a job, for callers that stream but keep no history."""
-    job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session)
-    return {"job": job.id, "model": QWEN_MODEL, "session": job.session,
-            "timeout": CHAT_TIMEOUT or None}
+    job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
+                    None, req.mode)
+    return {"job": job.id, "mode": job.mode, "model": job.report()["model"],
+            "session": job.session, "timeout": CHAT_TIMEOUT or None}
 
 
 # --- the executor on the other end -------------------------------------------------------
@@ -729,8 +885,10 @@ def chat_completions(payload: dict = Body(...), _: None = Depends(require_key)):
 
 @app.get("/v1/models")
 def models(_: None = Depends(require_key)):
-    """The model this bridge uses, then what else the proxy serves, for reference."""
+    """The models this bridge can answer with, then what else the proxy serves, for reference."""
     ids = [QWEN_MODEL]
+    if DEEPSEEK.configured and DEEPSEEK.model not in ids:
+        ids.append(DEEPSEEK.model)
     for mid in list_models():
         if mid not in ids:
             ids.append(mid)
@@ -759,8 +917,12 @@ async def root():
         chip(True, "api", "online"),
         chip(state["bridge"], "bridge",
              state["last_error"] or (state["provider_label"] if state["bridge"]
-                                     else "QWEN_TOKEN is not set")),
+                                     else "QWEN_TOKEN is not set -- qwen and agent are off")),
         chip(state["token_ok"], "token", state["token_detail"]),
+        # The second model: without it two of the three modes cannot run, and the picker says so.
+        chip(state["deepseek"]["ok"], "deepseek",
+             state["deepseek"]["detail"] if DEEPSEEK.configured
+             else "DEEPSEEK_TOKEN is not set -- agent and deepseek are off"),
         chip(tools["on"], "tools",
              f"{len(tools['names'])} on -- {', '.join(tools['names'][:3])}..."
              if tools["on"] else "off -- the model answers from what it knows"),
@@ -773,7 +935,7 @@ async def root():
         chip(tools["executor_ok"], "executor",
              (" · ".join(tools["executor_clients"])[:60] if tools["executor_ok"]
               else "not listening -- run_script says so instead of waiting")),
-        chip(True, "model", state["model"]),
+        chip(True, "model", state["chain"]),
         chip(True, "mode", f"{state['thinking']} · {state['greeting']}" if state["greeting"]
              else state["thinking"]),
     ])
@@ -789,6 +951,10 @@ async def root():
             .replace("__TOOLS__", html.escape(", ".join(tools["names"]) if tools["on"] else "off"))
             .replace("__TOOL_COUNT__", str(len(tools["names"]) if tools["on"] else 0))
             .replace("__ROUNDS__", str(AGENT_ROUNDS))
+            # The picker: the three modes as JSON (escaped, so it can sit in an attribute) and the
+            # one this service runs when the caller picks nothing.
+            .replace("__MODES__", html.escape(json.dumps(state["modes"])))
+            .replace("__MODE__", html.escape(state["mode"]))
     )
 
 
@@ -798,17 +964,28 @@ async def snapshot() -> dict:
     # network call, so it runs off the event loop -- /health is polled every few seconds and must
     # never hold up a turn. Nothing here fetches the API dump: the tool does that, on first use.
     state = await asyncio.to_thread(token_state)
+    deep = await asyncio.to_thread(deepseek_state)
     tools = await asyncio.to_thread(tool_state)
+    mode = default_mode()
     body = {
         "status": "ok",
         "bridge": CONFIGURED,
         "endpoint": QWEN_URL,
         "provider_label": QWEN.label(),
         "model": QWEN_MODEL,
+        # The chain the default mode runs, which is what the page shows in place of one model.
+        "chain": mode_label(mode),
+        "mode": mode,
+        "modes": modes_state(),
         "thinking": QWEN_THINKING,
         "greeting": GREETING,
         "token_ok": state["ok"],
         "token_detail": state["detail"],
+        "deepseek": {**deep, "model": DEEPSEEK.model, "endpoint": DEEPSEEK.url,
+                     "configured": DEEPSEEK.configured, "shape": DEEPSEEK_SHAPE,
+                     "thinking": DEEPSEEK_THINKING,
+                     "transport": "web" if DEEPSEEK.web is not None else DEEPSEEK_SHAPE,
+                     "chats": deepseek_chats()},
         "tools": tools,
         "sessions": session_count(),
         "rounds": AGENT_ROUNDS,
@@ -817,7 +994,9 @@ async def snapshot() -> dict:
         "last_error": last_error(),
         "api_key_required": bool(CALLER_KEY),
     }
-    if not CONFIGURED:
+    if not any(m["on"] for m in body["modes"]):
+        # Nothing can answer: no Qwen token and no DeepSeek credential. The platform healthcheck
+        # only depends on the API being up, so this is reported in the body like any other state.
         body["status"] = "degraded"
         body["error"] = NOT_CONFIGURED
     return body
