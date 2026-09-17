@@ -26,6 +26,12 @@ Four things worth knowing before reading the code:
 Buttons: send (Enter), modes, scan game, run last, copy code (the script and nothing else), full
 script, console, its thinking, auto -- which runs what it wrote, hands the console back, gets a fix
 and repeats until the script stops changing.
+
+On a phone as well as on a desktop. The panel and every window it opens are dragged by their bars
+with a finger or with a mouse -- `Draggable`, the property that sounds like this, only ever listens
+to a mouse, so on a touch screen it does nothing at all -- and the panel is fitted to the screen it
+is on: scaled down whole, or laid out with the rail above the column when the screen has no room to
+put them side by side.
 ]]
 
 -- =====================================================================================
@@ -63,6 +69,7 @@ local HS = game:GetService("HttpService")
 local P  = game:GetService("Players")
 local LS = game:GetService("LogService")
 local TW = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")   -- dragging, and knowing a finger from a mouse
 local LP = P.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
@@ -1004,6 +1011,192 @@ local function pad(object, top, bottom, left, right)
 	}, object)
 end
 
+-- --- the screen, and moving things around on it ----------------------------------------------
+--
+-- Two things the desktop shape does not have and a phone needs. Size: 760 by 474 pixels on a 390
+-- pixel screen puts the panel's edges somewhere past the screen, and a frame whose edges cannot be
+-- reached cannot be used at all. And movement: Roblox's own `Draggable` -- the property that sounds
+-- like exactly this -- only ever listens to a mouse, so on a touch screen the panel does not move.
+--
+-- So `wide` is the design this file was written as, scaled to the screen that is actually there,
+-- and `narrow` is the same pieces stacked, for a screen with no room to put a rail beside a column.
+-- Every position below comes from `L`, and every window is draggable once it exists.
+
+local camera = workspace.CurrentCamera or workspace:WaitForChild("Camera", 5)
+
+local function viewport()
+	local size = (camera and camera.ViewportSize) or Vector2.new(1280, 720)
+	return Vector2.new(math.max(size.X, 240), math.max(size.Y, 240))
+end
+
+local view = viewport()
+-- The rail is 132 wide and the column beside it wants 300 more: under 620 there is nothing to put
+-- side by side, so the rail becomes a strip above the column and scrolls sideways instead.
+local WIDE = view.X >= 620
+
+local PANEL_W, PANEL_H = 760, 474
+
+-- One axis of a UDim2 in pixels, against the container's own size.
+local function stretch(axis, base)
+	return axis.Scale * base + axis.Offset
+end
+
+local L
+if WIDE then
+	-- Never bigger than the screen, and never scaled up: a 760-pixel panel on a 1400-pixel desk is
+	-- the size it was drawn at.
+	L = {
+		fit = math.min(1, (view.X - 20) / PANEL_W, (view.Y - 20) / PANEL_H),
+		panel = UDim2.new(0, PANEL_W, 0, PANEL_H), overlay = UDim2.new(1, -80, 1, -80),
+		rail = UDim2.new(0, 132, 1, -124), rail_at = UDim2.new(0, 12, 0, 62),
+		rail_scroll = Enum.ScrollingDirection.Y, rail_auto = Enum.AutomaticSize.Y,
+		rail_fill = Enum.FillDirection.Vertical, rail_h = Enum.HorizontalAlignment.Center,
+		rail_v = Enum.VerticalAlignment.Top,
+		rail_button = UDim2.new(1, 0, 0, 30), rail_mode = UDim2.new(1, 0, 0, 28),
+		rail_label = UDim2.new(1, 0, 0, 14), rail_pad = {12, 12, 8, 8},
+		thoughts_label = UDim2.new(0, 160, 0, 60),
+		thoughts_at = UDim2.new(0, 156, 0, 76), thoughts_size = UDim2.new(1, -328, 0, 96),
+		open_thoughts = UDim2.new(1, -234, 0, 78),
+		open_thoughts_size = UDim2.new(0, 54, 0, 18),
+		code_label = UDim2.new(0, 160, 0, 178),
+		code_at = UDim2.new(0, 156, 0, 194), code_size = UDim2.new(1, -328, 0, 118),
+		feed_at = UDim2.new(0, 156, 0, 318), feed_size = UDim2.new(1, -328, 1, -400),
+		input_at = UDim2.new(0, 156, 1, -52), input_size = UDim2.new(1, -156, 0, 40),
+		send_at = UDim2.new(1, -104, 1, -52), send_size = UDim2.new(0, 88, 0, 40),
+		footer_at = UDim2.new(0, 156, 1, -14), footer_size = UDim2.new(1, -300, 0, 14),
+	}
+else
+	-- A phone held upright: the panel takes the screen -- a margin keeps its edges grabbable -- the
+	-- rail is a strip under the header, and the transcript gets whatever height is left over.
+	local panel_h = view.Y - 16
+	L = {
+		fit = 1,
+		panel = UDim2.new(0, view.X - 16, 0, panel_h), overlay = UDim2.new(1, -16, 1, -16),
+		rail = UDim2.new(1, -24, 0, 48), rail_at = UDim2.new(0, 12, 0, 58),
+		rail_scroll = Enum.ScrollingDirection.X, rail_auto = Enum.AutomaticSize.X,
+		rail_fill = Enum.FillDirection.Horizontal, rail_h = Enum.HorizontalAlignment.Left,
+		rail_v = Enum.VerticalAlignment.Center,
+		rail_button = UDim2.new(0, 108, 0, 36), rail_mode = UDim2.new(0, 78, 0, 36),
+		rail_label = UDim2.new(0, 0, 0, 0), rail_pad = {6, 6, 6, 6},
+		thoughts_label = UDim2.new(0, 14, 0, 112),
+		thoughts_at = UDim2.new(0, 12, 0, 128), thoughts_size = UDim2.new(1, -24, 0, 86),
+		open_thoughts = UDim2.new(1, -68, 0, 112),
+		open_thoughts_size = UDim2.new(0, 54, 0, 16),
+		code_label = UDim2.new(0, 14, 0, 222),
+		code_at = UDim2.new(0, 12, 0, 238), code_size = UDim2.new(1, -24, 0, 100),
+		-- Everything above the transcript is a fixed height, so the transcript is what is left of
+		-- the screen: it keeps a floor of 120, so a very short screen scrolls a small transcript
+		-- rather than an invisible one.
+		feed_at = UDim2.new(0, 12, 0, 348),
+		feed_size = UDim2.new(1, -24, 0, math.max(120, panel_h - 436)),
+		input_at = UDim2.new(0, 12, 1, -78), input_size = UDim2.new(1, -116, 0, 40),
+		send_at = UDim2.new(1, -96, 1, -78), send_size = UDim2.new(0, 84, 0, 40),
+		footer_at = UDim2.new(0, 12, 1, -34), footer_size = UDim2.new(1, -24, 0, 14),
+	}
+end
+
+-- --- dragging, with a finger or with a mouse --------------------------------------------------
+--
+-- A finger and a mouse are the same gesture with two names, so the drag remembers which one started
+-- it: a touch drag ends when the finger lifts, not when a mouse that never moved says so. The
+-- movement is read from UserInputService rather than from the handle's own `InputChanged`, because
+-- a handle's copy of that event stops arriving the moment the pointer leaves it -- which is exactly
+-- what dragging a window out from under the pointer does.
+
+local DRAG_START = {
+	[Enum.UserInputType.Touch] = true,
+	[Enum.UserInputType.MouseButton1] = true,
+}
+
+local function scale_of(object)
+	local scale = object:FindFirstChildOfClass("UIScale")
+	return scale and scale.Scale or 1
+end
+
+-- How big the object is on screen: its own UDim2 against the viewport (every window here is a child
+-- of the ScreenGui, so that is its parent) times the scale it is drawn at.
+local function shown_size(object, view)
+	local size, scale = object.Size, scale_of(object)
+	return stretch(size.X, view.X) * scale, stretch(size.Y, view.Y) * scale
+end
+
+-- Where its top-left corner is. Dragging works in corners while Position is whatever the object was
+-- anchored by, and the two are only the same thing when the anchor is the top-left one.
+local function corner_of(object, view)
+	local w, h = shown_size(object, view)
+	local anchor, position = object.AnchorPoint, object.Position
+	return stretch(position.X, view.X) - anchor.X * w,
+		stretch(position.Y, view.Y) - anchor.Y * h
+end
+
+local function place_corner(object, left, top, view)
+	local w, h = shown_size(object, view)
+	local anchor = object.AnchorPoint
+	object.Position = UDim2.new(0, left + anchor.X * w, 0, top + anchor.Y * h)
+end
+
+-- A window put back inside the screen. Both edges are clamped, and an object wider than the screen
+-- keeps its left edge: there is no position that would show more of it than the edge does.
+local function clamp_to_view(object, view)
+	local w, h = shown_size(object, view)
+	local left, top = corner_of(object, view)
+	place_corner(object, math.clamp(left, 0, math.max(0, view.X - w)),
+		math.clamp(top, 0, math.max(0, view.Y - h)), view)
+end
+
+local raised = 210
+
+-- Drag `object` by `handle` (by itself when there is no separate bar). The state comes back so a
+-- button that is also a drag handle can tell a tap from a drag.
+local function draggable(object, handle)
+	handle = handle or object
+	-- A Frame that is not Active does not answer a finger, however well it answers a mouse: this one
+	-- line is the difference between a panel that moves and a panel that does not.
+	if handle:IsA("GuiObject") then handle.Active = true end
+
+	local state = {started = nil, grab = nil, from = nil, moved = false}
+
+	handle.InputBegan:Connect(function(input)
+		if not DRAG_START[input.UserInputType] then return end
+		local view = viewport()
+		state.started = input.UserInputType
+		state.moved = false
+		state.grab = Vector2.new(input.Position.X, input.Position.Y)
+		state.from = Vector2.new(corner_of(object, view))
+		if object.Parent and object.Parent:IsA("ScreenGui") then
+			-- What was grabbed comes to the front, so the thing being moved is the thing being
+			-- looked at even when two windows overlap.
+			raised = raised + 1
+			object.ZIndex = raised
+		end
+	end)
+
+	UIS.InputChanged:Connect(function(input)
+		if not state.started then return end
+		-- The pointer that moves is the one that went down: a touch moves as a touch, a mouse as
+		-- MouseMovement, and neither drives the other's drag.
+		local moving = input.UserInputType == state.started
+			or (state.started == Enum.UserInputType.MouseButton1
+				and input.UserInputType == Enum.UserInputType.MouseMovement)
+		if not moving then return end
+		local now = Vector2.new(input.Position.X, input.Position.Y)
+		if (now - state.grab).Magnitude > 4 then state.moved = true end
+		-- Clamped as it goes rather than when it is let go: a window dragged past the edge has to
+		-- stop there, or it is dragged somewhere that cannot be seen and then has to be hunted for.
+		local view = viewport()
+		local w, h = shown_size(object, view)
+		place_corner(object,
+			math.clamp(state.from.X + (now.X - state.grab.X), 0, math.max(0, view.X - w)),
+			math.clamp(state.from.Y + (now.Y - state.grab.Y), 0, math.max(0, view.Y - h)), view)
+	end)
+
+	UIS.InputEnded:Connect(function(input)
+		if input.UserInputType == state.started then state.started = nil end
+	end)
+
+	return state
+end
+
 for _, old in ipairs(PG:GetChildren()) do
 	if old.Name == "Ghaith" or old.Name == "Kanha" then old:Destroy() end
 end
@@ -1023,16 +1216,23 @@ local orb = mk("TextButton", {
 round(orb, 29)
 local orb_gradient = gradient(orb, C.accent, Color3.fromRGB(168, 85, 247), 0)
 outline(orb, Color3.fromRGB(255, 255, 255), 1, 0.75)
+-- The orb is a drag handle as well as a button: on a phone it is the one thing always on screen,
+-- so it is the one thing that has to be able to get out of the way. Its state is kept, because a
+-- drag that ends over it also fires `Activated` and would otherwise toggle the panel as well.
+local orb_drag = draggable(orb)
 
 -- --- the frame ------------------------------------------------------------------------------
 
 local main = mk("Frame", {
-	Name = "GhaithPanel", Size = UDim2.new(0, 760, 0, 474), Position = UDim2.new(0.5, 380, 0.5, 237),
+	Name = "GhaithPanel", Size = L.panel, Position = UDim2.fromScale(0.5, 0.5),
 	AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.bg, BorderSizePixel = 0,
 	Visible = false, ZIndex = 50, Parent = gui, ClipsDescendants = true,
 })
 round(main, 18)
 outline(main, C.line, 1, 0.25)
+-- A phone screen is smaller than the panel was drawn, so the whole design is scaled to fit rather
+-- than cut off: the same 760 pixels, drawn at whatever fraction of them the screen actually has.
+local main_scale = mk("UIScale", {Scale = L.fit}, main)
 gradient(mk("Frame", {
 	Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
 	BackgroundTransparency = 0.965, BorderSizePixel = 0, ZIndex = 50, Parent = main,
@@ -1072,24 +1272,28 @@ local close_button = mk("TextButton", {
 })
 round(close_button, 10)
 
+-- The panel moves by its header, which is the one strip of it that is never scrolled or typed in.
+draggable(main, header)
+
 -- --- the left rail --------------------------------------------------------------------------
 
 local rail = mk("ScrollingFrame", {
-	Size = UDim2.new(0, 132, 1, -124), Position = UDim2.new(0, 12, 0, 62),
+	Size = L.rail, Position = L.rail_at,
 	BackgroundColor3 = C.panel, BorderSizePixel = 0, ZIndex = 51, Parent = main,
 	-- It scrolls rather than clips. Modes, actions and the thinking button are more than the rail
 	-- is tall, and a button nobody can reach is worse than no button at all.
 	ScrollBarThickness = 2, ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(0, 0, 0, 0),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+	AutomaticCanvasSize = L.rail_auto, ScrollingDirection = L.rail_scroll,
 	ClipsDescendants = true,
 })
 round(rail, 12)
 outline(rail, C.line, 1, 0.4)
 local rail_list = mk("UIListLayout", {
 	Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder,
-	HorizontalAlignment = Enum.HorizontalAlignment.Center, Parent = rail,
+	FillDirection = L.rail_fill, HorizontalAlignment = L.rail_h, VerticalAlignment = L.rail_v,
+	Parent = rail,
 })
-pad(rail, 12, 12, 8, 8)
+pad(rail, L.rail_pad[1], L.rail_pad[2], L.rail_pad[3], L.rail_pad[4])
 
 local MODES = {
 	{id = "agent", label = "agent"},
@@ -1113,7 +1317,7 @@ local function rail_button(text, color, callback)
 	order = order + 1
 	local base = color or C.card
 	local button = mk("TextButton", {
-		Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = base, Text = text, TextColor3 = C.text,
+		Size = L.rail_button, BackgroundColor3 = base, Text = text, TextColor3 = C.text,
 		Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 		LayoutOrder = order, ZIndex = 52, Parent = rail,
 	})
@@ -1130,14 +1334,14 @@ local function rail_button(text, color, callback)
 end
 
 mk("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = "MODE", TextColor3 = C.dim,
+	Size = L.rail_label, BackgroundTransparency = 1, Text = "MODE", TextColor3 = C.dim,
 	Font = SANS_B, TextSize = 10, LayoutOrder = (function() order = order + 1 return order end)(),
 	ZIndex = 52, Parent = rail,
 })
 for _, entry in ipairs(MODES) do
 	order = order + 1
 	local button = mk("TextButton", {
-		Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = C.card, Text = entry.label,
+		Size = L.rail_mode, BackgroundColor3 = C.card, Text = entry.label,
 		TextColor3 = C.dim, Font = SANS_B, TextSize = 12, BorderSizePixel = 0,
 		AutoButtonColor = false, LayoutOrder = order, ZIndex = 52, Parent = rail,
 	})
@@ -1152,7 +1356,7 @@ end
 refresh_modes()
 
 mk("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1, Text = "ACTIONS", TextColor3 = C.dim,
+	Size = L.rail_label, BackgroundTransparency = 1, Text = "ACTIONS", TextColor3 = C.dim,
 	Font = SANS_B, TextSize = 10, LayoutOrder = (function() order = order + 1 return order end)(),
 	ZIndex = 52, Parent = rail,
 })
@@ -1173,7 +1377,7 @@ end)
 -- --- the right column -----------------------------------------------------------------------
 
 local thoughts_label = mk("TextLabel", {
-	Size = UDim2.new(0, 100, 0, 14), Position = UDim2.new(0, 160, 0, 60), BackgroundTransparency = 1,
+	Size = UDim2.new(0, 100, 0, 14), Position = L.thoughts_label, BackgroundTransparency = 1,
 	Text = "THINKING", TextColor3 = C.dim, Font = SANS_B, TextSize = 10,
 	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52, Parent = main,
 })
@@ -1182,7 +1386,7 @@ local thoughts_label = mk("TextLabel", {
 -- that clipped it would hide exactly the part worth watching. The label inside it grows with the
 -- text (AutomaticSize) and the pane is kept at the bottom while the model works.
 local thoughts_frame = mk("ScrollingFrame", {
-	Size = UDim2.new(1, -328, 0, 96), Position = UDim2.new(0, 156, 0, 76), BackgroundColor3 = C.panel,
+	Size = L.thoughts_size, Position = L.thoughts_at, BackgroundColor3 = C.panel,
 	BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.accent,
 	CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
 	ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true,
@@ -1249,13 +1453,13 @@ UI.thoughts = function(thoughts, plan, tools, data, waited)
 end
 
 local code_label = mk("TextLabel", {
-	Size = UDim2.new(0, 100, 0, 14), Position = UDim2.new(0, 160, 0, 178), BackgroundTransparency = 1,
+	Size = UDim2.new(0, 100, 0, 14), Position = L.code_label, BackgroundTransparency = 1,
 	Text = "SCRIPT", TextColor3 = C.dim, Font = SANS_B, TextSize = 10,
 	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52, Parent = main,
 })
 
 local code_box = mk("TextBox", {
-	Size = UDim2.new(1, -328, 0, 118), Position = UDim2.new(0, 156, 0, 194), BackgroundColor3 = C.panel,
+	Size = L.code_size, Position = L.code_at, BackgroundColor3 = C.panel,
 	BorderSizePixel = 0, Text = "", PlaceholderText = "the script, as it is written",
 	PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = MONO, TextSize = 12, TextWrapped = true,
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
@@ -1266,7 +1470,7 @@ outline(code_box, C.line, 1, 0.45)
 pad(code_box, 8, 8, 10, 10)
 
 local feed = mk("ScrollingFrame", {
-	Size = UDim2.new(1, -328, 1, -400), Position = UDim2.new(0, 156, 0, 318),
+	Size = L.feed_size, Position = L.feed_at,
 	BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
 	ScrollBarImageColor3 = C.accent, CanvasSize = UDim2.new(0, 0, 0, 0),
 	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
@@ -1277,7 +1481,7 @@ mk("UIListLayout", {
 })
 
 local input = mk("TextBox", {
-	Size = UDim2.new(1, -156, 0, 40), Position = UDim2.new(0, 156, 1, -52), BackgroundColor3 = C.card,
+	Size = L.input_size, Position = L.input_at, BackgroundColor3 = C.card,
 	BorderSizePixel = 0, Text = "", PlaceholderText = "ask for a script…  (Enter sends)",
 	PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = SANS, TextSize = 14,
 	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 53, Parent = main,
@@ -1287,7 +1491,7 @@ outline(input, C.line, 1, 0.45)
 pad(input, 0, 0, 12, 12)
 
 local send_button = mk("TextButton", {
-	Size = UDim2.new(0, 88, 0, 40), Position = UDim2.new(1, -104, 1, -52), BackgroundColor3 = C.accent,
+	Size = L.send_size, Position = L.send_at, BackgroundColor3 = C.accent,
 	Text = "SEND", TextColor3 = C.text, Font = SANS_B, TextSize = 13, BorderSizePixel = 0,
 	AutoButtonColor = false, ZIndex = 53, Parent = main,
 })
@@ -1295,7 +1499,7 @@ round(send_button, 10)
 gradient(send_button, C.accent, Color3.fromRGB(99, 102, 241), 0)
 
 mk("TextLabel", {
-	Size = UDim2.new(1, -300, 0, 14), Position = UDim2.new(0, 156, 1, -14), BackgroundTransparency = 1,
+	Size = L.footer_size, Position = L.footer_at, BackgroundTransparency = 1,
 	Text = "Ghaith 2.0  ·  bahs agent service  ·  whole script every turn", TextColor3 = C.dim,
 	Font = SANS, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52, Parent = main,
 })
@@ -1304,7 +1508,7 @@ mk("TextLabel", {
 
 local function overlay(title, copy_kind)
 	local frame = mk("Frame", {
-		Size = UDim2.new(1, -80, 1, -80), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = L.overlay, Position = UDim2.fromScale(0.5, 0.5),
 		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.panel, BorderSizePixel = 0,
 		Visible = false, ZIndex = 200, Parent = gui,
 	})
@@ -1350,6 +1554,9 @@ local function overlay(title, copy_kind)
 	})
 	round(shut, 9)
 	shut.Activated:Connect(function() frame.Visible = false end)
+	-- By its bar, with a finger or a mouse: a window that covers the panel it was opened from has
+	-- to be movable on the screen it opened on.
+	draggable(frame, bar)
 	return frame, body
 end
 
@@ -1361,7 +1568,7 @@ local thoughts_window, thoughts_window_body = overlay(
 -- The thinking pane is deliberately small; this opens the same text whole, so a long chain of
 -- thought can be read properly instead of through a 96-pixel window.
 local open_thoughts = mk("TextButton", {
-	Size = UDim2.new(0, 54, 0, 18), Position = UDim2.new(1, -234, 0, 78), BackgroundColor3 = C.card2,
+	Size = L.open_thoughts_size, Position = L.open_thoughts, BackgroundColor3 = C.card2,
 	Text = "open", TextColor3 = C.text, Font = SANS_B, TextSize = 11, BorderSizePixel = 0,
 	AutoButtonColor = false, ZIndex = 53, Parent = main,
 })
@@ -1523,8 +1730,14 @@ send_button.Activated:Connect(submit)
 input.FocusLost:Connect(function(enter) if enter then submit() end end)
 
 orb.Activated:Connect(function()
+	if orb_drag.moved then
+		orb_drag.moved = false   -- that was a drag, not a tap
+		return
+	end
 	main.Visible = not main.Visible
 	if main.Visible then
+		-- Shown again where the screen can hold it, in case the screen changed behind it.
+		clamp_to_view(main, viewport())
 		TW:Create(main, TweenInfo.new(0.22, Enum.EasingStyle.Quint), {BackgroundTransparency = 0}):Play()
 	end
 end)
@@ -1533,7 +1746,7 @@ close_button.Activated:Connect(function() main.Visible = false end)
 -- the rail buttons
 order = order + 1
 local scan_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card2, Text = "scan game",
+	Size = L.rail_button, BackgroundColor3 = C.card2, Text = "scan game",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1548,7 +1761,7 @@ end)
 
 order = order + 1
 local run_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card, Text = "run last",
+	Size = L.rail_button, BackgroundColor3 = C.card, Text = "run last",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1564,7 +1777,7 @@ end)
 
 order = order + 1
 local copy_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card, Text = "copy code",
+	Size = L.rail_button, BackgroundColor3 = C.card, Text = "copy code",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1573,7 +1786,7 @@ copy_button.Activated:Connect(function() copy_code(last_code ~= "" and last_code
 
 order = order + 1
 local full_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card, Text = "full script",
+	Size = L.rail_button, BackgroundColor3 = C.card, Text = "full script",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1585,7 +1798,7 @@ end)
 
 order = order + 1
 local console_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card, Text = "console",
+	Size = L.rail_button, BackgroundColor3 = C.card, Text = "console",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1597,7 +1810,7 @@ end)
 
 order = order + 1
 local auto_button = mk("TextButton", {
-	Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = C.card, Text = "auto: off",
+	Size = L.rail_button, BackgroundColor3 = C.card, Text = "auto: off",
 	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
 	LayoutOrder = order, ZIndex = 52, Parent = rail,
 })
@@ -1609,15 +1822,19 @@ auto_button.Activated:Connect(function()
 	UI.setStatus("ready", auto and ("running and fixing itself, up to " .. MAXROUNDS .. " rounds") or "auto off")
 end)
 
--- The orb breathes while a turn is running, so a glance says whether it is working.
+-- The orb breathes while a turn is running, so a glance says whether it is working. It is a drag
+-- handle as well as a button, so it pulses around wherever it has been put -- its position is read
+-- back each tick rather than computed from the edge it started at, which would drag it home again.
 task.spawn(function()
 	local t = 0
 	while orb.Parent do
 		t = t + 0.045
 		orb_gradient.Rotation = (math.sin(t) * 0.5 + 0.5) * 360
+		local view = viewport()
+		local left, top, w, h = corner_of(orb, view)
 		local size = busy and (58 + math.sin(t * 3) * 3) or 58
 		orb.Size = UDim2.new(0, size, 0, size)
-		orb.Position = UDim2.new(1, -74 - (size - 58) / 2, 0.5, -29 - (size - 58) / 2)
+		place_corner(orb, left + (w - size) / 2, top + (h - size) / 2, view)
 		task.wait(0.03)
 	end
 end)
@@ -1626,11 +1843,40 @@ end)
 -- 9. boot
 -- =====================================================================================
 
+-- --- the screen it landed on ------------------------------------------------------------------
+--
+-- Every window inside the screen, whatever it was placed at: the panel starts centred, the orb at
+-- the right edge, and none of that was written against the screen it is running on now. A phone
+-- that turns over is a different screen, so the same fit runs again -- the panel keeps the shape it
+-- was built with, and is put back inside the new one.
+
+local windows = {code_window, console_window, thoughts_window}
+
+local function fit_to_screen()
+	local view = viewport()
+	if WIDE then
+		main_scale.Scale = math.min(1, (view.X - 20) / PANEL_W, (view.Y - 20) / PANEL_H)
+	else
+		-- Stacked: the panel is the screen, and the transcript is whatever height is left of it.
+		main.Size = UDim2.new(0, view.X - 16, 0, view.Y - 16)
+		feed.Size = UDim2.new(1, -24, 0, math.max(120, (view.Y - 16) - 436))
+	end
+	clamp_to_view(main, view)
+	for _, window in ipairs(windows) do clamp_to_view(window, view) end
+	clamp_to_view(orb, view)
+end
+
+fit_to_screen()
+if camera then
+	camera:GetPropertyChangedSignal("ViewportSize"):Connect(fit_to_screen)
+end
+
 MSGS = {{role = "system", content = SYSTEM .. "\n\n" .. tool_brief()}}
-UI.setStatus("ready", "orb on the right edge")
+UI.setStatus("ready", "drag the panel by its header")
 UI.setThoughts("", "", nil, nil)
 UI.bubble("system", "ready. ask for a script, or press scan game. the thinking pane fills in live"
-	.. " while it works, and every answer comes back as one whole script.")
+	.. " while it works, and every answer comes back as one whole script."
+	.. " drag the header, a window's bar, or the orb with your finger to move it.")
 
 log("System", "Ghaith 2.0 loaded")
 real_print("Ghaith 2.0 · " .. URL .. " · mode " .. MODE)
