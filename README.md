@@ -64,6 +64,13 @@ for one (default `qwen`), and if that mode cannot run the service falls back to 
 mode a caller asks for *by name*, on the other hand, is refused rather than swapped for another
 model.
 
+The one failure that looks like something else entirely is a build that is missing a module: the
+image builds, uvicorn exits on the import error at startup, and every request comes back a `502`
+from Railway with a body that names no reason at all -- which reads like the service refusing the
+request rather than the service never having started. That is why the `Dockerfile` copies each
+module by name *and* imports the app as its last step, so a module that was never added to the
+`COPY` list fails the build instead of the deployment.
+
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
 deepseek token accepted · tools 6 on -- luau_check, luau_format, roblox_api... · roblox 682
 classes · executor not listening -- run_script says so instead of waiting · model qwen3.8-max,
