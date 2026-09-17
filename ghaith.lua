@@ -16,13 +16,13 @@ Four things worth knowing before reading the code:
     turn in front that says how the script must come back.
   * Thinking is mentioned, never printed. The service streams the model's own chain of thought on a
     channel of its own -- the `thoughts` field of /chat/result -- and the client puts it to exactly
-    one use: the header line reads "thinking · 12s · 340 chars thought" while the turn is working
-    something out, so a quiet minute does not read as broken. The WRITER button turns that thinking
-    off for a turn (the service takes the setting per turn, so it can be either one on any turn),
-    and the header then reads "writing" for the same reason: it is writing, not working it out.
-    The reasoning is not shown in a pane
-    and not put in the transcript; it is long, and it is not what anybody is waiting for. "copy
-    code" never copies it either: the script is the only thing here that is code.
+    one use: the status line at the foot of the transcript reads "thinking · 12s · 340 chars
+    thought" while the turn is working something out, so a quiet minute does not read as broken. The
+    WRITER button turns that thinking off for a turn (the service takes the setting per turn, so it
+    can be either one on any turn), and the status line then reads "writing" for the same reason: it
+    is writing, not working it out. The reasoning itself is never printed, in a pane or in the
+    transcript: it is long, and it is not what anybody is waiting for. "copy code" never copies it
+    either: the script is the only thing here that is code.
   * The model can call tools on this client by writing a token in its answer -- @@GREP remote@@ or
     @@GREP@@ remote, both are read. Twenty-nine of them, and every one of them is about the game
     this client is running in rather than about the machine it is running on: the dump, the
@@ -1526,8 +1526,8 @@ local function process(question)
 	last_answer, last_code = text, code
 	-- The answer, and then agent mode's plan under it: the plan is what the script was written from
 	-- and the one part of the model's own thinking worth a turn of the transcript. The chain of
-	-- thought itself is not shown at all -- the header says it is thinking, and that is all a reader
-	-- needs from it.
+	-- thought itself is not shown at all -- the status line under the answer says it is thinking,
+	-- and that is all a reader needs from it.
 	if code ~= "" then UI.bubble("answer", text, code) else UI.bubble("system", text) end
 	if plan and plan ~= "" then UI.bubble("plan", plan) end
 
@@ -1560,8 +1560,8 @@ local function process(question)
 	busy = false
 	UI.setBusy(false)
 	-- A turn that spent itself asking for tools and never wrote a script has not answered, and the
-	-- header says so instead of "idle": the difference between nothing to do and nothing came back
-	-- is the one thing the transcript alone cannot show.
+	-- status line says so instead of "idle": the difference between nothing to do and nothing came
+	-- back is the one thing the transcript alone cannot show.
 	if last_code == "" then
 		UI.setStatus("no script", "the last answer was not one -- ask again, or say: now write it")
 	else
@@ -1718,6 +1718,15 @@ local function stretch(axis, base)
 	return axis.Scale * base + axis.Offset
 end
 
+-- The status line left the header, so the script box took that row: its height is a share of the
+-- screen it was handed rather than a fixed number of pixels, because 118 is a comfortable box on a
+-- 900-pixel desktop and most of a phone lying sideways. The floor sits above the size it used to
+-- be -- the row the header gave up, plus a little -- so the box is never smaller than it was.
+local CODE_H = math.clamp(math.floor(panel.h * (WIDE and 0.32 or 0.24)), 132, 280)
+-- Stacked on a phone: everything above the transcript, and the ask box and footer under it.
+local NARROW_TOP = 124
+local NARROW_BELOW = 88
+
 local L
 if WIDE then
 	-- The rail down the left, the working column beside it, and the panel itself is the screen.
@@ -1725,15 +1734,16 @@ if WIDE then
 		panel = UDim2.new(0, panel.w, 0, panel.h), panel_at = UDim2.new(0, panel.x, 0, panel.y),
 		overlay = UDim2.new(0, panel.w, 0, panel.h),
 		overlay_at = UDim2.new(0, panel.x, 0, panel.y),
-		rail = UDim2.new(0, 132, 1, -124), rail_at = UDim2.new(0, 12, 0, 62),
+		rail = UDim2.new(0, 132, 1, -110), rail_at = UDim2.new(0, 12, 0, 48),
 		rail_scroll = Enum.ScrollingDirection.Y, rail_auto = Enum.AutomaticSize.Y,
 		rail_fill = Enum.FillDirection.Vertical, rail_h = Enum.HorizontalAlignment.Center,
 		rail_v = Enum.VerticalAlignment.Top,
 		rail_button = UDim2.new(1, 0, 0, 30), rail_mode = UDim2.new(1, 0, 0, 28),
 		rail_label = UDim2.new(1, 0, 0, 14), rail_pad = {12, 12, 8, 8},
-		code_label = UDim2.new(0, 160, 0, 60),
-		code_at = UDim2.new(0, 156, 0, 76), code_size = UDim2.new(1, -328, 0, 118),
-		feed_at = UDim2.new(0, 156, 0, 212), feed_size = UDim2.new(1, -328, 1, -274),
+		code_label = UDim2.new(0, 160, 0, 46),
+		code_at = UDim2.new(0, 156, 0, 62), code_size = UDim2.new(1, -328, 0, CODE_H),
+		feed_at = UDim2.new(0, 156, 0, CODE_H + 80),
+		feed_size = UDim2.new(1, -328, 1, -(CODE_H + 142)),
 		input_at = UDim2.new(0, 156, 1, -52), input_size = UDim2.new(1, -156, 0, 40),
 		send_at = UDim2.new(1, -104, 1, -52), send_size = UDim2.new(0, 88, 0, 40),
 		footer_at = UDim2.new(0, 156, 1, -14), footer_size = UDim2.new(1, -300, 0, 14),
@@ -1745,19 +1755,19 @@ else
 		panel = UDim2.new(0, panel.w, 0, panel.h), panel_at = UDim2.new(0, panel.x, 0, panel.y),
 		overlay = UDim2.new(0, panel.w, 0, panel.h),
 		overlay_at = UDim2.new(0, panel.x, 0, panel.y),
-		rail = UDim2.new(1, -24, 0, 48), rail_at = UDim2.new(0, 12, 0, 58),
+		rail = UDim2.new(1, -24, 0, 48), rail_at = UDim2.new(0, 12, 0, 44),
 		rail_scroll = Enum.ScrollingDirection.X, rail_auto = Enum.AutomaticSize.X,
 		rail_fill = Enum.FillDirection.Horizontal, rail_h = Enum.HorizontalAlignment.Left,
 		rail_v = Enum.VerticalAlignment.Center,
 		rail_button = UDim2.new(0, 108, 0, 36), rail_mode = UDim2.new(0, 78, 0, 36),
 		rail_label = UDim2.new(0, 0, 0, 0), rail_pad = {6, 6, 6, 6},
-		code_label = UDim2.new(0, 14, 0, 112),
-		code_at = UDim2.new(0, 12, 0, 128), code_size = UDim2.new(1, -24, 0, 100),
+		code_label = UDim2.new(0, 14, 0, 98),
+		code_at = UDim2.new(0, 12, 0, 114), code_size = UDim2.new(1, -24, 0, CODE_H),
 		-- Everything above the transcript is a fixed height, so the transcript is what is left of
 		-- the screen: it keeps a floor of 120, so a very short screen scrolls a small transcript
 		-- rather than an invisible one.
-		feed_at = UDim2.new(0, 12, 0, 238),
-		feed_size = UDim2.new(1, -24, 0, math.max(120, panel.h - 326)),
+		feed_at = UDim2.new(0, 12, 0, NARROW_TOP + CODE_H),
+		feed_size = UDim2.new(1, -24, 0, math.max(120, panel.h - (NARROW_TOP + CODE_H + NARROW_BELOW))),
 		input_at = UDim2.new(0, 12, 1, -78), input_size = UDim2.new(1, -116, 0, 40),
 		send_at = UDim2.new(1, -96, 1, -78), send_size = UDim2.new(0, 84, 0, 40),
 		footer_at = UDim2.new(0, 12, 1, -34), footer_size = UDim2.new(1, -24, 0, 14),
@@ -1909,7 +1919,7 @@ gradient(mk("Frame", {
 }), Color3.fromRGB(139, 92, 246), Color3.fromRGB(34, 211, 238), 30)
 
 local header = mk("Frame", {
-	Size = UDim2.new(1, 0, 0, 54), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+	Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = C.panel, BorderSizePixel = 0,
 	ZIndex = 51, Parent = main,
 })
 local header_line = mk("Frame", {
@@ -1923,17 +1933,10 @@ mk("TextLabel", {
 	Text = "◈  GHAITH", TextColor3 = C.text, Font = SANS_B, TextSize = 18,
 	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 53, Parent = header,
 })
-local status_label = mk("TextLabel", {
-	Size = UDim2.new(1, -230, 0, 16), Position = UDim2.new(0, 18, 0, 31), BackgroundTransparency = 1,
-	Text = "ready", TextColor3 = C.dim, Font = SANS_M, TextSize = 12,
-	TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
-	ZIndex = 53, Parent = header,
-})
-local pulse_dot = mk("Frame", {
-	Size = UDim2.new(0, 8, 0, 8), Position = UDim2.new(1, -104, 0.5, -4), BackgroundColor3 = C.ok,
-	BorderSizePixel = 0, ZIndex = 53, Parent = header,
-})
-round(pulse_dot, 4)
+-- One row of header, and nothing else in it but the title and the close button. What the turn is
+-- doing used to be said here, in a row of its own that cost the panel that row's height; it is said
+-- at the foot of the transcript now (the status row below), under the answer it belongs to and in
+-- the same run of the page as copy code and run, and the script box has the row instead.
 
 local close_button = mk("TextButton", {
 	Size = UDim2.new(0, 34, 0, 34), Position = UDim2.new(1, -46, 0.5, -17), BackgroundColor3 = C.card2,
@@ -2055,11 +2058,12 @@ mk("TextLabel", {
 
 -- --- the right column -----------------------------------------------------------------------
 
--- Thinking is *said*, never printed. A pane used to sit here and scroll the model's own chain of
--- thought, and it was the wrong thing to watch: it is long, it is not what the reader is waiting
--- for, and it pushed the script and the transcript into a corner of the panel. What is left of it
--- is the mention in the header -- "thinking · 12s · 340 chars thought" -- which says the turn is
--- alive and working something out without spending a pane, or a bubble, on the reasoning itself.
+-- The script box: one row lower down the panel than it used to be, and that much taller. The row
+-- the header gave up when its status line moved into the transcript went here, and on top of that
+-- the box is a share of the screen's height -- reading the whole script is what the panel is for,
+-- and the transcript under it can scroll. What the turn is doing is said down there with it (the
+-- status row below); the chain of thought itself is still never printed, because it is long, and
+-- it is not what anybody is waiting for.
 
 local code_label = mk("TextLabel", {
 	Size = UDim2.new(0, 100, 0, 14), Position = L.code_label, BackgroundTransparency = 1,
@@ -2088,6 +2092,33 @@ local feed = mk("ScrollingFrame", {
 mk("UIListLayout", {
 	Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = feed,
 })
+
+-- What the turn is doing, said in the transcript, at the foot of it: "thinking · 12s · 340 chars
+-- thought" while it works something out, "writing · 620 chars" once the script is coming, "ready ·
+-- idle" when nothing is running, "no script" when a turn came back with none. Its LayoutOrder is
+-- past any bubble's, so it stays the last row of the page and always reads directly under the
+-- newest answer and the copy code / run buttons under it. The chain of thought itself is still
+-- never printed -- only the fact that there is one, and how far along it is.
+local status_row = mk("Frame", {
+	Size = UDim2.new(0.96, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+	BackgroundColor3 = C.card, BorderSizePixel = 0, LayoutOrder = 1000000, ZIndex = 52, Parent = feed,
+})
+round(status_row, 9)
+outline(status_row, C.line, 1, 0.45)
+
+local status_dot = mk("Frame", {
+	Size = UDim2.new(0, 7, 0, 7), Position = UDim2.new(0, 11, 0, 12),
+	BackgroundColor3 = C.ok, BorderSizePixel = 0, ZIndex = 53, Parent = status_row,
+})
+round(status_dot, 3)
+
+local status_label = mk("TextLabel", {
+	Size = UDim2.new(1, -36, 0, 0), Position = UDim2.new(0, 24, 0, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+	Text = "ready", TextColor3 = C.dim, Font = SANS_M, TextSize = 12, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 53, Parent = status_row,
+})
+pad(status_label, 8, 8, 0, 0)
 
 local input = mk("TextBox", {
 	Size = L.input_size, Position = L.input_at, BackgroundColor3 = C.card,
@@ -2257,11 +2288,21 @@ end
 
 UI.setStatus = function(state, note)
 	status_label.Text = tostring(state or "") .. (note and note ~= "" and ("  ·  " .. tostring(note)) or "")
-	local color = C.ok
+	-- Dim words with a green dot while there is nothing to say, cyan while it is working, red when
+	-- the turn came back with nothing: the dot is the glance, the words are the detail.
+	local color, dot = C.dim, C.ok
 	local lower = tostring(state):lower()
-	if lower:find("fail") or lower:find("error") or lower:find("no script") then color = C.bad end
-	if lower == "running" or lower == "reconnecting" or lower == "retrying" then color = C.accent2 end
-	pulse_dot.BackgroundColor3 = color
+	if lower:find("fail") or lower:find("error") or lower:find("no script") then
+		color, dot = C.bad, C.bad
+	elseif lower == "running" or lower == "reconnecting" or lower == "retrying" then
+		color, dot = C.accent2, C.accent2
+	end
+	status_label.TextColor3 = color
+	status_dot.BackgroundColor3 = dot
+	-- It is the last row of the transcript, so a reader who is already at the foot of it stays at the
+	-- foot of it: a status that only ever updates below the fold is not a status. A reader who has
+	-- scrolled up to read something is left where they are.
+	if feed.AbsoluteCanvasSize.Y - feed.CanvasPosition.Y - feed.AbsoluteSize.Y < 80 then scroll_down() end
 end
 
 UI.setBusy = function(on)
@@ -2408,7 +2449,7 @@ local function fit_to_screen()
 	local safe, rect = usable_screen()
 	if not WIDE then
 		-- Stacked, so the transcript is whatever height is left under the fixed rows above it.
-		feed.Size = UDim2.new(1, -24, 0, math.max(120, rect.h - 326))
+		feed.Size = UDim2.new(1, -24, 0, math.max(120, rect.h - (NARROW_TOP + CODE_H + NARROW_BELOW)))
 	end
 	local size = UDim2.new(0, rect.w, 0, rect.h)
 	local at = UDim2.new(0, rect.x, 0, rect.y)
@@ -2428,13 +2469,13 @@ end
 
 MSGS = {{role = "system", content = SYSTEM .. "\n\n" .. tool_brief()}}
 UI.setStatus("ready", "ask for a script, or press scan game")
-UI.bubble("system", "ready. ask for a script, or press scan game. the header says thinking while"
-	.. " it works something out -- the reasoning itself is not printed -- and the WRITER button"
-	.. " switches the writer to fast, which is the same model without the reasoning. every answer"
-	.. " comes back as one whole script, or the turn says it produced none instead of pretending."
-	.. " the tools marked @@ in the brief are run here and fed back to the model: it can read the"
-	.. " game's scripts, its files, fire and hook remotes, and walk the garbage collector."
-	.. " drag a window's bar, or the orb, with your finger to move it.")
+UI.bubble("system", "ready. ask for a script, or press scan game. the status line at the foot of"
+	.. " the transcript says thinking while it works something out -- the reasoning itself is not"
+	.. " printed -- and the WRITER button switches the writer to fast, which is the same model"
+	.. " without the reasoning. every answer comes back as one whole script, or the turn says it"
+	.. " produced none instead of pretending. the tools marked @@ in the brief are run here and fed"
+	.. " back to the model: it can read the game's scripts and modules, fire and hook remotes, and"
+	.. " walk the garbage collector. drag a window's bar, or the orb, with your finger to move it.")
 
 log("System", "Ghaith 2.0 loaded")
 real_print("Ghaith 2.0 · " .. URL .. " · mode " .. MODE .. " · writer " .. THINK)

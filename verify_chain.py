@@ -975,6 +975,18 @@ def client_checks():
     check("a path is read however it was written", "SERVICE_NAME" in source, True)
     check("and a path that is not there says what is",
           "names in the game closest to" in source, True)
+    # Where the client says what the turn is doing. The line used to be a second row of the header;
+    # it is the last row of the transcript now -- under the newest answer, in the same run of the
+    # page as the buttons that copy and run it -- and the header's freed row went to the script box.
+    check("the status line is the last row of the transcript",
+          "LayoutOrder = 1000000, ZIndex = 52, Parent = feed" in source, True)
+    check("and not a second line in the header", "pulse_dot" in source, False)
+    check("the script box takes the row it gave up, and a share of the screen",
+          "local CODE_H = math.clamp(math.floor(panel.h *" in source, True)
+    check("and the stacked transcript is measured from that box",
+          source.count("NARROW_TOP + CODE_H + NARROW_BELOW"), 2)
+    check("the status line stays in view while it updates",
+          "then scroll_down() end" in source, True)
 
 
 def main():

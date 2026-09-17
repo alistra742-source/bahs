@@ -150,15 +150,19 @@ and keeps the whole conversation, so every turn goes out with all of it. Buttons
 picker, **WRITER** (thinking or fast — the setting travels with the turn, so one chat can be asked
 either way), **scan game**, **run last**, **copy code** (the script and nothing else), **full
 script**, **console**, and **auto**, which runs what it wrote, hands the console back, takes the fix
-and repeats until the script stops changing. It fills the screen it was given minus the strip
-Roblox keeps for its own buttons, and it and every window it opens are dragged by their bars — with
-a finger, which `Draggable` cannot do.
+and repeats until the script stops changing. The header is one row — the title and the close button —
+and the SCRIPT box takes a share of the screen's height rather than a fixed number of pixels (a
+280-pixel box on a desktop, whatever is left over a phone's transcript), because that row is the one
+it now has. It fills the screen it was given minus the strip Roblox keeps for its own buttons, and
+it and every window it opens are dragged by their bars — with a finger, which `Draggable` cannot do.
 
 **Thinking is mentioned, never printed.** The chain of thought arrives on the `thoughts` channel
-and the header turns it into one line (`thinking · 12s · 340 chars thought`); it is not shown in a
-pane and not copied. What the SCRIPT pane holds is exactly what **copy code** would copy, and prose
-is never either of them: an answer that has not produced a script yet leaves the pane empty, and
-one that never produces one ends the turn with the header saying so rather than `idle`.
+and the client turns it into one line at the foot of the transcript (`thinking · 12s · 340 chars
+thought`), the last row of the page — so it reads directly under the newest answer and the **copy
+code** / **run** buttons that belong to it — and it is not shown in a pane and not copied. What the
+SCRIPT pane holds is exactly what **copy code** would copy, and prose is never either of them: an
+answer that has not produced a script yet leaves the pane empty, and one that never produces one
+ends the turn with that line saying so rather than `idle`.
 
 **Its own tool protocol.** The model asks the client for what it needs by writing a token in its
 answer — `@@GREP remote@@` or `@@GREP@@ remote`, both are read, and a multi-line argument
@@ -345,8 +349,9 @@ a mode whose credential is missing being refused by name, the default following 
 falling back when it cannot run, and the surface (`/health`, `/v1/models`, the page, the picker,
 the gate). Last, the Roblox client itself (`ghaith.lua`), read as the other half of the tool
 protocol: its own tool table, that everything in it reads the game rather than the player's
-machine, that the count its header claims is the count there is, and that neither the SCRIPT pane
-nor **copy code** can end up holding a paragraph of the model's notes.
+machine, that the count its header claims is the count there is, that neither the SCRIPT pane nor
+**copy code** can end up holding a paragraph of the model's notes, and where the status line sits
+— the last row of the transcript, with the script box holding the row the header gave up.
 
 ```bash
 .venv/bin/python verify_chain.py
