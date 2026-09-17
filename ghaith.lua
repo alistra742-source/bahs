@@ -14,24 +14,26 @@ Four things worth knowing before reading the code:
     the words "read the whole thing" are enforced by a balance check, not by hope.
   * Nothing goes out in halves either: the whole conversation is sent every turn, with a system
     turn in front that says how the script must come back.
-  * Its thinking is shown while it thinks. The service streams the model's own chain of thought on
-    a channel of its own -- the `thoughts` field of /chat/result -- and the pane prints it as it
-    arrives, above the plan in agent mode, every tool call and its result, the phase the turn is
-    in, and the script as it is being written character by character. The reasoning is never mixed
-    into the answer, and "copy code" never copies it: the script is the only thing that is code.
+  * Thinking is mentioned, never printed. The service streams the model's own chain of thought on a
+    channel of its own -- the `thoughts` field of /chat/result -- and the client puts it to exactly
+    one use: the header line reads "thinking · 12s · 340 chars thought" while the turn is working
+    something out, so a quiet minute does not read as broken. The reasoning is not shown in a pane
+    and not put in the transcript; it is long, and it is not what anybody is waiting for. "copy
+    code" never copies it either: the script is the only thing here that is code.
   * The model can call tools on this client by writing @@NAME arg@@ in its answer. Those tokens
     are run here (game dump, remotes, sources, greps, hooks, players, the console, a live run)
     and the results go back as the next turn -- that is the agentic part.
 
 Buttons: send (Enter), modes, scan game, run last, copy code (the script and nothing else), full
-script, console, its thinking, auto -- which runs what it wrote, hands the console back, gets a fix
-and repeats until the script stops changing.
+script, console, auto -- which runs what it wrote, hands the console back, gets a fix and repeats
+until the script stops changing.
 
-On a phone as well as on a desktop. The panel and every window it opens are dragged by their bars
-with a finger or with a mouse -- `Draggable`, the property that sounds like this, only ever listens
-to a mouse, so on a touch screen it does nothing at all -- and the panel is fitted to the screen it
-is on: scaled down whole, or laid out with the rail above the column when the screen has no room to
-put them side by side.
+On a phone as well as on a desktop. The panel fills the screen it was given -- minus the strip
+Roblox keeps for its own buttons, which is where its header would otherwise be sitting -- with the
+rail beside the column, or above it as a scrolling strip when the screen is too narrow to put them
+side by side. It and every window it opens are dragged by their bars with a finger or with a mouse:
+`Draggable`, the property that sounds like this, only ever listens to a mouse, so on a touch screen
+it does not move at all.
 ]]
 
 -- =====================================================================================
@@ -48,7 +50,6 @@ local HISTORY     = 24              -- turns of conversation kept here (the serv
 local auto        = false           -- auto: run what it wrote, hand the console back, fix and repeat
 local last_code   = ""              -- the script from the last answer, whole
 local last_answer = ""              -- everything the last turn said
-local last_thoughts = ""            -- the model's own chain of thought from the last turn
 
 -- The standing instruction. It goes in one system turn, once, instead of in front of every
 -- question: it is about how the script must come back, and it is true for every question.
@@ -70,6 +71,7 @@ local P  = game:GetService("Players")
 local LS = game:GetService("LogService")
 local TW = game:GetService("TweenService")
 local UIS = game:GetService("UserInputService")   -- dragging, and knowing a finger from a mouse
+local GUIS = game:GetService("GuiService")        -- the topbar strip the panel must stay out of
 local LP = P.LocalPlayer
 local PG = LP:WaitForChild("PlayerGui")
 
@@ -94,21 +96,32 @@ local function headers()
 	return h
 end
 
+-- The panel's own elements, filled in at the bottom of the file: the turn writes into this table
+-- and never holds the objects, which is also what lets the HTTP helpers below report a retry before
+-- there is any panel to report it on.
+local UI = {}
+
 local function raw_http(method, path, body)
 	local opts = {Url = URL .. path, Method = method, Headers = headers()}
 	if body ~= nil then opts.Body = HS:JSONEncode(body) end
+	-- What went wrong is kept, not swallowed: an executor that refuses the request ("Http requests
+	-- are not enabled", a trust check, a sandbox rule) says so in its own words, and those words are
+	-- the only clue there is when nothing answered at all.
+	local why = ""
 	if HTTP then
 		local ok, res = pcall(HTTP, opts)
 		if ok and type(res) == "table" then
 			return tonumber(res.StatusCode) or 0, tostring(res.Body or "")
 		end
+		why = (not ok) and tostring(res) or "the executor's request function answered nothing"
 	end
 	-- An executor without a request function of its own still has HttpService.
 	local ok, res = pcall(function()
 		return HS:RequestAsync({Url = opts.Url, Method = opts.Method, Headers = opts.Headers, Body = opts.Body})
 	end)
 	if ok and res then return res.StatusCode, res.Body end
-	return 0, "no HTTP is available in this executor"
+	if not ok then why = tostring(res) end
+	return 0, (why ~= "" and why or "no HTTP is available in this executor")
 end
 
 -- ok, table-or-error. Every call on the service goes through here, so nothing else has to
@@ -117,13 +130,48 @@ local function api(method, path, body)
 	local code, raw = raw_http(method, path, body)
 	if code == 0 then return false, raw end
 	local ok, data = pcall(function() return HS:JSONDecode(raw) end)
+	local where = method .. " " .. path
 	if not ok or type(data) ~= "table" then
-		return false, "HTTP " .. code .. ": " .. tostring(raw):sub(1, 200)
+		-- Not JSON at all: an error page from something standing in front of the service, and its
+		-- own words are the only thing there is to go on.
+		return false, "HTTP " .. code .. " from " .. where
+			.. (raw ~= "" and (": " .. raw:gsub("%s+", " "):sub(1, 160)) or ": empty answer")
 	end
 	if code >= 400 then
-		return false, tostring(data.detail or data.error or ("HTTP " .. code))
+		-- The service always names its own failures, so no name at all means the answer did not
+		-- come from the service: a proxy, a cold start, or a container being restarted.
+		local detail = data.detail or data.error
+		if detail == nil or detail == "" then
+			detail = "HTTP " .. code .. " from " .. where
+				.. " -- the answer gave no reason of its own, which the service gives for every failure"
+				.. " it decides, so this came from in front of it: a cold start, a restart, or a proxy"
+		end
+		return false, tostring(detail)
 	end
 	return true, data
+end
+
+-- One request, retried while the failure is the kind that fixes itself. A 502/503/504 is a proxy, a
+-- cold start or a restart in front of the service, and the same request a moment later is usually
+-- served -- which is exactly what a first request after the app has been asleep looks like, and a
+-- cold start can take ten seconds. Four tries, two seconds apart each time, covers that.
+--
+-- What is *not* retried is a 4xx (the service decided, and it would decide the same way again) and a
+-- request that never got an answer at all: retrying a POST into a black hole is how one turn ends up
+-- running twice.
+local function api_retry(method, path, body, tries)
+	tries = tries or 4
+	local last = ""
+	for attempt = 1, tries do
+		local ok, data = api(method, path, body)
+		if ok then return true, data end
+		last = tostring(data)
+		if attempt == tries or not last:find("^HTTP 5%d%d") then break end
+		UI.setStatus("retrying", "the service answered " .. last:sub(1, 48) .. " -- try "
+			.. (attempt + 1) .. " of " .. tries)
+		task.wait(2 * attempt)
+	end
+	return false, last
 end
 
 -- =====================================================================================
@@ -131,7 +179,6 @@ end
 -- =====================================================================================
 
 local LOGS = {}
-local UI   = {}          -- the elements, filled in at the bottom; the turn only writes into it
 
 local function log(kind, text)
 	table.insert(LOGS, {kind = kind, text = tostring(text), at = os.date("%H:%M:%S")})
@@ -764,7 +811,8 @@ end
 local function ask(question)
 	table.insert(MSGS, {role = "user", content = question})
 	trim()
-	local ok, started = api("POST", "/chat/stream", {messages = MSGS, session = SESSION, mode = MODE})
+	local ok, started = api_retry("POST", "/chat/stream",
+		{messages = MSGS, session = SESSION, mode = MODE})
 	if not ok then table.remove(MSGS) error(started, 0) end
 
 	local id = tostring(started.job or "")
@@ -794,10 +842,17 @@ local function ask(question)
 				thoughts = data.thoughts
 			end
 			last_note = tostring(data.note or data.phase or "")
-			-- Live: what it is thinking, what it planned, what it looked up, and the script as it
-			-- is being written. Every one of those is something the service reported.
-			UI.thoughts(thoughts, plan, tools_done, data, waited)
-			UI.setStatus(status ~= "" and status or "running", last_note)
+			-- The mention, and the only place thinking shows at all now: not the chain of thought
+			-- itself, but the fact that it is working one out -- how long it has been at it, and
+			-- how much it has thought so far -- because a turn that says nothing for a minute reads
+			-- as a broken turn. What the service says it is doing goes in front of the clock.
+			local doing = (#text > 0) and "writing" or "thinking"
+			local note = string.format("%ds", math.floor(waited))
+			if last_note ~= "" then note = last_note .. "  ·  " .. note end
+			if #text == 0 and #thoughts > 0 then
+				note = note .. "  ·  " .. #thoughts .. " chars thought"
+			end
+			UI.setStatus(doing, note)
 			UI.setCode(text)
 			if status == "error" then
 				table.remove(MSGS)
@@ -823,8 +878,6 @@ local function ask(question)
 	-- next turn is answered from, so nothing is ever summarised or cut here.
 	table.insert(MSGS, {role = "assistant", content = (code ~= "" and code or text)})
 	trim()
-	-- Kept for the buttons that read back what the last turn was working out.
-	last_thoughts = thoughts
 	return text, code, plan, tools_done
 end
 
@@ -868,7 +921,7 @@ local function process(question)
 	busy = true
 	UI.setBusy(true)
 	UI.bubble("user", question)
-	local ok, text, code = pcall(ask, question)
+	local ok, text, code, plan = pcall(ask, question)
 	if not ok then
 		UI.bubble("error", tostring(text))
 		UI.setStatus("failed", tostring(text))
@@ -877,10 +930,12 @@ local function process(question)
 		return
 	end
 	last_answer, last_code = text, code
-	-- Its thinking first, then the answer: the reasoning is what makes the script make sense, and
-	-- it is shown even on a turn that produced no script at all.
-	if last_thoughts ~= "" then UI.bubble("thinking", last_thoughts) end
-	if code ~= "" then UI.bubble("answer", text, code) else UI.bubble("thoughts", text) end
+	-- The answer, and then agent mode's plan under it: the plan is what the script was written from
+	-- and the one part of the model's own thinking worth a turn of the transcript. The chain of
+	-- thought itself is not shown at all -- the header says it is thinking, and that is all a reader
+	-- needs from it.
+	if code ~= "" then UI.bubble("answer", text, code) else UI.bubble("system", text) end
+	if plan and plan ~= "" then UI.bubble("plan", plan) end
 
 	-- The tools the model asked for, run here -- twice at most, so a model that keeps asking
 	-- cannot loop this forever.
@@ -899,12 +954,11 @@ local function process(question)
 			break
 		end
 		last_answer = text2
-		if last_thoughts ~= "" then UI.bubble("thinking", last_thoughts) end
 		if code2 ~= "" then
 			last_code = code2
 			UI.bubble("answer", text2, code2)
 		else
-			UI.bubble("thoughts", text2)
+			UI.bubble("system", text2)
 		end
 	end
 
@@ -1013,14 +1067,14 @@ end
 
 -- --- the screen, and moving things around on it ----------------------------------------------
 --
--- Two things the desktop shape does not have and a phone needs. Size: 760 by 474 pixels on a 390
--- pixel screen puts the panel's edges somewhere past the screen, and a frame whose edges cannot be
--- reached cannot be used at all. And movement: Roblox's own `Draggable` -- the property that sounds
--- like exactly this -- only ever listens to a mouse, so on a touch screen the panel does not move.
+-- The panel is the screen: not a 760-pixel window parked somewhere in the middle of it, but every
+-- pixel it is allowed to use, so nothing has to be scaled down to fit a phone and no edge of it
+-- ends up out of reach. The one part of the screen that is not ours is the strip Roblox keeps for
+-- its own buttons along the top, which is where the header would otherwise be sitting.
 --
--- So `wide` is the design this file was written as, scaled to the screen that is actually there,
--- and `narrow` is the same pieces stacked, for a screen with no room to put a rail beside a column.
--- Every position below comes from `L`, and every window is draggable once it exists.
+-- `wide` is the shape this file was written as -- a rail beside a working column -- and `narrow` is
+-- the same pieces stacked, for a screen with no room to put the two side by side. Every position
+-- below comes from `L`, and every window that opens is draggable once it exists.
 
 local camera = workspace.CurrentCamera or workspace:WaitForChild("Camera", 5)
 
@@ -1029,12 +1083,34 @@ local function viewport()
 	return Vector2.new(math.max(size.X, 240), math.max(size.Y, 240))
 end
 
+-- Roblox's own buttons -- the menu, the chat, the mic -- live in a strip along the top of the
+-- screen, and a panel drawn under it puts its header behind them, which is the one row of it that
+-- has to stay reachable. This is the screen minus that strip.
+local function safe_rect()
+	local view = viewport()
+	local top_left, bottom_right = GUIS:GetGuiInset()
+	return {
+		x = math.floor(top_left.X), y = math.floor(top_left.Y),
+		w = math.max(240, view.X - top_left.X - bottom_right.X),
+		h = math.max(180, view.Y - top_left.Y - bottom_right.Y),
+	}
+end
+
+-- A desk-sized screen does not want a 2560-pixel transcript, so the panel fills the screen it has
+-- up to a width a line of code is still readable at, and sits in the middle of the rest.
+local WIDTH_CAP = 1100
+
+local function usable_screen()
+	local screen = safe_rect()
+	local w = math.min(screen.w, WIDTH_CAP)
+	return screen, {x = screen.x + math.floor((screen.w - w) / 2), y = screen.y, w = w, h = screen.h}
+end
+
 local view = viewport()
 -- The rail is 132 wide and the column beside it wants 300 more: under 620 there is nothing to put
 -- side by side, so the rail becomes a strip above the column and scrolls sideways instead.
 local WIDE = view.X >= 620
-
-local PANEL_W, PANEL_H = 760, 474
+local screen, panel = usable_screen()
 
 -- One axis of a UDim2 in pixels, against the container's own size.
 local function stretch(axis, base)
@@ -1043,52 +1119,44 @@ end
 
 local L
 if WIDE then
-	-- Never bigger than the screen, and never scaled up: a 760-pixel panel on a 1400-pixel desk is
-	-- the size it was drawn at.
+	-- The rail down the left, the working column beside it, and the panel itself is the screen.
 	L = {
-		fit = math.min(1, (view.X - 20) / PANEL_W, (view.Y - 20) / PANEL_H),
-		panel = UDim2.new(0, PANEL_W, 0, PANEL_H), overlay = UDim2.new(1, -80, 1, -80),
+		panel = UDim2.new(0, panel.w, 0, panel.h), panel_at = UDim2.new(0, panel.x, 0, panel.y),
+		overlay = UDim2.new(0, panel.w, 0, panel.h),
+		overlay_at = UDim2.new(0, panel.x, 0, panel.y),
 		rail = UDim2.new(0, 132, 1, -124), rail_at = UDim2.new(0, 12, 0, 62),
 		rail_scroll = Enum.ScrollingDirection.Y, rail_auto = Enum.AutomaticSize.Y,
 		rail_fill = Enum.FillDirection.Vertical, rail_h = Enum.HorizontalAlignment.Center,
 		rail_v = Enum.VerticalAlignment.Top,
 		rail_button = UDim2.new(1, 0, 0, 30), rail_mode = UDim2.new(1, 0, 0, 28),
 		rail_label = UDim2.new(1, 0, 0, 14), rail_pad = {12, 12, 8, 8},
-		thoughts_label = UDim2.new(0, 160, 0, 60),
-		thoughts_at = UDim2.new(0, 156, 0, 76), thoughts_size = UDim2.new(1, -328, 0, 96),
-		open_thoughts = UDim2.new(1, -234, 0, 78),
-		open_thoughts_size = UDim2.new(0, 54, 0, 18),
-		code_label = UDim2.new(0, 160, 0, 178),
-		code_at = UDim2.new(0, 156, 0, 194), code_size = UDim2.new(1, -328, 0, 118),
-		feed_at = UDim2.new(0, 156, 0, 318), feed_size = UDim2.new(1, -328, 1, -400),
+		code_label = UDim2.new(0, 160, 0, 60),
+		code_at = UDim2.new(0, 156, 0, 76), code_size = UDim2.new(1, -328, 0, 118),
+		feed_at = UDim2.new(0, 156, 0, 212), feed_size = UDim2.new(1, -328, 1, -274),
 		input_at = UDim2.new(0, 156, 1, -52), input_size = UDim2.new(1, -156, 0, 40),
 		send_at = UDim2.new(1, -104, 1, -52), send_size = UDim2.new(0, 88, 0, 40),
 		footer_at = UDim2.new(0, 156, 1, -14), footer_size = UDim2.new(1, -300, 0, 14),
 	}
 else
-	-- A phone held upright: the panel takes the screen -- a margin keeps its edges grabbable -- the
-	-- rail is a strip under the header, and the transcript gets whatever height is left over.
-	local panel_h = view.Y - 16
+	-- A phone held upright: the rail is a strip under the header, and the transcript gets whatever
+	-- height is left over once the fixed rows above it have taken theirs.
 	L = {
-		fit = 1,
-		panel = UDim2.new(0, view.X - 16, 0, panel_h), overlay = UDim2.new(1, -16, 1, -16),
+		panel = UDim2.new(0, panel.w, 0, panel.h), panel_at = UDim2.new(0, panel.x, 0, panel.y),
+		overlay = UDim2.new(0, panel.w, 0, panel.h),
+		overlay_at = UDim2.new(0, panel.x, 0, panel.y),
 		rail = UDim2.new(1, -24, 0, 48), rail_at = UDim2.new(0, 12, 0, 58),
 		rail_scroll = Enum.ScrollingDirection.X, rail_auto = Enum.AutomaticSize.X,
 		rail_fill = Enum.FillDirection.Horizontal, rail_h = Enum.HorizontalAlignment.Left,
 		rail_v = Enum.VerticalAlignment.Center,
 		rail_button = UDim2.new(0, 108, 0, 36), rail_mode = UDim2.new(0, 78, 0, 36),
 		rail_label = UDim2.new(0, 0, 0, 0), rail_pad = {6, 6, 6, 6},
-		thoughts_label = UDim2.new(0, 14, 0, 112),
-		thoughts_at = UDim2.new(0, 12, 0, 128), thoughts_size = UDim2.new(1, -24, 0, 86),
-		open_thoughts = UDim2.new(1, -68, 0, 112),
-		open_thoughts_size = UDim2.new(0, 54, 0, 16),
-		code_label = UDim2.new(0, 14, 0, 222),
-		code_at = UDim2.new(0, 12, 0, 238), code_size = UDim2.new(1, -24, 0, 100),
+		code_label = UDim2.new(0, 14, 0, 112),
+		code_at = UDim2.new(0, 12, 0, 128), code_size = UDim2.new(1, -24, 0, 100),
 		-- Everything above the transcript is a fixed height, so the transcript is what is left of
 		-- the screen: it keeps a floor of 120, so a very short screen scrolls a small transcript
 		-- rather than an invisible one.
-		feed_at = UDim2.new(0, 12, 0, 348),
-		feed_size = UDim2.new(1, -24, 0, math.max(120, panel_h - 436)),
+		feed_at = UDim2.new(0, 12, 0, 238),
+		feed_size = UDim2.new(1, -24, 0, math.max(120, panel.h - 326)),
 		input_at = UDim2.new(0, 12, 1, -78), input_size = UDim2.new(1, -116, 0, 40),
 		send_at = UDim2.new(1, -96, 1, -78), send_size = UDim2.new(0, 84, 0, 40),
 		footer_at = UDim2.new(0, 12, 1, -34), footer_size = UDim2.new(1, -24, 0, 14),
@@ -1135,13 +1203,15 @@ local function place_corner(object, left, top, view)
 	object.Position = UDim2.new(0, left + anchor.X * w, 0, top + anchor.Y * h)
 end
 
--- A window put back inside the screen. Both edges are clamped, and an object wider than the screen
--- keeps its left edge: there is no position that would show more of it than the edge does.
-local function clamp_to_view(object, view)
+-- A window put back inside the screen it is allowed to use, both edges clamped; an object wider
+-- than that screen keeps its top-left edge, because no position would show more of it than the edge
+-- does. The bounds are the usable screen rather than the viewport: the topbar strip is not ours.
+local function clamp_to_view(object, view, screen)
+	screen = screen or safe_rect()
 	local w, h = shown_size(object, view)
 	local left, top = corner_of(object, view)
-	place_corner(object, math.clamp(left, 0, math.max(0, view.X - w)),
-		math.clamp(top, 0, math.max(0, view.Y - h)), view)
+	place_corner(object, math.clamp(left, screen.x, math.max(screen.x, screen.x + screen.w - w)),
+		math.clamp(top, screen.y, math.max(screen.y, screen.y + screen.h - h)), view)
 end
 
 local raised = 210
@@ -1183,11 +1253,13 @@ local function draggable(object, handle)
 		if (now - state.grab).Magnitude > 4 then state.moved = true end
 		-- Clamped as it goes rather than when it is let go: a window dragged past the edge has to
 		-- stop there, or it is dragged somewhere that cannot be seen and then has to be hunted for.
-		local view = viewport()
+		local view, screen = viewport(), safe_rect()
 		local w, h = shown_size(object, view)
 		place_corner(object,
-			math.clamp(state.from.X + (now.X - state.grab.X), 0, math.max(0, view.X - w)),
-			math.clamp(state.from.Y + (now.Y - state.grab.Y), 0, math.max(0, view.Y - h)), view)
+			math.clamp(state.from.X + (now.X - state.grab.X), screen.x,
+				math.max(screen.x, screen.x + screen.w - w)),
+			math.clamp(state.from.Y + (now.Y - state.grab.Y), screen.y,
+				math.max(screen.y, screen.y + screen.h - h)), view)
 	end)
 
 	UIS.InputEnded:Connect(function(input)
@@ -1224,15 +1296,12 @@ local orb_drag = draggable(orb)
 -- --- the frame ------------------------------------------------------------------------------
 
 local main = mk("Frame", {
-	Name = "GhaithPanel", Size = L.panel, Position = UDim2.fromScale(0.5, 0.5),
-	AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.bg, BorderSizePixel = 0,
+	Name = "GhaithPanel", Size = L.panel, Position = L.panel_at,
+	BackgroundColor3 = C.bg, BorderSizePixel = 0,
 	Visible = false, ZIndex = 50, Parent = gui, ClipsDescendants = true,
 })
 round(main, 18)
 outline(main, C.line, 1, 0.25)
--- A phone screen is smaller than the panel was drawn, so the whole design is scaled to fit rather
--- than cut off: the same 760 pixels, drawn at whatever fraction of them the screen actually has.
-local main_scale = mk("UIScale", {Scale = L.fit}, main)
 gradient(mk("Frame", {
 	Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.fromRGB(255, 255, 255),
 	BackgroundTransparency = 0.965, BorderSizePixel = 0, ZIndex = 50, Parent = main,
@@ -1361,96 +1430,13 @@ mk("TextLabel", {
 	ZIndex = 52, Parent = rail,
 })
 
--- The action buttons themselves are made further down; this one is made here because it is the one
--- that reads the pane above, and LayoutOrder -- not the order the file was written in -- decides
--- where a button lands in the rail.
-rail_button("its thinking", C.card2, function()
-	if last_thoughts == "" then
-		UI.bubble("system", "nothing yet -- give it something to work out first")
-		return
-	end
-	-- Printed as a turn of its own: the whole of it is there, and the button on that turn opens it
-	-- in a window when the transcript is not the place to read it.
-	UI.bubble("thinking", last_thoughts)
-end)
-
 -- --- the right column -----------------------------------------------------------------------
 
-local thoughts_label = mk("TextLabel", {
-	Size = UDim2.new(0, 100, 0, 14), Position = L.thoughts_label, BackgroundTransparency = 1,
-	Text = "THINKING", TextColor3 = C.dim, Font = SANS_B, TextSize = 10,
-	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52, Parent = main,
-})
-
--- The thinking pane scrolls, because a chain of thought is longer than six lines and the pane
--- that clipped it would hide exactly the part worth watching. The label inside it grows with the
--- text (AutomaticSize) and the pane is kept at the bottom while the model works.
-local thoughts_frame = mk("ScrollingFrame", {
-	Size = L.thoughts_size, Position = L.thoughts_at, BackgroundColor3 = C.panel,
-	BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.accent,
-	CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true,
-	ZIndex = 51, Parent = main,
-})
-round(thoughts_frame, 10)
-outline(thoughts_frame, C.line, 1, 0.45)
-pad(thoughts_frame, 8, 8, 10, 10)
-local thoughts_box = mk("TextLabel", {
-	Size = UDim2.new(1, -4, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
-	Text = "idle -- its thinking, its plan, the tools it runs and the writing appear here live",
-	TextColor3 = C.dim, Font = MONO, TextSize = 12, TextWrapped = true,
-	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-	ZIndex = 52, Parent = thoughts_frame,
-})
-
--- The tail of a long text: a pane being written into should show the last thing said rather than
--- grow without bound.
-local function tail(text, limit)
-	text = tostring(text or "")
-	if #text <= limit then return text end
-	return "..." .. text:sub(-limit)
-end
-
--- The live thinking pane, composed out of what the service actually reported: the model's own
--- chain of thought (which it streams as it arrives), the phase the turn is in, the plan in agent
--- mode, the tools it ran, and how long it has been going. Nothing here is invented, and nothing
--- is guessed from the model's prose: every line is something the service said.
-UI.thoughts = function(thoughts, plan, tools, data, waited)
-	local lines = {}
-	local phase = tostring((data and data.phase) or "")
-	local note = tostring((data and data.note) or "")
-	if phase ~= "" then
-		table.insert(lines, "● " .. phase .. (note ~= "" and ("  ·  " .. note) or ""))
-	end
-	if waited then
-		table.insert(lines, string.format("   %ds  ·  %d chars thought  ·  %d chars written",
-			math.floor(waited), #tostring(thoughts or ""), tonumber((data and data.chars) or 0) or 0))
-	end
-	if thoughts and thoughts ~= "" then
-		table.insert(lines, "")
-		table.insert(lines, "── IT IS THINKING ───────────────────────")
-		table.insert(lines, tail(thoughts, 1400))
-	end
-	if plan and plan ~= "" then
-		table.insert(lines, "")
-		table.insert(lines, "── THE PLAN ─────────────────────────────")
-		table.insert(lines, tail(plan, 700))
-	end
-	if tools and tools ~= "" then
-		table.insert(lines, "")
-		table.insert(lines, "── TOOLS IT RAN ─────────────────────────")
-		table.insert(lines, tail(tools, 700))
-	end
-	if #lines == 0 then
-		lines = {"idle -- its thinking, the plan, the tool calls and the writing appear here live"}
-	end
-	thoughts_box.Text = table.concat(lines, "\n")
-	thoughts_box.TextColor3 = (thoughts and thoughts ~= "") and C.text or C.dim
-	-- Follow the text down: the newest thinking is the part worth having on screen.
-	task.defer(function()
-		thoughts_frame.CanvasPosition = Vector2.new(0, thoughts_frame.AbsoluteCanvasSize.Y)
-	end)
-end
+-- Thinking is *said*, never printed. A pane used to sit here and scroll the model's own chain of
+-- thought, and it was the wrong thing to watch: it is long, it is not what the reader is waiting
+-- for, and it pushed the script and the transcript into a corner of the panel. What is left of it
+-- is the mention in the header -- "thinking · 12s · 340 chars thought" -- which says the turn is
+-- alive and working something out without spending a pane, or a bubble, on the reasoning itself.
 
 local code_label = mk("TextLabel", {
 	Size = UDim2.new(0, 100, 0, 14), Position = L.code_label, BackgroundTransparency = 1,
@@ -1508,8 +1494,8 @@ mk("TextLabel", {
 
 local function overlay(title, copy_kind)
 	local frame = mk("Frame", {
-		Size = L.overlay, Position = UDim2.fromScale(0.5, 0.5),
-		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+		Size = L.overlay, Position = L.overlay_at,
+		BackgroundColor3 = C.panel, BorderSizePixel = 0,
 		Visible = false, ZIndex = 200, Parent = gui,
 	})
 	round(frame, 16)
@@ -1562,22 +1548,6 @@ end
 
 local code_window, code_window_body = overlay("THE SCRIPT  ·  whole, no fences", "code")
 local console_window, console_window_body = overlay("CONSOLE  ·  everything this client printed", "text")
-local thoughts_window, thoughts_window_body = overlay(
-	"ITS THINKING  ·  what it worked out before it wrote", "text")
-
--- The thinking pane is deliberately small; this opens the same text whole, so a long chain of
--- thought can be read properly instead of through a 96-pixel window.
-local open_thoughts = mk("TextButton", {
-	Size = L.open_thoughts_size, Position = L.open_thoughts, BackgroundColor3 = C.card2,
-	Text = "open", TextColor3 = C.text, Font = SANS_B, TextSize = 11, BorderSizePixel = 0,
-	AutoButtonColor = false, ZIndex = 53, Parent = main,
-})
-round(open_thoughts, 6)
-open_thoughts.Activated:Connect(function()
-	thoughts_window_body.Text = (last_thoughts ~= "" and last_thoughts)
-		or "nothing yet -- a turn that is thinking writes into the pane on the left as it goes"
-	thoughts_window.Visible = true
-end)
 
 -- --- the transcript -------------------------------------------------------------------------
 
@@ -1618,29 +1588,13 @@ UI.bubble = function(kind, text, code)
 		body.BackgroundColor3 = C.panel
 		body.TextColor3 = C.text
 		outline(body, C.accent2, 1, 0.72)
-	elseif kind == "thinking" then
-		-- What the model worked out before it wrote anything: its own turn in the transcript rather
-		-- than a footnote under the script, because a long chain of thought pushed under the code
-		-- would never be read -- and it is the part that says why the script looks like it does.
+	elseif kind == "tools" or kind == "plan" then
+		-- Its own two turns, and neither is the reasoning: what the tools found, and (in agent
+		-- mode) the plan the script was written from.
 		body.BackgroundColor3 = C.panel
 		body.TextColor3 = C.dim
-		body.Text = "◇ it thought first:\n" .. tostring(text or "")
-		outline(body, C.accent2, 1, 0.85)
-		local more = mk("TextButton", {
-			Size = UDim2.new(0, 116, 0, 20), Position = UDim2.new(0, 12, 0, 2),
-			BackgroundColor3 = C.card2, Text = "read all of it", TextColor3 = C.text,
-			Font = SANS_B, TextSize = 11, BorderSizePixel = 0, AutoButtonColor = false,
-			ZIndex = 54, Parent = wrapper,
-		})
-		round(more, 7)
-		more.Activated:Connect(function()
-			thoughts_window_body.Text = tostring(text or "")
-			thoughts_window.Visible = true
-		end)
-		body.Position = UDim2.new(0, 0, 0, 24)
-	elseif kind == "tools" or kind == "thoughts" then
-		body.BackgroundColor3 = C.panel
-		body.Text = "◆ " .. tostring(text or "")
+		body.Text = (kind == "plan" and "◇ the plan it built from" or "◆ the tools it ran")
+			.. "\n" .. tostring(text or "")
 		outline(body, C.line, 1, 0.4)
 	else
 		body.BackgroundColor3 = C.card
@@ -1678,38 +1632,12 @@ UI.setCode = function(text)
 	code_box.TextColor3 = (#(text or "") > 0) and C.text or C.dim
 end
 
--- The live thinking pane: the phase it is in, what it planned, what it looked up, and how much it
--- has written. Nothing here is invented -- every line is something the service reported.
-UI.setThoughts = function(plan, tools, data, waited)
-	local lines = {}
-	local phase = tostring((data and data.phase) or "")
-	local note = tostring((data and data.note) or "")
-	if phase ~= "" then
-		table.insert(lines, "● " .. phase .. (note ~= "" and ("  ·  " .. note) or ""))
-	end
-	if waited then table.insert(lines, "   " .. math.floor(waited) .. "s  ·  "
-		.. tostring((data and data.chars) or 0) .. " chars written") end
-	if plan and plan ~= "" then
-		table.insert(lines, "")
-		table.insert(lines, "PLAN (the model working out what to build):")
-		table.insert(lines, plan:sub(1, 900))
-	end
-	if tools and tools ~= "" then
-		table.insert(lines, "")
-		table.insert(lines, "TOOLS IT RAN:")
-		table.insert(lines, tools:sub(-900))
-	end
-	if #lines == 0 then lines = {"idle -- ask for a script"} end
-	thoughts_box.Text = table.concat(lines, "\n")
-	thoughts_box.TextColor3 = C.text
-end
-
 UI.setStatus = function(state, note)
 	status_label.Text = tostring(state or "") .. (note and note ~= "" and ("  ·  " .. tostring(note)) or "")
 	local color = C.ok
 	local lower = tostring(state):lower()
 	if lower:find("fail") or lower:find("error") then color = C.bad end
-	if lower == "running" or lower == "reconnecting" then color = C.accent2 end
+	if lower == "running" or lower == "reconnecting" or lower == "retrying" then color = C.accent2 end
 	pulse_dot.BackgroundColor3 = color
 end
 
@@ -1845,25 +1773,29 @@ end)
 
 -- --- the screen it landed on ------------------------------------------------------------------
 --
--- Every window inside the screen, whatever it was placed at: the panel starts centred, the orb at
--- the right edge, and none of that was written against the screen it is running on now. A phone
--- that turns over is a different screen, so the same fit runs again -- the panel keeps the shape it
--- was built with, and is put back inside the new one.
+-- Every window inside the screen it is allowed to use, whatever it was placed at: the panel *is*
+-- that screen now, the orb sits at its right edge, and none of that was written against the screen
+-- this is running on. A phone that turns over is a different screen -- a shorter one, with the
+-- topbar somewhere else -- so the fit runs again and the panel takes the new one whole.
 
-local windows = {code_window, console_window, thoughts_window}
+local windows = {code_window, console_window}
 
 local function fit_to_screen()
 	local view = viewport()
-	if WIDE then
-		main_scale.Scale = math.min(1, (view.X - 20) / PANEL_W, (view.Y - 20) / PANEL_H)
-	else
-		-- Stacked: the panel is the screen, and the transcript is whatever height is left of it.
-		main.Size = UDim2.new(0, view.X - 16, 0, view.Y - 16)
-		feed.Size = UDim2.new(1, -24, 0, math.max(120, (view.Y - 16) - 436))
+	local safe, rect = usable_screen()
+	if not WIDE then
+		-- Stacked, so the transcript is whatever height is left under the fixed rows above it.
+		feed.Size = UDim2.new(1, -24, 0, math.max(120, rect.h - 326))
 	end
-	clamp_to_view(main, view)
-	for _, window in ipairs(windows) do clamp_to_view(window, view) end
-	clamp_to_view(orb, view)
+	local size = UDim2.new(0, rect.w, 0, rect.h)
+	local at = UDim2.new(0, rect.x, 0, rect.y)
+	main.Size, main.Position = size, at
+	for _, window in ipairs(windows) do
+		window.Size, window.Position = size, at
+	end
+	clamp_to_view(main, view, safe)
+	for _, window in ipairs(windows) do clamp_to_view(window, view, safe) end
+	clamp_to_view(orb, view, safe)
 end
 
 fit_to_screen()
@@ -1872,11 +1804,10 @@ if camera then
 end
 
 MSGS = {{role = "system", content = SYSTEM .. "\n\n" .. tool_brief()}}
-UI.setStatus("ready", "drag the panel by its header")
-UI.setThoughts("", "", nil, nil)
-UI.bubble("system", "ready. ask for a script, or press scan game. the thinking pane fills in live"
-	.. " while it works, and every answer comes back as one whole script."
-	.. " drag the header, a window's bar, or the orb with your finger to move it.")
+UI.setStatus("ready", "ask for a script, or press scan game")
+UI.bubble("system", "ready. ask for a script, or press scan game. the header says thinking while it"
+	.. " is working something out -- the reasoning itself is not printed -- and every answer comes"
+	.. " back as one whole script. drag a window's bar, or the orb, with your finger to move it.")
 
 log("System", "Ghaith 2.0 loaded")
 real_print("Ghaith 2.0 · " .. URL .. " · mode " .. MODE)
