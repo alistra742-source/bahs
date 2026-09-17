@@ -172,6 +172,17 @@ script` — and prose is never either of them: an answer that has not produced a
 pane empty, and one that never produces one ends the turn with that line saying so rather than
 `idle`.
 
+**A turn that has stopped moving is dropped, not watched.** That line is the only sign a turn is
+still alive, and a stream that dies mid-answer reads exactly like a model thinking: it once sat
+past 555s with the line still saying `thinking`. So the client counts what the turn has produced —
+the answer, the thinking, a tool result, or the service moving on to another phase, all of it — and
+a turn that has produced nothing new for `STALL` seconds (150) is dropped, with the last thing the
+service said in the reason and `nothing new for 90s` in the line from 30s onward:
+`thinking · qwen3.8-max answering after its last tool call · 555s · 16191 chars thought · nothing
+new for 435s`. The service bounds its own reads the same way (`CHAT_IDLE`), so a stream that goes
+quiet is normally ended there first, as `qwen3.8-max sent nothing for 120s, so the call was
+dropped — ask again`.
+
 **A console error is a turn of its own.** A failure the game prints — a script that threw long after
 the turn that wrote it, a remote that refused a value — reaches the console, and the client turns it
 into a turn: the error is the question, the script that produced it is already the newest assistant
@@ -244,7 +255,8 @@ reads the game is only useful if it can be pointed at something.
 | `REFINE_TOKENS` | `16384` | ceiling on the calls after a tool round, which may be rewriting a whole script |
 | `TOOL_RESULT_MAX` | `20000` | how much of a tool's output is handed back to the model |
 | `SESSION_TTL` | `3600` | how long one session's continuation marker (and its DeepSeek chat) is kept. `/health` reports how many of each are held |
-| `CHAT_TIMEOUT` | `0` | **no ceiling by default**: a turn with tool rounds may take as long as it takes. `0` means no limit; a number puts one back on each call |
+| `CHAT_TIMEOUT` | `0` | **no ceiling on a turn by default**: a turn with tool rounds may take as long as it takes. `0` means no limit; a number puts one back on each call |
+| `CHAT_IDLE` | `120` | how long a provider may send **nothing at all** before the call is dropped. Not a ceiling on the turn but on the silence: a stream that dies mid-answer raises nothing and closes nothing, so without this the turn is waited on forever. `0` waits forever |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |
 | `MAX_TOKENS` | `4096` | ceiling on a `/v1` passthrough the caller did not set one for |
 | `RATE_LIMIT` / `MAX_CONCURRENT` | `30` / `4` | per-IP requests per minute, and turns at once |
@@ -265,7 +277,7 @@ anywhere.
 | answer | Qwen | One streaming call with the eight tool schemas attached, in the setting the turn asked for (`thinking` or `fast`), and the plan as the turn above it. The tool XML and the metadata are cut out of what is streamed, and so is `reasoning_content` -- not by being thrown away, but onto the `thoughts` channel, so a client can show the writer thinking while it writes |
 | tool | this service | If the call asked for tools: each is run, one trace line per call goes to the page's `tool` channel, and the results go back as `tool` turns |
 | round | Qwen | Asked again, in the same chat, with the results in front of it — until an answer asks for nothing |
-| guard | this service | An empty answer, one cut off at the token ceiling, or a content filter is refused. A turn that used its last round on a tool call ships the best script it wrote on the way |
+| guard | this service | An empty answer, one cut off at the token ceiling, or a content filter is refused. A call that goes quiet — the provider sending nothing for `CHAT_IDLE` — is dropped with the silence named in seconds, rather than waited on forever. A turn that used its last round on a tool call ships the best script it wrote on the way |
 | check | this service | Is the answer a script? A paragraph about one is not: it is handed back with the reason (`only 2 of 6 lines read as Lua`) and the writer is asked again, in the same chat, up to `SCRIPT_RETRIES` times — and then the turn *fails*, with the reason in it, rather than reporting an answer nobody can paste anywhere. The one answer that is not a script and not a failure is a list of calls for the Roblox client: those ship, because the client runs them |
 | ship | this service | The script is the answer. The plan, the tool trace and the per-call records stay under it and are not carried into the next question |
 

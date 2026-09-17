@@ -19,6 +19,9 @@ table, that every tool in it reads the game rather than the player's machine, th
 SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes, and that a
 console error becomes a turn of its own for the script that printed it.
 
+And the ceiling on silence: a provider that opens a stream and stops sending ends the turn with
+the silence named in seconds, instead of a turn nobody is ever told about.
+
 No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
 import contextlib, html, io, json, os, re, sys, tempfile, threading, time
@@ -32,7 +35,7 @@ STUB_META = '<!-- qwen_metadata: {"response_id":"r1"} -->'
 CALLS = []
 STUB = {"mode": "plain", "tool": "luau_check", "arguments": None, "openai_tool": False,
         "finish": "stop", "script": "", "finite": 0, "prose": "Let me check that first.\n",
-        "plan": "", "decoy": "",
+        "plan": "", "decoy": "", "hold": 4.0,
         "meta": STUB_META}
 
 DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -159,6 +162,23 @@ class Stub(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _hold(self, first: bytes, seconds: float):
+        """A stream that opens, sends one frame, and then goes quiet.
+
+        No Content-Length and no end: the body runs until the connection closes, and the
+        connection is held open for `seconds`. Nothing about this is an error, a close or an
+        EOF -- which is the point: it is what a provider that dies mid-answer looks like from
+        the other side, and without a read bound it is indistinguishable from a model thinking.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(first)
+        self.wfile.flush()
+        time.sleep(seconds)
+        self.close_connection = True
+
     def do_GET(self):
         if self.path.endswith("/models"):
             return self._send(200, {"object": "list", "data": [{"id": "qwen3.8-max"},
@@ -172,6 +192,9 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.endswith("/validate"):
             return self._send(200, {"valid": True})
         CALLS.append({"path": self.path, "body": body})
+        if STUB["mode"] == "stall":
+            # One frame, then silence, with the connection still open.
+            return self._hold(delta_frame({"content": "local part = "}), STUB["hold"])
         if str(body.get("model") or "").startswith("deepseek") and STUB["plan"]:
             # The second model, in the one place it is used as a planner (agent mode) -- in
             # deepseek mode it is the writer, so no plan is configured and this call falls through
@@ -280,7 +303,8 @@ BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "QWEN_THINKING", "AGENT_ROUNDS", "AGENT_TOOLS", "AGENT_RUN",
     "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL",
     "CHAIN_MODE", "DEEPSEEK_URL", "DEEPSEEK_TOKEN", "DEEPSEEK_MODEL", "DEEPSEEK_THINKING",
-    "DEEPSEEK_SHAPE", "AGENT_WEB", "SCRIPT_RETRIES")}
+    "CHAT_IDLE",
+    "DEEPSEEK_SHAPE", "AGENT_WEB", "SCRIPT_RETRIES", "CHAT_TIMEOUT", "CHAT_IDLE")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
@@ -939,6 +963,44 @@ DEVICE_TOOLS = {"FILES", "READ", "WRITE", "LISTFILES", "READFILE", "WRITEFILE", 
                 "GETCUSTOMASSET", "MAKEFOLDER", "DELETEFILE"}
 
 
+def idle_checks():
+    """The ceiling on silence, which is the failure that reads as a model thinking.
+
+    Two clocks, and they cover different halves of it. The service holds an HTTP client against a
+    provider that can stop sending mid-answer without ever closing: the read bound is what turns
+    that into a 504 with the reason in it. The client's own clock is the other half -- a service
+    that is up, answering polls, and no longer moving -- and there is no Luau here to run, so it is
+    read out of ghaith.lua in client_checks.
+    """
+    print("\nthe ceiling on silence")
+    reload_with()
+    idle = bridge.client_timeout(bridge.CHAT_TIMEOUT)
+    check("no ceiling on a turn by default", bridge.CHAT_TIMEOUT, 0.0)
+    check("but a bound on the silence", idle.read, 120.0)
+    check("which is CHAT_IDLE", idle.read, bridge.CHAT_IDLE)
+    check("connecting is still bounded", idle.connect, 10.0)
+    check("and the answer as a whole still is not", idle.write, None)
+    check("a per-call ceiling is still a ceiling", bridge.client_timeout(30.0).read, 30.0)
+    check("and 0 puts waiting forever back", bridge.client_timeout(0, idle=0).read, None)
+
+    # A provider that opens a stream and then says nothing: the stub holds the connection wide
+    # open, so nothing here is an EOF, a close or an error -- only silence -- and the turn has to
+    # end anyway. The bound is turned down to a second so the check is a second long.
+    reload_with(CHAT_IDLE="1")
+    began = time.time()
+    frames, done, started, calls = turn(mode="stall", session="s-stall")
+    took = time.time() - began
+    errors = [f["error"] for f in frames if f.get("error")]
+    check_true("a stream that goes quiet fails the turn", bool(errors))
+    check("nothing was published as a finished answer", done, {})
+    check_true("and the reason is the silence, in seconds", "sent nothing for 1s" in errors[0])
+    check_true("naming the model rather than the host", bridge.QWEN_MODEL in errors[0])
+    check("so it is not passed off as a host that cannot be reached",
+          "cannot reach" in errors[0] or "cannot connect" in errors[0], False)
+    check_true("and the turn ends before the connection does", took < STUB["hold"])
+    reload_with()
+
+
 def client_checks():
     """The Roblox client, read as the other half of the tool protocol.
 
@@ -1032,6 +1094,21 @@ def client_checks():
           source.count('error_fix_rounds, last_error = 0, ""'), 2)
     check("and the button that stops the watching is on the rail",
           '"errors: ON"' in source, True)
+    # The other half of the same failure, and the one that was actually seen: a service that is
+    # up, answering polls, and no longer moving. The status line still says "thinking", the clock
+    # reads 555s, and nothing is coming -- so the turn is dropped rather than watched forever,
+    # with the silence said while it lasts and the last thing the service said in the reason.
+    check_true("the client gives up on a turn that has stopped moving",
+               re.search(r"local STALL\s+= 150", source))
+    check("and what counts as moving is anything the turn produced, thinking included",
+          "local produced = #text + #thoughts + #plan + #tools_done + #last_note" in source,
+          True)
+    check("so a turn that produced nothing new is the one that is quiet",
+          "quiet = (produced > progress) and 0 or (quiet + POLL)" in source, True)
+    check("the silence is said before it is fatal",
+          'nothing new for " .. math.floor(quiet) .. "s' in source, True)
+    check("and giving up carries what the service last said",
+          '(last_note ~= "" and last_note or "nothing")' in source, True)
 
 
 def main():
@@ -1043,6 +1120,7 @@ def main():
     mode_checks()
     surface_checks()
     client_checks()
+    idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:
         print("failed: " + ", ".join(failures))

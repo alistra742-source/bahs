@@ -297,9 +297,14 @@ def stream_any(provider, messages: list, temperature: Optional[float], max_token
     """
     if provider.web is not None:
         pieces: list = []
-        for piece in provider.web.stream(as_prompt(messages), box, web_session):
-            pieces.append(piece)
-            yield piece
+        try:
+            for piece in provider.web.stream(as_prompt(messages), box, web_session):
+                pieces.append(piece)
+                yield piece
+        except httpx.HTTPError as e:
+            # The site's own transport has no timeout mapping of its own -- bridge.upstream_error is
+            # what names a stream that went quiet rather than a host that cannot be reached.
+            raise upstream_error(e, provider) from e
         if box is not None:
             box["raw"] = "".join(pieces)
             box["tool_calls"] = []

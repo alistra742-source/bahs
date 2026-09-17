@@ -69,15 +69,27 @@ import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 # --- plumbing -------------------------------------------------------------------------
 
 
-def client_timeout(seconds: float) -> httpx.Timeout:
-    """How long a call may take: as long as the model needs, by default.
+def client_timeout(seconds: float, idle: Optional[float] = None) -> httpx.Timeout:
+    """How long a call may take: as long as the model needs, by default -- and how long it may
+    say nothing at all.
 
-    `seconds` of 0 or less means no limit on the answer. Connecting is always bounded, so a host
-    that cannot be reached still fails in seconds rather than sitting there looking like a model
-    that is thinking.
+    `seconds` of 0 or less means no limit on the answer as a whole: a turn with tool rounds may
+    take as long as it takes, and there is no honest number to cut it off at. What is always
+    bounded is the *silence* -- connecting (10s), and then every read, which waits at most `idle`
+    (CHAT_IDLE, 120s, unless the caller says otherwise) for the next chunk.
+
+    The read bound is the one that matters here. Without it a stream that dies mid-answer is
+    indistinguishable from a model thinking: the provider stops sending, nothing raises, and the
+    turn is waited on forever -- a client clock running past 555s while the status line still
+    reads "thinking". With it, that silence becomes a 504 with the reason in it, and the turn ends
+    instead of sitting there. `idle` of 0 or less waits forever, which is what this used to do.
     """
+    if idle is None:
+        idle = CHAT_IDLE
     if seconds and seconds > 0:
         return httpx.Timeout(seconds, connect=10.0)
+    if idle and idle > 0:
+        return httpx.Timeout(None, connect=10.0, read=idle)
     return httpx.Timeout(None, connect=10.0)
 
 
@@ -205,6 +217,10 @@ QWEN_THINKING = env("QWEN_THINKING", default="thinking")
 # a model off for taking its time. 0 (or less) means no limit at all -- connecting is still
 # bounded to 10s, so an unreachable host fails in seconds instead of looking like a slow model.
 CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="0"))
+# How long a provider may say nothing at all before the call is dropped. Not a ceiling on the turn
+# -- see client_timeout -- but a ceiling on the silence, because a stream that stops mid-answer is
+# the one failure that otherwise reads as a model thinking. 0 waits forever.
+CHAT_IDLE = float(env("CHAT_IDLE", default="120"))
 
 QWEN = Provider("qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
                 {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT)
@@ -1369,11 +1385,24 @@ def message_text(body: str) -> str:
     return message.get("content") or ""
 
 
-def upstream_error(e: httpx.HTTPError, provider: Provider) -> HTTPException:
-    """Map an httpx failure onto a status the caller can act on."""
+def upstream_error(e: httpx.HTTPError, provider: Provider,
+                   idle: Optional[float] = None) -> HTTPException:
+    """Map an httpx failure onto a status the caller can act on.
+
+    Three failures read the same in a log and are not the same thing: a host that cannot be
+    reached, a call that ran past its own ceiling, and a stream that went quiet mid-answer. The
+    last one is named as silence, because that is what the caller saw.
+    """
     if isinstance(e, httpx.TimeoutException):
         if provider.timeout and provider.timeout > 0:
             return HTTPException(504, f"{provider.label()} timed out after {provider.timeout:g}s")
+        if isinstance(e, httpx.ReadTimeout):
+            # The service's own read bound, not the caller's ceiling: the stream went quiet and was
+            # dropped. A stream that stops is not a host that cannot be reached, and saying so is
+            # what keeps somebody from going to look at a provider that is fine.
+            quiet = CHAT_IDLE if idle is None else idle
+            return HTTPException(504, f"{provider.model} sent nothing for {quiet:g}s, so the call "
+                                      "was dropped -- ask again")
         return HTTPException(504, f"cannot connect to {provider.endpoint()} in time "
                                   f"({e.__class__.__name__})")
     return HTTPException(502, f"cannot reach {provider.endpoint()} ({e.__class__.__name__})")

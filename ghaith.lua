@@ -61,6 +61,7 @@ local THINK       = "thinking"      -- thinking (work it out first) | fast (same
 -- service is asked to read each time (a whole script per turn adds up fast), and MAXROUNDS is how
 -- many extra round trips the auto loop may spend after the answer has already arrived.
 local POLL        = 0.6             -- seconds between reads of the running turn
+local STALL       = 150             -- seconds of nothing new before a turn is given up on
 local MAXROUNDS   = 3               -- auto: how many run-and-fix rounds it may take
 local HISTORY     = 16              -- turns of conversation kept here (the service trims too)
 
@@ -1452,6 +1453,13 @@ local function ask(question)
 		.. "  ·  " .. tostring(started.thinking or THINK) .. "  ·  session " .. SESSION:sub(1, 6))
 	local text, plan, thoughts, tools_done = "", "", "", ""
 	local last_note, waited = "", 0
+	-- How much the turn has produced, and how long it has been since it produced more. A turn that
+	-- has stopped -- the provider's stream dying mid-answer, a socket open and silent -- reads
+	-- exactly like a turn that is thinking, and the difference is the whole complaint: this client
+	-- once sat on a dead turn for 555 seconds with the status line still saying "thinking". The
+	-- service bounds its own reads (CHAT_IDLE), so this is the second net -- the one for a service
+	-- that is up, answering polls, and no longer moving.
+	local progress, quiet = 0, 0
 
 	while true do
 		task.wait(POLL)
@@ -1472,6 +1480,12 @@ local function ask(question)
 				thoughts = data.thoughts
 			end
 			last_note = tostring(data.note or data.phase or "")
+			-- Anything at all counts as progress: the answer, the thinking, a tool result, or the
+			-- service saying it moved on to another phase. Nothing new for STALL seconds is a turn
+			-- that is not running any more, whatever its status still says.
+			local produced = #text + #thoughts + #plan + #tools_done + #last_note
+			quiet = (produced > progress) and 0 or (quiet + POLL)
+			progress = math.max(progress, produced)
 			-- The mention, and the only place thinking shows at all now: not the chain of thought
 			-- itself, but the fact that it is working one out -- how long it has been at it, and
 			-- how much it has thought so far -- because a turn that says nothing for a minute reads
@@ -1482,7 +1496,19 @@ local function ask(question)
 			if #text == 0 and #thoughts > 0 then
 				note = note .. "  ·  " .. #thoughts .. " chars thought"
 			end
+			-- Said while it happens rather than only when it is over: "nothing new for 60s" is the
+			-- difference between a turn that is slow and one that is not there, and it is a number
+			-- the reader would otherwise be counting in their head.
+			if quiet >= 30 then
+				note = note .. "  ·  nothing new for " .. math.floor(quiet) .. "s"
+			end
 			UI.setStatus(doing, note)
+			if quiet >= STALL then
+				table.remove(MSGS)
+				error(string.format("the service sent nothing new for %ds, so this turn was dropped"
+					.. " -- ask again. It last said: %s", math.floor(quiet),
+					(last_note ~= "" and last_note or "nothing")), 0)
+			end
 			-- The script pane only ever holds a script. The streamed answer is prose about the script
 			-- -- with tool calls in it -- before there is a script at all, and a pane labelled SCRIPT
 			-- full of that is what made a turn with nothing in it read as finished.
