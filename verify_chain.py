@@ -15,8 +15,9 @@ attached, and a mode whose credential is missing being refused by name rather th
 other model.
 
 Last, the Roblox client (ghaith.lua), read as the other half of the tool protocol: its own tool
-table, that every tool in it reads the game rather than the player's machine, and that neither the
-SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes.
+table, that every tool in it reads the game rather than the player's machine, that neither the
+SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes, and that a
+console error becomes a turn of its own for the script that printed it.
 
 No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
@@ -945,8 +946,9 @@ def client_checks():
     they agree: a token the client has no tool for comes back "there is no such tool", and a tool
     the client has and the brief does not mention is never called. What is checked here is the
     client's own table, that everything in it reads the *game* rather than the machine the client
-    is running on, and the two places where an answer is read for a script -- the pane and the
-    copier -- which must never hold prose.
+    is running on, the two places where an answer is read for a script -- the pane and the copier,
+    which must never hold prose and must both read a short script as one -- and the console error
+    that becomes a turn of its own for the script that printed it.
     """
     print("\nthe Roblox client")
     source = Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
@@ -1010,6 +1012,26 @@ def client_checks():
           '" chars  ·  " ..' in source, True)
     check("the status line stays in view while it updates",
           "then scroll_down() end" in source, True)
+    # An answer that is nothing but code is a script however short it is. A three-word one sat in
+    # the pane while the turn's own status line said "no script", because extract's 80-character
+    # floor turned it down and only_code's fallback did not: the two readers agree on it now.
+    check("a whole answer that is code is read as a script whatever its length",
+          "if all_code(bare) then return bare end" in source, True)
+    # The console error nobody asked for, turned into a turn: the error is the question, the script
+    # that produced it is already the newest assistant turn of that chat, and what comes back is
+    # read by the same reader as any other answer.
+    check("a console error becomes a turn of its own",
+          [want for want in ('local ERROR_LINE = "^[%w_%.]+:%d+:"', "error_fix = function(line)",
+                             "task.spawn(error_fix,", "process(table.concat({")
+           if want not in source], [])
+    check("the same error twice is one question, not two",
+          "if problem == last_error then return end" in source, True)
+    check("and a script that fails on every frame cannot spend the conversation",
+          "if error_fix_rounds >= ERR_FIX_MAX then" in source, True)
+    check("a clean run, or a question the player asked, puts the budget back",
+          source.count('error_fix_rounds, last_error = 0, ""'), 2)
+    check("and the button that stops the watching is on the rail",
+          '"errors: ON"' in source, True)
 
 
 def main():

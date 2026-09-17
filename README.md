@@ -148,11 +148,12 @@ the model what is structurally wrong; a run tells it what actually happened.
 The panel you actually use in the game: it talks to `POST /chat/stream` and `GET /chat/result/{job}`
 and keeps the whole conversation, so every turn goes out with all of it. Buttons: **ask**, the mode
 picker, **WRITER** (thinking or fast — the setting travels with the turn, so one chat can be asked
-either way), **scan game**, **console**, and **auto**, which runs what it wrote, hands the console
-back, takes the fix and repeats until the script stops changing. **copy code**, **run** and **full
-script** are not on the rail at all: they are built under each answer that carries a script, which
-is the only place there is anything to copy or run — nothing in the panel offers to run a script
-before there is one. The header is one row, the title and the close button, and the SCRIPT box and
+either way), **scan game**, **console**, **errors** (a console error is sent to the model on its
+own, with the script it came from, for a fixed script), and **auto**, which runs what it wrote,
+hands the console back, takes the fix and repeats until the script stops changing. **copy code**,
+**run** and **full script** are not on the rail at all: they are built under each answer that carries
+a script, which is the only place there is anything to copy or run — nothing in the panel offers to
+run a script before there is one. The header is one row, the title and the close button, and the SCRIPT box and
 the ask box are both shares of the screen rather than fixed numbers of pixels (a 280-pixel box and a
 62-pixel field on a desktop, whatever a phone's height can spare, and stacked on a phone the box and
 the transcript split the room left between them so neither lands on the ask box). The SCRIPT label
@@ -164,9 +165,20 @@ their bars — with a finger, which `Draggable` cannot do.
 and the client turns it into one line at the foot of the transcript (`thinking · 12s · 340 chars
 thought`), the last row of the page — so it reads directly under the newest answer and the **copy
 code** / **run** buttons that belong to it — and it is not shown in a pane and not copied. What the
-SCRIPT pane holds is exactly what **copy code** would copy, and prose is never either of them: an
-answer that has not produced a script yet leaves the pane empty, and one that never produces one
-ends the turn with that line saying so rather than `idle`.
+SCRIPT pane holds is exactly what **copy code** would copy — and what the turn itself ships, so the
+pane and the turn cannot disagree about an answer: one that is nothing but code is a script however
+short it is, and a three-word one used to sit in the pane while the turn's own status line said `no
+script` — and prose is never either of them: an answer that has not produced a script yet leaves the
+pane empty, and one that never produces one ends the turn with that line saying so rather than
+`idle`.
+
+**A console error is a turn of its own.** A failure the game prints — a script that threw long after
+the turn that wrote it, a remote that refused a value — reaches the console, and the client turns it
+into a turn: the error is the question, the script that produced it is already the newest assistant
+turn of the same chat, and the answer comes back as the fixed script the way any other answer does.
+The same error is never asked twice, a turn already running is waited for rather than talked over,
+and three in a row is the ceiling — a script that fails on every frame would otherwise spend the
+whole conversation on itself. **errors** on the rail turns the watching off.
 
 **Its own tool protocol.** The model asks the client for what it needs by writing a token in its
 answer — `@@GREP remote@@` or `@@GREP@@ remote`, both are read, and a multi-line argument
@@ -354,7 +366,8 @@ falling back when it cannot run, and the surface (`/health`, `/v1/models`, the p
 the gate). Last, the Roblox client itself (`ghaith.lua`), read as the other half of the tool
 protocol: its own tool table, that everything in it reads the game rather than the player's
 machine, that the count its header claims is the count there is, that neither the SCRIPT pane nor
-**copy code** can end up holding a paragraph of the model's notes, and where the status line sits
+**copy code** can end up holding a paragraph of the model's notes, that a console error becomes a
+turn of its own for the script that printed it, and where the status line sits
 — the last row of the transcript, with the script box holding the row the header gave up.
 
 ```bash

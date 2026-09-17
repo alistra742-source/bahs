@@ -34,10 +34,11 @@ Four things worth knowing before reading the code:
     token is never part of the script.
 
 Buttons: send (Enter), modes, WRITER (thinking or fast: the same model with the reasoning or
-without it), scan game, console, and auto -- which runs what it wrote, hands the console back,
-gets a fix and repeats until the script stops changing. copy code, run and full are not up
-there: they are built under each answer that carries a script, so the rail never shows a run
-button with no script to run.
+without it), scan game, console, errors (a console error is sent to the model with the script it
+came from, for a fixed script, up to three in a row), and auto -- which runs what it wrote, hands
+the console back, gets a fix and repeats until the script stops changing. copy code, run and full
+are not up there: they are built under each answer that carries a script, so the rail never shows a
+run button with no script to run.
 
 On a phone as well as on a desktop. The panel fills the screen it was given -- minus the strip
 Roblox keeps for its own buttons, which is where its header would otherwise be sitting -- with the
@@ -66,6 +67,20 @@ local HISTORY     = 16              -- turns of conversation kept here (the serv
 local auto        = false           -- auto: run what it wrote, hand the console back, fix and repeat
 local last_code   = ""              -- the script from the last answer, whole
 local last_answer = ""              -- everything the last turn said
+
+-- A console error is the one thing here nobody asked for, and the only place the game says that
+-- something is wrong: the model wrote a script, it threw three minutes later, and the console is
+-- where that shows up. It is worth a turn of its own -- the error goes to the model as the
+-- question, the script that produced it is already the newest assistant turn of the same chat, and
+-- the answer is the fixed script, read exactly as any other answer is. On by default, turned off by
+-- the button on the rail, and bounded: three in a row and it stops and says so rather than spending
+-- the conversation on a script that fails on every frame.
+local watch_errors = true           -- errors: ON | off -- send a console error to the model for a fix
+local ERR_FIX_MAX  = 3              -- how many console errors in a row may each spend a turn
+local ERR_FIX_WAIT = 6              -- seconds a fix turn is given before another error starts one
+local error_fix    = nil            -- filled in below, once the turn it needs exists
+local error_fix_rounds = 0          -- how many of those three are used; a clean run puts it back to 0
+local last_error, last_error_at = "", 0
 
 -- The standing instruction. It goes in one system turn, once, instead of in front of every
 -- question: it is about how the script must come back, and it is true for every question.
@@ -206,10 +221,28 @@ end
 
 local LOGS = {}
 
+-- Whether a line that reached the console is a failure rather than a message. Roblox hands
+-- LogService an Enum.MessageType of its own for the errors it raises, so for those the kind answers
+-- it; a `print` cannot say it that way, so the shape Roblox writes an error in is read too --
+-- `Script:12: attempt to index nil with 'Health'`, and the traceback printed under it.
+local ERROR_LINE = "^[%w_%.]+:%d+:"
+local function looks_like_error(kind, text)
+	if tostring(kind or ""):lower():find("error", 1, true) then return true end
+	local body = tostring(text or "")
+	if body:find("stack traceback", 1, true) then return true end
+	return body:find(ERROR_LINE) ~= nil
+end
+
 local function log(kind, text)
 	table.insert(LOGS, {kind = kind, text = tostring(text), at = os.date("%H:%M:%S")})
 	while #LOGS > 300 do table.remove(LOGS, 1) end
 	if UI.onLog then UI.onLog(LOGS[#LOGS]) end
+	-- An error is handed to the turn below the moment it arrives; a message is just logged. What
+	-- `error_fix` is nil means is that this panel is still being built, which is why a line printed
+	-- before it exists starts nothing.
+	if watch_errors and error_fix and looks_like_error(kind, text) then
+		task.spawn(error_fix, tostring(text or ""))
+	end
 end
 
 pcall(function()
@@ -365,8 +398,9 @@ end
 
 -- The script out of an answer. In order: a fenced block if one is there (a model that fenced
 -- anyway); the whole answer when it reads as one script (the normal path -- this is what the
--- service sends); otherwise the longest run of lines that read as code. "" means the answer
--- carried no script, which is what the re-ask keys off.
+-- service sends); otherwise the longest run of lines that read as code; and last the whole answer
+-- again when every line of it reads as code, which is how a one-line script is read at all. ""
+-- means the answer carried no script, which is what the re-ask keys off.
 local function extract(text)
 	if not text or text == "" then return "" end
 	local t = strip_tool_lines(text:gsub("\r\n", "\n"):gsub("\r", "\n"))
@@ -410,6 +444,13 @@ local function extract(text)
 		local c = table.concat(out, "\n"):gsub("^%s+", ""):gsub("%s+$", "")
 		if #c >= 80 and math.abs(balance(c)) <= 1 then return c end
 	end
+	-- Nothing above took it, and every floor above is about cutting a script *out of* something.
+	-- An answer that is nothing but code is a script however short it is: a one-line `print(...)` is
+	-- three tokens and a whole script, and a turn reading it with extract alone reported no script
+	-- while the SCRIPT pane -- which reads with all_code above -- was showing one. Both readers agree
+	-- here rather than the turn guessing differently, so what the pane holds is what the turn ships.
+	local bare = t:gsub("^%s+", ""):gsub("%s+$", "")
+	if all_code(bare) then return bare end
 	return ""
 end
 
@@ -1575,7 +1616,61 @@ local function process(question)
 end
 
 -- =====================================================================================
--- 7. what a turn runs on: the script it just wrote, and the client itself
+-- 7. an error in the console, turned into a turn of its own
+-- =====================================================================================
+
+-- One console error, one turn. The error is the question; the script that produced it is
+-- already the newest assistant turn of the same chat, so it is not carried again -- the model
+-- answers in the conversation that wrote it, which is how every other question here is
+-- answered.
+--
+-- Four things keep this from becoming a loop, because a script that fails every frame prints
+-- the same error sixty times a second and a turn takes a minute:
+--   * the same text twice is the same answer, so it is not asked again;
+--   * a turn already running is waited for rather than talked over -- and rather than dropped:
+--     what that turn is doing is very likely the answer to this error;
+--   * a second error within ERR_FIX_WAIT of the last one is the tail of the same failure;
+--   * ERR_FIX_MAX of them in a row and it stops and says so. A clean run puts that count back
+--     to nothing, and so does a question the player typed themselves.
+error_fix = function(line)
+	local problem = tostring(line or ""):gsub("%s+$", "")
+	if problem == "" then return end
+	if problem == last_error then return end
+	if os.time() - last_error_at < ERR_FIX_WAIT then return end
+	local waited = 0
+	while busy and waited < 120 do
+		task.wait(1)
+		waited = waited + 1
+	end
+	if busy or last_code == "" then return end
+	-- Read again what was read before the wait: the turn that ran while this one waited may
+	-- have been the answer to this very error, or to the one before it.
+	if problem == last_error then return end
+	if os.time() - last_error_at < ERR_FIX_WAIT then return end
+	if error_fix_rounds >= ERR_FIX_MAX then
+		UI.bubble("system", "that is " .. ERR_FIX_MAX .. " console errors in a row, so this one"
+			.. " is not being sent: press .errors. to stop watching, or say what to change")
+		UI.setStatus("failed", ERR_FIX_MAX .. " console errors in a row; the next one is not sent")
+		return
+	end
+	error_fix_rounds = error_fix_rounds + 1
+	last_error, last_error_at = problem, os.time()
+	if #problem > 2000 then problem = problem:sub(1, 2000) .. "\n... (cut here)" end
+	UI.bubble("error", "console error -- sent to the model with the script it came from:\n"
+		.. problem)
+	process(table.concat({
+		"THE LAST SCRIPT YOU WROTE RAISED THIS IN THE CONSOLE:",
+		"",
+		problem,
+		"",
+		"That is the whole error, exactly as this client's console printed it. Fix the script it",
+		" came from. Reply with ONLY the complete corrected Luau script -- the whole script, not the",
+		" part that changed, and no prose.",
+	}, "\n"))
+end
+
+-- =====================================================================================
+-- 8. what a turn runs on: the script it just wrote, and the client itself
 -- =====================================================================================
 
 local function copy_code(code)
@@ -1616,11 +1711,12 @@ local function execute(code, quiet)
 	local ok, output = run_script(script)
 	if not quiet then UI.bubble(ok and "system" or "error", output) end
 	UI.setStatus(ok and "ready" or "failed", ok and "it ran" or "it failed -- see the console")
+	if ok then error_fix_rounds, last_error = 0, "" end
 	return ok
 end
 
 -- =====================================================================================
--- 8. the panel
+-- 9. the panel
 -- =====================================================================================
 
 local C = {
@@ -2349,6 +2445,7 @@ local function submit()
 	local question = input.Text
 	if question == nil or question:gsub("%s", "") == "" then return end
 	input.Text = ""
+	error_fix_rounds, last_error = 0, ""
 	process(question)
 end
 
@@ -2414,6 +2511,23 @@ auto_button.Activated:Connect(function()
 	UI.setStatus("ready", auto and ("running and fixing itself, up to " .. MAXROUNDS .. " rounds") or "auto off")
 end)
 
+order = order + 1
+order = order + 1
+local errors_button = mk("TextButton", {
+	Size = L.rail_button, BackgroundColor3 = C.ok, Text = "errors: ON",
+	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
+	LayoutOrder = order, ZIndex = 52, Parent = rail,
+})
+round(errors_button, 9)
+errors_button.Activated:Connect(function()
+	watch_errors = not watch_errors
+	errors_button.Text = watch_errors and "errors: ON" or "errors: off"
+	errors_button.BackgroundColor3 = watch_errors and C.ok or C.card
+	UI.setStatus("ready", watch_errors
+		and ("a console error is sent to the model for a fix, up to " .. ERR_FIX_MAX .. " in a row")
+		or "console errors are not sent")
+end)
+
 -- The orb breathes while a turn is running, so a glance says whether it is working. It is a drag
 -- handle as well as a button, so it pulses around wherever it has been put -- its position is read
 -- back each tick rather than computed from the edge it started at, which would drag it home again.
@@ -2432,7 +2546,7 @@ task.spawn(function()
 end)
 
 -- =====================================================================================
--- 9. boot
+-- 10. boot
 -- =====================================================================================
 
 -- --- the screen it landed on ------------------------------------------------------------------
