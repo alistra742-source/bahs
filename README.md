@@ -143,6 +143,49 @@ the model what is structurally wrong; a run tells it what actually happened.
   the model did to its own work), **new chat** (a new session) and **copy**. In agent mode the plan
   is shown above the script.
 
+## The Roblox client (`ghaith.lua`)
+
+The panel you actually use in the game: it talks to `POST /chat/stream` and `GET /chat/result/{job}`
+and keeps the whole conversation, so every turn goes out with all of it. Buttons: **ask**, the mode
+picker, **WRITER** (thinking or fast — the setting travels with the turn, so one chat can be asked
+either way), **scan game**, **run last**, **copy code** (the script and nothing else), **full
+script**, **console**, and **auto**, which runs what it wrote, hands the console back, takes the fix
+and repeats until the script stops changing. It fills the screen it was given minus the strip
+Roblox keeps for its own buttons, and it and every window it opens are dragged by their bars — with
+a finger, which `Draggable` cannot do.
+
+**Thinking is mentioned, never printed.** The chain of thought arrives on the `thoughts` channel
+and the header turns it into one line (`thinking · 12s · 340 chars thought`); it is not shown in a
+pane and not copied. What the SCRIPT pane holds is exactly what **copy code** would copy, and prose
+is never either of them: an answer that has not produced a script yet leaves the pane empty, and
+one that never produces one ends the turn with the header saying so rather than `idle`.
+
+**Its own tool protocol.** The model asks the client for what it needs by writing a token in its
+answer — `@@GREP remote@@` or `@@GREP@@ remote`, both are read, and a multi-line argument
+(`@@EXEC@@`, which is Luau rather than a path) ends at `@@` alone on a line. Eight calls per answer,
+two passes per turn;
+what the tools found goes back as the next turn, which is the agentic part. A line carrying a token
+is never part of the script.
+
+The 29 tools, and every one of them is about the game this client is running in rather than the
+machine it is running on:
+
+| | |
+| --- | --- |
+| **the game** | `@@DEEPSCAN@@`, `@@REMOTES@@`, `@@TREE path@@`, `@@PROPS path@@`, `@@FIND name@@`, `@@PLAYERS@@` |
+| **its scripts** | `@@SCRIPTS@@`, `@@MODULES@@`, `@@SOURCE path@@`, `@@DECOMPILE path@@`, `@@GREP word@@`, `@@DUMP_STRINGS word@@` |
+| **watching it** | `@@HOOK path@@`, `@@UNHOOK path@@`, `@@SPY@@`, `@@SIGNAL path Event@@`, `@@WATCH path Property@@` |
+| **acting on it** | `@@FIRE path args@@` (fires a remote for real and reads the reply), `@@SET path Property value@@` |
+| **inside a function** | `@@HOOKFN path@@`, `@@UPVALUES path@@`, `@@CONSTANTS path@@`, `@@GETGC word@@` |
+| **this client** | `@@EXEC code@@`, `@@RUN@@`, `@@CONSOLE@@`, `@@SELF@@`, `@@ENV word@@`, `@@HTTP url@@` |
+
+A path is read however the model wrote it: `ReplicatedStorage.X`, `game.ReplicatedStorage.X`,
+`game:GetService("ReplicatedStorage").X`, a service name in the wrong case, a bare instance name,
+and a path that misses a link is completed by name rather than refused. What the tool prints is the
+*real* path, so the model can see where the instance was. When nothing matches, the answer is not
+"there is no such thing" but the names in the game closest to the piece that failed — a tool that
+reads the game is only useful if it can be pointed at something.
+
 ## Variables
 
 | Variable | Default | Notes |
@@ -300,7 +343,10 @@ in that order, the plan streaming on its own channel and never into the answer, 
 being unable to install or clear the session's Qwen continuation, deepseek mode attaching no tools,
 a mode whose credential is missing being refused by name, the default following `CHAIN_MODE` and
 falling back when it cannot run, and the surface (`/health`, `/v1/models`, the page, the picker,
-the gate).
+the gate). Last, the Roblox client itself (`ghaith.lua`), read as the other half of the tool
+protocol: its own tool table, that everything in it reads the game rather than the player's
+machine, that the count its header claims is the count there is, and that neither the SCRIPT pane
+nor **copy code** can end up holding a paragraph of the model's notes.
 
 ```bash
 .venv/bin/python verify_chain.py

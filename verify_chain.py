@@ -14,6 +14,10 @@ channel and never into the answer, DeepSeek answering on its own in deepseek mod
 attached, and a mode whose credential is missing being refused by name rather than served by the
 other model.
 
+Last, the Roblox client (ghaith.lua), read as the other half of the tool protocol: its own tool
+table, that every tool in it reads the game rather than the player's machine, and that neither the
+SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes.
+
 No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
 import contextlib, html, io, json, os, re, sys, tempfile, threading, time
@@ -925,6 +929,54 @@ def surface_checks():
           client.get("/agent/pull").status_code, 401)
 
 
+# The client's own tool names, and the machine-reading ones it must not have: the Roblox client
+# reads the game it was executed in, never the player's files.
+GAME_TOOLS = {"DEEPSCAN", "REMOTES", "SCRIPTS", "MODULES", "GREP", "SOURCE", "DECOMPILE",
+              "TREE", "PROPS", "FIND", "DUMP_STRINGS", "FIRE", "HOOKFN", "UPVALUES",
+              "CONSTANTS", "GETGC", "ENV", "EXEC", "RUN", "CONSOLE", "PLAYERS", "SELF"}
+DEVICE_TOOLS = {"FILES", "READ", "WRITE", "LISTFILES", "READFILE", "WRITEFILE", "APPEND",
+                "GETCUSTOMASSET", "MAKEFOLDER", "DELETEFILE"}
+
+
+def client_checks():
+    """The Roblox client, read as the other half of the tool protocol.
+
+    The service hands the model the brief the client sends it, so the two halves only work while
+    they agree: a token the client has no tool for comes back "there is no such tool", and a tool
+    the client has and the brief does not mention is never called. What is checked here is the
+    client's own table, that everything in it reads the *game* rather than the machine the client
+    is running on, and the two places where an answer is read for a script -- the pane and the
+    copier -- which must never hold prose.
+    """
+    print("\nthe Roblox client")
+    source = Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
+    table = source.split("local TOOLS = {", 1)[1].split("\n}", 1)[0]
+    names = re.findall(r'\{name = "([A-Z_]+)"', table)
+    check("the client's tool table was read", len(names) > 20, True)
+    check("every game-reading tool is in it", sorted(GAME_TOOLS - set(names)), [])
+    check("and nothing that reads or writes the player's machine",
+          sorted(DEVICE_TOOLS & set(names)), [])
+    check("the count the header claims is the count there is", len(names), 29)
+    check("and the header claims it in words", "Twenty-nine of them" in source, True)
+    check("the brief goes out with every turn",
+          'MSGS = {{role = "system", content = SYSTEM .. "\\n\\n" .. tool_brief()}}' in source,
+          True)
+    check("the brief says a token is not code",
+          "never put one inside the script you send back" in source, True)
+    check("the pane holds what copy would copy", "local sofar = only_code(text)" in source, True)
+    check("and only_code's fallback has to read as code",
+          "if all_code(bare) then code = bare end" in source, True)
+    check("the scanner reads both token shapes", "@@([A-Z_]+)" in source, True)
+    # Only as the comment that records what it was: `@@([A-Z_]+)%s*([^@]*)@@` ate the next call's
+    # opening token as its own closing one, so half the model's calls were never run.
+    stale = [line for line in source.splitlines()
+             if "@@([A-Z_]+)%s*([^@]*)@@" in line and not line.lstrip().startswith("--")]
+    check("the one-pattern reader that ate the next call is gone", stale, [])
+    check("a path is read however it was written", "SERVICE_NAME" in source, True)
+    check("and a path that is not there says what is",
+          "names in the game closest to" in source, True)
+
+
 def main():
     toolbox_checks()
     reload_with()
@@ -933,6 +985,7 @@ def main():
     script_checks()
     mode_checks()
     surface_checks()
+    client_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:
         print("failed: " + ", ".join(failures))

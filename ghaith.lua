@@ -24,11 +24,14 @@ Four things worth knowing before reading the code:
     and not put in the transcript; it is long, and it is not what anybody is waiting for. "copy
     code" never copies it either: the script is the only thing here that is code.
   * The model can call tools on this client by writing a token in its answer -- @@GREP remote@@ or
-    @@GREP@@ remote, both are read. Twenty-nine of them: the game dump, remotes, sources, greps,
-    hooks, players and the console; the files on the device, a remote fired for real, a function
-    hooked in place, its upvalues and constants, the garbage collector, the executor's own
-    environment, and a live run. Whatever they found goes back as the next turn -- that is the
-    agentic part -- and a line carrying a token is never part of the script.
+    @@GREP@@ remote, both are read. Twenty-nine of them, and every one of them is about the game
+    this client is running in rather than about the machine it is running on: the dump, the
+    remotes, every script and module the client holds (and the decompiler, for the ones it was
+    never sent the source of), greps and string searches, hooks, signals and properties watched,
+    players and the console, a remote fired for real, a function hooked in place, its upvalues and
+    constants, the garbage collector, what this executor hands a script, and a live run. Whatever
+    they found goes back as the next turn -- that is the agentic part -- and a line carrying a
+    token is never part of the script.
 
 Buttons: send (Enter), modes, WRITER (thinking or fast: the same model with the reasoning or
 without it), scan game, run last, copy code (the script and nothing else), full script, console,
@@ -341,6 +344,20 @@ local function strip_tool_lines(text)
 	return table.concat(out, "\n")
 end
 
+-- Whether every line of it reads as code: the test looks_like_script makes, without the length
+-- floor, for the short scripts that test would turn down. What it is for is deciding whether a
+-- short answer may be treated as code at all.
+local function all_code(c)
+	local lines, code = 0, 0
+	for line in ((c or "") .. "\n"):gmatch("([^\n]*)\n") do
+		if line:find("%S") then
+			lines = lines + 1
+			if is_code(line) then code = code + 1 end
+		end
+	end
+	return lines > 0 and code * 3 >= lines * 2 and not has_talk(c)
+end
+
 -- The script out of an answer. In order: a fenced block if one is there (a model that fenced
 -- anyway); the whole answer when it reads as one script (the normal path -- this is what the
 -- service sends); otherwise the longest run of lines that read as code. "" means the answer
@@ -395,7 +412,13 @@ end
 -- one anyway.
 local function only_code(text)
 	local code = extract(text)
-	if code == "" then code = strip_tool_lines(text or "") end
+	if code == "" then
+		-- The fallback is for a script too short for extract's floor, not for prose: what is left
+		-- once the tool lines come out still has to read as code, or the copier would hand a
+		-- paragraph to the executor with the model's tool calls cut out of it.
+		local bare = strip_tool_lines(text or "")
+		if all_code(bare) then code = bare end
+	end
 	local out = {}
 	for line in ((code .. "\n"):gmatch("([^\n]*)\n")) do
 		if not line:find("^%s*```") then table.insert(out, line) end
@@ -438,12 +461,53 @@ local function path_of(instance)
 	return table.concat(parts, ".")
 end
 
+-- A service's name in whatever case it was typed: a model writes "workspace", the instance is
+-- called "Workspace", and the two are the same service.
+local SERVICE_NAME = {}
+for _, name in ipairs(SERVICES) do SERVICE_NAME[name:lower()] = name end
+
+-- The first instance below `root` called `name`, so a path written from memory that misses a link
+-- can still be followed to what was meant. Case is forgiven here and nowhere else: an instance
+-- called `WeaponRemote` is what `weaponremote` in a path meant.
+local function descendant_named(root, name)
+	local ok, list = pcall(function() return root:GetDescendants() end)
+	if not ok then return nil end
+	local wanted = name:lower()
+	for _, item in ipairs(list) do
+		local ok_named, called = pcall(function() return item.Name:lower() == wanted end)
+		if ok_named and called then return item end
+	end
+	return nil
+end
+
+-- A path, read as the instance it means.
+--
+-- Accepted: `ReplicatedStorage.X`, `game.ReplicatedStorage.X`, `game:GetService("ReplicatedStorage").X`
+-- -- everything here is already inside the game, so the prefix is noise -- a service name in the
+-- wrong case, a path with the client's own token marks still on it, and a bare name. A path that
+-- misses a link is completed by name rather than refused, and what the caller prints is the real
+-- path, so the model can see where the instance actually was.
+--
+-- Returns the instance, or `nil, piece` naming the part of the path that was not there.
 local function resolve(path)
+	local cleaned = tostring(path or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("@", "")
+	cleaned = cleaned:gsub("^game%s*[%.:]%s*", "")
+	local service, rest = cleaned:match("^GetService%s*%(%s*[\"']?([^\"')]+)[\"']?%s*%)%s*%.?(.*)$")
+	if service then cleaned = service .. (rest ~= "" and ("." .. rest) or "") end
+	cleaned = cleaned:gsub("^:?%s*", ""):gsub("%.$", "")
+	if cleaned == "" then return game end
 	local node = game
-	if path and path ~= "" then
-		for piece in path:gmatch("[^%.]+") do
-			node = node:FindFirstChild(piece)
-			if not node then return nil end
+	for piece in cleaned:gmatch("[^%.]+") do
+		piece = piece:gsub("^%s+", ""):gsub("%s+$", ""):gsub("[\"')]+$", "")
+		if piece ~= "" then
+			local child = node:FindFirstChild(piece)
+			if not child and SERVICE_NAME[piece:lower()] then
+				child = node:FindFirstChild(SERVICE_NAME[piece:lower()])
+			end
+			if not child then child = descendant_named(node, piece) end
+			if not child and node ~= game then child = descendant_named(game, piece) end
+			if not child then return nil, piece end
+			node = child
 		end
 	end
 	return node
@@ -455,6 +519,107 @@ local function source_of(instance, cap)
 	src = src:gsub("[%z\1-\8\11-\31\127]", "")
 	if #src > cap then src = src:sub(1, cap) .. "\n--" end
 	return src
+end
+
+-- Everything this client holds: the executor's own lists when it has them (they include instances
+-- that cannot be walked to from a service -- a module required out of nowhere, a script whose
+-- parent is not in the tree), and the services as well, because an executor with neither list still
+-- leaves the game walkable. This is the game's own contents, not anything on the device.
+local function all_instances()
+	local out, seen = {}, {}
+	local function add(item)
+		if not item or seen[item] then return end
+		seen[item] = true
+		table.insert(out, item)
+	end
+	local function add_all(list)
+		if type(list) ~= "table" then return end
+		for _, item in ipairs(list) do add(item) end
+	end
+	for _, name in ipairs({"getinstances", "getscripts", "getloadedmodules"}) do
+		local fn = primitive(name)
+		if type(fn) == "function" then pcall(function() add_all(fn()) end) end
+	end
+	for _, name in ipairs(SERVICES) do
+		local service = game:FindFirstChild(name)
+		if service then
+			add(service)
+			local ok, list = pcall(function() return service:GetDescendants() end)
+			if ok then add_all(list) end
+		end
+	end
+	add(game)
+	return out
+end
+
+local function all_scripts()
+	local out = {}
+	for _, item in ipairs(all_instances()) do
+		local ok, is = pcall(function()
+			return item:IsA("Script") or item:IsA("LocalScript") or item:IsA("ModuleScript")
+		end)
+		if ok and is then table.insert(out, item) end
+	end
+	return out
+end
+
+-- What a path that did not resolve gets back. "There is no such thing" leaves a model writing the
+-- same wrong path again; the names that are there -- the ones closest to the piece that failed --
+-- are what lets it write the right one, and a tool that reads the game is only useful if it can be
+-- pointed at something.
+local function no_such(path)
+	local text = tostring(path or "")
+	local piece = text:gsub("%s+$", ""):match("([^%.]+)$") or text
+	local names, seen = {}, {}
+	local wanted = piece:lower()
+	for _, item in ipairs(all_instances()) do
+		local ok, name = pcall(function() return tostring(item.Name) end)
+		-- Either direction: `part` names the instance called `Part1`, and `Part1` names `part`.
+		local lower = ok and tostring(name):lower() or ""
+		local close = #lower >= 3 and #wanted >= 3
+			and (lower:find(wanted, 1, true) or wanted:find(lower, 1, true))
+		if close and not seen[name] then
+			seen[name] = true
+			table.insert(names, name)
+		end
+		if #names >= 12 then break end
+	end
+	if #names > 0 then
+		return "there is no " .. text .. " -- names in the game closest to " .. piece .. ": "
+			.. table.concat(names, ", ")
+	end
+	return "there is no " .. text .. " -- @@TREE path@@, @@FIND name@@ and @@DEEPSCAN@@ show what is there"
+end
+
+-- The text of one script, from wherever it can be had. `Source` first: it is the real text and it
+-- costs nothing. The decompiler only when that reads empty, which is the normal case for a
+-- LocalScript the client was never sent the source of -- the bytecode is all there is, and turning
+-- it back into Lua is the only way to read the file at all. Nothing is invented: when neither works
+-- this says so in as many words.
+local function script_source(instance, cap, allow_decompile)
+	local src = source_of(instance, cap)
+	if src then return src, "source" end
+	if not allow_decompile then return nil, "this client was not sent the source" end
+	local decompile = primitive("decompile")
+	if type(decompile) ~= "function" then
+		return nil, "no source here, and this executor has no decompile()"
+	end
+	local arguments = {}
+	local bytes = primitive("getscriptbytecode")
+	if type(bytes) == "function" then
+		local ok, raw = pcall(bytes, instance)
+		if ok and type(raw) == "string" and #raw > 0 then table.insert(arguments, raw) end
+	end
+	table.insert(arguments, instance)
+	for _, argument in ipairs(arguments) do
+		local ok, text = pcall(decompile, argument)
+		if ok and type(text) == "string" and #text > 0 then
+			text = text:gsub("[%z\1-\8\11-\31\127]", "")
+			if #text > cap then text = text:sub(1, cap) .. "\n--" end
+			return text, "decompiled"
+		end
+	end
+	return nil, "the decompiler returned nothing for it"
 end
 
 -- Every instance under the usual services, with the things worth reading written out.
@@ -501,89 +666,89 @@ end
 
 local function remotes()
 	local out = {}
-	for _, name in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name)
-		if service then
-			for _, d in ipairs(service:GetDescendants()) do
-				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
-					table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
-				end
-			end
+	for _, d in ipairs(all_instances()) do
+		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
+			table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
 		end
 	end
+	if #out == 0 then return "no remotes in this client" end
 	return table.concat(out, "\n")
 end
 
+-- Every script this client holds, by path, with the text of the ones whose source it has. The ones
+-- it does not have are named too, and marked: a client is never sent the source of a LocalScript it
+-- did not load, so `@@DECOMPILE path@@` is how those files get read.
 local function sources(kind, cap)
-	local out = {}
-	for _, name in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name)
-		if service then
-			for _, d in ipairs(service:GetDescendants()) do
-				if d:IsA("ModuleScript") and (kind == "module" or kind == "all") then
-					table.insert(out, "[MODULE] " .. path_of(d))
-					local src = source_of(d, cap)
-					if src then table.insert(out, src) end
-				elseif (d:IsA("Script") or d:IsA("LocalScript"))
-					and (kind == "script" or kind == "all") then
-					table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
-					local src = source_of(d, cap)
-					if src then table.insert(out, src) end
-				end
+	local out, blind, listed = {}, 0, 0
+	for _, d in ipairs(all_scripts()) do
+		local module = d:IsA("ModuleScript")
+		if (module and (kind == "module" or kind == "all"))
+			or (not module and (kind == "script" or kind == "all")) then
+			listed = listed + 1
+			table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
+			local src = source_of(d, cap)
+			if src then
+				table.insert(out, src)
+			else
+				blind = blind + 1
+				table.insert(out, "-- no source here: @@DECOMPILE " .. path_of(d) .. "@@ reads it")
 			end
 		end
+	end
+	if listed == 0 then return "no " .. kind .. "s in this client" end
+	if blind > 0 then
+		table.insert(out, string.format("-- %d of the %d have no source here; @@DECOMPILE path@@ reads those",
+			blind, listed))
 	end
 	return table.concat(out, "\n\n")
 end
 
 local function grep(word)
 	if not word or word == "" then return "no word given" end
-	local out, needle = {}, word:lower()
-	for _, name in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name)
-		if service then
-			for _, d in ipairs(service:GetDescendants()) do
-				if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
-					local src = source_of(d, 30000)
-					if src and src:lower():find(needle, 1, true) then
-						table.insert(out, path_of(d))
-						local shown = 0
-						for line in src:gmatch("[^\n]+") do
-							if line:lower():find(needle, 1, true) then
-								table.insert(out, "  " .. line)
-								shown = shown + 1
-								if shown >= 6 then break end
-							end
-						end
-					end
+	local out, needle, blind = {}, word:lower(), 0
+	for _, d in ipairs(all_scripts()) do
+		local src = source_of(d, 30000)
+		if not src then
+			blind = blind + 1
+		elseif src:lower():find(needle, 1, true) then
+			table.insert(out, path_of(d))
+			local shown = 0
+			for line in src:gmatch("[^\n]+") do
+				if line:lower():find(needle, 1, true) then
+					table.insert(out, "  " .. line)
+					shown = shown + 1
+					if shown >= 6 then break end
 				end
 			end
 		end
 	end
-	if #out == 0 then return "nothing in the game's scripts contains " .. word end
+	if #out == 0 then
+		return "nothing in the game's readable scripts contains " .. word
+			.. (blind > 0 and (" (" .. blind .. " script(s) here have no source; @@DECOMPILE path@@ reads them)")
+				or "")
+	end
+	if blind > 0 then
+		table.insert(out, "-- " .. blind .. " further script(s) were not searched: no source here")
+	end
 	return table.concat(out, "\n")
 end
 
 local function find_by_name(name)
 	if not name or name == "" then return "no name given" end
 	local out, needle = {}, name:lower()
-	for _, name_service in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name_service)
-		if service then
-			for _, d in ipairs(service:GetDescendants()) do
-				if d.Name:lower():find(needle, 1, true) then
-					table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
-				end
-			end
+	for _, d in ipairs(all_instances()) do
+		local ok, label = pcall(function() return tostring(d.Name) end)
+		if ok and label:lower():find(needle, 1, true) then
+			table.insert(out, "[" .. d.ClassName .. "] " .. path_of(d))
 		end
 	end
-	if #out == 0 then return "nothing is named like " .. name end
+	if #out == 0 then return "nothing in this client is named like " .. name end
 	return table.concat(out, "\n")
 end
 
 local function tree(root)
 	local node = resolve(root)
-	if not node then return "there is no " .. tostring(root) end
+	if not node then return no_such(root) end
 	local out = {}
 	local function walk(item, depth)
 		table.insert(out, string.rep("  ", depth) .. item.Name .. " [" .. item.ClassName .. "]")
@@ -596,7 +761,7 @@ end
 
 local function props(path)
 	local node = resolve(path)
-	if not node then return "there is no " .. tostring(path) end
+	if not node then return no_such(path) end
 	local out = {"[PROPS] " .. path_of(node)}
 	local names = {"Name", "ClassName", "Value", "Text", "Health", "MaxHealth", "WalkSpeed",
 		"JumpPower", "JumpHeight", "Position", "Size", "Anchored", "CanCollide", "Transparency",
@@ -614,21 +779,14 @@ end
 -- this from a dump into a search.
 local function strings(word)
 	local out, needle, cap = {}, (word or ""):lower(), 400
-	for _, name in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name)
-		if service then
-			for _, d in ipairs(service:GetDescendants()) do
-				if d:IsA("Script") or d:IsA("LocalScript") or d:IsA("ModuleScript") then
-					local src = source_of(d, 30000)
-					if src then
-						for literal in src:gmatch('"(.-)"') do
-							local keep = #literal >= 4 and #literal <= 120
-							if keep and needle ~= "" then keep = literal:lower():find(needle, 1, true) ~= nil end
-							if keep and #out < cap then
-								table.insert(out, path_of(d) .. " -> " .. literal)
-							end
-						end
-					end
+	for _, d in ipairs(all_scripts()) do
+		local src = source_of(d, 30000)
+		if src then
+			for literal in src:gmatch('"(.-)"') do
+				local keep = #literal >= 4 and #literal <= 120
+				if keep and needle ~= "" then keep = literal:lower():find(needle, 1, true) ~= nil end
+				if keep and #out < cap then
+					table.insert(out, path_of(d) .. " -> " .. literal)
 				end
 			end
 		end
@@ -646,7 +804,7 @@ local SPY = {}
 
 local function hook(path)
 	local remote = resolve(path)
-	if not remote then return "there is no " .. tostring(path) end
+	if not remote then return no_such(path) end
 	if not (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then
 		return path .. " is not a remote"
 	end
@@ -667,7 +825,7 @@ end
 
 local function unhook(path)
 	local remote = resolve(path)
-	if not remote then return "there is no " .. tostring(path) end
+	if not remote then return no_such(path) end
 	HOOKED[remote] = nil
 	HOOKED[path] = nil          -- so @@HOOKFN@@ on the same path is not refused as a repeat
 	return "stopped logging " .. path
@@ -711,49 +869,58 @@ end
 -- guaranteed to exist -- executors differ -- so each one answers "this client cannot do that"
 -- instead of erroring, and the tool result is what tells the model which world it is in.
 
-local function files_under(prefix)
-	if type(listfiles) ~= "function" then return "this executor has no listfiles" end
-	local ok, list = pcall(listfiles, (prefix ~= "" and prefix) or nil)
-	if not ok then return "listfiles refused: " .. tostring(list) end
-	if type(list) ~= "table" or #list == 0 then
-		return "no files" .. (prefix ~= "" and (" under " .. prefix) or "")
+-- Everything an instance fires with, by event name: the way to read what the game does to itself --
+-- `@@SIGNAL workspace ChildAdded@@`, `@@SIGNAL game.Players.LocalPlayer CharacterAdded@@`. What it
+-- fires with goes to @@SPY@@, so several of these can be listening at once and read together.
+local function watch_signal(arg)
+	local path, member = (arg or ""):match("^(%S+)%s+(%S+)$")
+	if not path then
+		return "use @@SIGNAL path EventName@@, e.g. @@SIGNAL game.Workspace ChildAdded@@"
 	end
-	local out = {}
-	for i = 1, math.min(#list, 200) do table.insert(out, tostring(list[i])) end
-	if #list > 200 then table.insert(out, "... and " .. (#list - 200) .. " more") end
-	return table.concat(out, "\n")
+	local node = resolve(path)
+	if not node then return no_such(path) end
+	local ok, problem = pcall(function()
+		local signal = node[member]
+		if signal == nil then error(member .. " is not a member of " .. path) end
+		signal:Connect(function(...)
+			local parts = {}
+			for i, value in ipairs({...}) do parts[i] = tostring(value) end
+			table.insert(SPY, "[EVENT] " .. path .. "." .. member .. " -> " .. table.concat(parts, " | "))
+		end)
+	end)
+	if not ok then
+		return "could not listen to " .. path .. "." .. member .. ": " .. tostring(problem)
+	end
+	return "listening to " .. path .. "." .. member .. " -- every firing goes to @@SPY@@"
 end
 
-local function file_read(path)
-	if path == "" then return "no path given" end
-	if type(readfile) ~= "function" then return "this executor has no readfile" end
-	local ok, body = pcall(readfile, path)
-	if not ok then return "readfile refused " .. path .. ": " .. tostring(body) end
-	body = tostring(body)
-	if #body > 40000 then body = body:sub(1, 40000) .. "\n--[cut]" end
-	return body
-end
-
--- The path is the first line (or the first word, when it was written on one line) and the body is
--- everything after it, which is how a file that is more than one line gets written.
-local function file_write(arg)
-	local first_line, rest = (arg or ""):match("^([^\n]*)\n?(.*)$")
-	first_line = first_line or ""
-	local path, body = first_line, rest or ""
-	if body == "" then path, body = first_line:match("^(%S+)%s*(.*)$") end
-	path = (path or ""):gsub("%s+$", "")
-	if path == "" then return "no path given: write the path first, then the file body" end
-	if type(writefile) ~= "function" then return "this executor has no writefile" end
-	local ok, err = pcall(writefile, path, body or "")
-	if not ok then return "writefile refused " .. path .. ": " .. tostring(err) end
-	return "wrote " .. #(body or "") .. " characters to " .. path
+-- One property, followed: `@@WATCH game.Workspace.Part Transparency@@`. Its changes go to the same
+-- log as a hooked remote, which is how a value that a script only ever sets from inside is read.
+local function watch_property(arg)
+	local path, member = (arg or ""):match("^(%S+)%s+(%S+)$")
+	if not path then
+		return "use @@WATCH path Property@@, e.g. @@WATCH game.Workspace.Part Transparency@@"
+	end
+	local node = resolve(path)
+	if not node then return no_such(path) end
+	local ok, problem = pcall(function()
+		node:GetPropertyChangedSignal(member):Connect(function()
+			local got, value = pcall(function() return tostring(node[member]) end)
+			table.insert(SPY, "[CHANGED] " .. path .. "." .. member .. " = "
+				.. (got and value or "?") )
+		end)
+	end)
+	if not ok then
+		return "could not watch " .. path .. "." .. member .. ": " .. tostring(problem)
+	end
+	return "watching " .. path .. "." .. member .. " -- every change goes to @@SPY@@"
 end
 
 local function fire_remote(arg)
 	local path, rest = (arg or ""):match("^(%S+)%s*(.*)$")
 	if not path then return "use @@FIRE path arg1 arg2@@ -- the arguments are Lua values" end
 	local remote = resolve(path)
-	if not remote then return "there is no " .. path end
+	if not remote then return no_such(path) end
 	if not (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")
 		or remote:IsA("UnreliableRemoteEvent")) then
 		return path .. " is a " .. remote.ClassName .. ", which is not a remote"
@@ -784,7 +951,7 @@ end
 local function hook_fn(path)
 	if type(hookfunction) ~= "function" then return "this executor has no hookfunction" end
 	local object, member = resolve_member(path)
-	if not object then return "there is no " .. tostring(path) end
+	if not object then return no_such(path) end
 	local original = member and object[member] or object
 	if type(original) ~= "function" then return path .. " is not a function" end
 	if HOOKED[path] then return "already logging " .. path end
@@ -889,7 +1056,7 @@ local function set_property(arg)
 	local path, prop, written = (arg or ""):match("^(%S+)%s+(%S+)%s*(.*)$")
 	if not path then return "use @@SET path Property value@@ -- value is a Lua value" end
 	local node = resolve(path)
-	if not node then return "there is no " .. path end
+	if not node then return no_such(path) end
 	local value = value_of(written)
 	local ok, err = pcall(function() node[prop] = value end)
 	if not ok and type(sethiddenproperty) == "function" then
@@ -921,19 +1088,25 @@ local function executor_info()
 	pcall(function()
 		if identifyexecutor then name = tostring(identifyexecutor()) end
 	end)
-	-- What the deep tools need, and whether this executor hands it over: the answer decides
-	-- which of them are worth asking for on this device.
+	-- What the deep tools need, and whether this executor hands it over: the answer decides which
+	-- of them are worth asking for, and the ones about scripts decide whether a file this client
+	-- was not sent the source of can be read at all.
 	local can = {}
-	for _, wanted in ipairs({"listfiles", "readfile", "writefile", "getgc", "getupvalues",
-		"getconstants", "hookfunction", "getgenv"}) do
+	for _, wanted in ipairs({"getscripts", "getinstances", "getloadedmodules", "getscriptbytecode",
+		"decompile", "getgc", "getupvalues", "getconstants", "hookfunction", "getgenv"}) do
 		if type(primitive(wanted)) == "function" then table.insert(can, wanted) end
 	end
+	local scripts = #all_scripts()
 	return table.concat({
 		"executor: " .. name,
 		"loadstring: " .. (LOAD and "yes" or "no"),
 		"http: " .. (HTTP and "yes" or "no"),
 		"clipboard: " .. (clipboard and "yes" or "no"),
+		"scripts in this client: " .. scripts,
 		"primitives: " .. (#can > 0 and table.concat(can, ", ") or "none of the extra ones"),
+		((type(primitive("decompile")) == "function")
+			and "a decompiler is here, so @@SOURCE@@ reads a script whose source was never sent"
+			or "no decompile(): scripts whose source was not sent cannot be read here"),
 		"writer: " .. THINK .. " (the WRITER button switches it)",
 		"place: " .. game.Name .. " (" .. tostring(game.PlaceId) .. ")",
 		"player: " .. LP.Name .. " (" .. LP.DisplayName .. ")",
@@ -944,15 +1117,46 @@ end
 -- agent that can change one line in it instead of writing everything again.
 local function source_at(path)
 	local node = resolve(path)
-	if not node then return "there is no " .. tostring(path) end
+	if not node then return no_such(path) end
 	if not (node:IsA("Script") or node:IsA("LocalScript") or node:IsA("ModuleScript")) then
 		return path_of(node) .. " is a " .. node.ClassName .. " and has no source to read"
 	end
-	local src = source_of(node, 40000)
+	-- The decompiler as well as `Source`: a LocalScript the client was never sent the text of is
+	-- still a file in the game, and its bytecode is what there is of it.
+	local src, how = script_source(node, 60000, true)
 	if not src then
-		return "the source of " .. path_of(node) .. " reads as empty (no ProtectedString source)"
+		return "could not read " .. path_of(node) .. ": " .. tostring(how)
 	end
-	return "[" .. node.ClassName .. "] " .. path_of(node) .. "\n" .. src
+	return "[" .. node.ClassName .. "] " .. path_of(node) .. " (read from " .. how .. ")\n" .. src
+end
+
+-- The decompiler, asked for by name: the same text @@SOURCE@@ would give, but this one says how it
+-- was got and how big the bytecode behind it is, which is what tells the model whether it is looking
+-- at the game's own source or at a reconstruction of it.
+local function decompile_at(path)
+	local node = resolve(path)
+	if not node then return no_such(path) end
+	local ok, is_script = pcall(function()
+		return node:IsA("Script") or node:IsA("LocalScript") or node:IsA("ModuleScript")
+	end)
+	if not ok or not is_script then
+		return path_of(node) .. " is a " .. node.ClassName .. " and has no source to read"
+	end
+	local bytes = 0
+	local reader = primitive("getscriptbytecode")
+	if type(reader) == "function" then
+		local got, raw = pcall(reader, node)
+		if got and type(raw) == "string" then bytes = #raw end
+	end
+	local text, how = script_source(node, 60000, true)
+	if not text then
+		return "could not read " .. path_of(node) .. ": " .. tostring(how)
+	end
+	return table.concat({
+		"[" .. node.ClassName .. "] " .. path_of(node),
+		"read from: " .. how .. "  (bytecode: " .. bytes .. " bytes)",
+		(text .. "\n"):gsub("\n$", ""),
+	}, "\n")
 end
 
 -- What every hooked remote has fired with since it was hooked, newest last. The log the HOOK tool
@@ -994,10 +1198,10 @@ local TOOLS = {
 		run = function() return deep_scan() end},
 	{name = "REMOTES", hint = "every RemoteEvent / RemoteFunction and its path",
 		run = function() return remotes() end},
-	{name = "SCRIPTS", hint = "every script and local script with its source",
-		run = function() return sources("script", 4000) end},
-	{name = "MODULES", hint = "every module script with its source",
-		run = function() return sources("module", 6000) end},
+	{name = "SCRIPTS", hint = "every script and local script in the game, with the source of the ones this client has",
+		run = function() return sources("script", 8000) end},
+	{name = "MODULES", hint = "every module script in the game, with the source of the ones this client has",
+		run = function() return sources("module", 8000) end},
 	{name = "GREP", hint = "@@GREP word@@ the lines of script source containing word",
 		run = function(arg) return grep(arg) end},
 	{name = "FIND", hint = "@@FIND name@@ every instance whose name contains name",
@@ -1018,20 +1222,20 @@ local TOOLS = {
 		run = function() return console_since(math.max(0, #LOGS - 60), 4000) end},
 	{name = "RUN", hint = "run the last script you wrote here and get its prints or its error",
 		run = function() return run_last() end},
-	{name = "SOURCE", hint = "@@SOURCE path@@ the source of one script or module, on its own",
+	{name = "SOURCE", hint = "@@SOURCE path@@ read one script of the game: its source, or the decompiled bytecode when the client was never sent the text",
 		run = function(arg) return source_at(arg) end},
+	{name = "DECOMPILE", hint = "@@DECOMPILE path@@ the same text, but saying whether it is the game's own source or a decompilation",
+		run = function(arg) return decompile_at(arg) end},
 	{name = "SPY", hint = "what every @@HOOK@@ed remote has fired with since it was hooked",
 		run = function() return spy_log() end},
 	{name = "EXEC", hint = "@@EXEC code@@ run a snippet here: what it returned, and what it printed",
 		run = function(arg) return exec_snippet(arg) end},
 	{name = "SELF", hint = "this client: what it can do, and the tools available",
 		run = function() return executor_info() end},
-	{name = "FILES", hint = "@@FILES prefix@@ the files this executor can see, under prefix",
-		run = function(arg) return files_under(arg) end},
-	{name = "READ", hint = "@@READ path@@ the contents of a file on the device",
-		run = function(arg) return file_read(arg) end},
-	{name = "WRITE", hint = "@@WRITE@@ path, then the file body on the lines under it, then @@",
-		run = function(arg) return file_write(arg) end},
+	{name = "SIGNAL", hint = "@@SIGNAL path EventName@@ log everything that instance fires with",
+		run = function(arg) return watch_signal(arg) end},
+	{name = "WATCH", hint = "@@WATCH path Property@@ log every change of one property",
+		run = function(arg) return watch_property(arg) end},
 	{name = "FIRE", hint = "@@FIRE path arg1, arg2@@ fire or invoke a remote and read the reply",
 		run = function(arg) return fire_remote(arg) end},
 	{name = "HOOKFN", hint = "@@HOOKFN path@@ log every call of a function and what it returned",
@@ -1057,8 +1261,10 @@ local function tool_brief()
 	end
 	table.insert(out, table.concat({
 		"Put each call on a line of its own, either as @@GREP remote@@ or as @@GREP@@ remote.",
-		"For an argument longer than one line (a @@WRITE@@ body, an @@EXEC@@ snippet), write the token",
-		"alone on its line, then the argument, then @@ alone on a line to close it.",
+		"For an argument longer than one line (an @@EXEC@@ snippet), write the token alone on its",
+		"line, then the argument, then @@ alone on a line to close it.",
+		"Everything here reads the game this client is running in -- its scripts, its remotes, its",
+		"values and what it fires -- and never anything on the player's machine.",
 		"The tokens are not code: never put one inside the script you send back, and never describe",
 		"a call in prose instead of writing it -- a token is run, a sentence about one is not.",
 	}, " "))
@@ -1234,7 +1440,10 @@ local function ask(question)
 			-- The script pane only ever holds a script. The streamed answer is prose about the script
 			-- -- with tool calls in it -- before there is a script at all, and a pane labelled SCRIPT
 			-- full of that is what made a turn with nothing in it read as finished.
-			local sofar = extract(text)
+			-- Through only_code, never extract: the pane is what "copy code" would copy, so a turn
+			-- that has written prose so far leaves it empty rather than filling a pane labelled
+			-- SCRIPT with a paragraph of the model's notes.
+			local sofar = only_code(text)
 			if sofar ~= "" then UI.setCode(sofar) end
 			if status == "error" then
 				table.remove(MSGS)
@@ -1350,7 +1559,14 @@ local function process(question)
 	if auto and last_code ~= "" then auto_rounds() end
 	busy = false
 	UI.setBusy(false)
-	UI.setStatus("ready", "idle")
+	-- A turn that spent itself asking for tools and never wrote a script has not answered, and the
+	-- header says so instead of "idle": the difference between nothing to do and nothing came back
+	-- is the one thing the transcript alone cannot show.
+	if last_code == "" then
+		UI.setStatus("no script", "the last answer was not one -- ask again, or say: now write it")
+	else
+		UI.setStatus("ready", "idle")
+	end
 end
 
 -- =====================================================================================
@@ -2043,7 +2259,7 @@ UI.setStatus = function(state, note)
 	status_label.Text = tostring(state or "") .. (note and note ~= "" and ("  ·  " .. tostring(note)) or "")
 	local color = C.ok
 	local lower = tostring(state):lower()
-	if lower:find("fail") or lower:find("error") then color = C.bad end
+	if lower:find("fail") or lower:find("error") or lower:find("no script") then color = C.bad end
 	if lower == "running" or lower == "reconnecting" or lower == "retrying" then color = C.accent2 end
 	pulse_dot.BackgroundColor3 = color
 end
