@@ -191,6 +191,19 @@ The same error is never asked twice, a turn already running is waited for rather
 and three in a row is the ceiling — a script that fails on every frame would otherwise spend the
 whole conversation on itself. **errors** on the rail turns the watching off.
 
+**scan game sends the whole game, not a selection of it.** The dump it builds has two halves: every
+script and module this client holds, by path, with its text under it — or the line saying this
+client was never sent that text, and which token reads it anyway — and then every other instance in
+the game (parts, models, folders, GUIs, tools, remotes, values), by class and path, grouped under
+the service it lives in. Nothing is left out for looking uninteresting: the scripts are written
+first, so they are never what a size limit cuts, and the dump ends with the counts — naming how
+many lines did not fit when it did run out of room, rather than reading as a game that ended. What
+went out is readable byte for byte in the **GAME DUMP** window it opens, and the transcript says
+what was found before any answer arrives. Two numbers bound it, both named at the top of the
+client: `SCAN_BUDGET` (300,000 characters of dump — the question the model is asked, so it is the
+number to raise when a game does not fit and cut when a turn comes back complaining about the size
+of what it was sent) and `SCAN_SOURCE` (40,000 characters of one script's own text).
+
 **Its own tool protocol.** The model asks the client for what it needs by writing a token in its
 answer — `@@GREP remote@@` or `@@GREP@@ remote`, both are read, and a multi-line argument
 (`@@EXEC@@`, which is Luau rather than a path) ends at `@@` alone on a line. Eight calls per answer,

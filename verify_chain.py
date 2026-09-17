@@ -1111,6 +1111,79 @@ def client_checks():
           '(last_note ~= "" and last_note or "nothing")' in source, True)
 
 
+def scan_checks():
+    """scan game: the whole game written out, and what went out said out loud.
+
+    The first dump was a selection of the game: remotes, scripts, modules and values were written
+    down, every other instance in it was counted without ever being named, and the whole thing was
+    capped at a literal 180,000 characters with each script read at 4,000. What is checked here is
+    that nothing is filtered any more -- every service the game actually has is walked, every
+    instance in it gets a line, every script gets its text, and the scripts are written before
+    anything else so they are never what a budget cuts -- and that a dump which did run out of room
+    says so instead of reading as a game that has nothing more in it. There is no Roblox here to
+    run the client in, so the function is read out of ghaith.lua, as in client_checks.
+    """
+    print("\nscan game: the whole game")
+    source = Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
+    dump = source.split("local function deep_scan()", 1)[1].split("\nend\n", 1)[0]
+    check_true("the scan was read out of the client", len(dump) > 2000)
+
+    # Every service the game has, rather than the sixteen names the first dump knew: a game can
+    # hold a service that list never had, and everything under it used to be invisible.
+    check("the walk is the game's own services, not the usual list of names",
+          "return game:GetChildren()" in dump, True)
+    check("and the usual names are still asked for, in case one is not a child yet",
+          "for _, name in ipairs(SERVICES) do root(game:FindFirstChild(name)) end" in dump, True)
+    # Everything else in the game, by name: parts, models, folders, GUIs, tools -- the classes the
+    # first dump only counted.
+    check("every other instance is written down, whatever class it is",
+          'return "[" .. class .. "] " .. p' in dump, True)
+    check("with remotes and values still told apart",
+          [part for part in ('[REMOTE " .. class', '[VALUE " .. class') if part in dump],
+          ['[REMOTE " .. class', '[VALUE " .. class'])
+
+    # The scripts, first and whole: they are what a scan is for, so they are written before the
+    # names, which could otherwise spend the whole budget on Workspace.
+    check("the scripts are written first", 'write(script_box, "\\n== THE SCRIPTS ==")' in dump, True)
+    tail = dump.split("local out = {", 1)[1]
+    check("and they are what comes out first",
+          tail.index("script_box.lines") < tail.index("name_box.lines"), True)
+    check("with the bigger share of the budget",
+          "math.floor(SCAN_BUDGET * 0.6)" in dump, True)
+    check("every script is read with its text", "local src = source_of(d, SCAN_SOURCE)" in dump, True)
+    check("which is far past the 4000 characters the first dump read",
+          "source_of(d, 4000)" in source, False)
+    check("a script the client was never sent the text of is still named, with the token that reads it",
+          '@@DECOMPILE " .. p .. "@@ reads it' in dump, True)
+    # A module required out of nowhere, or a script with no parent in the tree, is under no service
+    # and would be missed by the walk: the executor's own lists are read for exactly those.
+    check("what is not under a service is read from the executor's own lists",
+          'for _, name in ipairs({"getinstances", "getscripts", "getloadedmodules"}) do' in dump, True)
+
+    # A dump that ran out of room is not a dump of a game that ended.
+    check("a cut dump says how much did not fit",
+          "more lines did not fit" in dump and "this dump is capped at %d characters" in dump, True)
+    check("and the counts are written whatever happened",
+          'table.insert(name_box.lines, "\\n== " .. summary .. " ==")' in dump, True)
+    check_true("the ceiling is one named number rather than a literal inside the walk",
+               re.search(r"local SCAN_BUDGET = \d+", source))
+    check_true("and so is the per-script read", re.search(r"local SCAN_SOURCE = \d+", source))
+
+    # What it sent is readable, and said: the window holds the dump byte for byte, and the
+    # transcript is told what the scan found before any answer arrives.
+    check("the dump has a window of its own",
+          'overlay("GAME DUMP  ·  the whole game, as it was sent", "text")' in source, True)
+    check("which follows the screen like the other two",
+          "local windows = {code_window, console_window, dump_window}" in source, True)
+    check("what the window holds is what was sent", "dump_window_body.Text = dump" in source, True)
+    check("and scan game says what it found before it sends it",
+          '"scan game: " .. tostring(summary)' in source, True)
+    check("the dump is the question the model is asked",
+          '"GAME DUMP:\\n\\n" .. dump' in source, True)
+    check("the DEEPSCAN tool is the same dump the button sends",
+          "run = function() return deep_scan() end" in source, True)
+
+
 def main():
     toolbox_checks()
     reload_with()
@@ -1120,6 +1193,7 @@ def main():
     mode_checks()
     surface_checks()
     client_checks()
+    scan_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:

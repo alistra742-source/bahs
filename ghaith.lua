@@ -34,7 +34,9 @@ Four things worth knowing before reading the code:
     token is never part of the script.
 
 Buttons: send (Enter), modes, WRITER (thinking or fast: the same model with the reasoning or
-without it), scan game, console, errors (a console error is sent to the model with the script it
+without it), scan game (the whole game written out and sent as the question -- every script with
+its text, then every other instance in it by name and class -- shown in a window of its own),
+console, errors (a console error is sent to the model with the script it
 came from, for a fixed script, up to three in a row), and auto -- which runs what it wrote, hands
 the console back, gets a fix and repeats until the script stops changing. copy code, run and full
 are not up there: they are built under each answer that carries a script, so the rail never shows a
@@ -64,6 +66,13 @@ local POLL        = 0.6             -- seconds between reads of the running turn
 local STALL       = 150             -- seconds of nothing new before a turn is given up on
 local MAXROUNDS   = 3               -- auto: how many run-and-fix rounds it may take
 local HISTORY     = 16              -- turns of conversation kept here (the service trims too)
+-- scan game: the whole game written out as one question. What is bounded here is the size of that
+-- question -- it is what the model is asked to read -- and never which parts of the game are
+-- written down: every script with its text, then every other instance by name and class, every
+-- name there is. A game bigger than the budget is cut at the end of the dump, and the summary it
+-- ends with says how much did not fit, so a cut dump never reads as a whole one.
+local SCAN_BUDGET = 300000          -- characters of the whole dump one scan may carry
+local SCAN_SOURCE = 40000           -- characters of one script's source written into it
 
 local auto        = false           -- auto: run what it wrote, hand the console back, fix and repeat
 local last_code   = ""              -- the script from the last answer, whole
@@ -669,46 +678,176 @@ local function script_source(instance, cap, allow_decompile)
 	return nil, "the decompiler returned nothing for it"
 end
 
--- Every instance under the usual services, with the things worth reading written out.
+-- The whole game, written out. Two sections, in this order on purpose:
+--
+--   * THE SCRIPTS -- every Script, LocalScript and ModuleScript this client holds, by path, with
+--     its text under it (or the line saying the client was never sent that text, and which token
+--     reads it anyway);
+--   * THE REST -- every other instance in the game, by class and path, grouped under the service
+--     it lives in. Not a selection of the interesting classes: a part with a name is a name the
+--     model can be asked about, and it is the model, not this function, that decides what matters.
+--
+-- The scripts come first and get the bigger share of the budget, so the part worth reading whole
+-- is never the part that gets cut. What is cut is counted and said at the end, so a dump that ran
+-- out of room never reads as a game that has nothing more in it. Returns the dump, and the one
+-- line that says what it found.
 local function deep_scan()
-	local out, budget = {}, 180000
-	local counts = {all = 0, remote = 0, script = 0, module = 0, value = 0}
-	local function add(line)
-		budget = budget - #line - 1
-		if budget < 0 then return end
-		table.insert(out, line)
+	local counts = {all = 0, script = 0, module = 0, remote = 0, value = 0, cut = 0}
+	local script_box = {lines = {}, used = 0, cap = math.floor(SCAN_BUDGET * 0.6)}
+	local name_box = {lines = {}, used = 0, cap = SCAN_BUDGET - math.floor(SCAN_BUDGET * 0.6)}
+
+	-- Writing a line spends that box's budget and is refused once it is gone. Refused lines are
+	-- counted rather than dropped quietly.
+	local function write(box, line)
+		line = tostring(line or "")
+		if box.used + #line + 1 > box.cap then
+			counts.cut = counts.cut + 1
+			return false
+		end
+		box.used = box.used + #line + 1
+		table.insert(box.lines, line)
+		return true
 	end
-	add("GAME DUMP  " .. game.Name .. "  place " .. tostring(game.PlaceId))
-	for _, name in ipairs(SERVICES) do
-		local service = game:FindFirstChild(name)
-		if service then
-			add("\n== " .. name .. " ==")
-			for _, d in ipairs(service:GetDescendants()) do
+
+	local function is_script(instance)
+		local class = instance.ClassName
+		return class == "ModuleScript" or class == "Script" or class == "LocalScript"
+	end
+
+	-- The roots of the walk: every service this game actually has, whatever it is called -- a game
+	-- may hold one no list of the usual names ever had -- plus the usual names in case one of them
+	-- has not been created as a child yet.
+	local roots, seen_root = {}, {}
+	local function root(item)
+		if item and not seen_root[item] then
+			seen_root[item] = true
+			table.insert(roots, item)
+		end
+	end
+	local ok_children, children = pcall(function() return game:GetChildren() end)
+	if ok_children then
+		for _, child in ipairs(children) do root(child) end
+	end
+	for _, name in ipairs(SERVICES) do root(game:FindFirstChild(name)) end
+
+	-- Read once, kept once: the walk is the slow part, and it is walked again below for the
+	-- sections rather than re-read per service.
+	local groups, in_group = {}, {}
+	for _, node in ipairs(roots) do
+		local ok, list = pcall(function() return node:GetDescendants() end)
+		if ok then
+			in_group[node] = true
+			table.insert(groups, {root = node, list = list})
+			for _, d in ipairs(list) do in_group[d] = true end
+		end
+	end
+
+	-- A module required out of nowhere, or a script with no parent in the tree, is not under any
+	-- service, and the walk above misses it. The executor's own lists are where those turn up, so
+	-- those lists are read for it -- and only those: walking the services a second time to find
+	-- what was walked a moment ago would double the slowest part of a scan for nothing.
+	local strays, seen_stray = {}, {}
+	local function stray(item)
+		if not item or item == game or in_group[item] or seen_stray[item] then return end
+		seen_stray[item] = true
+		table.insert(strays, item)
+	end
+	for _, name in ipairs({"getinstances", "getscripts", "getloadedmodules"}) do
+		local fn = primitive(name)
+		if type(fn) == "function" then
+			local ok_list, list = pcall(fn)
+			if ok_list and type(list) == "table" then
+				for _, item in ipairs(list) do stray(item) end
+			end
+		end
+	end
+
+	local function name_line(instance)
+		if is_script(instance) then return nil end      -- written above, with its text
+		counts.all = counts.all + 1
+		local class = instance.ClassName
+		local p = path_of(instance)
+		if class == "RemoteEvent" or class == "RemoteFunction" or class == "UnreliableRemoteEvent" then
+			counts.remote = counts.remote + 1
+			return "[REMOTE " .. class .. "] " .. p
+		end
+		local ok_value, value = pcall(function() return instance:IsA("ValueBase") end)
+		if ok_value and value then
+			counts.value = counts.value + 1
+			return "[VALUE " .. class .. "] " .. p .. " = " .. tostring(instance.Value)
+		end
+		return "[" .. class .. "] " .. p
+	end
+
+	-- --- the scripts, first, so they are never what a budget runs out on ---
+	write(script_box, "\n== THE SCRIPTS ==")
+	for _, group in ipairs(groups) do
+		for _, d in ipairs(group.list) do
+			if is_script(d) then
 				counts.all = counts.all + 1
+				local module = d.ClassName == "ModuleScript"
+				if module then counts.module = counts.module + 1 else counts.script = counts.script + 1 end
 				local p = path_of(d)
-				if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent") then
-					counts.remote = counts.remote + 1
-					add("[REMOTE " .. d.ClassName .. "] " .. p)
-				elseif d:IsA("ModuleScript") then
-					counts.module = counts.module + 1
-					add("[MODULE] " .. p)
-					local src = source_of(d, 4000)
-					if src then add(src) end
-				elseif d:IsA("Script") or d:IsA("LocalScript") then
-					counts.script = counts.script + 1
-					add("[" .. d.ClassName .. "] " .. p)
-					local src = source_of(d, 4000)
-					if src then add(src) end
-				elseif d:IsA("ValueBase") then
-					counts.value = counts.value + 1
-					add("[VALUE " .. d.ClassName .. "] " .. p .. " = " .. tostring(d.Value))
+				write(script_box, "[" .. d.ClassName .. "] " .. p)
+				local src = source_of(d, SCAN_SOURCE)
+				if src then
+					write(script_box, src)
+				else
+					write(script_box, "-- no source here: @@DECOMPILE " .. p .. "@@ reads it")
 				end
 			end
 		end
 	end
-	add(string.format("\n== %d instances, %d remotes, %d scripts, %d modules ==",
-		counts.all, counts.remote, counts.script, counts.module))
-	return table.concat(out, "\n")
+	for _, d in ipairs(strays) do
+		if is_script(d) then
+			counts.all = counts.all + 1
+			local module = d.ClassName == "ModuleScript"
+			if module then counts.module = counts.module + 1 else counts.script = counts.script + 1 end
+			local p = path_of(d)
+			write(script_box, "[" .. d.ClassName .. "] " .. p)
+			local src = source_of(d, SCAN_SOURCE)
+			if src then
+				write(script_box, src)
+			else
+				write(script_box, "-- no source here: @@DECOMPILE " .. p .. "@@ reads it")
+			end
+		end
+	end
+
+	-- --- everything else, grouped by the service it lives in ---
+	for _, group in ipairs(groups) do
+		write(name_box, "\n== " .. tostring(group.root.Name) .. " ==")
+		for _, d in ipairs(group.list) do
+			local line = name_line(d)
+			if line then write(name_box, line) end
+		end
+	end
+	if #strays > 0 then
+		write(name_box, "\n== held by the executor, not under a service ==")
+		for _, d in ipairs(strays) do
+			local line = name_line(d)
+			if line then write(name_box, line) end
+		end
+	end
+
+	local summary = string.format("%d instances: %d scripts, %d modules, %d remotes, %d values",
+		counts.all, counts.script, counts.module, counts.remote, counts.value)
+	-- Always written, budget or no budget: the counts are how a cut dump is told from a whole one.
+	table.insert(name_box.lines, "\n== " .. summary .. " ==")
+	if counts.cut > 0 then
+		table.insert(name_box.lines, string.format(
+			"== %d more lines did not fit: this dump is capped at %d characters ==",
+			counts.cut, SCAN_BUDGET))
+	end
+
+	local out = {
+		"GAME DUMP  " .. tostring(game.Name) .. "  place " .. tostring(game.PlaceId),
+		"every script this client holds with its text, then every other instance in the game by",
+		"name and class: every name there is, not a selection of them.",
+	}
+	for _, line in ipairs(script_box.lines) do table.insert(out, line) end
+	for _, line in ipairs(name_box.lines) do table.insert(out, line) end
+	return table.concat(out, "\n"), summary
 end
 
 local function remotes()
@@ -2344,6 +2483,11 @@ end
 
 local code_window, code_window_body = overlay("THE SCRIPT  ·  whole, no fences", "code")
 local console_window, console_window_body = overlay("CONSOLE  ·  everything this client printed", "text")
+-- Exactly what scan game sent, byte for byte. The dump is the question the model is answering
+-- -- every script with its text, then every other name in the game -- and a question that long
+-- is worth being able to read: it is where "did it really send every script" is answered,
+-- and where what the model was given can be counted without taking anybody's word for it.
+local dump_window, dump_window_body = overlay("GAME DUMP  ·  the whole game, as it was sent", "text")
 
 -- --- the transcript -------------------------------------------------------------------------
 
@@ -2503,7 +2647,13 @@ round(scan_button, 9)
 scan_button.Activated:Connect(function()
 	if busy then return end
 	UI.setStatus("running", "reading the game")
-	local dump = deep_scan()
+	local dump, summary = deep_scan()
+	-- Said before it is sent, not only once an answer arrives: the counts are what the scan
+	-- found, and the window is the whole of what went out of here.
+	dump_window_body.Text = dump
+	dump_window.Visible = true
+	UI.bubble("system", "scan game: " .. tostring(summary) .. " -- " .. #dump
+		.. " characters of game sent as the question")
 	process("GAME DUMP:\n\n" .. dump .. "\n\nRead the game above and reply with ONLY the"
 		.. " complete Luau script for the most useful thing it makes possible.")
 end)
@@ -2582,7 +2732,7 @@ end)
 -- this is running on. A phone that turns over is a different screen -- a shorter one, with the
 -- topbar somewhere else -- so the fit runs again and the panel takes the new one whole.
 
-local windows = {code_window, console_window}
+local windows = {code_window, console_window, dump_window}
 
 local function fit_to_screen()
 	local view = viewport()
