@@ -22,6 +22,7 @@ own work, which is what `luau_check` (structure), `roblox_api` (the real API dum
 `run_script` (the connected executor) are for.
 """
 from bridge import *  # noqa: F401,F403 -- the providers, the config and the session stores
+from thoughts import stream_with_thoughts  # the same writer's stream, its thinking kept
 from luau import (TOOLS, TOOL_NAMES, deliver, executor_state, run as run_tool, take_script,
                   tool_state, tools_enabled)  # noqa: F401 -- the toolbox
 from state import (client_ip, deepseek_state, last_error, list_models, note_error, rate_ok,
@@ -39,11 +40,13 @@ class Job:
     readers can attach to it -- including one that comes back after the connection dropped,
     which replays the output from the start and follows along.
 
-    Text arrives on three channels. `answer` is the script the writer is producing -- the pieces
+    Text arrives on four channels. `answer` is the script the writer is producing -- the pieces
     the model streams, with the tool XML and the continuation metadata cut out. `tool` is what
     happened instead of text: one trace line per tool call, so a turn that spends a minute
     looking up an API is visibly doing that rather than looking stuck. `plan` is the same idea for
     agent mode's first call, which is a plan rather than an answer and is none of the answer.
+    `thoughts` is the writer's own chain of thought, which the provider streams on every call while
+    thinking is on: it is what the client's thinking pane reads, and it is never the answer.
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, session: str,
@@ -56,7 +59,7 @@ class Job:
         self.mode = mode
         self.provider = QWEN          # the provider of the call in flight, for the error it raises
         self.pieces: list = []          # (channel, piece)
-        self.buffers: dict = {"answer": [], "tool": [], "plan": []}
+        self.buffers: dict = {"answer": [], "tool": [], "plan": [], "thoughts": []}
         self.tool_text = ""             # the same trace as one string, for the poll and the summary
         self.error = ""
         self.status = "queued"          # queued -> running -> done | error
@@ -135,6 +138,9 @@ class Job:
             "tools": len([p for p in self.phases if p["phase"] == "tool"]),
             "elapsed": round((self.finished or time.time()) - self.started, 1),
             "chars": len(self.text()),
+            # How much the writer thought. The text itself is on the job's `thoughts` channel, so a
+            # reader gets it as it arrives rather than in one lump at the end.
+            "thought_chars": len(self.channel("thoughts")),
         }
 
 
@@ -224,6 +230,7 @@ def poll_job(job_id: str):
         "text": job.text(),
         "tool": job.tool_text,
         "plan": job.channel("plan"),
+        "thoughts": job.channel("thoughts"),
         "mode": job.mode,
         "model": job.report()["model"],
         "session": job.session,
@@ -283,7 +290,10 @@ def stream_any(provider, messages: list, temperature: Optional[float], max_token
             # the planner call was made in.
             box["meta"] = None
         return
-    yield from stream_call(messages, temperature, provider, max_tokens, box, tools)
+    # The thinking-aware copy rather than the bridge's own: the same stream, except that the
+    # writer's chain of thought is kept (see thoughts.py) so a client has something real to show
+    # while the script is being written.
+    yield from stream_with_thoughts(messages, temperature, provider, max_tokens, box, tools)
 
 
 def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens: int,
@@ -305,6 +315,19 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
     box: dict = {"finish": None, "usage": None, "tool_calls": [], "raw": "", "meta": ""}
     started = time.time()
     pieces: list = []
+    thoughts: list = []
+
+    def note_thought(fragment: str) -> None:
+        """One reasoning fragment as it arrives: onto the job's thoughts channel, live.
+
+        This is the whole reason the stream is the thinking-aware one -- the writer is reasoning
+        about an API it cannot see, and a client that shows that reasoning is showing the turn
+        actually happening rather than a spinner.
+        """
+        thoughts.append(fragment)
+        job.add("thoughts", fragment)
+
+    box["thoughts"] = note_thought
     turns = with_continuation(messages, job.session) if provider is QWEN else messages
     for piece in stream_any(provider, turns, temperature, max_tokens, box, tools, web_session):
         pieces.append(piece)
@@ -330,6 +353,7 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
         "finish": box["finish"],
         "usage": box["usage"],
         "tools": [call["name"] for call in calls],
+        "thought_chars": len("".join(thoughts)),
     }
     job.phases.append(record)
     print(f"[job] {job.id} {phase}: {provider.model} {record['ms']}ms, {record['chars']} chars, "
@@ -615,6 +639,7 @@ def job_summary(job: Job) -> dict:
         "code": job.text(),
         "tool": job.tool_text,
         "plan": job.channel("plan"),
+        "thoughts": job.channel("thoughts"),
         "mode": job.mode,
         "model": job.report()["model"],
         "session": job.session,
@@ -695,6 +720,7 @@ def job_frames(job: Job):
         if status == "done":
             yield frame({"done": True, "text": job.text(), "code": job.text(),
                          "tool": job.tool_text, "plan": job.channel("plan"),
+                         "thoughts": job.channel("thoughts"),
                          "mode": job.mode, "session": job.session,
                          "phases": job.phases, **report})
             return
@@ -732,6 +758,7 @@ def job_result(job_id: str, _: None = Depends(require_key)):
         "text": job.text(),
         "tool": job.tool_text,
         "plan": job.channel("plan"),
+        "thoughts": job.channel("thoughts"),
         "mode": job.mode,
         "model": job.report()["model"],
         "session": job.session,

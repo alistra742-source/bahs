@@ -51,7 +51,7 @@ a site token to the API earns a 401 that reads like a broken token when the endp
 The service's surface (jobs, endpoints, the page) is in server.py; what the service can say about
 itself is in state.py.
 """
-# The shared imports live here and nowhere else: `state`, `luau` and `server` are written as
+# The shared imports live here and nowhere else -- nothing else imports them: `state`, `luau` and `server` are written as
 # `from bridge import *`, so these names are the plumbing all four modules are made of. They are
 # not re-exported for convenience -- moving them would break the other three.
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request  # noqa: F401
@@ -265,7 +265,14 @@ def read_chunk(chunk: dict, box: Optional[dict] = None) -> str:
         delta = choice.get("delta") or {}
         if box is not None and choice.get("finish_reason"):
             box["finish"] = choice["finish_reason"]
-        if str(delta.get("type") or "").lower() in ("thinking", "reasoning"):
+        kind = str(delta.get("type") or "").lower()
+        if kind in ("thinking", "reasoning"):
+            # The site's own thinking, on a field of its own: still never the answer -- a fragment
+            # here would land in the middle of the script -- but handed to a caller that asked to
+            # see it, which is what a client with a thinking pane is.
+            content = delta.get("content")
+            if box is not None and callable(box.get("thoughts")) and isinstance(content, str):
+                box["thoughts"](content)
             return ""
         return delta.get("content") or ""
     path = str(chunk.get("p") or "")
@@ -274,7 +281,12 @@ def read_chunk(chunk: dict, box: Optional[dict] = None) -> str:
         if box is not None and str(value).strip().upper() == "FINISHED":
             box["finish"] = box.get("finish") or "stop"
         return ""
-    if "thinking" in path.lower() or path.rsplit("/", 1)[-1].lower() in NON_TEXT_PATHS:
+    if "thinking" in path.lower():
+        # The same rule on the site's older frame shape.
+        if box is not None and callable(box.get("thoughts")) and isinstance(value, str):
+            box["thoughts"](value)
+        return ""
+    if path.rsplit("/", 1)[-1].lower() in NON_TEXT_PATHS:
         return ""
     if isinstance(value, str):
         return value
@@ -553,8 +565,9 @@ DEEPSEEK_COOKIE = env("DEEPSEEK_COOKIE", "REVIEW_COOKIE")
 if DEEPSEEK_SHAPE == "deepseek-web" and not env("DEEPSEEK_MODEL", "REVIEW_MODEL"):
     DEEPSEEK_MODEL = "deepseek-web"
 # Thinking is on: this model is writing a plan or a whole script here, not answering a quick
-# question, and on both transports its reasoning is dropped rather than streamed (see read_chunk
-# and the content loop in stream_call) -- so what comes back is the plan or the script either way.
+# question, and on neither transport does its reasoning reach the answer (see the content loop in
+# stream_call and read_chunk, which hand it to the box's `thoughts` callback instead) -- so what
+# comes back is the plan or the script either way, and a client can still watch it think.
 DEEPSEEK_THINKING = env("DEEPSEEK_THINKING", "REVIEW_THINKING", default="on").lower()
 # Search is never switched on anywhere in this service: the answers here are about the code in
 # front of the model, and a web search is neither free nor useful for that.
@@ -1070,6 +1083,10 @@ def strip_fences(text: str) -> str:
       * the model fenced the script *and* talked around it (or fenced two versions), so the block
         that reads as Lua is the answer and the prose is not, which is the rule the writer already
         had;
+      * the whole answer is nothing but fenced blocks -- the model split one script across them
+        ("part one", "part two") rather than offering two versions of it -- so the pieces are put
+        back together in the order they were written. Returning the longest block there would ship
+        half a script that looks whole, which is worse than an answer that fails loudly;
       * the whole answer is one fenced block of prose, or there is no complete block at all -- just
         markers, an unclosed one or a stale language tag -- and the markers come off while every
         other line stays as it was.
@@ -1080,8 +1097,13 @@ def strip_fences(text: str) -> str:
     body = (text or "").strip()
     blocks = [m.group(1).strip() for m in FENCE_BLOCK.finditer(body)]
     scripts = [b for b in blocks if looks_like_code(b)]
+    # What is left once every block is taken out: empty means the answer was nothing but blocks,
+    # which is a script in pieces rather than a script among talk about it.
+    talk = FENCE_LINE.sub("", FENCE_BLOCK.sub("", body)).strip()
+    if len(scripts) == len(blocks) > 1 and not talk:  # one script in pieces, not two versions
+        return "\n".join(scripts)
     if scripts:
-        return max(scripts, key=len)
+        return max(scripts, key=len)  # the block that reads as Lua is the answer
     whole = FENCE.match(body)
     if whole:
         return whole.group(1).strip()

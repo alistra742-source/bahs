@@ -53,6 +53,8 @@ button:disabled{opacity:.55;cursor:default}
 .turn.err .body{color:#ffb4ae}
 .turn.tool{align-self:flex-start;max-width:100%;background:#12161f;border-style:dashed;border-color:#242c3a}
 .turn.tool .body{color:#a9b4c7;font-size:12px;max-height:340px;overflow:auto}
+.turn.think{align-self:flex-start;max-width:100%;background:#101a18;border-style:dashed;border-color:#1f3a33}
+.turn.think .body{color:#93b3a6;font-size:12px;max-height:320px;overflow:auto}
 details.meta{align-self:flex-start;max-width:100%;background:#12161f;border:1px dashed var(--line);border-radius:10px;padding:6px 12px;font:11px ui-monospace,monospace;color:var(--dim)}
 details.meta summary{cursor:pointer}
 details.meta .body{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace;color:#c3cddd;margin-top:6px;max-height:280px;overflow:auto}
@@ -102,8 +104,9 @@ footer a{color:var(--blue);text-decoration:none}
     Every turn is sent with the conversation so far <i>and</i> with this page's session id, so a model keeps
     answering in <b>one chat</b> instead of a new one every question.<br>
     Each question goes out as <code>__GREETING__ your question</code>.<br>
-    The writer uses its own tools while it writes -- <code>__TOOLS__</code> -- up to <code>__ROUNDS__</code> rounds
-    of them in one turn; what it did, and the plan it built from in agent mode, are under the answer.<br>
+    The writer thinks in the open and uses its own tools while it writes -- <code>__TOOLS__</code> -- up to
+    <code>__ROUNDS__</code> rounds of them in one turn; its thinking, what the tools did, and the plan it
+    built from in agent mode are under the answer.<br>
     <code>run_script</code> runs a script in the executor polling <code>/agent/pull</code> (see <code>client.lua</code>),
     which is the only thing that can actually prove it runs.<br>
     Both tokens stay in this service's variables; neither reaches this page.
@@ -284,7 +287,9 @@ footer a{color:var(--blue);text-decoration:none}
 
   function bubble(channel, label) {
     if (bubbles[channel]) return bubbles[channel];
-    var cls = channel === "tool" ? "tool" : "";
+    // The three side channels are shown while the turn runs and styled apart from the answer:
+    // the tool trace, the plan, and the writer's own thinking.
+    var cls = channel === "tool" ? "tool" : (channel === "thoughts" ? "think" : "");
     var el = turnEl("assistant", "", label);
     if (cls) el.classList.add(cls);
     el.classList.add("pending");
@@ -306,15 +311,16 @@ footer a{color:var(--blue);text-decoration:none}
   function labelFor(channel) {
     if (channel === "tool") return "tools";
     if (channel === "plan") return "plan";
+    if (channel === "thoughts") return "thinking";
     return "script · " + (MODEL || "qwen");
   }
 
   function anyText() {
-    // The answer only: the plan and the tool trace are shown while they happen and are not what
-    // the character count is counting.
+    // The answer only: the thinking, the plan and the tool trace are shown while they happen and
+    // are not what the character count is counting.
     var out = "";
     Object.keys(bubbles).forEach(function (k) {
-      if (k === "tool" || k === "plan") return;
+      if (k === "tool" || k === "plan" || k === "thoughts") return;
       out += bodyOf(bubbles[k]).textContent;
     });
     return out;
@@ -432,6 +438,7 @@ footer a{color:var(--blue);text-decoration:none}
       var text = d.text || d.code || "";
       var tool = d.tool || "";
       var plan = d.plan || "";
+      var thinking = d.thoughts || "";
       var phases = d.phases || [];
       clearTransient();
       // The answer becomes part of the conversation, so the next question is asked in the
@@ -440,6 +447,9 @@ footer a{color:var(--blue);text-decoration:none}
       chat.job = null;
       save();
       render();
+      // What it was thinking, kept under the answer: the live bubble went with the turn, and the
+      // reasoning about an API it cannot see is the part a reader may want to check.
+      if (thinking) metaEl("what it was thinking", thinking);
       // What the model did to its own work is shown once, under the answer, and is not carried
       // into the next question: the model saw it, and the session remembers the chat.
       if (tool) metaEl("what the tools did", tool);
@@ -554,6 +564,7 @@ footer a{color:var(--blue);text-decoration:none}
     if (d.done) return handleFrame(JSON.stringify(Object.assign({ done: true }, d)));
     if (d.tool) setTransient("tool", d.tool);
     if (d.plan) setTransient("plan", d.plan);
+    if (d.thoughts) setTransient("thoughts", d.thoughts);
     if (d.text) setTransient("answer", d.text);
     return false;
   }

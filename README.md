@@ -83,9 +83,11 @@ Both credentials work, and the endpoint follows the one you paste:
   reimplementation that is subtly wrong earns the same refusal as no answer at all. The module is
   fetched into the image at build time and, if it is not there, on first use.
 
-Thinking is on for DeepSeek (`DEEPSEEK_THINKING`), and its reasoning is *not* the answer: it is
-dropped on both transports exactly like Qwen's, so what comes back is the plan or the script.
-Search is never switched on anywhere in this service.
+Thinking is on for DeepSeek (`DEEPSEEK_THINKING`), and its reasoning is *not* the answer: on both
+transports it is kept out of what comes back -- the plan or the script -- and handed to the
+`thoughts` channel instead, which carries the model's own chain of thought as it arrives and is
+what a client's thinking pane reads (`thoughts.py`). Search is never switched on anywhere in this
+service.
 
 ## The tools
 
@@ -132,7 +134,7 @@ the model what is structurally wrong; a run tells it what actually happened.
 | `CHAIN_MODE` | `qwen` | which mode runs when the caller asks for none: `agent`, `qwen` or `deepseek`. Falls back to one that can run |
 | `QWEN_URL` | `https://qwen.aikit.club/v1` | point it at your own qwen-api deployment if the public one is rate limited |
 | `QWEN_MODEL` | `qwen3.8-max` | the writer |
-| `QWEN_THINKING` | `thinking` | forced onto every Qwen call: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default and the point: a whole script, reasoned, with the `reasoning_content` dropped from the answer |
+| `QWEN_THINKING` | `thinking` | forced onto every Qwen call: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default and the point: a whole script, reasoned, with the `reasoning_content` kept out of the answer and shown on the `thoughts` channel instead |
 | `DEEPSEEK_TOKEN` | — | an `sk-...` API key (aliases `DEEPSEEK_API_KEY`, `DEEPSEEK_KEY`) or the site's `userToken` |
 | `DEEPSEEK_URL` | followed from the credential | `https://api.deepseek.com`, or `https://chat.deepseek.com` when the credential is a site `userToken` |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | the planner and the deepseek-mode writer. `deepseek-web` when the site transport is used and no model was asked for, because the site's model is whatever the account is set to |
@@ -176,7 +178,7 @@ anywhere.
 | --- | --- | --- |
 | ask | this service | The mode is resolved first (an unknown one is a 400, one whose credential is missing a 503 naming it), then the caller's turns are greeted and the session's continuation marker goes on the newest Qwen assistant turn |
 | plan | DeepSeek | *agent mode only, exactly once.* The conversation with `PLAN_SYSTEM` in front of it, streamed to the page's `plan` channel. The answer is a build plan, not a script |
-| answer | Qwen | One streaming call with the six tool schemas attached and the plan as the turn above it. `reasoning_content` is dropped; the tool XML and the metadata are cut out of what is streamed |
+| answer | Qwen | One streaming call with the six tool schemas attached and the plan as the turn above it. The tool XML and the metadata are cut out of what is streamed, and so is `reasoning_content` -- not by being thrown away, but onto the `thoughts` channel, so a client can show the writer thinking while it writes |
 | tool | this service | If the call asked for tools: each is run, one trace line per call goes to the page's `tool` channel, and the results go back as `tool` turns |
 | round | Qwen | Asked again, in the same chat, with the results in front of it — until an answer asks for nothing |
 | guard | this service | An empty answer, one cut off at the token ceiling, or a content filter is refused. A turn that used its last round on a tool call ships the best script it wrote on the way |
@@ -191,7 +193,12 @@ A few properties worth knowing:
   script in a markdown fence (it is pasted straight into an executor, where a fence line is a
   syntax error). When one does it anyway the turn is not refused: a whole-answer block is
   unwrapped, a script fenced with talk around it (or two fenced versions) is extracted, and a stray
-  fence line is dropped. Every other line is left exactly as it was.
+  fence line is dropped. An answer that is *nothing but* fenced blocks — one script the model split
+  across "part one" and "part two" — has its pieces put back together in the order they were
+  written, rather than the longest one being shipped on its own and looking whole. Every other line
+  is left exactly as it was. What `text` carries is therefore the finished script and no fence, so
+  a client that pulls code out of an answer must accept it **bare**: a client that only looks inside
+  ```lua blocks finds nothing at all on this endpoint.
 * **A second model is not an opinion.** In agent mode DeepSeek produces the plan and is never
   asked again; the plan is context for the writer, not a verdict on its script.
 * **Secrets do not leave for a provider.** Webhooks, tokens, `key = "..."` assignments and long
@@ -208,8 +215,8 @@ A few properties worth knowing:
 | Endpoint | What it is |
 | --- | --- |
 | `POST /chat/stream` | `{messages:[{role,content},...], session?: str, mode?: str}` -> `{job, mode, model, session, thinking, tools, turns, timeout}`. Starts the turn, returns at once |
-| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`answer` / `tool` / `plan`), `{reset, ch}`, `{phase, note}`, `{beat}`, then `{done, text, tool, plan, mode, session, phases}` or `{error}` |
-| `POST /chat` | The same turn, blocking. `{text, tool, plan, mode, session, phases}` |
+| `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`answer` / `tool` / `plan` / `thoughts`), `{reset, ch}`, `{phase, note}`, `{beat}`, then `{done, text, tool, plan, thoughts, mode, session, phases}` or `{error}` |
+| `POST /chat` | The same turn, blocking. `{text, tool, plan, thoughts, mode, session, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
 | `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
 | `POST /generate` / `POST /generate/stream` | One prompt, no history. The session and the mode still apply |
@@ -257,8 +264,10 @@ curl -s https://<your-domain>/chat -H "X-API-Key: $API_KEY" \
 itself — no keys, no network (both models are one local stub, and the API dump is a fixture). It
 covers: one call to one model with thinking on and the schemas attached; a tool round trip in both
 the XML and the OpenAI shape (fragmented arguments and all); the tool result going back and being
-matched to its call; the interim prose and the tool XML never reaching the reader; the session
-keeping one chat and no other session getting it; the executor round trip behind `run_script`
+matched to its call; the interim prose and the tool XML never reaching the reader; the writer's
+thinking arriving on the `thoughts` channel and never in the answer or the finished text; a script
+the model split across two fenced blocks being put back together in order rather than half of it
+shipping; the session keeping one chat and no other session getting it; the executor round trip behind `run_script`
 (including the refusal when nothing is listening); the round limit; a cut-off answer being refused;
 the toolbox's own units. And the modes: agent calling DeepSeek exactly once and Qwen exactly once
 in that order, the plan streaming on its own channel and never into the answer, a second model
@@ -271,7 +280,7 @@ the gate).
 .venv/bin/python verify_chain.py
 ```
 
-The service is five modules, smallest dependency first:
+The service is six modules, smallest dependency first:
 
 * `bridge.py` — everything that talks to a model: the tokens, the config, one request and its
   stream, the two transports, the marker cut out of it, and the sessions that keep one chat each
@@ -281,5 +290,9 @@ The service is five modules, smallest dependency first:
 * `state.py` — what the service can say about itself (both credentials, the model list, the last
   failure) and the two usage limits.
 * `luau.py` — the toolbox: the six tools, the Roblox API dump, and the queue the executor polls.
+* `thoughts.py` — the writer's stream with its chain of thought kept: the same call as
+  `bridge.stream_call`, except that every reasoning fragment is handed to the job's `thoughts`
+  channel as it arrives. A copy rather than a wrapper, because the fragment has to be caught
+  inside the loop that reads the provider's frames and there is no seam outside it.
 * `server.py` — the service on top: the modes, the turn, the tool rounds, the jobs, the endpoints
   and the page.

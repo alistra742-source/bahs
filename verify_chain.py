@@ -56,6 +56,19 @@ BROKEN_SCRIPT = SIMPLE_SCRIPT + "\nif true then\nprint(\"never closed\")\n"
 FINAL = "```lua\n" + SIMPLE_SCRIPT + "\n```"
 REASONING = "SECRET_REASONING_TEXT"
 
+# One script the model split across two fenced blocks ("part one", "part two"): both halves read
+# as Lua on their own, and there is nothing but the blocks -- which is the shape that has to be put
+# back together rather than half of it shipped.
+PART_ONE = """local Players = game:GetService("Players")
+local SPEED = 16
+local function apply(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)"""
+PART_TWO = """if humanoid then
+    humanoid.WalkSpeed = SPEED
+end
+end
+Players.PlayerAdded:Connect(apply)"""
+
 
 # --- the stub provider --------------------------------------------------------------------
 
@@ -418,8 +431,18 @@ def chain_checks():
           len(luau.TOOL_NAMES))
     check("the answer is the script, unwrapped", done.get("text"), SIMPLE_SCRIPT)
     check("the answer carries no metadata", "qwen_metadata" in (done.get("text") or ""), False)
-    check("the reasoning is dropped",
-          any(REASONING in (f.get("t") or "") for f in frames), False)
+    # The writer's chain of thought is the client's thinking pane, not the answer: it arrives on a
+    # channel of its own -- a fragment mixed into `answer` would land inside the script -- and the
+    # answer is the only channel that reaches `text`.
+    check("the reasoning is never in the answer channel",
+          REASONING in channel(frames, "answer"), False)
+    check("nor in the finished text", REASONING in (done.get("text") or ""), False)
+    check("the thinking arrives on a channel of its own", channel(frames, "thoughts"), REASONING)
+    check("the finished turn hands it back", done.get("thoughts"), REASONING)
+    check("and reports how much of it there was", done["phases"][0]["thought_chars"],
+          len(REASONING))
+    check("the poll reports it too",
+          client.get(f"/chat/poll/{started['job']}").json().get("thoughts"), REASONING)
     check("the session is reported", started.get("session"), "s-test")
     check("no tool call is recorded", done["phases"][0]["tools"], [])
     check("the turn is a call and a phase", len(done["phases"]), 1)
@@ -584,6 +607,14 @@ def fence_checks():
           bridge.strip_fences(FINAL), SIMPLE_SCRIPT)
     check("the largest script wins when several are fenced",
           bridge.strip_fences("```lua\nprint(1)\n```\nand\n```lua\n" + SIMPLE_SCRIPT + "\n```"),
+          SIMPLE_SCRIPT)
+    # The shape that used to ship half a script looking whole: the model fenced "part one" and
+    # "part two" of one script, with nothing between them.
+    check("a script split across two blocks is put back together",
+          bridge.strip_fences("```lua\n" + PART_ONE + "\n```\n```lua\n" + PART_TWO + "\n```"),
+          PART_ONE + "\n" + PART_TWO)
+    check("but a block of prose is not glued onto the script",
+          bridge.strip_fences("```lua\n" + SIMPLE_SCRIPT + "\n```\n```\nThat is the whole script.\n```"),
           SIMPLE_SCRIPT)
     check("prose in fences is kept by unwrap_fences",
           bridge.unwrap_fences("Use this:\n\n```lua\nA = 1\n```\n\nThat is all."),
