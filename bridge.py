@@ -740,9 +740,13 @@ EXECUTOR_NOTE = """You write Luau that runs under a Roblox executor, injected in
 It is not a Roblox Studio place script and not a script for the Studio editor: there is no server \
 side, no plugin API and no edit mode, and a script that assumes any of them is wrong."""
 
-# What the answer has to be, whatever writes it: the script, and nothing around it.
+# What the answer has to be, whatever writes it: the script, and nothing around it. The fence is
+# said three ways because it is the one formatting habit every model has, and a ``` is a syntax
+# error the moment the answer is pasted into an executor -- which is where it goes.
 ANSWER_RULE = """Answer with the complete runnable script and nothing else: no commentary, no \
-summary of your changes, no markdown code fences."""
+summary of your changes, and no markdown fence -- never write ``` anywhere, not before the script, \
+not after it, and not around a snippet inside it. The answer is pasted straight into an executor, \
+where a fence line is a syntax error."""
 
 # With tools on, this rides in front of the caller's conversation as the system turn.
 TOOL_SYSTEM = EXECUTOR_NOTE + """
@@ -1039,12 +1043,49 @@ def redact(text: str) -> tuple:
 # --- reading the answer --------------------------------------------------------------------
 
 FENCE = re.compile(r"^\s*```[A-Za-z0-9_+-]*\s*\n(.*?)\n?```\s*$", re.S)
+# Every fenced block anywhere in the text, and a fence line on its own (an unclosed one, or a
+# language tag left with nothing under it).
+FENCE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)```", re.S)
+FENCE_LINE = re.compile(r"^[ \t]*```[A-Za-z0-9_+-]*[ \t]*$", re.M)
+
+
+def unwrap_fences(text: str) -> str:
+    """Every fence taken off, with everything that was inside it left where it was.
+
+    For an answer that is prose and may quote a snippet -- the planner's plan -- where dropping
+    the talk around a block would throw away the thing being asked for. The markers go, nothing
+    else does.
+    """
+    body = (text or "").strip()
+    body = FENCE_BLOCK.sub(lambda m: m.group(1).strip(), body)
+    return FENCE_LINE.sub("", body).strip()
 
 
 def strip_fences(text: str) -> str:
-    """A whole answer wrapped in one ``` block is unwrapped; anything else is left alone."""
-    match = FENCE.match(text or "")
-    return match.group(1).strip() if match else (text or "").strip()
+    """The script out of an answer, whatever the model wrapped it in.
+
+    The prompt asks for the script and nothing else, and a fence is a syntax error the moment the
+    answer is pasted into an executor -- so a fence is taken off rather than the turn refused:
+
+      * the model fenced the script *and* talked around it (or fenced two versions), so the block
+        that reads as Lua is the answer and the prose is not, which is the rule the writer already
+        had;
+      * the whole answer is one fenced block of prose, or there is no complete block at all -- just
+        markers, an unclosed one or a stale language tag -- and the markers come off while every
+        other line stays as it was.
+
+    The blocks are looked at before the whole-answer shape because the whole-answer pattern would
+    gladly swallow two blocks as one, quotes and all.
+    """
+    body = (text or "").strip()
+    blocks = [m.group(1).strip() for m in FENCE_BLOCK.finditer(body)]
+    scripts = [b for b in blocks if looks_like_code(b)]
+    if scripts:
+        return max(scripts, key=len)
+    whole = FENCE.match(body)
+    if whole:
+        return whole.group(1).strip()
+    return unwrap_fences(body) or body
 
 
 def looks_like_code(text: str) -> bool:

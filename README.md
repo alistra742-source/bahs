@@ -187,8 +187,11 @@ A few properties worth knowing:
 * **Nothing is cut off for being slow.** There is no ceiling on a model call by default, and
   connecting is still bounded to 10s, so an unreachable host fails in seconds instead of looking
   like a model that is thinking.
-* **The model is not a verifier.** `luau_check` reads structure, `roblox_api` reads the dump, and
-  only `run_script` runs anything. Without a listening executor, "it works" is still a claim.
+* **A fence is taken off, not shipped.** Both models are told, in as many words, never to wrap the
+  script in a markdown fence (it is pasted straight into an executor, where a fence line is a
+  syntax error). When one does it anyway the turn is not refused: a whole-answer block is
+  unwrapped, a script fenced with talk around it (or two fenced versions) is extracted, and a stray
+  fence line is dropped. Every other line is left exactly as it was.
 * **A second model is not an opinion.** In agent mode DeepSeek produces the plan and is never
   asked again; the plan is context for the writer, not a verdict on its script.
 * **Secrets do not leave for a provider.** Webhooks, tokens, `key = "..."` assignments and long

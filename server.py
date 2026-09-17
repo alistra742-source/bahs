@@ -462,7 +462,9 @@ def plan_turn(job: Job) -> tuple:
         job, [{"role": "system", "content": PLAN_SYSTEM}] + list(job.messages),
         DEEPSEEK_TEMPERATURE, DEEPSEEK_PLAN_TOKENS, "plan", "plan",
         f"{DEEPSEEK.model} planning", None, DEEPSEEK, deepseek_chat(job.session))
-    plan = strip_fences(plan)
+    # Unwrapped, not extracted: a plan is prose and may quote a line of Lua, so the fences come off
+    # and the plan stays whole. (`strip_fences` is for an answer, where the script is the answer.)
+    plan = unwrap_fences(plan)
     tools = TOOLS if (tools_enabled() and AGENT_ROUNDS > 0) else None
     turns = [{"role": "system", "content": writer_system()}] + list(job.messages)
     if plan:

@@ -568,6 +568,30 @@ def chain_checks():
     reload_with()
 
 
+def fence_checks():
+    print("\nthe fences")
+    # The prompt asks for the script with no fence around it, and a model that adds one anyway is
+    # not refused: the fence comes off, because it is a syntax error where the answer is going.
+    wrapped = "Here is the script:\n\n```lua\n" + SIMPLE_SCRIPT + "\n```\n\nIt should work now."
+    _, done, _, _ = turn(script=wrapped)
+    check("a fenced script with talk around it ships as the script", done.get("text"), SIMPLE_SCRIPT)
+    check("and no fence survives into the answer", "```" in (done.get("text") or ""), False)
+    _, done, _, _ = turn(script=SIMPLE_SCRIPT + "\n```\n")
+    check("a stray fence line is dropped", done.get("text"), SIMPLE_SCRIPT)
+    check("a one-line block is still unwrapped",
+          bridge.strip_fences("```lua\nprint(1)\n```"), "print(1)")
+    check("a whole answer in one block is unwrapped",
+          bridge.strip_fences(FINAL), SIMPLE_SCRIPT)
+    check("the largest script wins when several are fenced",
+          bridge.strip_fences("```lua\nprint(1)\n```\nand\n```lua\n" + SIMPLE_SCRIPT + "\n```"),
+          SIMPLE_SCRIPT)
+    check("prose in fences is kept by unwrap_fences",
+          bridge.unwrap_fences("Use this:\n\n```lua\nA = 1\n```\n\nThat is all."),
+          "Use this:\n\nA = 1\n\nThat is all.")
+    check("and the answer rule says so in as many words",
+          "never write ```" in bridge.ANSWER_RULE, True)
+
+
 def mode_checks():
     print("\nthe three modes")
     reload_with()
@@ -628,6 +652,11 @@ def mode_checks():
     check("and the job says which model wrote it", done.get("mode"), "deepseek")
     check("the start response offers no tools in this mode", started.get("tools"), [])
     check("and names the mode", started.get("mode"), "deepseek")
+    # The model the user complained about specifically: it fences its scripts too, and the fence is
+    # taken off on this path exactly as it is on Qwen's.
+    _, done, _, _ = turn(session="s-deepseek-fence", asked_mode="deepseek", plan="",
+                         script="```lua\n" + SIMPLE_SCRIPT + "\n```")
+    check("deepseek mode ships its script without a fence", done.get("text"), SIMPLE_SCRIPT)
 
     # --- a mode this service cannot run is refused by name, never served by the other model
     reload_with(DEEPSEEK_TOKEN=UNSET)
@@ -700,6 +729,7 @@ def main():
     toolbox_checks()
     reload_with()
     chain_checks()
+    fence_checks()
     mode_checks()
     surface_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
