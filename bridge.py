@@ -868,18 +868,21 @@ members you are sure exist, and prefer the plainly-supported call over the cleve
     + ANSWER_RULE
 
 AGENT_ROUNDS_MAX = 12
-# How many tool rounds one turn may take. A round is one model call plus the tools it asked for;
-# a script that compiles on the second try needs three or four, and a turn nobody would sit
-# through is not worth starting, so this is clamped rather than trusted.
-AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="8")), AGENT_ROUNDS_MAX))
+# How many tool rounds one turn may take. A round is one model call plus the tools it asked for, so
+# this is the turn's wall-clock as much as it is its budget: at 8 a curious model could spend nine
+# calls on one question, which is minutes of somebody watching a status line. Four is enough for a
+# script that needs a second look, and the Roblox client runs a further round of tools of its own
+# after every answer besides. Clamped rather than trusted.
+AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="4")), AGENT_ROUNDS_MAX))
 # The tool that actually runs a script is the one that can hang (an executor stuck in a wait), so
 # it is bounded separately.
 TOOL_RESULT_MAX = int(env("TOOL_RESULT_MAX", default="20000"))
 # How many times one turn may tell the writer "that was not a script, send the script" before it
 # gives up. One is normally enough -- it is the same chat, and the second answer arrives while the
-# first is still in front of it -- so this is a bound on a model stuck in prose, not a budget to
-# spend on every turn.
-SCRIPT_RETRIES = max(0, min(int(env("SCRIPT_RETRIES", default="2")), 4))
+# first is still in front of it -- and each retry is another whole model call, which is the slowest
+# thing in a turn, so the default is one rather than two. The bound is on a model stuck in prose,
+# not a budget to spend on every turn. It is a real gap when it does not fire: `0` ships the prose.
+SCRIPT_RETRIES = max(0, min(int(env("SCRIPT_RETRIES", default="1")), 4))
 
 # --- the three modes ---------------------------------------------------------------------
 #

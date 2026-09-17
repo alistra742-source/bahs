@@ -34,9 +34,10 @@ Four things worth knowing before reading the code:
     token is never part of the script.
 
 Buttons: send (Enter), modes, WRITER (thinking or fast: the same model with the reasoning or
-without it), scan game, run last, copy code (the script and nothing else), full script, console,
-auto -- which runs what it wrote, hands the console back, gets a fix and repeats until the script
-stops changing.
+without it), scan game, console, and auto -- which runs what it wrote, hands the console back,
+gets a fix and repeats until the script stops changing. copy code, run and full are not up
+there: they are built under each answer that carries a script, so the rail never shows a run
+button with no script to run.
 
 On a phone as well as on a desktop. The panel fills the screen it was given -- minus the strip
 Roblox keeps for its own buttons, which is where its header would otherwise be sitting -- with the
@@ -54,9 +55,13 @@ local URL         = "https://bahs-production-d68f.up.railway.app"
 local KEY         = "roblox321@"    -- API key, if the service asks for one
 local MODE        = "agent"         -- agent (plan then write) | qwen | deepseek
 local THINK       = "thinking"      -- thinking (work it out first) | fast (same model, no reasoning)
-local POLL        = 0.8             -- seconds between reads of the running turn
-local MAXROUNDS   = 4               -- auto: how many run-and-fix rounds it may take
-local HISTORY     = 24              -- turns of conversation kept here (the service trims too)
+-- A turn's wall-clock is the number of model calls it takes, and the size of every prompt that
+-- goes with them, so both budgets here are small on purpose: HISTORY is how much conversation the
+-- service is asked to read each time (a whole script per turn adds up fast), and MAXROUNDS is how
+-- many extra round trips the auto loop may spend after the answer has already arrived.
+local POLL        = 0.6             -- seconds between reads of the running turn
+local MAXROUNDS   = 3               -- auto: how many run-and-fix rounds it may take
+local HISTORY     = 16              -- turns of conversation kept here (the service trims too)
 
 local auto        = false           -- auto: run what it wrote, hand the console back, fix and repeat
 local last_code   = ""              -- the script from the last answer, whole
@@ -1718,14 +1723,26 @@ local function stretch(axis, base)
 	return axis.Scale * base + axis.Offset
 end
 
--- The status line left the header, so the script box took that row: its height is a share of the
--- screen it was handed rather than a fixed number of pixels, because 118 is a comfortable box on a
--- 900-pixel desktop and most of a phone lying sideways. The floor sits above the size it used to
--- be -- the row the header gave up, plus a little -- so the box is never smaller than it was.
-local CODE_H = math.clamp(math.floor(panel.h * (WIDE and 0.32 or 0.24)), 132, 280)
+-- The ask box is the thing every eye is on after the script, so it is a share of the screen too
+-- rather than a flat 40 pixels -- a comfortable field on a desktop and a sliver on a phone. 48 is
+-- the floor, below which the box is smaller than the finger typing in it, and 62 the ceiling, past
+-- which it is taking the transcript's room for one line of text.
+local INPUT_H = math.clamp(math.floor(panel.h * 0.15), 48, 62)
 -- Stacked on a phone: everything above the transcript, and the ask box and footer under it.
 local NARROW_TOP = 124
-local NARROW_BELOW = 88
+local NARROW_BELOW = INPUT_H + 48
+-- The status line left the header, so the script box took that row: its height is a share of the
+-- screen it was handed rather than a fixed number of pixels, because 118 is a comfortable box on a
+-- 900-pixel desktop and most of a phone lying sideways.
+local CODE_H
+if WIDE then
+	CODE_H = math.clamp(math.floor(panel.h * 0.32), 132, 280)
+else
+	-- Stacked, the script box and the transcript are the pair sharing what the fixed rows leave, so
+	-- 45% of the room goes to the box and neither one can push the other down into the ask box. The
+	-- 96-pixel floor is four lines of Lua: a script box shorter than the script is not worth having.
+	CODE_H = math.clamp(math.floor((panel.h - NARROW_TOP - NARROW_BELOW) * 0.45), 96, 280)
+end
 
 local L
 if WIDE then
@@ -1743,9 +1760,10 @@ if WIDE then
 		code_label = UDim2.new(0, 160, 0, 46),
 		code_at = UDim2.new(0, 156, 0, 62), code_size = UDim2.new(1, -328, 0, CODE_H),
 		feed_at = UDim2.new(0, 156, 0, CODE_H + 80),
-		feed_size = UDim2.new(1, -328, 1, -(CODE_H + 142)),
-		input_at = UDim2.new(0, 156, 1, -52), input_size = UDim2.new(1, -156, 0, 40),
-		send_at = UDim2.new(1, -104, 1, -52), send_size = UDim2.new(0, 88, 0, 40),
+		feed_size = UDim2.new(1, -328, 1, -(CODE_H + 106 + INPUT_H)),
+		input_at = UDim2.new(0, 156, 1, -(INPUT_H + 16)),
+		input_size = UDim2.new(1, -156, 0, INPUT_H),
+		send_at = UDim2.new(1, -104, 1, -(INPUT_H + 16)), send_size = UDim2.new(0, 88, 0, INPUT_H),
 		footer_at = UDim2.new(0, 156, 1, -14), footer_size = UDim2.new(1, -300, 0, 14),
 	}
 else
@@ -1763,13 +1781,15 @@ else
 		rail_label = UDim2.new(0, 0, 0, 0), rail_pad = {6, 6, 6, 6},
 		code_label = UDim2.new(0, 14, 0, 98),
 		code_at = UDim2.new(0, 12, 0, 114), code_size = UDim2.new(1, -24, 0, CODE_H),
-		-- Everything above the transcript is a fixed height, so the transcript is what is left of
-		-- the screen: it keeps a floor of 120, so a very short screen scrolls a small transcript
-		-- rather than an invisible one.
+		-- Everything above the transcript is a fixed height, so the transcript is what is left of the
+		-- screen -- measured from the same three numbers the script box was, which is what keeps the
+		-- two of them and the ask box from ever landing on top of each other.
 		feed_at = UDim2.new(0, 12, 0, NARROW_TOP + CODE_H),
-		feed_size = UDim2.new(1, -24, 0, math.max(120, panel.h - (NARROW_TOP + CODE_H + NARROW_BELOW))),
-		input_at = UDim2.new(0, 12, 1, -78), input_size = UDim2.new(1, -116, 0, 40),
-		send_at = UDim2.new(1, -96, 1, -78), send_size = UDim2.new(0, 84, 0, 40),
+		feed_size = UDim2.new(1, -24, 0,
+			math.max(0, panel.h - (NARROW_TOP + CODE_H + NARROW_BELOW))),
+		input_at = UDim2.new(0, 12, 1, -(INPUT_H + 38)),
+		input_size = UDim2.new(1, -116, 0, INPUT_H),
+		send_at = UDim2.new(1, -96, 1, -(INPUT_H + 38)), send_size = UDim2.new(0, 84, 0, INPUT_H),
 		footer_at = UDim2.new(0, 12, 1, -34), footer_size = UDim2.new(1, -24, 0, 14),
 	}
 end
@@ -2066,7 +2086,7 @@ mk("TextLabel", {
 -- it is not what anybody is waiting for.
 
 local code_label = mk("TextLabel", {
-	Size = UDim2.new(0, 100, 0, 14), Position = L.code_label, BackgroundTransparency = 1,
+	Size = UDim2.new(0, 220, 0, 14), Position = L.code_label, BackgroundTransparency = 1,
 	Text = "SCRIPT", TextColor3 = C.dim, Font = SANS_B, TextSize = 10,
 	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 52, Parent = main,
 })
@@ -2123,7 +2143,7 @@ pad(status_label, 8, 8, 0, 0)
 local input = mk("TextBox", {
 	Size = L.input_size, Position = L.input_at, BackgroundColor3 = C.card,
 	BorderSizePixel = 0, Text = "", PlaceholderText = "ask for a script…  (Enter sends)",
-	PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = SANS, TextSize = 14,
+	PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = SANS, TextSize = 16,
 	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 53, Parent = main,
 })
 round(input, 10)
@@ -2132,7 +2152,7 @@ pad(input, 0, 0, 12, 12)
 
 local send_button = mk("TextButton", {
 	Size = L.send_size, Position = L.send_at, BackgroundColor3 = C.accent,
-	Text = "SEND", TextColor3 = C.text, Font = SANS_B, TextSize = 13, BorderSizePixel = 0,
+	Text = "SEND", TextColor3 = C.text, Font = SANS_B, TextSize = 15, BorderSizePixel = 0,
 	AutoButtonColor = false, ZIndex = 53, Parent = main,
 })
 round(send_button, 10)
@@ -2225,7 +2245,7 @@ UI.bubble = function(kind, text, code)
 		AnchorPoint = is_user and Vector2.new(1, 0) or Vector2.new(0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0,
 		Text = tostring(text or ""), TextColor3 = is_user and C.text or C.dim,
-		Font = (kind == "answer" or kind == "tools") and MONO or SANS, TextSize = 12,
+		Font = (kind == "answer" or kind == "tools") and MONO or SANS, TextSize = 13,
 		TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 52, Parent = wrapper,
 	})
@@ -2255,7 +2275,10 @@ UI.bubble = function(kind, text, code)
 	end
 	pad(body, padding, padding, 12, 12)
 
-	if kind == "answer" then
+	-- copy code, run and full are built only when the answer carries a script, and an answer
+	-- that is a paragraph gets no bar at all: a button whose only possible answer is "there is no
+	-- script in that answer" is worse than no button.
+	if kind == "answer" and only_code(tostring(code or "")) ~= "" then
 		local bar = mk("Frame", {
 			Size = UDim2.new(0.96, 0, 0, 22), BackgroundTransparency = 1, ZIndex = 53, Parent = wrapper,
 		})
@@ -2282,8 +2305,19 @@ UI.bubble = function(kind, text, code)
 end
 
 UI.setCode = function(text)
-	code_box.Text = text or ""
-	code_box.TextColor3 = (#(text or "") > 0) and C.text or C.dim
+	local body = text or ""
+	code_box.Text = body
+	code_box.TextColor3 = (#body > 0) and C.text or C.dim
+	-- The label says how much is in the box, so "how long is this script" is a glance rather
+	-- than a scroll to its last line: characters and lines while it holds one, plainly SCRIPT
+	-- while it holds nothing.
+	if #body == 0 then
+		code_label.Text = "SCRIPT"
+	else
+		local lines = 1
+		for _ in body:gmatch("\n") do lines = lines + 1 end
+		code_label.Text = "SCRIPT  ·  " .. #body .. " chars  ·  " .. lines .. " lines"
+	end
 end
 
 UI.setStatus = function(state, note)
@@ -2351,42 +2385,8 @@ scan_button.Activated:Connect(function()
 		.. " complete Luau script for the most useful thing it makes possible.")
 end)
 
-order = order + 1
-local run_button = mk("TextButton", {
-	Size = L.rail_button, BackgroundColor3 = C.card, Text = "run last",
-	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
-	LayoutOrder = order, ZIndex = 52, Parent = rail,
-})
-round(run_button, 9)
-run_button.Activated:Connect(function()
-	if busy then return end
-	if last_code == "" then
-		UI.bubble("system", "no script yet")
-		return
-	end
-	execute(last_code)
-end)
-
-order = order + 1
-local copy_button = mk("TextButton", {
-	Size = L.rail_button, BackgroundColor3 = C.card, Text = "copy code",
-	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
-	LayoutOrder = order, ZIndex = 52, Parent = rail,
-})
-round(copy_button, 9)
-copy_button.Activated:Connect(function() copy_code(last_code ~= "" and last_code or last_answer) end)
-
-order = order + 1
-local full_button = mk("TextButton", {
-	Size = L.rail_button, BackgroundColor3 = C.card, Text = "full script",
-	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0, AutoButtonColor = false,
-	LayoutOrder = order, ZIndex = 52, Parent = rail,
-})
-round(full_button, 9)
-full_button.Activated:Connect(function()
-	code_window_body.Text = only_code(last_code ~= "" and last_code or last_answer)
-	code_window.Visible = true
-end)
+-- run last, copy code and full script have left the rail: they are the buttons under the
+-- answer that carries a script, which is the only place there is anything to copy or run.
 
 order = order + 1
 local console_button = mk("TextButton", {
@@ -2449,7 +2449,8 @@ local function fit_to_screen()
 	local safe, rect = usable_screen()
 	if not WIDE then
 		-- Stacked, so the transcript is whatever height is left under the fixed rows above it.
-		feed.Size = UDim2.new(1, -24, 0, math.max(120, rect.h - (NARROW_TOP + CODE_H + NARROW_BELOW)))
+		feed.Size = UDim2.new(1, -24, 0,
+			math.max(0, rect.h - (NARROW_TOP + CODE_H + NARROW_BELOW)))
 	end
 	local size = UDim2.new(0, rect.w, 0, rect.h)
 	local at = UDim2.new(0, rect.x, 0, rect.y)

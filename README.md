@@ -148,13 +148,17 @@ the model what is structurally wrong; a run tells it what actually happened.
 The panel you actually use in the game: it talks to `POST /chat/stream` and `GET /chat/result/{job}`
 and keeps the whole conversation, so every turn goes out with all of it. Buttons: **ask**, the mode
 picker, **WRITER** (thinking or fast — the setting travels with the turn, so one chat can be asked
-either way), **scan game**, **run last**, **copy code** (the script and nothing else), **full
-script**, **console**, and **auto**, which runs what it wrote, hands the console back, takes the fix
-and repeats until the script stops changing. The header is one row — the title and the close button —
-and the SCRIPT box takes a share of the screen's height rather than a fixed number of pixels (a
-280-pixel box on a desktop, whatever is left over a phone's transcript), because that row is the one
-it now has. It fills the screen it was given minus the strip Roblox keeps for its own buttons, and
-it and every window it opens are dragged by their bars — with a finger, which `Draggable` cannot do.
+either way), **scan game**, **console**, and **auto**, which runs what it wrote, hands the console
+back, takes the fix and repeats until the script stops changing. **copy code**, **run** and **full
+script** are not on the rail at all: they are built under each answer that carries a script, which
+is the only place there is anything to copy or run — nothing in the panel offers to run a script
+before there is one. The header is one row, the title and the close button, and the SCRIPT box and
+the ask box are both shares of the screen rather than fixed numbers of pixels (a 280-pixel box and a
+62-pixel field on a desktop, whatever a phone's height can spare, and stacked on a phone the box and
+the transcript split the room left between them so neither lands on the ask box). The SCRIPT label
+reads back how much is in it — `SCRIPT · 4821 chars · 213 lines`. It fills the screen it was given
+minus the strip Roblox keeps for its own buttons, and it and every window it opens are dragged by
+their bars — with a finger, which `Draggable` cannot do.
 
 **Thinking is mentioned, never printed.** The chain of thought arrives on the `thoughts` channel
 and the client turns it into one line at the foot of the transcript (`thinking · 12s · 340 chars
@@ -199,7 +203,7 @@ reads the game is only useful if it can be pointed at something.
 | `QWEN_MODEL` | `qwen3.8-max` | the writer |
 | `QWEN_THINKING` | `thinking` | the writer's setting, and the one a turn that asks for none gets: `fast`, `auto` or `thinking` — qwen-api's own enum. `thinking` is the default and the point: a whole script, reasoned, with the `reasoning_content` kept out of the answer and shown on the `thoughts` channel instead. A caller can ask for the other one per turn (`"thinking": "fast"`) and gets `QWEN_FAST_THINKING` |
 | `QWEN_FAST_THINKING` | `fast` | what a `fast` turn sends instead — the same model, reached with the other value |
-| `SCRIPT_RETRIES` | `2` | how many times one turn may tell the writer "that was not a script, send the script" before the turn fails. A paragraph about a script is not shipped as one |
+| `SCRIPT_RETRIES` | `1` | how many times one turn may tell the writer "that was not a script, send the script" before the turn fails. A paragraph about a script is not shipped as one. One retry is another whole model call, which is the slowest thing in a turn, so the default is one |
 | `AGENT_WEB` | `on` | `off` and `web_get` refuses instead of fetching |
 | `WEB_MAX_CHARS` | `8000` | how much of a fetched page is kept |
 | `WEB_TIMEOUT` | `20` | connecting to a page, in seconds |
@@ -217,7 +221,7 @@ reads the game is only useful if it can be pointed at something.
 | `POW_MAX_TRIES` | `5000000` | the largest difficulty the proof of work will attempt |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
 | `AGENT_TOOLS` | `on` | `off` and no tool schemas are attached: the model answers from what it knows |
-| `AGENT_ROUNDS` | `8` | how many tool rounds one turn may take, capped at 12. A round is a model call plus the tools it asked for; `0` disables the toolbox as well |
+| `AGENT_ROUNDS` | `4` | how many tool rounds one turn may take, capped at 12. A round is a model call plus the tools it asked for, so this is the turn's wall-clock as much as its budget — at `8` a curious model could spend nine calls on one question. `0` disables the toolbox as well |
 | `AGENT_RUN` | `on` | `off` and `run_script` refuses: nothing can be executed, whatever is listening |
 | `RUN_TIMEOUT` | `45` | seconds one `run_script` waits for the executor before giving up (5–300) |
 | `EXECUTOR_IDLE` | `90` | how long after its last poll a client still counts as listening |

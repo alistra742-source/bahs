@@ -982,9 +982,32 @@ def client_checks():
           "LayoutOrder = 1000000, ZIndex = 52, Parent = feed" in source, True)
     check("and not a second line in the header", "pulse_dot" in source, False)
     check("the script box takes the row it gave up, and a share of the screen",
-          "local CODE_H = math.clamp(math.floor(panel.h *" in source, True)
+          "CODE_H = math.clamp(math.floor(panel.h * 0.32)" in source, True)
+    check("and the ask box is measured from the screen the same way",
+          "local INPUT_H = math.clamp(math.floor(panel.h *" in source, True)
+    check("which is the height the ask box is built at",
+          "input_size = UDim2.new(1, -156, 0, INPUT_H)" in source, True)
+    check("and it is legible rather than a sliver",
+          "PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = SANS, TextSize = 16,"
+          in source, True)
+    # Stacked, the two things that grow -- the script box and the transcript -- split the room the
+    # fixed rows leave, because a 120-pixel floor on the transcript used to push it down into the
+    # ask box on a short screen: 'neither can push the other' is a claim, and this is it tested.
+    check("stacked, the script box and the transcript share what is left",
+          "(panel.h - NARROW_TOP - NARROW_BELOW) * 0.45" in source, True)
     check("and the stacked transcript is measured from that box",
           source.count("NARROW_TOP + CODE_H + NARROW_BELOW"), 2)
+    check("with no floor left that could land on the ask box",
+          source.count("math.max(0, panel.h - (NARROW_TOP + CODE_H + NARROW_BELOW))"), 1)
+    # copy code, run and full were rail buttons that had to answer "no script yet"; they are built
+    # under the answer that carries a script now, so the rail never shows one with nothing to do.
+    check("copy, run and full are not buttons on the rail",
+          [word for word in ('Text = "run last"', 'Text = "copy code"', 'Text = "full script"')
+           if word in source], [])
+    check("they are built under an answer that carries a script",
+          'if kind == "answer" and only_code(tostring(code or "")) ~= "" then' in source, True)
+    check("and the SCRIPT label says how much is in the box",
+          '" chars  ·  " ..' in source, True)
     check("the status line stays in view while it updates",
           "then scroll_down() end" in source, True)
 
