@@ -66,7 +66,7 @@ footer{margin-top:24px;color:#69738a;font-size:12px;line-height:2}
 footer a{color:var(--blue);text-decoration:none}
 </style>
 </head>
-<body data-model="__MODEL__" data-mode="__MODE__" data-modes="__MODES__" data-greeting="__GREETING__" data-tools="__TOOLS__" data-tool-count="__TOOL_COUNT__" data-rounds="__ROUNDS__">
+<body data-model="__MODEL__" data-mode="__MODE__" data-modes="__MODES__" data-thinking="__THINKING__" data-greeting="__GREETING__" data-tools="__TOOLS__" data-tool-count="__TOOL_COUNT__" data-rounds="__ROUNDS__">
 <div class="wrap">
 
   <div class="top">
@@ -86,6 +86,7 @@ footer a{color:var(--blue);text-decoration:none}
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="hint" id="turns">one conversation, kept in this browser</span>
         <select id="modePick" title="which chain answers your next question"></select>
+        <select id="thinkPick" title="how much the writer reasons before it writes"></select>
         <button class="ghost" id="newChat">new chat</button>
       </div>
     </div>
@@ -100,7 +101,8 @@ footer a{color:var(--blue);text-decoration:none}
   <footer>
     <code>POST /chat/stream</code> &middot; <code>GET /chat/stream/{job}</code> &middot; <code>POST /chat</code> &middot; <code>POST /v1/chat/completions</code> &middot; <code>GET /agent/pull</code> &middot; <code>GET /health</code> &middot; <a href="/docs">/docs</a><br>
     Three ways to be answered, picked above: <b>agent</b> (DeepSeek plans once, then <code>__MODEL__</code> writes
-    it), <b>qwen</b> (<code>__MODEL__</code> alone) and <b>deepseek</b> (DeepSeek alone).<br>
+    it), <b>qwen</b> (<code>__MODEL__</code> alone) and <b>deepseek</b> (DeepSeek alone). The second picker is
+    how much that writer reasons first -- <b>thinking</b> or <b>fast</b>, per turn.<br>
     Every turn is sent with the conversation so far <i>and</i> with this page's session id, so a model keeps
     answering in <b>one chat</b> instead of a new one every question.<br>
     Each question goes out as <code>__GREETING__ your question</code>.<br>
@@ -139,6 +141,22 @@ footer a{color:var(--blue);text-decoration:none}
     return MODES.some(function (m) { return m.id === id && m.on; });
   }
   if (!modeOn(MODE)) MODE = modeOn(DEFAULT_MODE) ? DEFAULT_MODE : ((MODES[0] || {}).id || "");
+
+  // How much the writer reasons first, sent with every turn beside the mode. Two settings, one
+  // writer: "thinking" is the model working the script out before it writes it and is what the
+  // service does when a turn says nothing, and "fast" is the same model spending those tokens on
+  // the script instead. A quick edit wants the second; a remote protocol wants the first.
+  var THINK_KEY = "bahs-think";
+  var THINK_DEFAULT = BODY.dataset.thinking || "thinking";
+  var THINK = THINK_DEFAULT;
+  try {
+    var thinkMemory = localStorage.getItem(THINK_KEY) || "";
+    if (thinkMemory === "thinking" || thinkMemory === "fast") THINK = thinkMemory;
+  } catch (e) {}
+  var THINKINGS = [
+    { id: "thinking", label: "thinking first" },
+    { id: "fast", label: "fast -- no reasoning" }
+  ];
 
   // The session is what keeps one upstream chat: the same value on every turn is the same chat on
   // the provider's side, and a new chat is a new value. It lives here so a reload continues the
@@ -595,7 +613,8 @@ footer a{color:var(--blue);text-decoration:none}
     try {
       // The session goes with every turn -- same value, same upstream chat -- and so does the
       // mode, so the chain a question takes is decided per turn.
-      var data = await api("/chat/stream", { messages: messages, session: SESSION, mode: MODE });
+      var data = await api("/chat/stream", { messages: messages, session: SESSION, mode: MODE,
+                                            thinking: THINK });
       if (data.session && data.session !== SESSION) {
         SESSION = data.session;
         try { localStorage.setItem(SESSION_KEY, SESSION); } catch (e) {}
@@ -701,6 +720,26 @@ footer a{color:var(--blue);text-decoration:none}
     sel.value = MODE;
     flow();
   }
+
+  // The thinking picker: two options, remembered like the mode, and read at send time.
+  function renderThink() {
+    var sel = $("thinkPick");
+    if (!sel) return;
+    sel.textContent = "";
+    THINKINGS.forEach(function (t) {
+      var option = document.createElement("option");
+      option.value = t.id;
+      option.textContent = t.label;
+      sel.appendChild(option);
+    });
+    sel.value = THINK;
+    sel.onchange = function () {
+      THINK = sel.value;
+      try { localStorage.setItem(THINK_KEY, THINK); } catch (e) {}
+      flow();
+    };
+  }
+  renderThink();
 
   function flow() {
     var chosen = MODES.filter(function (m) { return m.id === MODE; })[0];

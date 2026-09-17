@@ -17,16 +17,23 @@ Four things worth knowing before reading the code:
   * Thinking is mentioned, never printed. The service streams the model's own chain of thought on a
     channel of its own -- the `thoughts` field of /chat/result -- and the client puts it to exactly
     one use: the header line reads "thinking · 12s · 340 chars thought" while the turn is working
-    something out, so a quiet minute does not read as broken. The reasoning is not shown in a pane
+    something out, so a quiet minute does not read as broken. The WRITER button turns that thinking
+    off for a turn (the service takes the setting per turn, so it can be either one on any turn),
+    and the header then reads "writing" for the same reason: it is writing, not working it out.
+    The reasoning is not shown in a pane
     and not put in the transcript; it is long, and it is not what anybody is waiting for. "copy
     code" never copies it either: the script is the only thing here that is code.
-  * The model can call tools on this client by writing @@NAME arg@@ in its answer. Those tokens
-    are run here (game dump, remotes, sources, greps, hooks, players, the console, a live run)
-    and the results go back as the next turn -- that is the agentic part.
+  * The model can call tools on this client by writing a token in its answer -- @@GREP remote@@ or
+    @@GREP@@ remote, both are read. Twenty-nine of them: the game dump, remotes, sources, greps,
+    hooks, players and the console; the files on the device, a remote fired for real, a function
+    hooked in place, its upvalues and constants, the garbage collector, the executor's own
+    environment, and a live run. Whatever they found goes back as the next turn -- that is the
+    agentic part -- and a line carrying a token is never part of the script.
 
-Buttons: send (Enter), modes, scan game, run last, copy code (the script and nothing else), full
-script, console, auto -- which runs what it wrote, hands the console back, gets a fix and repeats
-until the script stops changing.
+Buttons: send (Enter), modes, WRITER (thinking or fast: the same model with the reasoning or
+without it), scan game, run last, copy code (the script and nothing else), full script, console,
+auto -- which runs what it wrote, hands the console back, gets a fix and repeats until the script
+stops changing.
 
 On a phone as well as on a desktop. The panel fills the screen it was given -- minus the strip
 Roblox keeps for its own buttons, which is where its header would otherwise be sitting -- with the
@@ -43,6 +50,7 @@ it does not move at all.
 local URL         = "https://bahs-production-d68f.up.railway.app"
 local KEY         = "roblox321@"    -- API key, if the service asks for one
 local MODE        = "agent"         -- agent (plan then write) | qwen | deepseek
+local THINK       = "thinking"      -- thinking (work it out first) | fast (same model, no reasoning)
 local POLL        = 0.8             -- seconds between reads of the running turn
 local MAXROUNDS   = 4               -- auto: how many run-and-fix rounds it may take
 local HISTORY     = 24              -- turns of conversation kept here (the service trims too)
@@ -88,6 +96,16 @@ local function clipboard(text)
 		if pcall(write) then return true end
 	end
 	return false
+end
+
+-- A primitive the executor may or may not hand a script, read without assuming it is there:
+-- some executors put their functions in _G, some only in getgenv()'s table, and a script that
+-- indexes a name that is not there is an error rather than a nil.
+local function primitive(name)
+	local ok, value = pcall(function() return _G[name] end)
+	if ok and value ~= nil then return value end
+	local env = (type(getgenv) == "function") and getgenv() or nil
+	return type(env) == "table" and env[name] or nil
 end
 
 local function headers()
@@ -309,13 +327,27 @@ local function looks_like_script(c)
 	return code * 3 >= lines * 2
 end
 
+-- Any line carrying a tool token is not part of a script: `@@` is not Luau, so a line that has one
+-- is a call rather than code, and leaving it in would paste a token into the executor. Declared
+-- here because everything below reads an answer through extract().
+local function strip_tool_lines(text)
+	if not text or text == "" then return text or "" end
+	local out = {}
+	for line in ((text .. "\n"):gmatch("([^\n]*)\n")) do
+		if not line:find("@@[A-Z_]+[%s@]") and not line:find("@@[A-Z_]+$") then
+			table.insert(out, line)
+		end
+	end
+	return table.concat(out, "\n")
+end
+
 -- The script out of an answer. In order: a fenced block if one is there (a model that fenced
 -- anyway); the whole answer when it reads as one script (the normal path -- this is what the
 -- service sends); otherwise the longest run of lines that read as code. "" means the answer
 -- carried no script, which is what the re-ask keys off.
 local function extract(text)
 	if not text or text == "" then return "" end
-	local t = text:gsub("\r\n", "\n"):gsub("\r", "\n")
+	local t = strip_tool_lines(text:gsub("\r\n", "\n"):gsub("\r", "\n"))
 
 	local best, i = "", 1
 	while true do
@@ -363,7 +395,7 @@ end
 -- one anyway.
 local function only_code(text)
 	local code = extract(text)
-	if code == "" then code = text or "" end
+	if code == "" then code = strip_tool_lines(text or "") end
 	local out = {}
 	for line in ((code .. "\n"):gmatch("([^\n]*)\n")) do
 		if not line:find("^%s*```") then table.insert(out, line) end
@@ -577,8 +609,11 @@ local function props(path)
 	return table.concat(out, "\n")
 end
 
-local function strings()
-	local out = {}
+-- Every string literal in the game's scripts, or the ones containing a word: the hardcoded names,
+-- the remote a script compares against, the key nobody meant to ship. The filter is what turns
+-- this from a dump into a search.
+local function strings(word)
+	local out, needle, cap = {}, (word or ""):lower(), 400
 	for _, name in ipairs(SERVICES) do
 		local service = game:FindFirstChild(name)
 		if service then
@@ -587,7 +622,9 @@ local function strings()
 					local src = source_of(d, 30000)
 					if src then
 						for literal in src:gmatch('"(.-)"') do
-							if #literal >= 4 and #literal <= 120 then
+							local keep = #literal >= 4 and #literal <= 120
+							if keep and needle ~= "" then keep = literal:lower():find(needle, 1, true) ~= nil end
+							if keep and #out < cap then
 								table.insert(out, path_of(d) .. " -> " .. literal)
 							end
 						end
@@ -596,6 +633,11 @@ local function strings()
 			end
 		end
 	end
+	if #out == 0 then
+		return needle == "" and "no string literals in the game's scripts"
+			or ("no string literal contains " .. word)
+	end
+	if #out >= cap then table.insert(out, "... stopped at " .. cap .. " literals") end
 	return table.concat(out, "\n")
 end
 
@@ -627,7 +669,234 @@ local function unhook(path)
 	local remote = resolve(path)
 	if not remote then return "there is no " .. tostring(path) end
 	HOOKED[remote] = nil
+	HOOKED[path] = nil          -- so @@HOOKFN@@ on the same path is not refused as a repeat
 	return "stopped logging " .. path
+end
+
+-- The last piece of a dotted path is often a member rather than a child -- `Kick`, `FireServer`,
+-- `WalkSpeed` -- so this walks everything but it, and gives back either the instance the path
+-- names or the object the member lives on plus the member's name.
+local function resolve_member(path)
+	local object, member = game, ""
+	for piece in (path or ""):gmatch("[^%.]+") do
+		if member ~= "" then object = object and object:FindFirstChild(member) end
+		member = piece
+		if not object then return nil, nil end
+	end
+	if member == "" then return object, nil end
+	local child = object:FindFirstChild(member)
+	if child then return child, nil end
+	return object, member
+end
+
+-- A written value: `5`, `true`, `"text"`, `game.Workspace.Baseplate`. Run through loadstring when
+-- there is one, so a call can be fired with a real instance as an argument; the text is handed
+-- over as it stands when there is not.
+local function value_of(piece)
+	if LOAD and piece and piece ~= "" then
+		local fn = LOAD("return " .. piece)
+		if fn then
+			local ok, value = pcall(fn)
+			if ok then return value end
+		end
+	end
+	return piece
+end
+
+-- =====================================================================================
+-- 5b. the deep end: files, remotes, functions and the garbage collector
+-- =====================================================================================
+--
+-- Everything here reaches past the game tree, into the executor's own primitives. None of them is
+-- guaranteed to exist -- executors differ -- so each one answers "this client cannot do that"
+-- instead of erroring, and the tool result is what tells the model which world it is in.
+
+local function files_under(prefix)
+	if type(listfiles) ~= "function" then return "this executor has no listfiles" end
+	local ok, list = pcall(listfiles, (prefix ~= "" and prefix) or nil)
+	if not ok then return "listfiles refused: " .. tostring(list) end
+	if type(list) ~= "table" or #list == 0 then
+		return "no files" .. (prefix ~= "" and (" under " .. prefix) or "")
+	end
+	local out = {}
+	for i = 1, math.min(#list, 200) do table.insert(out, tostring(list[i])) end
+	if #list > 200 then table.insert(out, "... and " .. (#list - 200) .. " more") end
+	return table.concat(out, "\n")
+end
+
+local function file_read(path)
+	if path == "" then return "no path given" end
+	if type(readfile) ~= "function" then return "this executor has no readfile" end
+	local ok, body = pcall(readfile, path)
+	if not ok then return "readfile refused " .. path .. ": " .. tostring(body) end
+	body = tostring(body)
+	if #body > 40000 then body = body:sub(1, 40000) .. "\n--[cut]" end
+	return body
+end
+
+-- The path is the first line (or the first word, when it was written on one line) and the body is
+-- everything after it, which is how a file that is more than one line gets written.
+local function file_write(arg)
+	local first_line, rest = (arg or ""):match("^([^\n]*)\n?(.*)$")
+	first_line = first_line or ""
+	local path, body = first_line, rest or ""
+	if body == "" then path, body = first_line:match("^(%S+)%s*(.*)$") end
+	path = (path or ""):gsub("%s+$", "")
+	if path == "" then return "no path given: write the path first, then the file body" end
+	if type(writefile) ~= "function" then return "this executor has no writefile" end
+	local ok, err = pcall(writefile, path, body or "")
+	if not ok then return "writefile refused " .. path .. ": " .. tostring(err) end
+	return "wrote " .. #(body or "") .. " characters to " .. path
+end
+
+local function fire_remote(arg)
+	local path, rest = (arg or ""):match("^(%S+)%s*(.*)$")
+	if not path then return "use @@FIRE path arg1 arg2@@ -- the arguments are Lua values" end
+	local remote = resolve(path)
+	if not remote then return "there is no " .. path end
+	if not (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")
+		or remote:IsA("UnreliableRemoteEvent")) then
+		return path .. " is a " .. remote.ClassName .. ", which is not a remote"
+	end
+	local args, shown = {}, {}
+	for piece in (rest or ""):gmatch("[^,]+") do
+		piece = piece:gsub("^%s+", ""):gsub("%s+$", "")
+		if piece ~= "" then
+			local value = value_of(piece)
+			table.insert(args, value)
+			table.insert(shown, tostring(value))
+		end
+	end
+	table.insert(SPY, "[SENT] " .. path .. " (" .. table.concat(shown, " | ") .. ")")
+	if remote:IsA("RemoteFunction") then
+		local ok, result = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
+		if not ok then return "InvokeServer failed: " .. tostring(result) end
+		return "InvokeServer(" .. table.concat(shown, ", ") .. ") returned: " .. tostring(result)
+	end
+	local ok, err = pcall(function() remote:FireServer(table.unpack(args)) end)
+	if not ok then return "FireServer failed: " .. tostring(err) end
+	return "fired " .. path .. " with " .. #args .. " argument(s): "
+		.. (table.concat(shown, " | ") ~= "" and table.concat(shown, " | ") or "none")
+end
+
+-- Hook a function in place, so every call and every return value lands in @@SPY@@. This is how the
+-- model reads a protocol it cannot see: hook the handler, trigger it, ask what it was handed.
+local function hook_fn(path)
+	if type(hookfunction) ~= "function" then return "this executor has no hookfunction" end
+	local object, member = resolve_member(path)
+	if not object then return "there is no " .. tostring(path) end
+	local original = member and object[member] or object
+	if type(original) ~= "function" then return path .. " is not a function" end
+	if HOOKED[path] then return "already logging " .. path end
+	local replacement = function(...)
+		local args = { ... }
+		local parts = {}
+		for i, value in ipairs(args) do parts[i] = tostring(value) end
+		table.insert(SPY, "[CALLED] " .. path .. "(" .. table.concat(parts, " | ") .. ")")
+		local ok, result = pcall(original, ...)
+		table.insert(SPY, "[RETURN] " .. path .. " -> "
+			.. (ok and tostring(result) or ("error: " .. tostring(result))))
+		if not ok then error(result, 0) end
+		return result
+	end
+	local ok, err = pcall(hookfunction, original, replacement)
+	if not ok then return "hookfunction refused " .. path .. ": " .. tostring(err) end
+	HOOKED[path] = true
+	return "hooking " .. path .. " -- every call and return value goes to @@SPY@@"
+end
+
+-- The upvalues and the constants of a function: where a hidden handler keeps the remote it fires
+-- and the strings it compares against.
+local function function_parts(path, reader, label)
+	if type(reader) ~= "function" then
+		return "this executor has no " .. (label == "upvalues" and "getupvalues" or "getconstants")
+	end
+	local object, member = resolve_member(path)
+	local fn = object and (member and object[member] or object)
+	if type(fn) ~= "function" then return tostring(path) .. " is not a function" end
+	local ok, list = pcall(reader, fn)
+	if not ok then return label .. " refused " .. path .. ": " .. tostring(list) end
+	local out = {}
+	for i, value in ipairs(list or {}) do table.insert(out, i .. ": " .. tostring(value)) end
+	if #out == 0 then return "no " .. label .. " on " .. path end
+	return table.concat(out, "\n")
+end
+
+-- The garbage collector: every function alive in this client, by name. A script that was hidden
+-- from the tree still has its handler running, and this is where it is found.
+local function gc_scan(word)
+	if type(getgc) ~= "function" then return "this executor has no getgc" end
+	local ok, list = pcall(getgc, true)
+	if not ok then return "getgc refused: " .. tostring(list) end
+	local needle = (word or ""):lower()
+	local total, functions, found = 0, 0, {}
+	for _, value in ipairs(list or {}) do
+		total = total + 1
+		if type(value) == "function" then
+			functions = functions + 1
+			local name = ""
+			pcall(function() name = tostring(debug.info(value, "n") or "") end)
+			if needle == "" or name:lower():find(needle, 1, true) then
+				if #found < 80 then
+					table.insert(found, (name ~= "" and name or "anonymous") .. "  " .. tostring(value))
+				end
+			end
+		end
+	end
+	table.insert(found, 1, string.format("%d object(s) alive, %d of them functions", total, functions))
+	if #found == 1 then
+		return found[1] .. "\nno function name matches " .. (word ~= "" and word or "(anything)")
+	end
+	return table.concat(found, "\n")
+end
+
+-- What this executor can do: the environment it hands a script. Asked with a filter, it is "is
+-- there a primitive for this" -- the answer that decides what a script may assume.
+local function env_scan(word)
+	local genv = (type(getgenv) == "function" and getgenv()) or _G
+	local needle = (word or ""):lower()
+	local out = {}
+	for key, value in pairs(genv) do
+		local kind = type(value)
+		if kind == "function" or kind == "table" then
+			local name = tostring(key)
+			if needle == "" or name:lower():find(needle, 1, true) then
+				table.insert(out, name .. " (" .. kind .. ")")
+			end
+		end
+	end
+	table.sort(out)
+	if #out == 0 then return "nothing in this executor's environment matches " .. (word ~= "" and word or "") end
+	local capped = {}
+	for i = 1, math.min(#out, 250) do capped[i] = out[i] end
+	if #out > 250 then table.insert(capped, "... and " .. (#out - 250) .. " more") end
+	return table.concat(capped, "\n")
+end
+
+local function fetch_text(url)
+	if url == "" then return "no url given" end
+	if not HTTP then
+		return "this executor has no request function -- use @@EXEC@@ with HttpService:GetAsync instead"
+	end
+	local ok, res = pcall(HTTP, {Url = url, Method = "GET"})
+	if not ok or type(res) ~= "table" then return "the request failed: " .. tostring(res) end
+	local body = tostring(res.Body or "")
+	if #body > 20000 then body = body:sub(1, 20000) .. "\n--[cut]" end
+	return "HTTP " .. tostring(res.StatusCode) .. "\n" .. body
+end
+
+local function set_property(arg)
+	local path, prop, written = (arg or ""):match("^(%S+)%s+(%S+)%s*(.*)$")
+	if not path then return "use @@SET path Property value@@ -- value is a Lua value" end
+	local node = resolve(path)
+	if not node then return "there is no " .. path end
+	local value = value_of(written)
+	local ok, err = pcall(function() node[prop] = value end)
+	if not ok and type(sethiddenproperty) == "function" then
+		ok, err = pcall(sethiddenproperty, node, prop, value)
+	end
+	if not ok then return "could not set " .. path .. "." .. prop .. ": " .. tostring(err) end
+	return path .. "." .. prop .. " = " .. tostring(value)
 end
 
 local function players()
@@ -652,11 +921,20 @@ local function executor_info()
 	pcall(function()
 		if identifyexecutor then name = tostring(identifyexecutor()) end
 	end)
+	-- What the deep tools need, and whether this executor hands it over: the answer decides
+	-- which of them are worth asking for on this device.
+	local can = {}
+	for _, wanted in ipairs({"listfiles", "readfile", "writefile", "getgc", "getupvalues",
+		"getconstants", "hookfunction", "getgenv"}) do
+		if type(primitive(wanted)) == "function" then table.insert(can, wanted) end
+	end
 	return table.concat({
 		"executor: " .. name,
 		"loadstring: " .. (LOAD and "yes" or "no"),
 		"http: " .. (HTTP and "yes" or "no"),
 		"clipboard: " .. (clipboard and "yes" or "no"),
+		"primitives: " .. (#can > 0 and table.concat(can, ", ") or "none of the extra ones"),
+		"writer: " .. THINK .. " (the WRITER button switches it)",
 		"place: " .. game.Name .. " (" .. tostring(game.PlaceId) .. ")",
 		"player: " .. LP.Name .. " (" .. LP.DisplayName .. ")",
 	}, "\n")
@@ -728,8 +1006,8 @@ local TOOLS = {
 		run = function(arg) return tree(arg) end},
 	{name = "PROPS", hint = "@@PROPS path@@ the interesting properties of one instance",
 		run = function(arg) return props(arg) end},
-	{name = "DUMP_STRINGS", hint = "every string literal in the game's scripts",
-		run = function() return strings() end},
+	{name = "DUMP_STRINGS", hint = "@@DUMP_STRINGS word@@ every string literal in the game's scripts containing word",
+		run = function(arg) return strings(arg) end},
 	{name = "HOOK", hint = "@@HOOK path@@ log what a remote fires with",
 		run = function(arg) return hook(arg) end},
 	{name = "UNHOOK", hint = "@@UNHOOK path@@ stop logging that remote",
@@ -748,6 +1026,28 @@ local TOOLS = {
 		run = function(arg) return exec_snippet(arg) end},
 	{name = "SELF", hint = "this client: what it can do, and the tools available",
 		run = function() return executor_info() end},
+	{name = "FILES", hint = "@@FILES prefix@@ the files this executor can see, under prefix",
+		run = function(arg) return files_under(arg) end},
+	{name = "READ", hint = "@@READ path@@ the contents of a file on the device",
+		run = function(arg) return file_read(arg) end},
+	{name = "WRITE", hint = "@@WRITE@@ path, then the file body on the lines under it, then @@",
+		run = function(arg) return file_write(arg) end},
+	{name = "FIRE", hint = "@@FIRE path arg1, arg2@@ fire or invoke a remote and read the reply",
+		run = function(arg) return fire_remote(arg) end},
+	{name = "HOOKFN", hint = "@@HOOKFN path@@ log every call of a function and what it returned",
+		run = function(arg) return hook_fn(arg) end},
+	{name = "UPVALUES", hint = "@@UPVALUES path@@ the upvalues of a function: what it is holding",
+		run = function(arg) return function_parts(arg, primitive("getupvalues"), "upvalues") end},
+	{name = "CONSTANTS", hint = "@@CONSTANTS path@@ the constants of a function: the strings it uses",
+		run = function(arg) return function_parts(arg, primitive("getconstants"), "constants") end},
+	{name = "GETGC", hint = "@@GETGC word@@ every live function in the client whose name contains word",
+		run = function(arg) return gc_scan(arg) end},
+	{name = "ENV", hint = "@@ENV word@@ what this executor hands a script: its functions and tables",
+		run = function(arg) return env_scan(arg) end},
+	{name = "HTTP", hint = "@@HTTP url@@ fetch a URL from here and read the body",
+		run = function(arg) return fetch_text(arg) end},
+	{name = "SET", hint = "@@SET path Property value@@ write a property (value is a Lua value)",
+		run = function(arg) return set_property(arg) end},
 }
 
 local function tool_brief()
@@ -755,7 +1055,13 @@ local function tool_brief()
 	for _, tool in ipairs(TOOLS) do
 		table.insert(out, "  @@" .. tool.name .. "@@ " .. tool.hint)
 	end
-	table.insert(out, "Example: write @@GREP remote@@ on a line of its own. The token is not code: never put one inside the script.")
+	table.insert(out, table.concat({
+		"Put each call on a line of its own, either as @@GREP remote@@ or as @@GREP@@ remote.",
+		"For an argument longer than one line (a @@WRITE@@ body, an @@EXEC@@ snippet), write the token",
+		"alone on its line, then the argument, then @@ alone on a line to close it.",
+		"The tokens are not code: never put one inside the script you send back, and never describe",
+		"a call in prose instead of writing it -- a token is run, a sentence about one is not.",
+	}, " "))
 	return table.concat(out, "\n")
 end
 
@@ -765,18 +1071,90 @@ run_last = function()
 	return (ok and "the script ran without error" or "the script failed") .. "\n" .. out
 end
 
--- Every @@NAME arg@@ in an answer, run, as one block of text for the next turn.
+-- Every tool call in an answer, in the order it was written.
+--
+-- Both shapes the models actually write are read: @@GREP word@@, with the argument between the
+-- tokens, and @@SOURCE@@ game.ReplicatedStorage.X, with it after them. A call ends at its closing
+-- token or at the end of its line, whichever comes first -- and when the token is alone on its
+-- line, at the next @@ instead, which is how a multi-line argument is written.
+--
+-- This used to be one pattern, @@([A-Z_]+)%s*([^@]*)@@, and that pattern ate the *next* call's
+-- opening token as its own closing one: a block of six calls ran three of them and half of the
+-- model's requests vanished, which is what a turn that "answered" without building anything was.
+local function tool_calls_in(answer)
+	local calls, text, pos = {}, answer or "", 1
+	while true do
+		local start, finish, name = text:find("@@([A-Z_]+)", pos)
+		if not start then break end
+		local after = finish + 1
+		-- Spaces and tabs only: a call never spans two lines unless its token says so.
+		while true do
+			local char = text:sub(after, after)
+			if char == " " or char == "\t" then after = after + 1 else break end
+		end
+		local close = text:find("@@", after, true)
+		local newline = text:find("\n", after, true)
+		local closing_here = close ~= nil and (newline == nil or close < newline)
+		local arg, next_pos
+		if closing_here and close > after then
+			-- @@GREP word@@ -- the argument sits between the two tokens.
+			arg = text:sub(after, close - 1)
+			next_pos = close + 2
+		elseif closing_here then
+			-- @@SOURCE@@ path -- the token closed itself, so what follows on the line is the first
+			-- of the argument, and the lines under it may go on being the argument up to a line
+			-- holding nothing but @@. That closer is only taken as this call's when no other token
+			-- comes first -- otherwise a call with an argument of its own (@@FIRE@@ Remote, 1) would
+			-- swallow the call written under it.
+			local rest = newline and text:sub(after + 2, newline - 1) or text:sub(after + 2)
+			local from = newline or (#text + 1)
+			local closer = text:find("\n@@", from, true)
+			while closer do
+				local end_of_that_line = text:find("\n", closer + 3, true) or (#text + 1)
+				if text:sub(closer + 3, end_of_that_line - 1):match("^[ \t\r]*$") then break end
+				closer = text:find("\n@@", closer + 3, true)
+			end
+			local other = text:find("@@[A-Z_]", from + 1)
+			if closer and (not other or other > closer) then
+				arg = rest .. text:sub(from, closer - 1)
+				next_pos = (text:find("\n", closer + 3, true) or #text) + 1
+			else
+				arg = rest
+				next_pos = from
+			end
+		else
+			-- No closing token on this line at all: the rest of the line is the argument.
+			arg = newline and text:sub(after, newline - 1) or text:sub(after)
+			next_pos = newline and (newline + 1) or (#text + 1)
+		end
+		table.insert(calls, {name = name,
+			arg = (arg or ""):gsub("^[ \t\r\n]+", ""):gsub("[ \t\r\n]+$", "")})
+		pos = next_pos
+	end
+	return calls
+end
+
+-- How many calls one answer may run: enough for a scan and a follow-up, few enough that a model
+-- that writes twenty of them cannot spend the turn's whole minute inside this function.
+local MAXTOOLS = 8
+
+-- Every tool call in an answer, run, as one block of text for the next turn.
 local function run_tools(answer)
-	local out = {}
-	for name, arg in (answer or ""):gmatch("@@([A-Z_]+)%s*([^@]*)@@") do
+	local out, ran = {}, 0
+	local calls = tool_calls_in(answer)
+	for _, call in ipairs(calls) do
+		local name, arg = call.name, call.arg
 		local tool = nil
 		for _, candidate in ipairs(TOOLS) do
 			if candidate.name == name then tool = candidate break end
 		end
-		arg = arg:gsub("^%s+", ""):gsub("%s+$", "")
 		if not tool then
 			table.insert(out, "@@" .. name .. "@@: there is no such tool")
+		elseif ran >= MAXTOOLS then
+			table.insert(out, "@@" .. name .. "@@: not run -- a turn runs at most " .. MAXTOOLS
+				.. " tools. Ask for it again in the next answer if it still matters.")
 		else
+			ran = ran + 1
 			local ok, result = pcall(tool.run, arg)
 			table.insert(out, "@@" .. name .. (arg ~= "" and (" " .. arg) or "") .. "@@:\n"
 				.. (ok and tostring(result) or ("the tool failed: " .. tostring(result))))
@@ -812,14 +1190,14 @@ local function ask(question)
 	table.insert(MSGS, {role = "user", content = question})
 	trim()
 	local ok, started = api_retry("POST", "/chat/stream",
-		{messages = MSGS, session = SESSION, mode = MODE})
+		{messages = MSGS, session = SESSION, mode = MODE, thinking = THINK})
 	if not ok then table.remove(MSGS) error(started, 0) end
 
 	local id = tostring(started.job or "")
 	if id == "" then table.remove(MSGS) error("the service did not return a job", 0) end
 
 	UI.setStatus("running", tostring(started.model or "") .. "  ·  " .. tostring(started.mode or MODE)
-		.. "  ·  session " .. SESSION:sub(1, 6))
+		.. "  ·  " .. tostring(started.thinking or THINK) .. "  ·  session " .. SESSION:sub(1, 6))
 	local text, plan, thoughts, tools_done = "", "", "", ""
 	local last_note, waited = "", 0
 
@@ -853,7 +1231,11 @@ local function ask(question)
 				note = note .. "  ·  " .. #thoughts .. " chars thought"
 			end
 			UI.setStatus(doing, note)
-			UI.setCode(text)
+			-- The script pane only ever holds a script. The streamed answer is prose about the script
+			-- -- with tool calls in it -- before there is a script at all, and a pane labelled SCRIPT
+			-- full of that is what made a turn with nothing in it read as finished.
+			local sofar = extract(text)
+			if sofar ~= "" then UI.setCode(sofar) end
 			if status == "error" then
 				table.remove(MSGS)
 				error(tostring(data.error or "the turn failed"), 0)
@@ -920,6 +1302,9 @@ local function process(question)
 	if question == nil or question == "" then return end
 	busy = true
 	UI.setBusy(true)
+	-- The pane is cleared for the new turn: what is in it is the last answer's script, and
+	-- leaving it there while the next answer is written is how a stale one gets copied.
+	UI.setCode("")
 	UI.bubble("user", question)
 	local ok, text, code, plan = pcall(ask, question)
 	if not ok then
@@ -1424,6 +1809,28 @@ for _, entry in ipairs(MODES) do
 end
 refresh_modes()
 
+-- How much the writer reasons before it writes. One button, two states: the service takes the
+-- setting per turn, so the same conversation can be asked in thinking and then asked again fast.
+mk("TextLabel", {
+	Size = L.rail_label, BackgroundTransparency = 1, Text = "WRITER", TextColor3 = C.dim,
+	Font = SANS_B, TextSize = 10, LayoutOrder = (function() order = order + 1 return order end)(),
+	ZIndex = 52, Parent = rail,
+})
+local think_button = mk("TextButton", {
+	Size = L.rail_mode, BackgroundColor3 = C.card2, Text = "qwen: " .. THINK,
+	TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0,
+	AutoButtonColor = false, LayoutOrder = (function() order = order + 1 return order end)(),
+	ZIndex = 52, Parent = rail,
+})
+round(think_button, 9)
+outline(think_button, C.line, 1, 0.5)
+think_button.Activated:Connect(function()
+	THINK = (THINK == "thinking") and "fast" or "thinking"
+	think_button.Text = "qwen: " .. THINK
+	think_button.TextColor3 = (THINK == "fast") and C.accent2 or C.text
+	UI.setStatus("ready", "the writer answers " .. THINK .. " from the next turn on")
+end)
+
 mk("TextLabel", {
 	Size = L.rail_label, BackgroundTransparency = 1, Text = "ACTIONS", TextColor3 = C.dim,
 	Font = SANS_B, TextSize = 10, LayoutOrder = (function() order = order + 1 return order end)(),
@@ -1805,9 +2212,13 @@ end
 
 MSGS = {{role = "system", content = SYSTEM .. "\n\n" .. tool_brief()}}
 UI.setStatus("ready", "ask for a script, or press scan game")
-UI.bubble("system", "ready. ask for a script, or press scan game. the header says thinking while it"
-	.. " is working something out -- the reasoning itself is not printed -- and every answer comes"
-	.. " back as one whole script. drag a window's bar, or the orb, with your finger to move it.")
+UI.bubble("system", "ready. ask for a script, or press scan game. the header says thinking while"
+	.. " it works something out -- the reasoning itself is not printed -- and the WRITER button"
+	.. " switches the writer to fast, which is the same model without the reasoning. every answer"
+	.. " comes back as one whole script, or the turn says it produced none instead of pretending."
+	.. " the tools marked @@ in the brief are run here and fed back to the model: it can read the"
+	.. " game's scripts, its files, fire and hook remotes, and walk the garbage collector."
+	.. " drag a window's bar, or the orb, with your finger to move it.")
 
 log("System", "Ghaith 2.0 loaded")
-real_print("Ghaith 2.0 · " .. URL .. " · mode " .. MODE)
+real_print("Ghaith 2.0 · " .. URL .. " · mode " .. MODE .. " · writer " .. THINK)

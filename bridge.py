@@ -209,6 +209,50 @@ CHAT_TIMEOUT = float(env("CHAT_TIMEOUT", default="0"))
 QWEN = Provider("qwen", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
                 {"thinking_mode": QWEN_THINKING}, CHAT_TIMEOUT)
 
+# The same model on the same endpoint with the other setting, so the caller can ask for speed on
+# the turn where it wants speed and for reasoning on the turn where it wants that -- instead of the
+# whole service being pinned to whichever one the operator happened to start it with. A fast turn
+# is the same writer with fewer tokens spent before it starts writing.
+QWEN_FAST_THINKING = env("QWEN_FAST_THINKING", default="fast")
+QWEN_FAST = Provider("qwen-fast", QWEN_URL, QWEN_TOKEN, QWEN_MODEL,
+                     {"thinking_mode": QWEN_FAST_THINKING}, CHAT_TIMEOUT)
+
+# Both of these are the writer: the tool rounds belong to them, and the session's continuation
+# marker rides on their answers and no one else's -- so "is this Qwen" is a membership test here
+# rather than an identity one, or a fast turn would forget the chat it was in.
+QWEN_PROVIDERS = (QWEN, QWEN_FAST)
+
+# The words a caller may use for the setting, in the sense a caller would mean them. Anything not
+# listed as fast is thinking: thinking is what this service does, and an unrecognised word must not
+# quietly turn reasoning off.
+FAST_WORDS = ("fast", "quick", "instant", "speed", "off", "no", "false", "0", "none")
+
+
+def writer_thinking(asked: str = "") -> str:
+    """The writer's setting for one turn: "fast" or "thinking".
+
+    An empty value is the service's own default, which is thinking -- the setting that produces the
+    better script, and the one every turn had before a caller could pick.
+    """
+    word = (asked or "").strip().lower()
+    if not word:
+        return "fast" if QWEN_THINKING.strip().lower() in FAST_WORDS else "thinking"
+    return "fast" if word in FAST_WORDS else "thinking"
+
+
+def thinking_label(value: str) -> str:
+    """How a setting reads on a chip, a log line or a status.
+
+    The same words the caller may use, so every spelling of "not thinking" reads back as "fast" --
+    including DeepSeek's on/off, which is a setting of its own.
+    """
+    return "fast" if (value or "").strip().lower() in FAST_WORDS else "thinking"
+
+
+def writer_for(value: str = "") -> Provider:
+    """The provider that writes the script: the same model, thinking or not."""
+    return QWEN_FAST if writer_thinking(value) == "fast" else QWEN
+
 # --- chat.deepseek.com, driven by the token the site itself stores -----------------------
 #
 # The web app has no public API, but its own endpoints answer a server, so a *userToken* -- the
@@ -628,6 +672,22 @@ DEEPSEEK = Provider(
 
 META_RE = re.compile(r"<!--\s*qwen_metadata:.*?-->", re.S)
 TOOL_XML = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.S)
+# A line that is a tool call for the Roblox client: `@@GREP word@@`, `@@SOURCE@@ path`, or the
+# opening line of one whose argument runs on. The client reads these out of the answer and runs
+# them, which is a job this service cannot do -- it has no Roblox to look at.
+TOOL_LINE = re.compile(r"(?m)^[ \t]*@@[A-Z_]+")
+
+
+def tool_request(text: str) -> bool:
+    """Whether the answer is asking the client to run its tools rather than answering.
+
+    The difference that matters here: prose about a script is a turn that failed, and a list of
+    calls for the client is a turn doing its work. The first has to be asked again or refused; the
+    second has to be shipped, because the client runs those calls and asks its next question with
+    what they found -- and asking the model again instead would throw the calls away and have it
+    answer from less than it knew.
+    """
+    return bool(TOOL_LINE.search(text or ""))
 # The two things that must never reach the text: a tool call in its XML shape, and the metadata.
 MARKERS = (("<tool_calls>", "</tool_calls>"), ("<!--", "-->"))
 
@@ -761,14 +821,18 @@ summary of your changes, and no markdown fence -- never write ``` anywhere, not 
 not after it, and not around a snippet inside it. The answer is pasted straight into an executor, \
 where a fence line is a syntax error."""
 
-# With tools on, this rides in front of the caller's conversation as the system turn.
+# With tools on, this rides in front of the caller's conversation as the system turn. Every tool
+# this service has is named here: a tool the writer is not told about is a tool it will not use,
+# and the list is one line each so it stays cheap on every call.
 TOOL_SYSTEM = EXECUTOR_NOTE + """
 
 You have tools, and using them is part of writing the script:
 * `roblox_api` -- check that a class, property, function or event really exists before you rely on it.
+* `web_get` -- read a page: Roblox documentation, a DevForum thread, a raw file. Use it when the answer depends on how something is really used, not on whether the member exists.
 * `luau_check` -- check the whole script for unbalanced blocks, unterminated strings and calls that break in an executor, before you hand it over.
 * `run_script` -- run it in the executor that is listening, when one is, and read what it printed or how it failed. Nothing else can prove a script runs.
 * `apply_edit` -- change one part of a script you already have instead of writing the whole thing again.
+* `luau_find` -- the lines of a script that match a pattern, with line numbers, when you need one part of a long script.
 * `luau_format` -- re-indent a script you assembled from pieces.
 * `secret_scan` -- find credentials in the script before it ships.
 
@@ -811,6 +875,11 @@ AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="8")), AGENT_ROUNDS_MA
 # The tool that actually runs a script is the one that can hang (an executor stuck in a wait), so
 # it is bounded separately.
 TOOL_RESULT_MAX = int(env("TOOL_RESULT_MAX", default="20000"))
+# How many times one turn may tell the writer "that was not a script, send the script" before it
+# gives up. One is normally enough -- it is the same chat, and the second answer arrives while the
+# first is still in front of it -- so this is a bound on a model stuck in prose, not a budget to
+# spend on every turn.
+SCRIPT_RETRIES = max(0, min(int(env("SCRIPT_RETRIES", default="2")), 4))
 
 # --- the three modes ---------------------------------------------------------------------
 #
@@ -1129,6 +1198,90 @@ def looks_like_code(text: str) -> bool:
                if line.startswith("--") or any(marker in line for marker in markers)
                or (("=" in line or "(" in line) and len(line) > 3))
     return hits >= max(2, (len(lines) * 2) // 3)
+
+
+# --- is the answer actually a script? -----------------------------------------------------
+#
+# The one failure that reads as success: a model that answers with a paragraph about the script it
+# is going to write, or with a list of tools it means to call. `structural_notes` below cannot see
+# it -- that check is about an answer being whole, and a paragraph is whole -- so it used to ship,
+# with the turn reported as answered and the paragraph sitting where the script goes.
+#
+# Everything here is structural on purpose, because that is all this service can honestly be: it
+# says what the text looks like, not what it does.
+
+# A tool call the Roblox client runs by reading it out of the answer. Both shapes are in the wild --
+# `@@GREP word@@` and `@@SOURCE@@ path` -- and neither is Lua. Longest branch first, so a token that
+# closes before its argument is not left with a stray `@@` in the text.
+TOOL_TOKEN = re.compile(r"@@[A-Z_]+[ \t]+[^@\n]*@@|@@[A-Z_]+@@|@@[A-Z_]+")
+# A whole line that is one of those calls. Cut by line as well as by token, because the argument
+# of `@@SOURCE@@ path` is the rest of that line: it is the client's to read, and the path is not
+# a line of any script.
+TOOL_CALL_LINE = re.compile(r"(?m)^[ \t]*@@[A-Z_]+.*$")
+
+# The words that make a line look like a statement rather than a sentence about one. `game` and
+# `script` are in here because `game.Workspace.Baseplate.Transparency = 1` is a whole script.
+LUA_WORD = re.compile(r"\b(local|function|end|then|else|elseif|for|while|repeat|until|do|return|"
+                      r"break|continue|and|or|not|nil|true|false|game|script|Instance|Enum|"
+                      r"task|wait|spawn|print|warn|pcall|xpcall|ipairs|pairs|require|math|"
+                      r"string|table|tostring|tonumber|type|typeof|self)\b")
+# A line of nothing but closers is not evidence either way, so it is not counted at all.
+PUNCTUATION_ONLY = re.compile(r"^[)\]},;]+$")
+
+
+def reads_as_english(line: str) -> bool:
+    """Whether a line reads as a sentence rather than as a statement.
+
+    Four or more words with no assignment, no call and no table in them is English. It is what
+    keeps `and`, `for`, `then` and `end` -- Lua words that are also ordinary words -- from
+    making a paragraph of prose look like a script, which is the failure this verdict exists to
+    catch.
+    """
+    if any(char in line for char in "=({["):
+        return False
+    return len(line.split()) >= 4
+
+
+def script_verdict(text: str) -> tuple:
+    """Whether an answer is a script, and when it is not, why -- in one sentence.
+
+    Deliberately generous about what counts as one. A script is short and ugly and full of
+    one-line statements, and refusing a real one costs a caller a turn; so the bar is "most of the
+    lines read as Lua", with the single-statement and two-line scripts going through on their own.
+    """
+    body = TOOL_TOKEN.sub("", TOOL_CALL_LINE.sub("", text or ""))
+    lines = []
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not PUNCTUATION_ONLY.match(line):
+            lines.append(line)
+    if not lines:
+        return False, "the answer carried no script at all"
+    readable = sum(1 for line in lines
+                   if not reads_as_english(line)
+                   and (LUA_WORD.search(line) or line.startswith("--")
+                        or "=" in line or "(" in line or "{" in line))
+    if readable == 0:
+        return False, "no line of the answer reads as Lua"
+    if len(lines) >= 3:
+        if readable * 3 < len(lines) * 2:
+            return False, f"only {readable} of {len(lines)} lines read as Lua"
+    elif readable < len(lines):
+        # One or two lines have no room for a majority, so every one of them counts.
+        return False, f"only {readable} of {len(lines)} lines read as Lua"
+    return True, ""
+
+
+def prose_correction(why: str) -> str:
+    """The turn that turns a prose answer into a script, asked in the chat that produced it.
+
+    Sent as the newest user turn rather than as a new system instruction: the conversation is the
+    writer's own, and what it needs to hear is what was wrong with what it just said.
+    """
+    return (f"That answer was not a script ({why}), so nothing could be pasted into the executor "
+            f"and nothing was built. Reply with ONLY the complete Luau script, ready to run: no "
+            f"prose, no explanation of the approach, no markdown fence, and no tool token on a "
+            f"line of its own. The script itself, whole.")
 
 
 def structural_notes(text: str, finish: Optional[str]) -> tuple:

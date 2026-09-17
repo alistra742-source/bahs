@@ -16,14 +16,21 @@ which is what turns "write a script" into "write it, run it, read the error, fix
 
     luau_check(script)                      structural read of the script
     luau_format(script)                     re-indent by block depth
+    luau_find(script, pattern, context)     the lines that match, numbered -- one part of a script
     roblox_api(query, class_name, member)   the real API dump: does that member exist, and how
     apply_edit(script, find, replace)       one targeted edit, instead of the whole file again
     secret_scan(script)                     what must not ship in the script
+    web_get(url, max_chars)                 read a page: docs, a DevForum answer, a raw file
     run_script(script, timeout)             run it in the connected executor and read the output
+
+The two that look outside the script -- `roblox_api` at the API dump and `web_get` at the open web
+-- are the writer's only way to check something it cannot see from here: there is no Roblox in this
+image, so a member is either in the dump or it is a guess, and how a thing is *used* is either on a
+page it can read or it is a guess too.
 """
 from bridge import env, redact  # the same env(), and the same masking the chain already uses
 
-import httpx, json, re, threading, time, uuid
+import html as html_mod, httpx, json, re, threading, time, uuid
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -87,6 +94,45 @@ TOOLS = [
                     "limit": {"type": "integer", "description": "how many members to show"},
                 },
                 "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "luau_find",
+            "description": ("Find the lines of a script that match a pattern, with line numbers and "
+                            "optional context. The way to look at the one part of a long script "
+                            "you are changing instead of reading the whole thing again."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": SCRIPT_ARG,
+                    "pattern": {"type": "string",
+                                "description": ("a Lua pattern: 'FireServer' , '%.Name', "
+                                                "'for .- do', '%d+'")},
+                    "context": {"type": "integer",
+                                "description": "lines to show after each match (default 0)"},
+                },
+                "required": ["script", "pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_get",
+            "description": ("Fetch a page and read it as text: Roblox documentation, a DevForum "
+                            "thread, a gist, a raw file. Use it when the answer depends on how "
+                            "something is really used rather than on whether the member exists."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "the http(s) URL to read"},
+                    "max_chars": {"type": "integer",
+                                  "description": "how much of it to keep (default 8000)"},
+                },
+                "required": ["url"],
             },
         },
     },
@@ -742,6 +788,104 @@ def _text(title: str, body: str) -> str:
     return f"{title}\n{body}" if body else title
 
 
+# --- looking at one part of a script, and at a page --------------------------------------
+
+# Lua's character classes, in Python's spelling. Only the ones a writer types, and `%X` with an
+# unknown letter stays literal: a pattern the model got wrong has to come back as a message about
+# the pattern, not as a search that quietly matches the wrong thing.
+LUA_CLASS = {"a": "[A-Za-z]", "c": "[\\x00-\\x1f\\x7f]", "d": "\\d", "l": "[a-z]",
+             "p": "[^\\w\\s]", "s": "\\s", "u": "[A-Z]", "w": "[A-Za-z0-9_]",
+             "x": "[A-Fa-f0-9]", "z": "\\x00"}
+
+
+def lua_pattern(pattern: str) -> str:
+    """A Lua pattern, close enough to search with: the classes, and the magic that is the same.
+
+    `-` is Lua's lazy repetition and becomes Python's `*?`; everything Lua treats as literal is
+    escaped. It is not the whole language -- there is no `%b` nor `%f` -- and it says so by simply
+    not matching, which is the same answer as a pattern that finds nothing.
+    """
+    out, index = [], 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "%" and index + 1 < len(pattern):
+            nxt = pattern[index + 1]
+            out.append(LUA_CLASS.get(nxt.lower(), re.escape(nxt)))
+            index += 2
+            continue
+        if char == "-":
+            out.append("*?")
+        elif char in ".[]*+?^$()|":
+            out.append(char)
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return "".join(out)
+
+
+def find_lines(script: str, pattern: str, context: int = 0, limit: int = 80) -> str:
+    """The matching lines of a script, numbered, with a little context each. "" means none."""
+    if not (pattern or "").strip():
+        return "no pattern was given"
+    try:
+        rx = re.compile(lua_pattern(pattern))
+    except re.error as e:
+        return f"that is not a pattern that can be searched with: {e}"
+    lines = (script or "").splitlines()
+    hits = [index for index, line in enumerate(lines) if rx.search(line)]
+    if not hits:
+        return f"no line of the script matches {pattern!r}"
+    out, shown = [], 0
+    for index in hits[:limit]:
+        out.append(f"{index + 1}: {lines[index].strip()[:200]}")
+        for offset in range(1, max(0, context) + 1):
+            if index + offset < len(lines):
+                out.append(f"{index + offset + 1}:   {lines[index + offset].strip()[:200]}")
+        shown += 1
+    head = f"{len(hits)} line(s) match {pattern!r}"
+    if len(hits) > shown:
+        head += f" (showing the first {shown})"
+    return _text(head, "\n".join(out))
+
+
+# What a fetched page is worth keeping of. Bigger pages exist; nothing here needs all of one.
+WEB_MAX_CHARS = int(env("WEB_MAX_CHARS", default="8000"))
+WEB_TIMEOUT = float(env("WEB_TIMEOUT", default="20"))
+WEB_AGENT = "bahs-agent/1.0 (+luau writer; reads public documentation pages)"
+# Where the page's own machinery sits between the reader and the words: cut it, then everything
+# else that is a tag, then turn the entities back into the characters they stand for.
+PAGE_NOISE = re.compile(r"<(script|style|nav|svg|noscript)\b.*?</\1>", re.S | re.I)
+PAGE_BREAK = re.compile(r"</(p|div|li|h[1-6]|tr|section|article|pre|code)>|<br\s*/?>", re.I)
+PAGE_TAG = re.compile(r"<[^>]+>")
+
+
+def page_text(raw: str) -> str:
+    """A page as readable text: no scripts, no styles, no tags, no run of blank lines."""
+    body = PAGE_NOISE.sub(" ", raw or "")
+    body = PAGE_BREAK.sub("\n", body)
+    body = html_mod.unescape(PAGE_TAG.sub(" ", body))
+    lines = [" ".join(line.split()) for line in body.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def fetch_text(url: str, cap: int = 0, timeout: float = 0) -> str:
+    """Fetch a URL and give back what it says. Raises nothing: a failure is the answer."""
+    limit = max(500, min(int(cap or WEB_MAX_CHARS), 60000))
+    with httpx.Client(timeout=timeout or WEB_TIMEOUT, follow_redirects=True,
+                      headers={"User-Agent": WEB_AGENT, "Accept": "text/html,text/plain,*/*"}) as c:
+        r = c.get(url)
+        if r.status_code >= 400:
+            return f"{url} answered HTTP {r.status_code} {r.reason_phrase}"
+        raw = r.text or ""
+        ctype = r.headers.get("content-type", "").lower()
+    body = page_text(raw) if "html" in ctype else raw
+    body = body.strip()
+    if not body:
+        return f"{url} answered with nothing readable"
+    cut = "\n[... the page was longer than the cap; ask for another part of it ...]"
+    return body if len(body) <= limit else body[:limit] + cut
+
+
 def run(name: str, arguments: dict, session: str = "") -> dict:
     """Run one tool call and give back something a model can act on.
 
@@ -766,6 +910,12 @@ def run(name: str, arguments: dict, session: str = "") -> dict:
             formatted = format_script(script)
             return {"ok": True, "summary": f"re-indented {len(formatted.splitlines())} line(s)",
                     "output": formatted}
+        if name == "luau_find":
+            script = str(arguments.get("script") or "")
+            pattern = str(arguments.get("pattern") or "")
+            answer = find_lines(script, pattern, int(arguments.get("context") or 0))
+            return {"ok": not answer.startswith(("no pattern", "that is not a pattern")),
+                    "summary": answer.splitlines()[0][:200], "output": answer}
         if name == "roblox_api":
             answer = api_lookup(str(arguments.get("query") or ""),
                                 str(arguments.get("class_name") or ""),
@@ -807,6 +957,18 @@ def run(name: str, arguments: dict, session: str = "") -> dict:
             return {"ok": True, "summary": f"{count} credential(s) in the script",
                     "output": _text(f"{count} credential(s) found -- do not ship them",
                                     "\n".join(lines))}
+        if name == "web_get":
+            url = str(arguments.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                return {"ok": False, "summary": "not a URL",
+                        "output": "the url has to start with http:// or https://"}
+            if env("AGENT_WEB", default="on").lower() in ("off", "0", "false", "no"):
+                return {"ok": False, "summary": "reading pages is switched off",
+                        "output": "AGENT_WEB=off on this service, so nothing can be fetched"}
+            body = fetch_text(url, int(arguments.get("max_chars") or 0))
+            ok = not body.startswith((f"{url} answered HTTP", f"{url} answered with nothing"))
+            return {"ok": ok, "summary": f"{len(body)} chars from {url}" if ok else body[:200],
+                    "output": _text(f"GET {url}", body)}
         if name == "run_script":
             script = str(arguments.get("script") or "")
             if not script.strip():
@@ -849,6 +1011,7 @@ def tool_state() -> dict:
         "on": tools_enabled(),
         "names": TOOL_NAMES,
         "run": env("AGENT_RUN", default="on"),
+        "web": env("AGENT_WEB", default="on"),
         "dump_ok": dump["ok"],
         "dump_classes": dump["classes"],
         "dump_source": dump["source"],

@@ -18,8 +18,19 @@ A turn runs in one of three modes, and which is the caller's to pick:
 
 Agent mode is two models called once each, not a negotiation: the plan is context for the writer
 and is never handed back to the planner or reviewed by it. What follows the plan is the writer's
-own work, which is what `luau_check` (structure), `roblox_api` (the real API dump) and
-`run_script` (the connected executor) are for.
+own work, which is what `luau_check` (structure), `roblox_api` (the real API dump), `web_get` (how
+something is used) and `run_script` (the connected executor) are for.
+
+The writer has two settings, and the caller picks one per turn: `thinking` (the default) has it
+reason the script out before writing it, `fast` has it spend those tokens on the script. Either
+one can be asked for on any turn of the same conversation.
+
+And what the turn produces is checked before it is called an answer. A paragraph about a script is
+not a script: it is handed back to the writer with the reason and the writer is asked again, and a
+turn that never gets there fails saying so -- it used to ship, marked answered, with the client
+showing a paragraph where the script goes. The exception is a list of calls for the Roblox client
+(`@@DEEPSCAN@@`, `@@GREP@@ word`), which cannot be a script and is not one: that ships, because the
+client runs those calls and asks its next question with what they found.
 """
 from bridge import *  # noqa: F401,F403 -- the providers, the config and the session stores
 from thoughts import stream_with_thoughts  # the same writer's stream, its thinking kept
@@ -50,14 +61,19 @@ class Job:
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, session: str,
-                 mode: str):
+                 mode: str, thinking: str = ""):
         self.id = uuid.uuid4().hex[:12]
         self.messages = messages
         self.temperature = temperature
         self.note = note
         self.session = session
         self.mode = mode
-        self.provider = QWEN          # the provider of the call in flight, for the error it raises
+        # The writer's setting for this turn, decided before the turn starts: "thinking" or
+        # "fast". It is per turn, not per service, because the same question can want either --
+        # a quick edit to a line does not need a minute of reasoning, and a remote protocol does.
+        self.thinking = writer_thinking(thinking)
+        self.writer = writer_for(self.thinking)
+        self.provider = self.writer  # the provider of the call in flight, for the error it raises
         self.pieces: list = []          # (channel, piece)
         self.buffers: dict = {"answer": [], "tool": [], "plan": [], "thoughts": []}
         self.tool_text = ""             # the same trace as one string, for the poll and the summary
@@ -132,8 +148,10 @@ class Job:
             "model": mode_label(self.mode),
             "session": self.session,
             # Agent mode's plan is made by DeepSeek and the script by Qwen; the writer's setting
-            # is the one that describes the answer, so that is what is reported.
-            "thinking": (DEEPSEEK_THINKING if self.mode == MODE_DEEPSEEK else QWEN_THINKING),
+            # is the one that describes the answer, so that is what is reported -- and it is the
+            # choice this turn was started with, not the service's own default.
+            "thinking": (thinking_label(DEEPSEEK_THINKING) if self.mode == MODE_DEEPSEEK
+                         else thinking_label(self.thinking)),
             "calls": len(self.phases),
             "tools": len([p for p in self.phases if p["phase"] == "tool"]),
             "elapsed": round((self.finished or time.time()) - self.started, 1),
@@ -328,7 +346,7 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
         job.add("thoughts", fragment)
 
     box["thoughts"] = note_thought
-    turns = with_continuation(messages, job.session) if provider is QWEN else messages
+    turns = with_continuation(messages, job.session) if provider in QWEN_PROVIDERS else messages
     for piece in stream_any(provider, turns, temperature, max_tokens, box, tools, web_session):
         pieces.append(piece)
         job.add(channel, piece)
@@ -339,7 +357,7 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
     # Only a Qwen answer carries this service's continuation marker, so only a Qwen answer may
     # install or clear it: another model's answer -- and a decoy that looks like a marker -- must
     # leave the session's chat alone.
-    session_remember(job.session, box.get("meta") if provider is QWEN else None)
+    session_remember(job.session, box.get("meta") if provider in QWEN_PROVIDERS else None)
     if streamed != visible:
         job.reset_channel(channel)
         job.add(channel, visible)
@@ -417,22 +435,47 @@ def tool_loop(job: Job, turns: list, tools: Optional[list]) -> tuple:
     call in between wrote (the last of which is where a script is recovered from when the rounds
     do run out).
     """
+    writer = job.writer
     answer = ""
     seen: list = []
     calls_made = 0
+    rewrites = 0
+    asked_again = False      # the last thing it heard was "that was not a script"
     out_of_rounds = False
     rounds = AGENT_ROUNDS + 1
     for round_index in range(rounds):
         first = round_index == 0
-        note = (f"{QWEN.model} writing a draft" if first
-                else f"{QWEN.model} answering after its last tool call")
+        note = (f"{writer.model} writing a draft" if first
+                else (f"{writer.model} writing the script again" if asked_again
+                      else f"{writer.model} answering after its last tool call"))
         answer, record, box = run_phase(
             job, turns, job.temperature, ANSWER_TOKENS if first else REFINE_TOKENS, "answer",
-            "draft" if first else "tools", note, tools, QWEN)
+            "draft" if first else "tools", note, tools, writer)
         calls = box.get("tool_calls") or []
         if not calls:
-            break
+            # It stopped calling tools -- but a turn that stops is not a turn that answered. Prose
+            # about the script, or a list of tools it only meant to call, is the one failure that
+            # would otherwise ship as if it were the script: the caller copies a paragraph into an
+            # executor and the turn says answered. So the answer is judged before the loop ends,
+            # and a model that wrote prose is told so, in the chat, and asked once more.
+            ok, why = script_verdict(answer)
+            # A list of calls for the Roblox client is not prose about a script: the client runs
+            # them and asks again, so the turn is over as far as this service is concerned.
+            if ok or tool_request(answer) or rewrites >= SCRIPT_RETRIES:
+                break
+            rewrites += 1
+            asked_again = True
+            if box["raw"].strip():
+                seen.append(box["raw"])
+            job.reset_channel("answer")
+            turns.append({"role": "assistant", "content": box["raw"]})
+            turns.append({"role": "user", "content": prose_correction(why)})
+            job.finish(phase="rewrite",
+                       note=f"no script in that answer ({why}); asking {writer.model} again")
+            print(f"[job] {job.id} prose answer ({why}); asking again", flush=True)
+            continue
         calls_made += len(calls)
+        asked_again = False
         # Whatever it wrote while calling a tool is not the answer; the turn is not over.
         job.reset_channel("answer")
         if box["raw"].strip():
@@ -457,7 +500,7 @@ def tool_loop(job: Job, turns: list, tools: Optional[list]) -> tuple:
         if round_index == rounds - 1:
             out_of_rounds = True
             job.finish(phase="tools",
-                       note=f"{QWEN.model} used all {AGENT_ROUNDS} tool round(s)")
+                       note=f"{writer.model} used all {AGENT_ROUNDS} tool round(s)")
     return answer, calls_made, out_of_rounds, seen
 
 
@@ -499,7 +542,7 @@ def plan_turn(job: Job) -> tuple:
         # A planner that answered with nothing costs the turn one call and nothing else: the
         # writer is asked anyway, and the job says which half did not happen.
         job.finish(phase="plan", note=f"{DEEPSEEK.model} returned no plan; "
-                                       f"{QWEN.model} writes it alone")
+                                       f"{job.writer.model} writes it alone")
     return tool_loop(job, turns, tools)
 
 
@@ -507,13 +550,33 @@ def solo_turn(job: Job) -> tuple:
     """deepseek mode: it writes the script itself, and no tools are attached.
 
     Nothing checks the answer on this path -- the toolbox is Qwen's, and there is no Qwen call
-    here -- so the model is told as much, and the script is taken as it comes.
+    here -- so the model is told as much, and the script is taken as it comes. What is still
+    checked is that there *is* one: this model talks its way towards the script out loud more than
+    the writer does, so a prose answer is handed back to it with the reason, the same way the
+    writer's is.
     """
-    answer, record, box = run_phase(
-        job, [{"role": "system", "content": WRITE_SYSTEM}] + list(job.messages),
-        DEEPSEEK_TEMPERATURE, DEEPSEEK_TOKENS, "answer", "draft",
-        f"{DEEPSEEK.model} writing", None, DEEPSEEK, deepseek_chat(job.session))
-    return answer, 0, False, []
+    writer_says = f"{DEEPSEEK.model} writing"
+    turns = [{"role": "system", "content": WRITE_SYSTEM}] + list(job.messages)
+    seen: list = []
+    rewrites = 0
+    while True:
+        answer, record, box = run_phase(
+            job, turns, DEEPSEEK_TEMPERATURE, DEEPSEEK_TOKENS, "answer", "draft",
+            writer_says, None, DEEPSEEK, deepseek_chat(job.session))
+        ok, why = script_verdict(answer)
+        if ok or rewrites >= SCRIPT_RETRIES:
+            break
+        rewrites += 1
+        if box["raw"].strip():
+            seen.append(box["raw"])
+        job.reset_channel("answer")
+        turns.append({"role": "assistant", "content": box["raw"]})
+        turns.append({"role": "user", "content": prose_correction(why)})
+        job.finish(phase="rewrite",
+                   note=f"no script in that answer ({why}); asking {DEEPSEEK.model} again")
+        writer_says = f"{DEEPSEEK.model} writing the script again"
+        print(f"[job] {job.id} prose answer ({why}); asking again", flush=True)
+    return answer, 0, False, seen
 
 
 def run_job(job: Job) -> None:
@@ -534,27 +597,50 @@ def run_job(job: Job) -> None:
             answer, calls_made, out_of_rounds, seen = plan_turn(job)
         else:
             answer, calls_made, out_of_rounds, seen = think_turn(job)
-        if out_of_rounds or not answer.strip():
-            # The last thing it wrote was a message that carried a tool call, not an answer, so the
-            # script is taken out of what it wrote on the way: a fenced block if there is one, and
-            # the message itself only when it is nothing but Lua.
-            answer = best_script(seen or [answer]) or answer
+        script_ok, why = script_verdict(answer)
+        if not script_ok or out_of_rounds or not answer.strip():
+            # Either the last thing it wrote was a message that carried a tool call rather than an
+            # answer, or what it settled on is not a script at all. Both are recovered the same way:
+            # the script is taken out of what it wrote on the way -- a fenced block if there is one,
+            # and a message itself only when it is nothing but Lua -- and kept if that is better than
+            # the answer that failed the test.
+            recovered = best_script(seen or [answer])
+            if recovered:
+                answer, why = recovered, ""
         answer = strip_fences(answer)
         notes, usable = structural_notes(answer, job.phases[-1]["finish"] if job.phases else None)
         if not usable:
             reason = "; ".join(notes) or "the model returned nothing"
             raise HTTPException(502, f"{reason} -- try again, or raise ANSWER_TOKENS")
+        script_ok, why = script_verdict(answer)
+        if not script_ok and tool_request(answer):
+            # Not a script, and not a failure either: this is the Roblox client's own protocol. The
+            # answer is a list of calls, the client runs them, and its next turn carries what they
+            # found. Shipping it is the whole point of the tokens.
+            job.finish(phase="tools",
+                       note=f"{job.writer.model} asked the client's tools; waiting on them")
+        elif not script_ok:
+            # The one failure that used to ship: a turn marked answered whose answer is a paragraph.
+            # Saying so is the whole point -- the client shows this instead of a "script" nobody can
+            # paste anywhere, and the caller knows the turn produced nothing rather than guessing.
+            raise HTTPException(502, f"the model answered with {why} instead of a script, and did "
+                                     f"not write one when it was asked again -- send the question "
+                                     f"once more, or switch mode")
         if job.channel("answer").strip() != answer:
             job.reset_channel("answer")
             job.add("answer", answer)
         note_error("")
         used = sorted({name for phase in job.phases for name in (phase.get("tools") or [])})
-        who = {MODE_AGENT: f"{DEEPSEEK.model} planned, {QWEN.model} answered",
-               MODE_DEEPSEEK: f"{DEEPSEEK.model} answered"}.get(job.mode,
-                                                                f"{QWEN.model} answered")
+        who = {MODE_AGENT: f"{DEEPSEEK.model} planned, {job.writer.model} answered",
+               MODE_DEEPSEEK: f"{DEEPSEEK.model} answered"}.get(
+                   job.mode, f"{job.writer.model} answered ({thinking_label(job.thinking)})")
         settled = f"{who} after {calls_made} tool call(s)" if calls_made else who
         if used:
             settled += f" ({', '.join(used)})"
+        if not script_ok and tool_request(answer):
+            # The header line the client shows: this turn is not done, it is handing a list of
+            # calls to the client, and the script comes back on the turn after those have run.
+            settled = f"{who} asked the client's tools: running them now"
         job.finish(status="done", phase="done", note=settled)
         print(f"[job] {job.id} [{job.mode}] done in {job.report()['elapsed']:g}s, {len(answer)} "
               f"chars, {len(job.phases)} model call(s), {calls_made} tool call(s)", flush=True)
@@ -577,15 +663,20 @@ def run_job(job: Job) -> None:
 
 
 def start_job(messages: list, temperature: Optional[float] = None, session: str = "",
-              request: Optional[Request] = None, mode: str = "") -> Job:
-    """Pick the mode, address the newest question, then set the work going on its own thread.
+              request: Optional[Request] = None, mode: str = "", thinking: str = "") -> Job:
+    """Pick the mode and the writer's setting, then set the work going on its own thread.
 
     The mode is resolved before anything else, so a caller who asked for one this service cannot
     run is told which variable is missing rather than getting an answer from another model. There
     is no "is it configured" gate in front of this any more: an unconfigured service is exactly a
     mode whose credential is missing, and that is what resolve_mode names.
+
+    `thinking` is the writer's setting for this turn -- "fast" or "thinking" -- and it is resolved
+    here rather than at the call, so the whole turn reads one setting and a caller that sends
+    nothing gets the service's own default.
     """
     chosen = resolve_mode(mode)
+    setting = writer_thinking(thinking)
     ip = client_ip(request)
     if not rate_ok(ip):
         raise HTTPException(429, f"too many requests from {ip}; {RATE_LIMIT} per minute")
@@ -593,9 +684,9 @@ def start_job(messages: list, temperature: Optional[float] = None, session: str 
     # The session is what keeps one upstream chat: the caller keeps its own id (the page keeps it
     # in localStorage, the Roblox client per chat) and every turn in it continues the last answer.
     name = (session or "").strip()[:64] or session_new()
-    job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen)
+    job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen, thinking)
     register(job)
-    print(f"[job] {job.id} [{chosen}] session {name}: {len(turns)} turn(s), asking about "
+    print(f"[job] {job.id} [{chosen}/{setting}] session {name}: {len(turns)} turn(s), asking about "
           f"{last_user_text(turns).strip()[:60]!r}", flush=True)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
@@ -610,6 +701,7 @@ class GenReq(BaseModel):
     temperature: Optional[float] = 0.7
     session: str = ""
     mode: str = ""                # agent | qwen | deepseek; empty means the service's default
+    thinking: str = ""            # thinking | fast; empty means the service's own default
 
 
 class ChatReq(BaseModel):
@@ -623,12 +715,18 @@ class ChatReq(BaseModel):
     `mode` is which chain answers this turn -- agent (deepseek plans, then qwen writes), qwen
     (qwen alone) or deepseek (deepseek alone). Left empty it is the service's own default, and the
     mode can change between turns of one conversation.
+
+    `thinking` is how much the writer reasons before it writes: "thinking" (the default, and the
+    one that produces the better script) or "fast" (the same model spending its tokens on the
+    script instead of on working it out first). It is per turn, so a quick edit and a remote
+    protocol can be asked for in the same conversation, and it applies to whichever model writes.
     """
 
     messages: list
     temperature: Optional[float] = 0.7
     session: str = ""
     mode: str = ""
+    thinking: str = ""               # thinking | fast; empty means the service's own default
 
 
 def job_summary(job: Job) -> dict:
@@ -658,7 +756,7 @@ def chat_stream(req: ChatReq, request: Request):
     uses, so it is not key-gated -- only rate limited.
     """
     messages = clean_messages(req.messages)
-    job = start_job(messages, req.temperature, req.session, request, req.mode)
+    job = start_job(messages, req.temperature, req.session, request, req.mode, req.thinking)
     # Only the writer is ever given the toolbox, and only when it is on -- so the list is empty in
     # deepseek mode, where there is no writer to attach it to.
     tools = (TOOL_NAMES if (tools_enabled() and AGENT_ROUNDS > 0 and job.mode != MODE_DEEPSEEK)
@@ -673,7 +771,8 @@ def chat_stream(req: ChatReq, request: Request):
 @app.post("/chat")
 def chat(req: ChatReq, _: None = Depends(require_key)):
     """The same turn, blocking -- for callers that cannot follow a stream."""
-    job = start_job(clean_messages(req.messages), req.temperature, req.session, None, req.mode)
+    job = start_job(clean_messages(req.messages), req.temperature, req.session, None, req.mode,
+                    req.thinking)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -787,7 +886,7 @@ def job_wait() -> float:
 def generate(req: GenReq, _: None = Depends(require_key)):
     """Block until the whole turn is done -- this is the path `client.lua` uses."""
     job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
-                    None, req.mode)
+                    None, req.mode, req.thinking)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -798,7 +897,7 @@ def generate(req: GenReq, _: None = Depends(require_key)):
 def start_stream(req: GenReq, _: None = Depends(require_key)):
     """The one-shot flow as a job, for callers that stream but keep no history."""
     job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
-                    None, req.mode)
+                    None, req.mode, req.thinking)
     return {"job": job.id, "mode": job.mode, "model": job.report()["model"],
             "session": job.session, "timeout": CHAT_TIMEOUT or None}
 
@@ -984,6 +1083,8 @@ async def root():
             # one this service runs when the caller picks nothing.
             .replace("__MODES__", html.escape(json.dumps(state["modes"])))
             .replace("__MODE__", html.escape(state["mode"]))
+            # The writer's setting, which the page offers per turn beside the mode.
+            .replace("__THINKING__", html.escape(state["thinking_default"]))
     )
 
 
@@ -1007,6 +1108,12 @@ async def snapshot() -> dict:
         "mode": mode,
         "modes": modes_state(),
         "thinking": QWEN_THINKING,
+        # The writer's setting is the caller's to pick per turn, so what is reported here is what a
+        # turn that says nothing gets, and the two settings it may ask for instead.
+        "thinking_default": writer_thinking(""),
+        "thinking_choices": [{"id": value, "label": thinking_label(value),
+                              "mode": QWEN_FAST_THINKING if value == "fast" else QWEN_THINKING}
+                             for value in ("thinking", "fast")],
         "greeting": GREETING,
         "token_ok": state["ok"],
         "token_detail": state["detail"],

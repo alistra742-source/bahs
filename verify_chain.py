@@ -20,11 +20,15 @@ import contextlib, html, io, json, os, re, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# The hidden continuation marker qwen-api puts in an answer, and the one thing that keeps one
+# upstream chat: named here because a section that turns it off has to turn it back on.
+STUB_META = '<!-- qwen_metadata: {"response_id":"r1"} -->'
+
 CALLS = []
 STUB = {"mode": "plain", "tool": "luau_check", "arguments": None, "openai_tool": False,
         "finish": "stop", "script": "", "finite": 0, "prose": "Let me check that first.\n",
         "plan": "", "decoy": "",
-        "meta": '<!-- qwen_metadata: {"response_id":"r1"} -->'}
+        "meta": STUB_META}
 
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
@@ -55,6 +59,28 @@ end)"""
 BROKEN_SCRIPT = SIMPLE_SCRIPT + "\nif true then\nprint(\"never closed\")\n"
 FINAL = "```lua\n" + SIMPLE_SCRIPT + "\n```"
 REASONING = "SECRET_REASONING_TEXT"
+
+# An answer that is about the script rather than the script: the failure the last
+# "deepseek-web answered" turn had -- prose full of the tools it meant to call, which used to ship
+# as if a turn had produced a script. The tool tokens are the ones its own client reads.
+PROSE_ANSWER = """Let me try @@SOURCE@@ with a full path like game.ReplicatedStorage.Weapons
+the tool says "path". Let me try @@GREP@@ FireServer
+@@GREP@@ RemoteEvent
+@@TREE@@ ReplicatedStorage.WeaponsFolder
+@@SOURCE@@ game.ReplicatedStorage.WeaponsFolder.ThompsonScript
+@@PROPS@@ game.Workspace.Baseplate"""
+
+# Prose with no calls in it at all: no script, and nothing for the client to run either, so it is
+# the one shape that has to be asked again and then refused.
+PLAIN_PROSE = """Let me work out how this should be built before writing anything.
+The player needs a faster walk speed, and it has to survive their character respawning.
+The connection should be made once and cleaned up when the character dies.
+I will use the humanoid, checked every frame, and nothing else."""
+
+# A list of calls for the Roblox client -- the tokens it reads out of an answer and runs. The
+# service cannot run these (there is no Roblox in the image), so an answer that is only these has
+# to ship for the client to act on rather than being refused as prose.
+CLIENT_CALLS = "@@DEEPSCAN@@\n@@GREP@@ remote\n@@SOURCE@@ game.ReplicatedStorage.Weapons"
 
 # One script the model split across two fenced blocks ("part one", "part two"): both halves read
 # as Lua on their own, and there is nothing but the blocks -- which is the shape that has to be put
@@ -166,6 +192,21 @@ class Stub(BaseHTTPRequestHandler):
             # Prose around the call, which must not end up in the answer either.
             return self._send(200, tool_stream(xml=STUB["prose"] + call),
                               "text/event-stream")
+        if STUB["mode"] == "client_tools":
+            # The Roblox client's own protocol: the answer is a list of calls for it to run, not a
+            # script -- which is a turn doing its work, not a turn that failed to write one.
+            return self._send(200, answer_stream(CLIENT_CALLS, STUB["finish"]), "text/event-stream")
+        if STUB["mode"] == "always_prose":
+            # A model that never reaches the script, however many times it is asked.
+            return self._send(200, answer_stream(STUB["prose"], STUB["finish"]),
+                              "text/event-stream")
+        if STUB["mode"] == "prose_then_script":
+            # Prose first, and the script only once it has been told what was wrong with that: the
+            # correction is the newest user turn, so this is what "asking again" looks like.
+            if "not a script" in asked:
+                return self._send(200, answer_stream(FINAL, STUB["finish"]), "text/event-stream")
+            return self._send(200, answer_stream(STUB["prose"], STUB["finish"]),
+                              "text/event-stream")
         text = (STUB["script"] or FINAL) + (("\n" + STUB["meta"]) if STUB["meta"] else "")
         return self._send(200, answer_stream(text, STUB["finish"]), "text/event-stream")
 
@@ -234,7 +275,7 @@ BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "QWEN_THINKING", "AGENT_ROUNDS", "AGENT_TOOLS", "AGENT_RUN",
     "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL",
     "CHAIN_MODE", "DEEPSEEK_URL", "DEEPSEEK_TOKEN", "DEEPSEEK_MODEL", "DEEPSEEK_THINKING",
-    "DEEPSEEK_SHAPE")}
+    "DEEPSEEK_SHAPE", "AGENT_WEB", "SCRIPT_RETRIES")}
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import importlib  # noqa: E402
@@ -293,11 +334,12 @@ def fresh_toolbox():
 
 def turn(question="make me a walk script", session="s-test", mode="plain", tool="luau_check",
          arguments=None, openai_tool=False, script=None, meta=None, finish="stop",
-         messages=None, prose=":ASK:", asked_mode=None, plan=None, decoy=""):
+         messages=None, prose=":ASK:", asked_mode=None, plan=None, decoy="", thinking=""):
     """One turn, watched to the end, with the model stub configured for it.
 
     `mode` is what the stub does; `asked_mode` is the mode the request asks for, which is empty
-    (the service's default) unless a test is about a specific chain.
+    (the service's default) unless a test is about a specific chain; `thinking` is the writer's
+    setting, sent only when a test is about it so everything else keeps the default.
     """
     CALLS.clear()
     STUB.update({"mode": mode, "tool": tool, "arguments": arguments, "openai_tool": openai_tool,
@@ -308,6 +350,8 @@ def turn(question="make me a walk script", session="s-test", mode="plain", tool=
     body = {"messages": messages or [{"role": "user", "content": question}], "session": session}
     if asked_mode:
         body["mode"] = asked_mode
+    if thinking:
+        body["thinking"] = thinking
     started = client.post("/chat/stream", json=body)
     assert started.status_code == 200, started.text
     frames = []
@@ -416,6 +460,123 @@ def toolbox_checks():
     check_true("there is a tool for each name", all(callable(luau.run) for _ in luau.TOOL_NAMES))
     check("an unknown tool is a result, not a crash",
           luau.run("nope", {})["output"], "there is no tool 'nope'")
+
+    print("\nthe tools that look outside the script")
+    found = luau.run("luau_find", {"script": SIMPLE_SCRIPT, "pattern": "Humanoid", "context": 1})
+    check("luau_find counts the lines that match", found["summary"], "1 line(s) match 'Humanoid'")
+    check_true("and numbers them", found["output"].splitlines()[1].startswith("4: "))
+    check_true("with the lines under them when asked",
+               found["output"].splitlines()[2].startswith("5: "))
+    check_true("a Lua class is a class", luau.find_lines(SIMPLE_SCRIPT, "%d+").splitlines()[1]
+               .startswith("2: "))
+    check("and a Lua literal is a literal", luau.lua_pattern("%.WalkSpeed"), r"\.WalkSpeed")
+    check_true("no match is not an error",
+               luau.find_lines(SIMPLE_SCRIPT, "Nonsense").startswith("no line"))
+    check_true("nor is an empty pattern",
+               luau.run("luau_find", {"script": SIMPLE_SCRIPT})["ok"] is False)
+    check("a fetched page is reduced to its words",
+          luau.page_text("<html><head><style>a{}</style></head><body><p>Hello <b>there</b></p>"
+                         "<script>var x=1</script><p>Second</p></body></html>"),
+          "Hello there\nSecond")
+    check("web_get wants a URL", luau.run("web_get", {"url": "example.com"})["ok"], False)
+    check_true("and says what one looks like",
+               "http://" in luau.run("web_get", {"url": "example.com"})["output"])
+    reload_with(AGENT_WEB="off")
+    check("reading pages can be switched off",
+          luau.run("web_get", {"url": "https://example.com"})["ok"], False)
+    reload_with()
+
+
+# --- is the answer a script? --------------------------------------------------------------
+
+def script_checks():
+    print("\nis the answer a script?")
+    reload_with()
+    check("a script is a script", bridge.script_verdict(SIMPLE_SCRIPT)[0], True)
+    check("and nothing is held against it", bridge.script_verdict(SIMPLE_SCRIPT)[1], "")
+    check("a fenced script still is one", bridge.script_verdict(FINAL)[0], True)
+    check("one line of Lua is a script", bridge.script_verdict('print("hi")')[0], True)
+    check("an empty answer is not", bridge.script_verdict("   \n\n")[0], False)
+    check("and it says which kind of nothing",
+          bridge.script_verdict("  ")[1], "the answer carried no script at all")
+    check("prose about a script is not a script", bridge.script_verdict(PROSE_ANSWER)[0], False)
+    check_true("and it says what was wrong with it",
+               "reads as Lua" in bridge.script_verdict(PROSE_ANSWER)[1])
+    check("its own words are not Lua", bridge.script_verdict(PLAIN_PROSE)[0], False)
+    check("and a paragraph of English says so plainly",
+          bridge.script_verdict(PLAIN_PROSE)[1], "no line of the answer reads as Lua")
+    check("an if/end pair with no calls in it is still a script",
+          bridge.script_verdict("if a then\nprint(1)\nend")[0], True)
+    check_true("the rewrite asks for the whole script",
+               "ONLY the complete Luau script" in bridge.prose_correction("it was prose"))
+
+    print("\na turn that answers with prose")
+    frames, done, started, calls = turn(mode="prose_then_script", prose=PLAIN_PROSE,
+                                        session="s-prose")
+    said = writer_calls(calls)
+    check("the model is asked again", len(said), 2)
+    check("the answer is the script in the end", done.get("text"), SIMPLE_SCRIPT)
+    check("and the turn is done", done.get("status"), "done")
+    check("the prose was not thrown away", len([m for m in messages_of(said[1])
+                                                 if m.get("role") == "assistant"]), 1)
+    correction = [m for m in messages_of(said[1]) if m.get("role") == "user"][-1]["content"]
+    check_true("the writer is told what was wrong", "not a script" in correction)
+    check_true("with the reason in it", "reads as Lua" in correction)
+    check("the prose never reached the reader as the answer",
+          channel(frames, "answer"), SIMPLE_SCRIPT)
+
+    print("\na turn that never writes a script")
+    frames, done, started, calls = turn(mode="always_prose", prose=PLAIN_PROSE,
+                                        session="s-prose-stop")
+    errors = [f["error"] for f in frames if f.get("error")]
+    check("it is asked SCRIPT_RETRIES more times and no more", len(writer_calls(calls)),
+          1 + bridge.SCRIPT_RETRIES)
+    check_true("and the turn fails instead of reporting an answer", bool(errors))
+    check_true("the failure says what the answer was", "instead of a script" in errors[0])
+    check_true("and that it was asked again", "asked again" in errors[0])
+    check("nothing was published as a finished answer", done, {})
+
+    print("\nthe client's own tool calls")
+    frames, done, started, calls = turn(mode="client_tools", session="s-client-tools")
+    check("a list of calls for the client is not prose", bridge.tool_request(CLIENT_CALLS), True)
+    check("and it is not a script either", bridge.script_verdict(CLIENT_CALLS)[0], False)
+    check("the turn ships it instead of asking again", len(writer_calls(calls)), 1)
+    check("the calls reach the reader", done.get("text"), CLIENT_CALLS)
+    check("and the turn is done", done.get("status"), "done")
+    check_true("with the header saying what is happening",
+               "client's tools" in (done.get("note") or ""))
+    check("prose with a call in it is a call, not an answer",
+          bridge.tool_request(PROSE_ANSWER), True)
+    check("and plain prose is nobody's tool request", bridge.tool_request(PLAIN_PROSE), False)
+    check("and a plain script is nobody's tool request", bridge.tool_request(SIMPLE_SCRIPT), False)
+
+    print("\nfast, or thinking first")
+    frames, done, started, calls = turn(session="s-fast", thinking="fast", meta=STUB_META)
+    check("fast is asked for by name", calls[0]["body"].get("thinking_mode"), "fast")
+    check("the start response reports it", started.get("thinking"), "fast")
+    check("the turn reports it too", done.get("thinking"), "fast")
+    check("and the answer is still the script", done.get("text"), SIMPLE_SCRIPT)
+    check("a fast turn still stores the session's marker", bridge.session_meta("s-fast"),
+          STUB["meta"])
+    # The same chat, continued. A fast turn is the same session, so the marker has to ride on the
+    # next turn's messages: a writer outside QWEN_PROVIDERS would quietly open a new upstream chat
+    # on every fast turn instead.
+    history = [{"role": "user", "content": "make me a walk script"},
+               {"role": "assistant", "content": SIMPLE_SCRIPT},
+               {"role": "user", "content": "now make it 100"}]
+    _, _, _, again = turn(session="s-fast", thinking="fast", messages=history)
+    carried = [m for m in messages_of(writer_calls(again)[0])
+               if m.get("role") == "assistant" and "qwen_metadata" in (m.get("content") or "")]
+    check("and the next fast turn continues that chat", len(carried), 1)
+    _, _, _, calls = turn(session="s-think", thinking="thinking")
+    check("thinking is asked for by name too", calls[0]["body"].get("thinking_mode"), "thinking")
+    _, _, _, calls = turn(session="s-default")
+    check("a turn that says nothing gets the service's default",
+          calls[0]["body"].get("thinking_mode"), bridge.QWEN_THINKING)
+    check("a word this service does not know means thinking, not fast",
+          bridge.writer_thinking("turbo"), "thinking")
+    check("and an empty one is the default", bridge.writer_thinking(""),
+          "fast" if bridge.QWEN_THINKING in bridge.FAST_WORDS else "thinking")
 
 
 # --- the chain ---------------------------------------------------------------------------
@@ -582,6 +743,9 @@ def chain_checks():
                           headers={"X-API-Key": "qwen-test-token"})
     check("the blocking endpoint reports it too", blocked.status_code, 502)
     check_true("and says why", "token ceiling" in blocked.text)
+    # Put the stub back the way it was found: a section that switches the marker off and leaves it
+    # off makes every marker check after it compare nothing to nothing, and pass.
+    STUB.update({"finish": "stop", "script": "", "meta": STUB_META})
 
     print("\nno tools, when they are switched off")
     reload_with(AGENT_TOOLS="off")
@@ -751,6 +915,11 @@ def surface_checks():
           json.loads(html.unescape(picker.group(1))) if picker else None,
           client.get("/health").json()["modes"])
     check("the page sends the mode it picked", "mode: MODE" in page, True)
+    check("health reports the writer's default", body["thinking_default"], bridge.writer_thinking(""))
+    check("and offers the two settings", [c["id"] for c in body["thinking_choices"]],
+          ["thinking", "fast"])
+    check("the page has a thinking picker", 'id="thinkPick"' in page, True)
+    check("and sends what it picked", "thinking: THINK" in page, True)
     check("an unknown job is a 404", client.get("/chat/poll/nope").status_code, 404)
     check("a key is required when one is set",
           client.get("/agent/pull").status_code, 401)
@@ -761,6 +930,7 @@ def main():
     reload_with()
     chain_checks()
     fence_checks()
+    script_checks()
     mode_checks()
     surface_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
