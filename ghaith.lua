@@ -89,6 +89,13 @@ local HISTORY     = 16              -- turns of conversation kept here (the serv
 -- ends with says how much did not fit, so a cut dump never reads as a whole one.
 local SCAN_BUDGET = 300000          -- characters of the whole dump one scan may carry
 local SCAN_SOURCE = 40000           -- characters of one script's source written into it
+-- What a *reader* can be shown, which is not the same question as what may be sent. Roblox lays
+-- out every glyph of a label, so the game put whole into a TextBox or a bubble is a stall rather
+-- than a picture of it. The dump goes out whole either way; these bound only the copies on screen.
+local SCAN_SHOW   = 60000           -- characters of the dump the GAME DUMP window holds
+local BUBBLE_SHOW = 20000           -- characters of one message the transcript holds
+local LONG_ASK    = 60000           -- characters of dump that may go into a question instead
+local SCAN_BREATH = 4000            -- instances walked between handing the thread back
 -- picture: the writer is a vision model, and a file is not a longer question. What is bounded here
 -- is what one file may be -- the service's own ceiling is 12 MB and a screenshot is a fraction of
 -- that -- and how many ride on one question at once, which is the service's own per-turn limit.
@@ -728,10 +735,26 @@ end
 -- is never the part that gets cut. What is cut is counted and said at the end, so a dump that ran
 -- out of room never reads as a game that has nothing more in it. Returns the dump, and the one
 -- line that says what it found.
-function deep_scan()
+function deep_scan(on_progress)
 	local counts = {all = 0, script = 0, module = 0, remote = 0, value = 0, cut = 0}
 	local script_box = {lines = {}, used = 0, cap = math.floor(SCAN_BUDGET * 0.6)}
 	local name_box = {lines = {}, used = 0, cap = SCAN_BUDGET - math.floor(SCAN_BUDGET * 0.6)}
+
+	-- A whole game is a lot of instances to walk, and the walk is this client's own thread -- the
+	-- one that draws the panel. On a game with tens of thousands of them that is a frozen client,
+	-- and a frozen client is only readable as a dead one, so the walk hands the thread back every
+	-- SCAN_BREATH instances and says where it got to. `on_progress` is the caller's: the scan
+	-- button puts the counts on the status line, and a tool call passes nothing and only breathes.
+	local walked, since_breath = 0, 0
+	local function breathe()
+		walked = walked + 1
+		since_breath = since_breath + 1
+		if since_breath >= SCAN_BREATH then
+			since_breath = 0
+			if on_progress then on_progress(walked, counts) end
+			task.wait()
+		end
+	end
 
 	-- Writing a line spends that box's budget and is refused once it is gone. Refused lines are
 	-- counted rather than dropped quietly.
@@ -800,6 +823,7 @@ function deep_scan()
 	end
 
 	local function name_line(instance)
+		breathe()
 		if is_script(instance) then return nil end      -- written above, with its text
 		counts.all = counts.all + 1
 		local class = instance.ClassName
@@ -820,6 +844,7 @@ function deep_scan()
 	write(script_box, "\n== THE SCRIPTS ==")
 	for _, group in ipairs(groups) do
 		for _, d in ipairs(group.list) do
+			breathe()
 			if is_script(d) then
 				counts.all = counts.all + 1
 				local module = d.ClassName == "ModuleScript"
@@ -836,6 +861,7 @@ function deep_scan()
 		end
 	end
 	for _, d in ipairs(strays) do
+		breathe()
 		if is_script(d) then
 			counts.all = counts.all + 1
 			local module = d.ClassName == "ModuleScript"
@@ -3234,6 +3260,18 @@ local function scroll_down()
 	end)
 end
 
+-- What a message may show, which is not what it may carry: the transcript is a place to read a
+-- line or a script, and a bubble holding a three-hundred-thousand-character dump is a frozen
+-- client wearing a message. The head is shown and the size is named; what was sent is untouched.
+local function shown(body, cap, note)
+	body = tostring(body or "")
+	if #body <= cap then return body end
+	local head = body:sub(1, cap)
+	local line = head:match(".*()\n")
+	if line and line > cap * 0.6 then head = head:sub(1, line - 1) end
+	return head .. "\n\n… " .. (#body - #head) .. " more " .. note
+end
+
 UI.bubble = function(kind, text, code)
 	bubble_order = bubble_order + 1
 	local wrapper = mk("Frame", {
@@ -3246,7 +3284,8 @@ UI.bubble = function(kind, text, code)
 		Position = is_user and UDim2.new(1, 0, 0, 0) or UDim2.new(0, 0, 0, 0),
 		AnchorPoint = is_user and Vector2.new(1, 0) or Vector2.new(0, 0),
 		AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.card, BorderSizePixel = 0,
-		Text = tostring(text or ""), TextColor3 = is_user and C.text or C.dim,
+		Text = shown(text, BUBBLE_SHOW, "characters (the whole of it was still what was sent)"),
+		TextColor3 = is_user and C.text or C.dim,
 		Font = (kind == "answer" or kind == "tools") and MONO or SANS, TextSize = 13,
 		TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 52, Parent = wrapper,
@@ -3270,7 +3309,7 @@ UI.bubble = function(kind, text, code)
 		body.BackgroundColor3 = C.panel
 		body.TextColor3 = C.dim
 		body.Text = (kind == "plan" and "◇ the plan it built from" or "◆ the tools it ran")
-			.. "\n" .. tostring(text or "")
+			.. "\n" .. shown(text, BUBBLE_SHOW, "characters")
 		outline(body, C.line, 1, 0.4)
 	else
 		body.BackgroundColor3 = C.card
@@ -3383,11 +3422,28 @@ round(scan_button, 9)
 scan_button.Activated:Connect(function()
 	if busy then return end
 	UI.setStatus("running", "reading the game")
-	local dump, summary = deep_scan()
-	-- Said before it is sent, not only once an answer arrives: the counts are what the scan
-	-- found, and the window is the whole of what went out of here.
-	dump_window_body.Text = dump
+	local began = os.clock()
+	-- A scan that throws used to leave the status line saying "reading the game" for as long as the
+	-- client stayed open, with nothing anywhere saying why: a wait for a turn that never started,
+	-- which is what "it is not responding" looks like from the outside.
+	local ok_scan, dump, summary = pcall(deep_scan, function(walked, counts)
+		UI.setStatus("running", string.format("reading the game  ·  %d instance(s) walked  ·  %d script(s)",
+			walked, counts.script + counts.module))
+	end)
+	if not ok_scan then
+		UI.bubble("error", "the scan did not finish: " .. tostring(dump))
+		UI.setStatus("failed", "the scan failed -- see the transcript")
+		return
+	end
+	summary = string.format("%s  ·  %.1fs to walk it", tostring(summary), os.clock() - began)
+	-- Said before it is sent, not only once an answer arrives: the counts are what the scan found,
+	-- and the window holds what went out of here -- the whole dump when it fits, the head of it
+	-- with the size named when it does not, because a TextBox holding three hundred thousand
+	-- characters is a stall rather than a picture of the game.
+	dump_window_body.Text = shown(dump, SCAN_SHOW,
+		"characters of the dump are in this window; the whole of it was sent")
 	dump_window.Visible = true
+	UI.setStatus("running", "sending the game  ·  " .. kb(dump))
 	-- It goes up as a file rather than as a question: uploaded once, named by the turn, and read by
 	-- the model as an attachment -- so the question stays one line instead of three hundred thousand
 	-- characters, and the dump is never carried by hand again. A scan that cannot be attached -- a
@@ -3406,8 +3462,11 @@ scan_button.Activated:Connect(function()
 	end
 	UI.bubble("system", "scan game: " .. tostring(summary) .. " -- " .. #dump
 		.. " characters of game sent as the question: it could not be attached (" .. tostring(why)
-		.. "), so it goes in the question itself.")
-	process("GAME DUMP:\n\n" .. dump .. "\n\nRead the game above and reply with ONLY the"
+		.. "), so the head of it goes in the question itself. Set PUBLIC_URL on the service to the"
+		.. " address it is reached at, and the next scan arrives as one whole file instead.")
+	process("GAME DUMP:\n\n" .. shown(dump, LONG_ASK, "characters -- one question cannot carry"
+			.. " the whole game, so read this and ask for @@DEEPSCAN@@ or @@SOURCE path@@ for more")
+		.. "\n\nRead the game above and reply with ONLY the"
 		.. " complete Luau script for the most useful thing it makes possible.")
 end)
 

@@ -249,6 +249,16 @@ local function service(name)
 	if name == "GuiService" then
 		made.GetGuiInset = function() return Vector2.new(0, 36), Vector2.new(0, 0) end
 	end
+	-- A service is a child of the DataModel, which is how the client's scan finds them: it walks
+	-- `game:GetChildren()` rather than trusting a list of names.
+	if name ~= "Workspace" then made.Parent = game end
+	if name == "HttpService" then
+		-- JSON is stubbed whole: what a check wants to know is what the *client* does with an
+		-- answer, and a table handed straight through answers that without a parser in the way.
+		made.JSONEncode = function(_, value) return STUB_JSON_PUT(value) end
+		made.JSONDecode = function(_, text) return STUB_JSON_GET(text) end
+		made.RequestAsync = function(_, options) return STUB_HTTP(options) end
+	end
 	if name == "TweenService" then
 		made.Create = function(_, object, info, goals)
 			return {Play = function()
@@ -269,3 +279,129 @@ workspace.Name = "Workspace"
 workspace.CurrentCamera = camera
 workspace.WaitForChild = function(_, name) return name == "Camera" and camera or nil end
 workspace.Parent = game
+-- the one service that already exists here, so asking for it hands back the one with the camera
+services.Workspace = workspace
+
+-- =====================================================================================
+-- A game to scan, a service to answer, and a way to press a button
+-- =====================================================================================
+-- The panel above is half of what a client does; the other half is reading a game and handing it to
+-- a model. These three make that half runnable here: instances enough to walk, an HTTP layer that
+-- answers the client's own requests without a network, and a way to reach into the tree and fire a
+-- button's Activated signal the way a player's finger would.
+
+-- --- JSON, as a table handed through rather than written out ---
+local JSON_BOX = {}
+STUB_JSON_PUT = function(value)
+	local id = #JSON_BOX + 1
+	JSON_BOX[id] = value
+	return "<stub-json:" .. id .. ">"
+end
+STUB_JSON_GET = function(text)
+	local id = type(text) == "string" and text:match("^<stub%-json:(%d+)>$")
+	return id and JSON_BOX[tonumber(id)] or nil
+end
+
+-- --- the service's answers ---
+STUB_CALLS = {}
+local result_round = 0
+STUB_ANSWER = "print('hello from the stub')"
+STUB_RESULT_ROUNDS = function() result_round = 0 end
+local function reply(body) return {StatusCode = 200, Body = STUB_JSON_PUT(body)} end
+
+STUB_HTTP = function(options)
+	local url = tostring(options.Url or "")
+	local path = url:gsub("^https?://[^/]+", "")
+	local body = STUB_JSON_GET(options.Body)
+	table.insert(STUB_CALLS, {path = path, method = options.Method, body = body,
+		raw = tostring(options.Body or "")})
+	if path == "/attach" then
+		local bytes = body and body.data and #body.data or 0
+		return reply({id = "stubattach01", name = (body and body.name) or "file",
+			mime = (body and body.mime) or "", bytes = bytes, kind = "document"})
+	end
+	if path == "/chat/stream" then
+		result_round = 0
+		return reply({job = "stubjob1", model = "qwen3.8-max", mode = "agent", thinking = "thinking"})
+	end
+	if path:find("^/chat/result/") then
+		result_round = result_round + 1
+		if result_round == 1 then
+			return reply({status = "running", note = "reading the dump", thoughts = "thinking about it"})
+		end
+		if result_round == 2 then
+			return reply({status = "running", note = "writing", text = "print('partial')"})
+		end
+		return reply({status = "done", note = "done", text = STUB_ANSWER, plan = "one: look, two: write"})
+	end
+	return {StatusCode = 404, Body = STUB_JSON_PUT({detail = "no such path in the stub: " .. path})}
+end
+
+http_request = STUB_HTTP
+
+-- --- a game to walk ---
+STUB_GAME = function(parts)
+	for _, child in ipairs(METHODS.GetChildren(game)) do child.Parent = nil end
+	local workspace_ = service("Workspace")
+	local map = new_instance("Folder")
+	map.Name = "Map"
+	map.Parent = workspace_
+	for index = 1, parts or 0 do
+		local part = new_instance("Part")
+		part.Name = "Part" .. index
+		part.Parent = map
+	end
+	local storage = service("ReplicatedStorage")
+	local fire = new_instance("RemoteEvent")
+	fire.Name = "Fire"
+	fire.Parent = storage
+	local ask = new_instance("RemoteFunction")
+	ask.Name = "Ask"
+	ask.Parent = storage
+	local mode = new_instance("StringValue")
+	mode.Name = "Mode"
+	mode.Value = "test"
+	mode.Parent = storage
+	local util = new_instance("ModuleScript")
+	util.Name = "Util"
+	util.Source = "local Util = {}\nfunction Util.add(a, b)\n\treturn a + b\nend\nreturn Util\n"
+	util.Parent = storage
+	local server = new_instance("Script")
+	server.Name = "Server"
+	server.Source = "print('server')\nlocal Util = require(script.Parent.Util)\n"
+	server.Parent = service("ServerScriptService")
+	return parts or 0
+end
+
+-- --- reaching into the tree, the way a finger does ---
+local function walk(node, out)
+	for _, child in ipairs(METHODS.GetChildren(node)) do
+		table.insert(out, child)
+		walk(child, out)
+	end
+	return out
+end
+STUB_TREE = function() return walk(player_gui, {}) end
+STUB_BUTTON = function(text)
+	for _, node in ipairs(STUB_TREE()) do
+		if rawget(node, "ClassName") == "TextButton" and rawget(node, "Text") == text then return node end
+	end
+	return nil
+end
+STUB_TEXTS = function()
+	local out = {}
+	for _, node in ipairs(STUB_TREE()) do
+		local class = rawget(node, "ClassName")
+		if class == "TextLabel" or class == "TextBox" then table.insert(out, tostring(rawget(node, "Text") or "")) end
+	end
+	return out
+end
+STUB_PRESS = function(text)
+	local button = STUB_BUTTON(text)
+	if not button then return false end
+	local fired = button.Activated
+	-- Driven from a coroutine of its own, so that a handler which yields (the scan does, on purpose)
+	-- is not the harness's main thread wedged where it stands.
+	table.insert(QUEUE, {co = coroutine.create(function() fired:Fire() end)})
+	return true
+end

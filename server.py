@@ -711,10 +711,7 @@ def start_job(messages: list, temperature: Optional[float] = None, session: str 
     # The session is what keeps one upstream chat: the caller keeps its own id (the page keeps it
     # in localStorage, the Roblox client per chat) and every turn in it continues the last answer.
     name = (session or "").strip()[:64] or session_new()
-    # A document is fetched by the provider from this service, so the URL it is given has to be an
-    # address the provider can reach. PUBLIC_URL is that address when it is set; otherwise it is
-    # whatever the caller reached, which is already right for a caller that used the real one.
-    base_url = PUBLIC_URL or (str(request.base_url).rstrip("/") if request is not None else "")
+    base_url = request_base(request)
     job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen, thinking,
               files, base_url)
     # What the attachment is attached to: the question as the model will read it, greeting and all,
@@ -725,6 +722,33 @@ def start_job(messages: list, temperature: Optional[float] = None, session: str 
           f"{last_user_text(turns).strip()[:60]!r}", flush=True)
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
     return job
+
+
+def request_base(request) -> str:
+    """The address this service is reached at, for a document the provider has to fetch.
+
+    PUBLIC_URL when it is set -- it is the only setting that cannot be wrong about a deployment
+    behind a proxy -- and otherwise the request itself: the forwarded host and scheme when a proxy
+    sent them (Railway, Fly and anything else that terminates TLS does), and what the caller
+    reached when it did not. Without a scheme from the proxy, `request.base_url` says `http://` for
+    a service that only answers https, which is a redirect a fetcher may or may not follow, and a
+    document nobody read looks exactly like a model that ignored it.
+    """
+    if PUBLIC_URL:
+        return PUBLIC_URL.rstrip("/")
+    if request is None:
+        return ""
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if not proto and request.headers.get("x-forwarded-for"):
+        # A proxy is in front and did not say which scheme it speaks for. Everything that puts
+        # x-forwarded-for there terminates TLS, and a URL that comes out http:// on a service that
+        # redirects to https is a document a fetcher may give up on.
+        proto = "https"
+    if host:
+        scheme = proto or request.url.scheme or "https"
+        return f"{scheme}://{host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
 
 
 # --- the conversation endpoints --------------------------------------------------------

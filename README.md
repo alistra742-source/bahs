@@ -207,12 +207,27 @@ client was never sent that text, and which token reads it anyway — and then ev
 the game (parts, models, folders, GUIs, tools, remotes, values), by class and path, grouped under
 the service it lives in. Nothing is left out for looking uninteresting: the scripts are written
 first, so they are never what a size limit cuts, and the dump ends with the counts — naming how
-many lines did not fit when it did run out of room, rather than reading as a game that ended. What
-went out is readable byte for byte in the **GAME DUMP** window it opens, and the transcript says
-what was found before any answer arrives. Two numbers bound it, both named at the top of the
-client: `SCAN_BUDGET` (300,000 characters of dump — the question the model is asked, so it is the
-number to raise when a game does not fit and cut when a turn comes back complaining about the size
-of what it was sent) and `SCAN_SOURCE` (40,000 characters of one script's own text).
+many lines did not fit when it did run out of room, rather than reading as a game that ended. The
+**GAME DUMP** window it opens holds what went out, and the transcript says what was found before
+any answer arrives.
+
+**A scan says what it is doing while it does it.** Walking a whole game is tens of thousands of
+instances on the client's own thread — the one that draws the panel — so the walk hands the thread
+back every `SCAN_BREATH` instances and the status line counts what it has been through (`reading
+the game · 24,000 instance(s) walked · 2 script(s)`), then `sending the game · 296 KB`, then the
+turn's own `thinking · 3s · 412 chars thought`. A client that says nothing for a minute while it
+works reads as a broken one, which is the whole reason those lines are there. Three things are
+capped for the same reason, and none of them is what is *sent*: `SCAN_SHOW` (60,000 — how much of
+the dump the GAME DUMP window draws), `BUBBLE_SHOW` (20,000 — how much of one message the
+transcript draws) and `LONG_ASK` (60,000 — how much of the dump goes into a question on the
+fallback path). A TextBox or a bubble holding a three-hundred-thousand-character dump is a stall,
+not a picture of the game; the model is still handed all of it.
+
+Three numbers bound what is *sent*, all named at the top of the client: `SCAN_BUDGET` (300,000
+characters of dump — the question the model is asked, so it is the number to raise when a game does
+not fit and cut when a turn comes back complaining about the size of what it was sent),
+`SCAN_SOURCE` (40,000 characters of one script's own text) and `SCAN_BREATH` (4,000 instances
+between one breath and the next).
 
 **A picture, or any file, goes in front of the model — because the writer can see.** `qwen3.8-max`
 is a vision model, and the proxy takes a turn whose content is a *list of parts*: a picture as an
@@ -320,7 +335,7 @@ reads the game is only useful if it can be pointed at something.
 | `ATTACH_MAX_FILES` | `4` | how many files one question may carry, capped at the provider's own ceiling of 5. `0` turns attachments off and `/attach` refuses everything |
 | `ATTACH_MAX_MB` | `12` | the largest single file, in MB (the provider takes 20) |
 | `ATTACH_TTL` | `3600` | how long an uploaded file is held. Nothing is written to disk: a restart forgets them, and a turn that names a forgotten id simply has no attachment |
-| `PUBLIC_URL` | — | what a document's URL is built from. Unset, it is the address the caller reached, which is right whenever the service is reached at its real one; set it when a proxy passes something else, or the provider cannot fetch the file |
+| `PUBLIC_URL` | — | what a document's URL is built from (`https://your-service.example`). Unset, it is the address the caller reached — the proxy's forwarded host and scheme when it sent them, so a service behind TLS hands out an `https://` URL rather than an `http://` one a fetcher may not follow. Set it when the service is reached at an address the proxy does not forward |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |
 | `MAX_TOKENS` | `4096` | ceiling on a `/v1` passthrough the caller did not set one for |
 | `RATE_LIMIT` / `MAX_CONCURRENT` | `30` / `4` | per-IP requests per minute, and turns at once |
@@ -463,6 +478,14 @@ client's own boot line printed with nothing thrown first — which is exactly wh
 up, or a script that does not compile, does not do. Two failures came out of that one run: the
 register wall above, and the orb's animation loop reading four values out of a function that returns
 two and dying on its first frame.
+
+The same stub then does what a player does: builds a game of twelve thousand parts, presses
+**scan game** the way a finger does, and pumps the client's own tasks while it works. What that run
+checks is the failure with no symptom in the source — the walk saying where it got to (`walked=6`),
+the whole dump going up as a file (`attached=160716`), the question staying a line
+(`asked=273`), the status line reaching `thinking`, the answer arriving, and nothing on screen the
+size of a whole game (`longest=60070`). It was written because a player cannot describe that
+failure: the panel said nothing, never said it was thinking, and never answered.
 
 Both of those checks want the Luau CLI. Nothing is downloaded — get `luau-ubuntu.zip` from
 [the Luau releases](https://github.com/luau-lang/luau/releases), then either put the binaries on

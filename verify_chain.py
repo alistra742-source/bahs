@@ -29,6 +29,10 @@ one road from this device to the model -- the user picks the file, the model nev
 And the ceiling on silence: a provider that opens a stream and stops sending ends the turn with
 the silence named in seconds, instead of a turn nobody is ever told about.
 
+And the client doing what a player does: `scan game` pressed on a game of twelve
+thousand parts, the dump uploaded, the turn answered -- the failure that had no symptom
+in the source at all, because what was wrong was the panel frozen while it walked.
+
 And the client itself, run rather than read, on the Luau CLI: roblox_stub.lua is
 enough of Roblox for the panel to be built and its last line printed, which is what a
 compile error and a nil on the way up both look like from the outside.
@@ -335,6 +339,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 client = TestClient(server.app)
 failures, count = [], [0]
 UNSET = object()
+
+
+def fake_request(headers, scheme="http", base="http://internal/"):
+    """A request object with the three things `request_base` reads."""
+    return type("Request", (), {"headers": headers, "url": type("Url", (), {"scheme": scheme})(),
+                                "base_url": base})()
 
 
 def check(name, got, want):
@@ -1309,6 +1319,78 @@ def boot_checks():
         print("\n".join(output.strip().splitlines()[-12:]))
 
 
+SCAN_DRIVER = '''
+-- A game big enough to walk, pressed the way a finger presses it, with the client's own tasks
+-- pumped while it works. The last line is the report the checks read.
+STUB_GAME(12000)
+local statuses, seen, longest, answered = {}, {}, 0, false
+STUB_PRESS("scan game")
+for round = 1, 400 do
+	for _, text in ipairs(STUB_TEXTS()) do
+		if #text > longest then longest = #text end
+		if #text > 0 and #text <= 200 and not seen[text] then
+			seen[text] = true
+			table.insert(statuses, text)
+		end
+		if text:find("hello from the stub", 1, true) then answered = true end
+	end
+	if answered then break end
+	STUB_STEPS(1)
+end
+local walked, thinking, attached, asked = 0, false, 0, 0
+for _, text in ipairs(statuses) do
+	if text:find("instance(s) walked", 1, true) then walked = walked + 1 end
+	if text:find("thinking", 1, true) then thinking = true end
+end
+for _, call in ipairs(STUB_CALLS) do
+	if call.path == "/attach" and call.body and call.body.data then attached = #call.body.data end
+	if call.path == "/chat/stream" and call.body and call.body.messages then
+		local turn = call.body.messages[#call.body.messages]
+		if turn and turn.role == "user" then asked = #tostring(turn.content) end
+	end
+end
+print(string.format("SCANREPORT statuses=%d longest=%d walked=%d thinking=%s attached=%d asked=%d"
+	.. " answer=%s", #statuses, longest, walked, tostring(thinking), attached, asked,
+	tostring(answered)))
+'''
+
+
+def run_checks():
+    """Press `scan game` on a game of twelve thousand parts, and watch the panel go through it.
+
+    This is the check for the failure a player cannot describe: the panel said nothing, never said
+    it was thinking, and never answered -- which was a scan walking a whole game on the thread that
+    draws the panel, the dump then handed to a TextBox and a bubble whole, and a handler with no
+    error path at all. Reading the source would not have found any of it, so the client is run:
+    `roblox_stub.lua` builds the game, presses the button, and pumps the client's own tasks, and the
+    one line it prints at the end is what these checks read.
+    """
+    print("\nscan game, on a game of twelve thousand parts")
+    compiler = luau_cli("luau")
+    if not compiler:
+        print("  --   no Luau CLI here (set LUAU_BIN or put luau on PATH), so the scan is not run")
+        return
+    stub = Path(__file__).with_name("roblox_stub.lua").read_text(encoding="utf-8")
+    with tempfile.TemporaryDirectory() as folder:
+        runnable = Path(folder) / "scan.lua"
+        runnable.write_text(stub + "\n" + client_source() + "\n" + SCAN_DRIVER, encoding="utf-8")
+        done = subprocess.run([compiler, str(runnable)], capture_output=True, text=True, timeout=300)
+    output = done.stdout + done.stderr
+    line = next((row for row in output.splitlines() if row.startswith("SCANREPORT ")), "")
+    check("the client scanned a game, sent it and answered", bool(line), True)
+    if not line:
+        print("\n".join(output.strip().splitlines()[-12:]))
+        return
+    got = dict(piece.split("=", 1) for piece in line.split()[1:])
+    check(f"the walk said where it got to ({got['walked']} time(s))", int(got["walked"]) >= 2, True)
+    check("the whole game went up as a file", int(got["attached"]) > 150000, True)
+    check("so the question itself is a line, not a game", int(got["asked"]) < 2000, True)
+    check("the panel said it was thinking", got["thinking"], "true")
+    check("and the answer came back", got["answer"], "true")
+    check("with nothing on screen the size of a whole game",
+          int(got["longest"]) <= 61000, True)
+
+
 def scan_checks():
     """scan game: the whole game written out, and what went out said out loud.
 
@@ -1373,13 +1455,30 @@ def scan_checks():
           'overlay("GAME DUMP  ·  the whole game, as it was sent", "text")' in source, True)
     check("which follows the screen like the others",
           "local windows = {code_window, console_window, dump_window, pic_window}" in source, True)
-    check("what the window holds is what was sent", "dump_window_body.Text = dump" in source, True)
+    # The window holds the dump, but a head of it when the dump is the size of a game: a TextBox
+    # with three hundred thousand characters in it is a stall, and a stalled client is the one
+    # complaint that cannot be told from a broken one.
+    check("the window holds the dump, capped with the size named",
+          ["shown(dump, SCAN_SHOW" in source, "the whole of it was sent" in source], [True, True])
     check("and scan game says what it found before it sends it",
           '"scan game: " .. tostring(summary)' in source, True)
-    check("the dump is the question the model is asked",
-          '"GAME DUMP:\\n\\n" .. dump' in source, True)
+    check("the dump is the question the model is asked, when it is the question",
+          '"GAME DUMP:\\n\\n" .. shown(dump, LONG_ASK' in source, True)
     check("the DEEPSCAN tool is the same dump the button sends",
           "run = function() return deep_scan() end" in source, True)
+
+    # A scan is a long walk on the thread that draws the panel, and what it finds used to be handed
+    # to a TextBox and a bubble whole. That is the client a player describes as "not responding",
+    # and it is what `run_checks` presses a button to prove; these are the same three facts read
+    # out of the source, where a *reader* of it also needs them.
+    check("the walk hands the thread back and says where it got to",
+          "SCAN_BREATH" in dump and "task.wait()" in dump, True)
+    check("a scan that throws is reported rather than left silent",
+          "the scan did not finish" in source, True)
+    check("what is drawn is capped while what is sent is not",
+          ["shown(dump, SCAN_SHOW" in source, "shown(dump, LONG_ASK" in source], [True, True])
+    check("and no message in the transcript is a whole game",
+          "shown(text, BUBBLE_SHOW" in source, True)
 
 
 def attach_checks():
@@ -1475,6 +1574,20 @@ def attach_checks():
     fetched = client.get(parts[2]["file_url"]["url"].split("http://testserver")[-1])
     check("and serves back the dump the caller uploaded", fetched.content, text)
 
+    # The address a document is handed out at. PUBLIC_URL is the setting for a deployment, and
+    # without it the request is all there is -- and behind a proxy that terminates TLS the
+    # forwarded pair is the only thing that says https: `request.base_url` there says `http://`,
+    # which is a redirect a fetcher may or may not follow, and a document nobody read looks exactly
+    # like a model that ignored what it was asked.
+    check("the document URL is the forwarded one when a proxy sent it",
+          server.request_base(fake_request({"x-forwarded-proto": "https",
+                                            "x-forwarded-host": "svc.test"})), "https://svc.test")
+    check("a proxy that says nothing is taken to be serving https",
+          server.request_base(fake_request({"x-forwarded-for": "1.2.3.4", "host": "svc.test"})),
+          "https://svc.test")
+    check("and a caller reaching it directly keeps its own scheme",
+          server.request_base(fake_request({"host": "127.0.0.1:8000"})), "http://127.0.0.1:8000")
+
     # DeepSeek has no eyes: the planner is told what is attached rather than handed it, and the
     # question it is planning for is still there.
     frames, done, started, calls = turn(question="what does this do", session="s-att",
@@ -1546,8 +1659,8 @@ def picture_checks():
     # refuses the upload, because a scan that arrives the long way beats one that never arrives.
     check("scan game sends the dump as a file",
           'attach_upload("game-dump.txt", dump, "text/plain", true)' in source, True)
-    check("and falls back to pasting it only when that fails",
-          '"GAME DUMP:\\n\\n" .. dump' in source, True)
+    check("and falls back to pasting as much of it as one question can hold",
+          '"GAME DUMP:\\n\\n" .. shown(dump, LONG_ASK' in source, True)
     check_true("saying which of the two happened",
                "characters of game sent as the file" in source)
     # The one road from this device to the model, and the user is the one who takes it: not one of
@@ -1775,6 +1888,7 @@ def main():
     register_checks()
     memory_checks()
     boot_checks()
+    run_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:
