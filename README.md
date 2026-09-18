@@ -148,7 +148,8 @@ the model what is structurally wrong; a run tells it what actually happened.
 The panel you actually use in the game: it talks to `POST /chat/stream` and `GET /chat/result/{job}`
 and keeps the whole conversation, so every turn goes out with all of it. Buttons: **ask**, the mode
 picker, **WRITER** (thinking or fast — the setting travels with the turn, so one chat can be asked
-either way), **scan game**, **console**, **errors** (a console error is sent to the model on its
+either way), **scan game**, **picture**, **console**, **errors** (a console error is sent to the
+model on its
 own, with the script it came from, for a fixed script), and **auto**, which runs what it wrote,
 hands the console back, takes the fix and repeats until the script stops changing. **copy code**,
 **run** and **full script** are not on the rail at all: they are built under each answer that carries
@@ -203,6 +204,23 @@ what was found before any answer arrives. Two numbers bound it, both named at th
 client: `SCAN_BUDGET` (300,000 characters of dump — the question the model is asked, so it is the
 number to raise when a game does not fit and cut when a turn comes back complaining about the size
 of what it was sent) and `SCAN_SOURCE` (40,000 characters of one script's own text).
+
+**A picture, or any file, goes in front of the model — because the writer can see.** `qwen3.8-max`
+is a vision model, and the proxy takes a turn whose content is a *list of parts*: a picture as an
+`image_url` (the bytes, as a data URI) and a document as a `file_url` (a URL the provider fetches,
+served back out of this service). So **picture** opens a window that puts a file from your device
+into the chat: pick it, tap it, and it is uploaded once to `POST /attach` and named by every turn
+after that — the model sees it with each question until **CLEAR**, without the file being re-sent by
+hand or pasted anywhere. **scan game** takes the same road: its dump goes up as `game-dump.txt`
+rather than as 300,000 characters of question, and the old shape (the dump pasted into the turn) is
+still there as the fallback for a service that refuses the upload.
+
+Roblox has no file dialog and a script cannot open the system one, so the picker is built out of the
+two things an executor does hand a script — `readfile` for a path, `listfiles` for the folder it was
+given — and lists the picture files *it* can open, one tap each, with a path/URL box for the
+executors that hand over neither (a URL needs no file access at all). That is also the only road
+from the device to the model that exists: not one of the model's own tools can read a file or list a
+folder, so a script it writes cannot reach your disk — you are the one who picks the file.
 
 **Its own tool protocol.** The model asks the client for what it needs by writing a token in its
 answer — `@@GREP remote@@` or `@@GREP@@ remote`, both are read, and a multi-line argument
@@ -270,6 +288,10 @@ reads the game is only useful if it can be pointed at something.
 | `SESSION_TTL` | `3600` | how long one session's continuation marker (and its DeepSeek chat) is kept. `/health` reports how many of each are held |
 | `CHAT_TIMEOUT` | `0` | **no ceiling on a turn by default**: a turn with tool rounds may take as long as it takes. `0` means no limit; a number puts one back on each call |
 | `CHAT_IDLE` | `120` | how long a provider may send **nothing at all** before the call is dropped. Not a ceiling on the turn but on the silence: a stream that dies mid-answer raises nothing and closes nothing, so without this the turn is waited on forever. `0` waits forever |
+| `ATTACH_MAX_FILES` | `4` | how many files one question may carry, capped at the provider's own ceiling of 5. `0` turns attachments off and `/attach` refuses everything |
+| `ATTACH_MAX_MB` | `12` | the largest single file, in MB (the provider takes 20) |
+| `ATTACH_TTL` | `3600` | how long an uploaded file is held. Nothing is written to disk: a restart forgets them, and a turn that names a forgotten id simply has no attachment |
+| `PUBLIC_URL` | — | what a document's URL is built from. Unset, it is the address the caller reached, which is right whenever the service is reached at its real one; set it when a proxy passes something else, or the provider cannot fetch the file |
 | `HISTORY_MESSAGES` / `HISTORY_CHARS` | `40` / `120000` | how much of a long chat one request may carry |
 | `MAX_TOKENS` | `4096` | ceiling on a `/v1` passthrough the caller did not set one for |
 | `RATE_LIMIT` / `MAX_CONCURRENT` | `30` / `4` | per-IP requests per minute, and turns at once |
@@ -324,12 +346,14 @@ A few properties worth knowing:
 
 | Endpoint | What it is |
 | --- | --- |
-| `POST /chat/stream` | `{messages:[{role,content},...], session?: str, mode?: str, thinking?: str}` -> `{job, mode, model, session, thinking, tools, turns, timeout}`. Starts the turn, returns at once. `thinking` is the writer's setting for this turn: `thinking` (the default) or `fast` |
+| `POST /chat/stream` | `{messages:[{role,content},...], session?: str, mode?: str, thinking?: str, files?: [id]}` -> `{job, mode, model, session, thinking, tools, turns, timeout}`. Starts the turn, returns at once. `thinking` is the writer's setting for this turn: `thinking` (the default) or `fast` |
 | `GET /chat/stream/{job}` | NDJSON: `{replay}`, `{t, ch}` pieces (`answer` / `tool` / `plan` / `thoughts`), `{reset, ch}`, `{phase, note}`, `{beat}`, then `{done, text, tool, plan, thoughts, mode, session, phases}` or `{error}` |
 | `POST /chat` | The same turn, blocking. `{text, tool, plan, thoughts, mode, session, phases}` |
 | `GET /chat/result/{job}` | The same thing as one JSON object, for callers that cannot hold a stream open (Roblox). Needs the API key |
 | `GET /chat/poll/{job}` | The same fields plus `done`, in a response that closes at once. Not key-gated: it is what the page falls back to when a phone network keeps cutting the stream |
-| `POST /generate` / `POST /generate/stream` | One prompt, no history. The session and the mode still apply |
+| `POST /generate` / `POST /generate/stream` | One prompt, no history. The session, the mode and `files` still apply |
+| `POST /attach` | `{name, mime?, data(base64), session?}` -> `{id, name, mime, bytes, kind}`. Takes one file — a picture or a document — and hands back the id a turn names. Needs the API key |
+| `GET /attach/{id}` | The bytes themselves, at the type they went in as. **Not key-gated**, and for one reason: the reader is the model provider fetching the document it was pointed at, and it has no key to send. An unguessable 12-hex-character id is what protects it, the same bargain `/chat/stream/{job}` makes |
 | `GET /agent/pull?client=...` | The next script the model queued for the executor, or nothing. Needs the API key |
 | `POST /agent/push` | `{run, ok, output, error}` — the executor's answer for one run |
 | `POST /v1/chat/completions` | OpenAI-compatible passthrough to Qwen. The newest user turn gets the greeting and the model is pinned; `tools`, `web_search_options`, `reasoning_effort`, `stream` pass through. No tool loop here — a tool call comes back to you, which is what an OpenAI client expects |
@@ -393,7 +417,13 @@ protocol: its own tool table, that everything in it reads the game rather than t
 machine, that the count its header claims is the count there is, that neither the SCRIPT pane nor
 **copy code** can end up holding a paragraph of the model's notes, that a console error becomes a
 turn of its own for the script that printed it, and where the status line sits
-— the last row of the transcript, with the script box holding the row the header gave up.
+— the last row of the transcript, with the script box holding the row the header gave up. And what
+can be attached, on both sides: the upload and every refusal it can earn, the bytes served back out
+at the URL a document is fetched from, the parts that reach the writer (the picture on the *question*
+rather than on the plan agent mode puts above it), the words that reach DeepSeek instead — it has no
+vision on either transport, and a turn carrying a picture must not lose the question to it — and, in
+the client, that the picker is the executor's own file access and that no tool of the model's reads
+the device.
 
 ```bash
 .venv/bin/python verify_chain.py

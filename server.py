@@ -61,13 +61,19 @@ class Job:
     """
 
     def __init__(self, messages: list, temperature: Optional[float], note: str, session: str,
-                 mode: str, thinking: str = ""):
+                 mode: str, thinking: str = "", files=None, base_url: str = ""):
         self.id = uuid.uuid4().hex[:12]
         self.messages = messages
         self.temperature = temperature
         self.note = note
         self.session = session
         self.mode = mode
+        # What the caller attached to this turn, by id, and the address this service is reached at:
+        # a document is handed to the writer as a URL to fetch, so it has to be this service's own.
+        self.files = [str(f) for f in (files or [])]
+        self.base_url = base_url
+        # The text of the turn an attachment belongs to, filled in once the turns are built.
+        self.question = ""
         # The writer's setting for this turn, decided before the turn starts: "thinking" or
         # "fast". It is per turn, not per service, because the same question can want either --
         # a quick edit to a line does not need a minute of reasoning, and a remote protocol does.
@@ -159,6 +165,8 @@ class Job:
             # How much the writer thought. The text itself is on the job's `thoughts` channel, so a
             # reader gets it as it arrives rather than in one lump at the end.
             "thought_chars": len(self.channel("thoughts")),
+            # How many files ride on this turn, so a client can say what the model was given.
+            "files": len(self.files),
         }
 
 
@@ -219,6 +227,12 @@ async def lifespan(_app: FastAPI):
             print("[tools] AGENT_RUN=off: the model cannot execute anything", flush=True)
     else:
         print("[tools] no tools attached; the model answers from what it knows", flush=True)
+    if ATTACH_MAX > 0:
+        print(f"[attach] up to {ATTACH_MAX} file(s) a turn, "
+              f"{ATTACH_MAX_BYTES // 1048576} MB each, kept {ATTACH_TTL:g}s; a picture is sent as "
+              "a data URI and a document as a URL back out of /attach/<id>", flush=True)
+    else:
+        print("[attach] off (ATTACH_MAX_FILES=0): /attach refuses everything", flush=True)
     if GREETING:
         print(f"[chat] every question is sent as {GREETING} <your question>", flush=True)
     yield
@@ -352,6 +366,13 @@ def run_phase(job: Job, messages: list, temperature: Optional[float], max_tokens
 
     box["thoughts"] = note_thought
     turns = with_continuation(messages, job.session) if provider in QWEN_PROVIDERS else messages
+    # What was attached rides on the newest question, and only the writer is given it as a file:
+    # Qwen takes a picture or a document as part of the turn, while DeepSeek has no vision on either
+    # transport and is told what is attached rather than handed something it cannot read.
+    if job.files:
+        turns = (with_attachments(turns, job.files, job.base_url, job.question)
+                 if provider in QWEN_PROVIDERS
+                 else with_note(turns, attach_note(job.files)))
     for piece in stream_any(provider, turns, temperature, max_tokens, box, tools, web_session):
         pieces.append(piece)
         job.add(channel, piece)
@@ -668,7 +689,8 @@ def run_job(job: Job) -> None:
 
 
 def start_job(messages: list, temperature: Optional[float] = None, session: str = "",
-              request: Optional[Request] = None, mode: str = "", thinking: str = "") -> Job:
+              request: Optional[Request] = None, mode: str = "", thinking: str = "",
+              files=None) -> Job:
     """Pick the mode and the writer's setting, then set the work going on its own thread.
 
     The mode is resolved before anything else, so a caller who asked for one this service cannot
@@ -689,7 +711,15 @@ def start_job(messages: list, temperature: Optional[float] = None, session: str 
     # The session is what keeps one upstream chat: the caller keeps its own id (the page keeps it
     # in localStorage, the Roblox client per chat) and every turn in it continues the last answer.
     name = (session or "").strip()[:64] or session_new()
-    job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen, thinking)
+    # A document is fetched by the provider from this service, so the URL it is given has to be an
+    # address the provider can reach. PUBLIC_URL is that address when it is set; otherwise it is
+    # whatever the caller reached, which is already right for a caller that used the real one.
+    base_url = PUBLIC_URL or (str(request.base_url).rstrip("/") if request is not None else "")
+    job = Job(turns, temperature, f"{mode_label(chosen)} drafting", name, chosen, thinking,
+              files, base_url)
+    # What the attachment is attached to: the question as the model will read it, greeting and all,
+    # so the part lands on the turn that asked it rather than on the plan agent mode puts above it.
+    job.question = last_user_text(turns)
     register(job)
     print(f"[job] {job.id} [{chosen}/{setting}] session {name}: {len(turns)} turn(s), asking about "
           f"{last_user_text(turns).strip()[:60]!r}", flush=True)
@@ -707,6 +737,7 @@ class GenReq(BaseModel):
     session: str = ""
     mode: str = ""                # agent | qwen | deepseek; empty means the service's default
     thinking: str = ""            # thinking | fast; empty means the service's own default
+    files: list = []              # attachment ids from /attach, in the order they should be read
 
 
 class ChatReq(BaseModel):
@@ -732,6 +763,7 @@ class ChatReq(BaseModel):
     session: str = ""
     mode: str = ""
     thinking: str = ""               # thinking | fast; empty means the service's own default
+    files: list = []                 # attachment ids from /attach, in the order they should be read
 
 
 def job_summary(job: Job) -> dict:
@@ -761,14 +793,15 @@ def chat_stream(req: ChatReq, request: Request):
     uses, so it is not key-gated -- only rate limited.
     """
     messages = clean_messages(req.messages)
-    job = start_job(messages, req.temperature, req.session, request, req.mode, req.thinking)
+    job = start_job(messages, req.temperature, req.session, request, req.mode, req.thinking,
+                    req.files)
     # Only the writer is ever given the toolbox, and only when it is on -- so the list is empty in
     # deepseek mode, where there is no writer to attach it to.
     tools = (TOOL_NAMES if (tools_enabled() and AGENT_ROUNDS > 0 and job.mode != MODE_DEEPSEEK)
              else [])
     return {"job": job.id, "mode": job.mode, "model": job.report()["model"],
             "session": job.session, "thinking": job.report()["thinking"],
-            "turns": len(job.messages), "tools": tools,
+            "turns": len(job.messages), "tools": tools, "files": len(job.files),
             # null rather than 0: there is no ceiling on this turn unless one is configured.
             "timeout": CHAT_TIMEOUT or None}
 
@@ -777,7 +810,7 @@ def chat_stream(req: ChatReq, request: Request):
 def chat(req: ChatReq, _: None = Depends(require_key)):
     """The same turn, blocking -- for callers that cannot follow a stream."""
     job = start_job(clean_messages(req.messages), req.temperature, req.session, None, req.mode,
-                    req.thinking)
+                    req.thinking, req.files)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -891,7 +924,7 @@ def job_wait() -> float:
 def generate(req: GenReq, _: None = Depends(require_key)):
     """Block until the whole turn is done -- this is the path `client.lua` uses."""
     job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
-                    None, req.mode, req.thinking)
+                    None, req.mode, req.thinking, req.files)
     job.wait(job_wait())
     if job.status == "error":
         raise HTTPException(502, job.error)
@@ -902,9 +935,67 @@ def generate(req: GenReq, _: None = Depends(require_key)):
 def start_stream(req: GenReq, _: None = Depends(require_key)):
     """The one-shot flow as a job, for callers that stream but keep no history."""
     job = start_job([{"role": "user", "content": req.prompt}], req.temperature, req.session,
-                    None, req.mode, req.thinking)
+                    None, req.mode, req.thinking, req.files)
     return {"job": job.id, "mode": job.mode, "model": job.report()["model"],
             "session": job.session, "timeout": CHAT_TIMEOUT or None}
+
+
+# --- taking a file in, and handing it back out -------------------------------------------
+#
+# Two calls, and both exist for the same reason: what the writer should look at is a file, and a
+# file is not a long question. `POST /attach` takes the bytes (base64 in JSON, because the Roblox
+# client has no multipart) and hands back an id; every turn after that names the ids it wants in
+# front of it. `GET /attach/{id}` gives the bytes back, and it is the one endpoint here that is not
+# key-gated -- the reader is the model provider fetching the document it was pointed at, and it has
+# no key to send. An id is 12 random hex characters, and a file is the caller's own.
+
+class AttachReq(BaseModel):
+    """One file: a name, whatever type it claims, and its bytes as base64."""
+
+    name: str = "file"
+    mime: str = ""
+    data: str = ""            # base64, with or without a `data:<mime>;base64,` prefix
+    session: str = ""         # so one chat holds no more than a turn can use
+
+
+@app.post("/attach")
+def attach(req: AttachReq, _: None = Depends(require_key)):
+    """Take one file and hand back what to call it by.
+
+    Key-gated, because this is the Roblox client's own upload: `API_KEY` is set on any deployment
+    that is exposed, and what comes in here is then served back out at a public URL.
+    """
+    raw = (req.data or "").strip()
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[-1]
+    if not raw:
+        raise HTTPException(400, "data is empty: send the file as base64")
+    try:
+        blob = base64.b64decode(raw, validate=False)
+    except ValueError:
+        raise HTTPException(400, "data is not base64")
+    kept = attach_put(req.name, blob, req.mime, req.session)
+    print(f"[attach] {kept['id']} {kept['name']} {kept['mime']}, {kept['bytes']} bytes, "
+          f"session {kept['by'][:6] or '-'}", flush=True)
+    return kept
+
+
+@app.get("/attach/{attach_id}")
+def attach_raw(attach_id: str):
+    """The bytes themselves, for whoever was pointed at them.
+
+    Deliberately not key-gated: the provider downloading this has no key to send, and an
+    unguessable id is what protects it -- the same bargain /chat/stream/{job} makes. A name is
+    cleaned before it goes into a header, so nothing in it can rewrite the response.
+    """
+    found = attach_get(attach_id)
+    if found is None:
+        raise HTTPException(404, "unknown or expired attachment; upload it again")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", found["name"])[:80] or "file"
+    return Response(found["data"], media_type=found["mime"],
+                    headers={"Content-Disposition": f'inline; filename="{name}"',
+                             "Cache-Control": "no-store",
+                             "X-Content-Type-Options": "nosniff"})
 
 
 # --- the executor on the other end -------------------------------------------------------
@@ -1129,6 +1220,11 @@ async def snapshot() -> dict:
                      "chats": deepseek_chats()},
         "tools": tools,
         "sessions": session_count(),
+        "attachments": attach_count(),
+        # What a caller may attach, said out loud so a client can refuse a file before sending it
+        # rather than reading the refusal back off a failed upload.
+        "attachment_limits": {"files": ATTACH_MAX, "max_mb": ATTACH_MAX_BYTES // 1048576,
+                              "ttl": ATTACH_TTL, "public_url": bool(PUBLIC_URL)},
         "rounds": AGENT_ROUNDS,
         "limits": {"per_minute": RATE_LIMIT, "concurrent": MAX_CONCURRENT,
                    "running": running_now()},

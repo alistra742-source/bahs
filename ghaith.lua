@@ -42,6 +42,16 @@ the console back, gets a fix and repeats until the script stops changing. copy c
 are not up there: they are built under each answer that carries a script, so the rail never shows a
 run button with no script to run.
 
+And one more, which is not a button that asks for a script at all: picture. The writer is a vision
+model and the service takes a file as part of a turn, so a screenshot, a picture or any file this
+device can read can be put in front of it with the question -- POST /attach takes the bytes once and
+answers with an id, and every turn after that names the id instead of carrying the file. A picture
+stays attached to the chat until CLEAR; scan game's dump goes up the same way, once, as a .txt, so
+the question is a line rather than three hundred thousand characters. Roblox has no file dialog and
+a script cannot open the system one, so the window is built out of what an executor does hand over
+-- readfile for the bytes, listfiles for the folder it was given -- with a path/URL box for the
+executors that hand over neither.
+
 On a phone as well as on a desktop. The panel fills the screen it was given -- minus the strip
 Roblox keeps for its own buttons, which is where its header would otherwise be sitting -- with the
 rail beside the column, or above it as a scrolling strip when the screen is too narrow to put them
@@ -73,6 +83,11 @@ local HISTORY     = 16              -- turns of conversation kept here (the serv
 -- ends with says how much did not fit, so a cut dump never reads as a whole one.
 local SCAN_BUDGET = 300000          -- characters of the whole dump one scan may carry
 local SCAN_SOURCE = 40000           -- characters of one script's source written into it
+-- picture: the writer is a vision model, and a file is not a longer question. What is bounded here
+-- is what one file may be -- the service's own ceiling is 12 MB and a screenshot is a fraction of
+-- that -- and how many ride on one question at once, which is the service's own per-turn limit.
+local PIC_MAX     = 12              -- MB one picture or file may be
+local PIC_KEEP    = 4               -- how many may ride on one question
 
 local auto        = false           -- auto: run what it wrote, hand the console back, fix and repeat
 local last_code   = ""              -- the script from the last answer, whole
@@ -225,7 +240,6 @@ local function api_retry(method, path, body, tries)
 	return false, last
 end
 
--- =====================================================================================
 -- 3. the console this client can show the model
 -- =====================================================================================
 
@@ -1575,15 +1589,169 @@ local function trim()
 	while #MSGS > HISTORY + 1 do table.remove(MSGS, 2) end
 end
 
+-- --- what can be attached to a question -------------------------------------------------------
+--
+-- Three things the model can be *shown* rather than told: a picture of this screen, a file from
+-- this device, and the game itself -- scan game sends its dump up this same road. All three take
+-- the same shape: POST /attach takes the bytes and answers with an id, and the turn names the ids
+-- it wants in front of it. What the model reads on the other end is a file, not a wall of base64
+-- pasted into the question.
+--
+-- The bytes come from the executor, which is the only file access a Roblox script has: `readfile`
+-- for a path, `listfiles` and `isfile` for finding one. An executor that hands over neither is not
+-- a broken client -- it is one where a picture has to come from a URL -- and it is told that in as
+-- many words rather than failing with a mystery.
+local RD  = primitive("readfile")
+local ISF = primitive("isfile")
+local LSF = primitive("listfiles")
+-- Some executors ship a file dialog of their own. Not one of these names is guaranteed, which is
+-- why every one is tried and the list built from the folder is the fallback that always works.
+local PICKS = {
+	primitive("pickfile"), primitive("pick_file"), primitive("choosefile"),
+	primitive("selectfile"), primitive("openfiledialog"), primitive("promptforfile"),
+}
+
+local PICS = {}      -- pictures kept attached to every question until they are cleared
+local PENDING = {}   -- files uploaded for the next turn only (scan game's dump)
+
+-- What the service calls each kind of picture. The extension is what decides it -- a `.png` is a
+-- picture whatever the bytes claim -- and a file that is not one of these goes up as itself, which
+-- is the point of the file box next to the picture list.
+local MIME_BY_EXT = {
+	png = "image/png", jpg = "image/jpeg", jpeg = "image/jpeg", jfif = "image/jpeg",
+	gif = "image/gif", webp = "image/webp", bmp = "image/bmp", ico = "image/x-icon",
+	tif = "image/tiff", tiff = "image/tiff",
+}
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+-- Base64, by hand: it is what an upload has to be and no executor hands over an encoder. Six bits
+-- at a time out of an accumulator, four characters to every three bytes, padded at the end.
+local function b64(bytes)
+	local out, acc, bits = {}, 0, 0
+	for i = 1, #bytes do
+		acc = acc * 256 + bytes:byte(i)
+		bits = bits + 8
+		while bits >= 6 do
+			bits = bits - 6
+			local index = math.floor(acc / 2 ^ bits) % 64 + 1
+			out[#out + 1] = B64:sub(index, index)
+		end
+		acc = acc % 2 ^ bits
+	end
+	if bits > 0 then
+		local index = math.floor(acc * 2 ^ (6 - bits)) % 64 + 1
+		out[#out + 1] = B64:sub(index, index)
+	end
+	while #out % 4 ~= 0 do out[#out + 1] = "=" end
+	return table.concat(out)
+end
+
+-- The name and the extension of a path, whatever separators it was written with.
+local function file_parts(path)
+	local name = tostring(path or ""):gsub("\\", "/")
+	name = name:match("([^/]*)$") or name
+	return name, (name:match("%.(%w+)$") or ""):lower()
+end
+
+local function kb(bytes)
+	local n = #bytes
+	return n >= 1048576 and string.format("%.1f MB", n / 1048576) or string.format("%.0f KB", n / 1024)
+end
+
+-- One file off this device, as bytes. Nil and a reason rather than an error: every caller here has
+-- somewhere to say why, and throwing on a path nobody typed correctly is not one of them.
+local function read_bytes(path)
+	if type(RD) ~= "function" then
+		return nil, "this executor hands a script no readfile, so it cannot read a file for you"
+	end
+	local ok, data = pcall(RD, tostring(path))
+	if not ok or type(data) ~= "string" then
+		return nil, tostring(path) .. " could not be read"
+			.. ((not ok) and (" (" .. tostring(data) .. ")") or "")
+	end
+	if #data == 0 then return nil, tostring(path) .. " is empty" end
+	return data
+end
+
+-- A picture that is already on the internet needs no file access at all.
+local function bytes_from_url(url)
+	local ok, data = pcall(function() return game:HttpGet(tostring(url)) end)
+	if not ok or type(data) ~= "string" or #data == 0 then
+		return nil, "that URL could not be fetched"
+	end
+	return data
+end
+
+-- One file up to the service, and the id it answers with is what every turn after it names. `once`
+-- is for a file that belongs to one question -- the game dump -- while a picture stays attached.
+local function attach_upload(name, bytes, mime, once)
+	if type(bytes) ~= "string" or #bytes == 0 then return nil, "there is nothing to upload" end
+	if #bytes > PIC_MAX * 1048576 then
+		return nil, string.format("%s is %s and the service takes up to %d MB",
+			tostring(name), kb(bytes), PIC_MAX)
+	end
+	local ok, kept = api_retry("POST", "/attach",
+		{name = tostring(name), mime = mime or "", data = b64(bytes), session = SESSION})
+	if not ok then return nil, tostring(kept) end
+	local id = tostring(kept.id or "")
+	if id == "" then return nil, "the service took the file and returned no id for it" end
+	local into = once and PENDING or PICS
+	into[#into + 1] = id
+	while #into > PIC_KEEP do table.remove(into, 1) end
+	return kept, nil
+end
+
+-- What the next turn names in front of its question: the pictures the chat is keeping, then
+-- whatever was uploaded for this turn alone.
+local function attach_ids()
+	local out = {}
+	for _, id in ipairs(PICS) do out[#out + 1] = id end
+	for _, id in ipairs(PENDING) do out[#out + 1] = id end
+	return out
+end
+
+-- The picture files this client can see. Nothing here has to work: an executor with no listfiles
+-- simply finds nothing, and the window says so instead of pretending the folder is empty.
+local FOLDERS = {"", "/", "workspace", "Ghaith", "ghaith", "pictures", "images"}
+
+local function image_files()
+	if type(LSF) ~= "function" then return {} end
+	local found, seen = {}, {}
+	for _, folder in ipairs(FOLDERS) do
+		local ok, files = pcall(LSF, folder)
+		if ok and type(files) == "table" then
+			for _, item in ipairs(files) do
+				local path = tostring(item)
+				local name, ext = file_parts(path)
+				if MIME_BY_EXT[ext] and not seen[folder .. "/" .. path] then
+					seen[folder .. "/" .. path] = true
+					found[#found + 1] = {path = path, folder = folder, name = name}
+					if #found >= 30 then return found end
+				end
+			end
+		end
+	end
+	return found
+end
+
+-- =====================================================================================
 -- Start one turn and watch it to the end. Returns:
 --   text (everything it said), code (the script in it, "" when there is none)
 -- Raises an error string when the turn itself failed, so the caller can show it.
 local function ask(question)
 	table.insert(MSGS, {role = "user", content = question})
 	trim()
-	local ok, started = api_retry("POST", "/chat/stream",
-		{messages = MSGS, session = SESSION, mode = MODE, thinking = THINK})
+	local body = {messages = MSGS, session = SESSION, mode = MODE, thinking = THINK}
+	-- What is attached rides on this question: the pictures the chat is keeping, and whatever was
+	-- uploaded for this one turn. Only the ids go -- the file itself was sent once, to /attach --
+	-- which is the difference between a question with a picture and a question that *is* a picture.
+	local attached = attach_ids()
+	if #attached > 0 then body.files = attached end
+	local ok, started = api_retry("POST", "/chat/stream", body)
 	if not ok then table.remove(MSGS) error(started, 0) end
+	-- A one-shot file has now been named by the turn it was uploaded for, so it is done.
+	PENDING = {}
 
 	local id = tostring(started.job or "")
 	if id == "" then table.remove(MSGS) error("the service did not return a job", 0) end
@@ -2487,6 +2655,198 @@ local console_window, console_window_body = overlay("CONSOLE  ·  everything thi
 -- -- every script with its text, then every other name in the game -- and a question that long
 -- is worth being able to read: it is where "did it really send every script" is answered,
 -- and where what the model was given can be counted without taking anybody's word for it.
+-- --- the picture window -----------------------------------------------------------------------
+--
+-- The shortest path from this device to the model's eyes. A file is picked here, uploaded once, and
+-- from then on it rides on every question until CLEAR -- the picture the chat is about stays the
+-- picture the model can see, turn after turn, without being re-sent by hand or pasted anywhere.
+--
+-- There is no file dialog in Roblox: a script cannot open one, and the picker is instead built out
+-- of the two things an executor does hand over -- the files in the folder it gave this script, and
+-- readfile for a path. That is why the list is a list of *its* folder and not of the device: what
+-- is shown is what this client can actually open. A path or a URL in the box below goes the same
+-- road, and a URL needs no file access at all.
+local pic_window = mk("Frame", {
+	Size = L.overlay, Position = L.overlay_at, BackgroundColor3 = C.panel, BorderSizePixel = 0,
+	Visible = false, ZIndex = 210, Parent = gui,
+})
+round(pic_window, 16)
+outline(pic_window, C.line, 1, 0.2)
+local pic_bar = mk("Frame", {
+	Size = UDim2.new(1, 0, 0, 46), BackgroundColor3 = C.card, BorderSizePixel = 0,
+	ZIndex = 211, Parent = pic_window,
+})
+round(pic_bar, 16)
+mk("TextLabel", {
+	Size = UDim2.new(1, -180, 1, 0), Position = UDim2.new(0, 16, 0, 0), BackgroundTransparency = 1,
+	Text = "PICTURE  ·  pick a file and the model sees it with the question", TextColor3 = C.text,
+	Font = SANS_B, TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 212,
+	Parent = pic_bar,
+})
+local pic_clear = mk("TextButton", {
+	Size = UDim2.new(0, 74, 0, 30), Position = UDim2.new(1, -162, 0.5, -15), BackgroundColor3 = C.card2,
+	Text = "CLEAR", TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0,
+	ZIndex = 212, Parent = pic_bar,
+})
+round(pic_clear, 9)
+local pic_close = mk("TextButton", {
+	Size = UDim2.new(0, 74, 0, 30), Position = UDim2.new(1, -80, 0.5, -15), BackgroundColor3 = C.bad,
+	Text = "CLOSE", TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0,
+	ZIndex = 212, Parent = pic_bar,
+})
+round(pic_close, 9)
+
+local pic_status = mk("TextLabel", {
+	Size = UDim2.new(1, -32, 0, 0), Position = UDim2.new(0, 12, 0, 52),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, Text = "",
+	TextColor3 = C.dim, Font = SANS_M, TextSize = 12, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 211, Parent = pic_window,
+})
+pad(pic_status, 6, 6, 4, 4)
+
+local pic_list = mk("ScrollingFrame", {
+	Size = UDim2.new(1, -24, 1, -236), Position = UDim2.new(0, 12, 0, 122),
+	BackgroundColor3 = C.bg, BorderSizePixel = 0, ZIndex = 211, Parent = pic_window,
+	ScrollBarThickness = 3, ScrollBarImageColor3 = C.line, CanvasSize = UDim2.new(0, 0, 0, 0),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+	ClipsDescendants = true,
+})
+round(pic_list, 10)
+mk("UIListLayout", {Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = pic_list})
+pad(pic_list, 8, 8, 8, 8)
+
+local pic_path = mk("TextBox", {
+	Size = UDim2.new(1, -24, 0, 38), Position = UDim2.new(0, 12, 1, -104), BackgroundColor3 = C.bg,
+	BorderSizePixel = 0, Text = "", PlaceholderText = "…or a path to a picture, or a picture's URL",
+	PlaceholderColor3 = C.dim, TextColor3 = C.text, Font = MONO, TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false, ZIndex = 211,
+	Parent = pic_window,
+})
+round(pic_path, 9)
+outline(pic_path, C.line, 1, 0.45)
+pad(pic_path, 0, 0, 10, 10)
+
+local pic_use = mk("TextButton", {
+	Size = UDim2.new(0, 116, 0, 38), Position = UDim2.new(1, -128, 1, -104), BackgroundColor3 = C.accent,
+	Text = "USE THIS", TextColor3 = C.text, Font = SANS_B, TextSize = 13, BorderSizePixel = 0,
+	ZIndex = 211, Parent = pic_window,
+})
+round(pic_use, 9)
+local pic_find = mk("TextButton", {
+	Size = UDim2.new(0, 148, 0, 34), Position = UDim2.new(0, 12, 1, -58), BackgroundColor3 = C.card2,
+	Text = "find my files", TextColor3 = C.text, Font = SANS_B, TextSize = 12, BorderSizePixel = 0,
+	ZIndex = 211, Parent = pic_window,
+})
+round(pic_find, 9)
+local pic_help = mk("TextLabel", {
+	Size = UDim2.new(1, -180, 0, 34), Position = UDim2.new(0, 170, 1, -58), BackgroundTransparency = 1,
+	Text = "", TextColor3 = C.dim, Font = SANS, TextSize = 11, TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 211, Parent = pic_window,
+})
+draggable(pic_window, pic_bar)
+
+-- The one line that says where the panel stands, in colour: what is attached, or why nothing is.
+local function pic_note(text, bad)
+	pic_status.Text = tostring(text or "")
+	pic_status.TextColor3 = bad and C.bad or C.dim
+end
+
+-- One picture, once it is in hand: upload it and say what the model was given.
+local function pic_send(name, bytes)
+	local clean, ext = file_parts(name)
+	local mime = MIME_BY_EXT[ext] or ""
+	UI.setStatus("running", "uploading " .. clean .. "  ·  " .. kb(bytes))
+	pic_note("uploading " .. clean .. "  ·  " .. kb(bytes), false)
+	local kept, why = attach_upload(clean, bytes, mime, false)
+	if not kept then
+		UI.setStatus("failed", tostring(why))
+		pic_note(why, true)
+		return
+	end
+	local shown = tostring(kept.name or clean)
+	pic_note(shown .. " is attached (" .. kb(bytes) .. ") as "
+		.. (mime ~= "" and "a picture" or "a file")
+		.. ". It stays with the chat -- the model sees it with every question -- until CLEAR.", false)
+	UI.bubble("system", "picture: " .. shown .. "  ·  " .. kb(bytes) .. "  ·  "
+		.. (mime ~= "" and "sent as a picture" or "sent as a file")
+		.. "  ·  attached to every question until CLEAR")
+	UI.setStatus("ready", "#" .. #PICS .. " attached to this chat")
+end
+
+-- One file off this device: read it, then send it. A path the executor gave nothing for is tried
+-- under the folder it was found in as well, because listfiles names a file in its own way.
+local function pic_take(path, folder)
+	UI.setStatus("running", "reading " .. tostring(path))
+	local bytes, why = read_bytes(path)
+	if not bytes and folder and folder ~= "" and folder ~= "/" then
+		bytes, why = read_bytes(folder .. "/" .. path)
+	end
+	if not bytes then
+		UI.setStatus("failed", tostring(why))
+		pic_note(why, true)
+		return
+	end
+	pic_send(path, bytes)
+end
+
+-- The list: what this client can actually open, one tap each.
+local function pic_refresh()
+	for _, row in ipairs(pic_list:GetChildren()) do
+		if row:IsA("TextButton") then row:Destroy() end
+	end
+	local files = image_files()
+	if #files == 0 then
+		pic_note("no picture files found in the folder this executor gave the script"
+			.. (type(LSF) == "function" and "" or ", and this executor lists no files at all")
+			.. ". put a picture beside the script and press find my files again, or type its path"
+			.. " or a URL in the box below.", false)
+		return
+	end
+	for index, entry in ipairs(files) do
+		local row = mk("TextButton", {
+			Size = UDim2.new(1, -8, 0, 30), BackgroundColor3 = C.card, Text = "  " .. entry.name,
+			TextColor3 = C.text, Font = MONO, TextSize = 13, BorderSizePixel = 0,
+			AutoButtonColor = false, LayoutOrder = index, ZIndex = 212, Parent = pic_list,
+		})
+		round(row, 8)
+		row.MouseEnter:Connect(function()
+			TW:Create(row, TweenInfo.new(0.12), {BackgroundColor3 = C.card2}):Play()
+		end)
+		row.MouseLeave:Connect(function()
+			TW:Create(row, TweenInfo.new(0.12), {BackgroundColor3 = C.card}):Play()
+		end)
+		row.Activated:Connect(function() pic_take(entry.path, entry.folder) end)
+	end
+	pic_note(#files .. " picture file(s) in the folder this client can read -- tap one to attach it,"
+		.. " or type a path or a URL below.", false)
+end
+
+pic_find.Activated:Connect(pic_refresh)
+
+pic_use.Activated:Connect(function()
+	local text = tostring(pic_path.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if text == "" then
+		pic_note("type a path to a picture, or its URL, in the box first", true)
+		return
+	end
+	if text:match("^https?://") then
+		local bytes, why = bytes_from_url(text)
+		if not bytes then pic_note(why, true) return end
+		pic_send(text, bytes)
+		return
+	end
+	pic_take(text, nil)
+end)
+
+pic_clear.Activated:Connect(function()
+	PICS, PENDING = {}, {}
+	pic_note("nothing attached. what was here is forgotten by this client -- the service drops its"
+		.. " own copy an hour after it was uploaded.", false)
+	UI.setStatus("ready", "nothing attached to this chat")
+end)
+
+pic_close.Activated:Connect(function() pic_window.Visible = false end)
+
 local dump_window, dump_window_body = overlay("GAME DUMP  ·  the whole game, as it was sent", "text")
 
 -- --- the transcript -------------------------------------------------------------------------
@@ -2652,10 +3012,35 @@ scan_button.Activated:Connect(function()
 	-- found, and the window is the whole of what went out of here.
 	dump_window_body.Text = dump
 	dump_window.Visible = true
+	-- It goes up as a file rather than as a question: uploaded once, named by the turn, and read by
+	-- the model as an attachment -- so the question stays one line instead of three hundred thousand
+	-- characters, and the dump is never carried by hand again. A scan that cannot be attached -- a
+	-- service with attachments off, or one that refuses this file -- falls back to the old shape,
+	-- because a scan that arrives the long way is better than one that never arrives.
+	local kept, why = attach_upload("game-dump.txt", dump, "text/plain", true)
+	if kept then
+		UI.bubble("system", "scan game: " .. tostring(summary) .. " -- " .. #dump
+			.. " characters of game sent as the file " .. tostring(kept.name or "game-dump.txt")
+			.. " (the whole of it is in the GAME DUMP window)")
+		process("The whole game is attached to this question as "
+			.. tostring(kept.name or "game-dump.txt") .. " (" .. tostring(summary)
+			.. "). Read the attached file and reply with ONLY the complete Luau script for the most"
+			.. " useful thing it makes possible.")
+		return
+	end
 	UI.bubble("system", "scan game: " .. tostring(summary) .. " -- " .. #dump
-		.. " characters of game sent as the question")
+		.. " characters of game sent as the question: it could not be attached (" .. tostring(why)
+		.. "), so it goes in the question itself.")
 	process("GAME DUMP:\n\n" .. dump .. "\n\nRead the game above and reply with ONLY the"
 		.. " complete Luau script for the most useful thing it makes possible.")
+end)
+
+-- picture sits beside scan game: both of them put something in front of the model that is not a
+-- question -- one file for this turn, a picture for every turn until it is cleared.
+local picture_button = rail_button("picture", C.card2, function()
+	pic_refresh()
+	pic_window.Visible = true
+	clamp_to_view(pic_window, viewport(), usable_screen())
 end)
 
 -- run last, copy code and full script have left the rail: they are the buttons under the
@@ -2732,7 +3117,7 @@ end)
 -- this is running on. A phone that turns over is a different screen -- a shorter one, with the
 -- topbar somewhere else -- so the fit runs again and the panel takes the new one whole.
 
-local windows = {code_window, console_window, dump_window}
+local windows = {code_window, console_window, dump_window, pic_window}
 
 local function fit_to_screen()
 	local view = viewport()
@@ -2760,7 +3145,9 @@ end
 
 MSGS = {{role = "system", content = SYSTEM .. "\n\n" .. tool_brief()}}
 UI.setStatus("ready", "ask for a script, or press scan game")
-UI.bubble("system", "ready. ask for a script, or press scan game. the status line at the foot of"
+UI.bubble("system", "ready. ask for a script, press scan game to have it read the whole game, or"
+	.. " press picture to hand it a screenshot or any file this device can read -- qwen sees"
+	.. " pictures, and one stays with the chat until CLEAR. the status line at the foot of"
 	.. " the transcript says thinking while it works something out -- the reasoning itself is not"
 	.. " printed -- and the WRITER button switches the writer to fast, which is the same model"
 	.. " without the reasoning. every answer comes back as one whole script, or the turn says it"

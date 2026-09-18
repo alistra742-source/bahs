@@ -62,7 +62,7 @@ from typing import Optional
 from contextlib import asynccontextmanager  # noqa: F401
 from pathlib import Path
 from collections import defaultdict, deque  # noqa: F401
-import asyncio, hmac, html, httpx, json, os, re, threading, time, uuid  # noqa: F401
+import asyncio, base64, hmac, html, httpx, json, os, re, threading, time, uuid  # noqa: F401
 
 import pow_solver  # DeepSeek's proof of work; imports wasmtime lazily
 
@@ -191,9 +191,9 @@ def fold(shape: str, messages: list) -> list:
         return messages
     parts = []
     for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content.strip())
+        content = text_of(message.get("content")).strip()
+        if content:
+            parts.append(content)
     return [{"role": "user", "content": "\n\n".join(parts)}]
 
 
@@ -297,9 +297,9 @@ def as_prompt(messages: list) -> str:
     """
     parts = []
     for message in messages:
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            parts.append(content.strip())
+        content = text_of(message.get("content")).strip()
+        if content:
+            parts.append(content)
     return "\n\n".join(parts)
 
 
@@ -782,6 +782,269 @@ def deepseek_chats() -> int:
         return len(_ds_chats)
 
 
+# --- what a caller can attach ------------------------------------------------------------
+#
+# A picture of the game screen, or a whole game dumped out as a file, is not a longer question: it
+# is a file, and the writer reads it as one. The Qwen side takes both -- `image_url` for a picture
+# and `file_url` for a document -- and the writer is a vision model, so what is attached here is
+# something it actually looks at rather than a line about it. DeepSeek has no vision on either
+# transport, so a turn that carries an attachment is built twice: the file for the writer, and a
+# line naming what it is for the planner.
+#
+# Nothing is written to disk or to a database. An attachment lives in this process for ATTACH_TTL
+# exactly like a session, so a restart forgets it and the caller uploads again.
+#
+# A picture goes to the provider as a data URI -- it is one request, and there is no URL for a byte
+# string. A document goes as a URL the provider fetches, which is why GET /attach/{id} exists and
+# why that one endpoint is not key-gated: the reader is the provider downloading the file it was
+# pointed at, and it has no key to send. The id is 12 random hex characters, which is the same
+# protection /chat/stream/{job} has, and it is the caller's own file either way.
+
+ATTACH_MAX_BYTES = int(env("ATTACH_MAX_MB", default="12")) * 1024 * 1024
+# Five is the provider's own ceiling on documents and on images; four is the default here, and 0
+# turns attachments off entirely.
+ATTACH_MAX = max(0, min(int(env("ATTACH_MAX_FILES", default="4")), 5))
+ATTACH_TTL = float(env("ATTACH_TTL", default="3600") or 3600)
+# What a document's URL is built from. Empty means the caller's own request is used, which is right
+# whenever the service is reached at the address it should be reached at.
+PUBLIC_URL = env("PUBLIC_URL").rstrip("/")
+
+# The types the provider accepts, and what to call each one. A picture and a document are different
+# groups there: several images may ride together, several documents may, and a document may be
+# combined with one media type -- which is exactly what this sends.
+IMAGE_EXT = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "jfif": "image/jpeg",
+             "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp", "tif": "image/tiff",
+             "tiff": "image/tiff", "ico": "image/x-icon", "jp2": "image/jp2"}
+DOC_EXT = {"txt": "text/plain", "md": "text/markdown", "csv": "text/csv", "pdf": "application/pdf",
+           "doc": "application/msword",
+           "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+           "ppt": "application/vnd.ms-powerpoint",
+           "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+           "xls": "application/vnd.ms-excel",
+           "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+           # Not a document type the provider lists, so a script -- or a dump of one -- is sent as
+           # text rather than as a `.lua` file it would skip.
+           "lua": "text/plain", "luau": "text/plain", "json": "text/plain", "log": "text/plain"}
+
+_EXT_MIME = {**IMAGE_EXT, **DOC_EXT}
+_attachments: dict = {}
+_attachments_lock = threading.Lock()
+
+
+def text_of(content) -> str:
+    """The words of one turn, whether it is a string or the parts an attachment arrives as."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(str(part.get("text") or "") for part in content
+                         if isinstance(part, dict) and part.get("type") == "text")
+    return ""
+
+
+def attach_mime(name: str, declared: str = "") -> str:
+    """What an attachment should be called by, from its name first and the caller second.
+
+    The extension is what the provider sorts a file by, so a name with a known one is believed over
+    a declared type: a `.txt` is sent as text however it is labelled. The declared mime is used
+    only when the name says nothing useful, and an empty answer means the bytes have to decide.
+    """
+    text = str(name or "")
+    ext = text.rsplit(".", 1)[-1].lower() if "." in text else ""
+    if ext in _EXT_MIME:
+        return _EXT_MIME[ext]
+    declared = (declared or "").split(";")[0].strip().lower()
+    if declared in _EXT_MIME.values():
+        return declared
+    return ""
+
+
+def sniff_mime(data: bytes) -> str:
+    """What the bytes are, for a file whose name says nothing -- an executor hands over a path."""
+    head = data[:12]
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:2] == b"BM":
+        return "image/bmp"
+    if head[:4] == b"%PDF":
+        return "application/pdf"
+    try:
+        data[:4096].decode("utf-8")
+        return "text/plain"
+    except UnicodeDecodeError:
+        return ""
+
+
+def attach_clean(now: float = 0.0) -> None:
+    """Forget what has expired. Called on every read and write, so nothing has to run on a timer."""
+    now = now or time.time()
+    for attach_id in [k for k, v in _attachments.items() if now - v["at"] > ATTACH_TTL]:
+        _attachments.pop(attach_id, None)
+
+
+def attach_public(record: dict) -> dict:
+    """One attachment without its bytes: what a caller is told it got."""
+    return {key: value for key, value in record.items() if key != "data"}
+
+
+def attach_put(name: str, data: bytes, mime: str = "", by: str = "") -> dict:
+    """Keep one file for a while and hand back what to call it by. Raises on what it cannot be.
+
+    A refusal names the number that was hit: the caller here is a phone, and the only useful thing
+    it can do with a no is show why there is one.
+    """
+    if ATTACH_MAX <= 0:
+        raise HTTPException(503, "attachments are off on this service (ATTACH_MAX_FILES=0)")
+    if not data:
+        raise HTTPException(400, "the attachment is empty")
+    if len(data) > ATTACH_MAX_BYTES:
+        raise HTTPException(413, f"that file is {len(data) / 1048576:.1f} MB, and this service "
+                                 f"takes up to {ATTACH_MAX_BYTES / 1048576:.0f} MB")
+    kind = attach_mime(name, mime) or sniff_mime(data)
+    if not kind:
+        raise HTTPException(415, f"cannot tell what {name or 'that file'} is: send a picture (png, "
+                                 "jpg, gif, webp, bmp) or a document (txt, md, csv, pdf)")
+    with _attachments_lock:
+        attach_clean()
+        # The provider takes five, and this holds no more than a turn can use: the oldest of this
+        # caller's own is dropped rather than refusing the new one, which is what a chat wants.
+        mine = [aid for aid, found in _attachments.items() if by and found["by"] == by]
+        if mine and len(mine) >= ATTACH_MAX:
+            for attach_id in mine[: len(mine) - ATTACH_MAX + 1]:
+                _attachments.pop(attach_id, None)
+        if len(_attachments) > 512:
+            for attach_id in sorted(_attachments, key=lambda k: _attachments[k]["at"])[:64]:
+                _attachments.pop(attach_id, None)
+        record = {"id": uuid.uuid4().hex[:12],
+                  "name": (str(name or "").strip()[:80] or "file"),
+                  "mime": kind, "data": data, "bytes": len(data),
+                  "by": str(by or "")[:64], "at": time.time(),
+                  "kind": "image" if kind.startswith("image/") else "document"}
+        _attachments[record["id"]] = record
+    return attach_public(record)
+
+
+def attach_get(attach_id: str) -> Optional[dict]:
+    """One attachment by id, or None once it has expired."""
+    with _attachments_lock:
+        attach_clean()
+        found = _attachments.get(str(attach_id or "").strip())
+        return dict(found) if found is not None else None
+
+
+def attach_count() -> int:
+    with _attachments_lock:
+        attach_clean()
+        return len(_attachments)
+
+
+def attach_data_uri(record: dict) -> str:
+    return f"data:{record['mime']};base64," + base64.b64encode(record["data"]).decode("ascii")
+
+
+def attach_text(record: dict, limit: int = 200000) -> str:
+    """A text attachment's own words, for a path that cannot fetch a file."""
+    return record["data"].decode("utf-8", "replace")[:limit]
+
+
+def attach_parts(attach_ids, base_url: str = "") -> list:
+    """What was attached, as the parts of a turn the provider reads.
+
+    A picture is a data URI: there is no URL for bytes, and it is one request either way. A
+    document is a URL the provider fetches -- `file_url` -- and it is this service's own URL, so
+    what it fetches is exactly the bytes the caller handed over.
+    """
+    parts: list = []
+    seen: set = set()
+    for attach_id in list(attach_ids or [])[:ATTACH_MAX]:
+        found = attach_get(attach_id)
+        if not found or found["id"] in seen:
+            continue
+        seen.add(found["id"])
+        if found["kind"] == "image":
+            parts.append({"type": "image_url", "image_url": {"url": attach_data_uri(found)}})
+        elif base_url:
+            parts.append({"type": "file_url",
+                          "file_url": {"url": f"{base_url}/attach/{found['id']}"}})
+        else:
+            # No address for it to be fetched at, so the words go into the prompt rather than
+            # nowhere: a dump is text, and text in a turn is still read.
+            parts.append({"type": "text",
+                          "text": f"[attached: {found['name']}]\n\n{attach_text(found)}"})
+    return parts
+
+
+def with_attachments(messages: list, attach_ids, base_url: str = "", question: str = "") -> list:
+    """The turns to send, with what was attached riding on the question it belongs to.
+
+    One turn, and the question's rather than the newest user turn's: agent mode puts the planner's
+    plan in front of the writer as a turn of its own, so the newest user turn there is the plan --
+    and a picture of the game does not belong under a plan about it. `question` is the text of the
+    turn to attach to, and with none given the newest user turn is used, which is the same thing
+    for every path that has no plan in front of it.
+
+    A turn that is already parts keeps them and gets these after, so asking again inside one turn
+    -- a tool round -- does not lose them.
+    """
+    parts = attach_parts(attach_ids, base_url)
+    if not parts:
+        return messages
+    out = list(messages)
+    for index in range(len(out) - 1, -1, -1):
+        turn = out[index]
+        if turn.get("role") != "user":
+            continue
+        if question and text_of(turn.get("content")).strip() != question.strip():
+            continue
+        content = turn.get("content")
+        if isinstance(content, list):
+            before = [part for part in content if isinstance(part, dict)]
+        else:
+            text = str(content or "")
+            before = [{"type": "text", "text": text}] if text.strip() else []
+        out[index] = {**turn, "content": before + parts}
+        return out
+    return messages
+
+
+def attach_note(attach_ids) -> str:
+    """What a model with no vision is told about the files it cannot see.
+
+    DeepSeek is the planner in agent mode and gets this instead, so its plan is written for a
+    question that has a picture with it rather than pretending the question was all there was.
+    """
+    names = []
+    for attach_id in list(attach_ids or [])[:ATTACH_MAX]:
+        found = attach_get(attach_id)
+        if found:
+            names.append(f"{found['name']} ({found['kind']}, {found['bytes'] / 1024:.0f} KB)")
+    if not names:
+        return ""
+    return ("[The caller attached: " + "; ".join(names) + ". You cannot see attached files, so do "
+            "not describe them or guess at their contents: plan for the question, and say what the "
+            "writer -- which can see them -- should take from them.]")
+
+
+def with_note(messages: list, note: str) -> list:
+    """The turns to send with one line added to the newest question."""
+    if not note:
+        return messages
+    out = list(messages)
+    for index in range(len(out) - 1, -1, -1):
+        turn = out[index]
+        if turn.get("role") != "user":
+            continue
+        text = text_of(turn.get("content")).strip()
+        out[index] = {**turn, "content": (text + "\n\n" + note).strip()}
+        return out
+    return messages
+
+
 def strip_metadata(text: str) -> str:
     """The text without the hidden continuation marker."""
     return META_RE.sub("", text or "").strip()
@@ -851,6 +1114,10 @@ You have tools, and using them is part of writing the script:
 * `luau_find` -- the lines of a script that match a pattern, with line numbers, when you need one part of a long script.
 * `luau_format` -- re-indent a script you assembled from pieces.
 * `secret_scan` -- find credentials in the script before it ships.
+
+A picture or a file may be attached to the question -- a screenshot of the game, or a dumped \
+script. What is attached is in front of you with the question: read it, and answer for what it \
+shows instead of asking for it again.
 
 Call a tool when it would change your answer; never describe a call in prose. """ + ANSWER_RULE
 

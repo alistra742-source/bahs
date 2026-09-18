@@ -14,17 +14,24 @@ channel and never into the answer, DeepSeek answering on its own in deepseek mod
 attached, and a mode whose credential is missing being refused by name rather than served by the
 other model.
 
+And what a caller can attach: a picture of the screen, or a whole game dumped out as a file. The
+writer is a vision model and the Qwen side takes a turn whose content is a list of parts, so the
+road is checked end to end -- the upload and its refusals, the bytes served back out at a URL the
+provider fetches, the parts that reach the writer, and the words that reach DeepSeek instead,
+because it has no vision on either transport.
+
 Last, the Roblox client (ghaith.lua), read as the other half of the tool protocol: its own tool
 table, that every tool in it reads the game rather than the player's machine, that neither the
-SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes, and that a
-console error becomes a turn of its own for the script that printed it.
+SCRIPT pane nor "copy code" can end up holding a paragraph of the model's notes, that a console
+error becomes a turn of its own for the script that printed it, and that the picture button is the
+one road from this device to the model -- the user picks the file, the model never reaches for one.
 
 And the ceiling on silence: a provider that opens a stream and stops sending ends the turn with
 the silence named in seconds, instead of a turn nobody is ever told about.
 
 No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
-import contextlib, html, io, json, os, re, sys, tempfile, threading, time
+import base64, contextlib, html, io, json, os, re, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -363,7 +370,8 @@ def fresh_toolbox():
 
 def turn(question="make me a walk script", session="s-test", mode="plain", tool="luau_check",
          arguments=None, openai_tool=False, script=None, meta=None, finish="stop",
-         messages=None, prose=":ASK:", asked_mode=None, plan=None, decoy="", thinking=""):
+         messages=None, prose=":ASK:", asked_mode=None, plan=None, decoy="", thinking="",
+         files=None):
     """One turn, watched to the end, with the model stub configured for it.
 
     `mode` is what the stub does; `asked_mode` is the mode the request asks for, which is empty
@@ -381,6 +389,8 @@ def turn(question="make me a walk script", session="s-test", mode="plain", tool=
         body["mode"] = asked_mode
     if thinking:
         body["thinking"] = thinking
+    if files:
+        body["files"] = files
     started = client.post("/chat/stream", json=body)
     assert started.status_code == 200, started.text
     frames = []
@@ -1173,8 +1183,8 @@ def scan_checks():
     # transcript is told what the scan found before any answer arrives.
     check("the dump has a window of its own",
           'overlay("GAME DUMP  ·  the whole game, as it was sent", "text")' in source, True)
-    check("which follows the screen like the other two",
-          "local windows = {code_window, console_window, dump_window}" in source, True)
+    check("which follows the screen like the others",
+          "local windows = {code_window, console_window, dump_window, pic_window}" in source, True)
     check("what the window holds is what was sent", "dump_window_body.Text = dump" in source, True)
     check("and scan game says what it found before it sends it",
           '"scan game: " .. tostring(summary)' in source, True)
@@ -1182,6 +1192,183 @@ def scan_checks():
           '"GAME DUMP:\\n\\n" .. dump' in source, True)
     check("the DEEPSCAN tool is the same dump the button sends",
           "run = function() return deep_scan() end" in source, True)
+
+
+def attach_checks():
+    """A picture of the screen, or a file: what goes up, and what the model is given.
+
+    The writer is a vision model and the Qwen side takes a turn whose content is a *list of parts*
+    -- `image_url` for a picture, `file_url` for a document -- so what is checked here is the whole
+    road: the upload and every refusal it can earn, the bytes coming back out at a URL the provider
+    can fetch, and the parts that actually reach the writer. DeepSeek has no vision on either
+    transport, so the other half of it is that a turn carrying a picture is still built for the
+    planner as words -- never losing the question, and never handing it something it cannot read.
+    """
+    print("\nwhat a caller can attach")
+    reload_with()
+    headers = {"X-API-Key": "qwen-test-token"}
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 64
+    b64 = lambda blob: base64.b64encode(blob).decode()  # noqa: E731
+    keep = lambda name, blob, mime="": client.post(  # noqa: E731
+        "/attach", json={"name": name, "mime": mime, "data": b64(blob), "session": "s-att"},
+        headers=headers)
+
+    kept = keep("shot.png", png)
+    check("a picture uploads", kept.status_code, 200)
+    image = kept.json()
+    check("and is called what it is", image["mime"], "image/png")
+    check("as a picture", image["kind"], "image")
+    check("with the size it is", image["bytes"], len(png))
+    check("and its bytes are not echoed back", "data" in image, False)
+
+    # Every way it can be refused, each naming its own reason: the caller is a phone and the only
+    # useful thing it can do with a no is show why there is one.
+    check("an upload needs the key, like every other write",
+          client.post("/attach", json={"name": "x.png", "data": b64(png)}).status_code, 401)
+    check("an empty one is refused",
+          client.post("/attach", json={"name": "x.png", "data": ""}, headers=headers).status_code,
+          400)
+    check("a body that is not base64 is refused",
+          client.post("/attach", json={"name": "x.png", "data": "!!!!"}, headers=headers).status_code,
+          400)
+    check("and bytes that are nothing recognisable are refused",
+          client.post("/attach", json={"name": "x.dat", "mime": "application/x-nonsense",
+                                       "data": b64(b"\xff\xfe\x00\x01")},
+                      headers=headers).status_code, 415)
+    reload_with(ATTACH_MAX_MB="0")
+    too_big = client.post("/attach", json={"name": "big.png", "data": b64(png)}, headers=headers)
+    check("one past the size ceiling is a 413", too_big.status_code, 413)
+    check_true("naming the size it was", "MB" in too_big.json()["detail"])
+    # Each of these is cleared again in the next reload: reload_with() restores the fixed set of
+    # variables, so an override left behind would quietly turn the section after it off.
+    reload_with(ATTACH_MAX_MB=UNSET, ATTACH_MAX_FILES="0")
+    check("and attachments can be turned off altogether",
+          client.post("/attach", json={"name": "x.png", "data": b64(png)},
+                      headers=headers).status_code, 503)
+    reload_with(ATTACH_MAX_MB=UNSET, ATTACH_MAX_FILES=UNSET, ATTACH_TTL="0.01")
+    short = client.post("/attach", json={"name": "shot.png", "data": b64(png)},
+                        headers=headers).json()
+    time.sleep(0.05)
+    check("an attachment expires on its own clock",
+          client.get(f"/attach/{short['id']}").status_code, 404)
+    reload_with(ATTACH_TTL=UNSET)
+
+    # The store lives in the module and the reload above rebuilt it, so the picture uploaded before
+    # the refusals is gone with it: this is a fresh one, and the id below is one it is holding.
+    image = keep("shot.png", png).json()
+
+    # The bytes come back out, because a document is handed to the provider as a URL to fetch and
+    # the reader there has no key to send: an unguessable id is what protects it.
+    back = client.get(f"/attach/{image['id']}")
+    check("the bytes come back out of the service", back.content, png)
+    check("with the type they went in as", back.headers["content-type"], "image/png")
+    check("for a reader with no key at all", back.status_code, 200)
+    check("and an id nobody holds is a 404", client.get("/attach/nope").status_code, 404)
+
+    text = b"instance [Part] Workspace.Rock\n" * 40
+    dump = keep("game-dump.txt", text).json()
+    check("a document is called one", dump["kind"], "document")
+    check("and goes up as the text it is", dump["mime"], "text/plain")
+
+    # One turn carrying both: the question, then the picture, then the file.
+    frames, done, started, calls = turn(question="what does this do", session="s-att",
+                                        files=[image["id"], dump["id"]])
+    check("the turn still answers", bool(done), True)
+    check("and says what it was given", started["files"], 2)
+    parts = messages_of(writer_calls(calls)[0])[-1]["content"]
+    check("the newest question is parts now, not a string", isinstance(parts, list), True)
+    check("with the question first", parts[0]["type"], "text")
+    check("then the picture", parts[1]["type"], "image_url")
+    check_true("as the bytes themselves",
+               parts[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+    check("and the file last, as a URL to fetch", parts[2]["type"], "file_url")
+    check("which is this service's own",
+          parts[2]["file_url"]["url"].endswith("/attach/" + dump["id"]), True)
+    fetched = client.get(parts[2]["file_url"]["url"].split("http://testserver")[-1])
+    check("and serves back the dump the caller uploaded", fetched.content, text)
+
+    # DeepSeek has no eyes: the planner is told what is attached rather than handed it, and the
+    # question it is planning for is still there.
+    frames, done, started, calls = turn(question="what does this do", session="s-att",
+                                        asked_mode="agent", files=[image["id"]])
+    planner = planner_calls(calls)
+    check("the planner is still called", len(planner), 1)
+    told = messages_of(planner[0])[-1]["content"]
+    check("and is given words rather than a file", isinstance(told, str), True)
+    check_true("still asked the question", "what does this do" in told)
+    check_true("and told what it cannot see", "attached" in told and "shot.png" in told)
+    # Agent mode puts the plan in front of the writer as a turn of its own, so the newest user turn
+    # of that call is the plan: the picture belongs on the question underneath it instead.
+    written = messages_of(writer_calls(calls)[0])
+    check("the plan is the newest turn of that call",
+          written[-1]["content"].startswith("The plan"), True)
+    attached = [m for m in written if m["role"] == "user" and isinstance(m.get("content"), list)]
+    check("and the picture is on the question, not on the plan", len(attached), 1)
+    check("as a picture part", attached[0]["content"][-1]["type"], "image_url")
+    check_true("on the question the caller actually asked",
+               attached[0]["content"][0]["text"].endswith("what does this do"))
+
+    body = client.get("/health").json()
+    check("health says what it is holding", body["attachments"] > 0, True)
+    check("and what may be attached", body["attachment_limits"]["files"], bridge.ATTACH_MAX)
+    check("as one named number per limit", body["attachment_limits"]["max_mb"], 12)
+    reload_with(ATTACH_MAX_MB=UNSET, ATTACH_MAX_FILES=UNSET, ATTACH_TTL=UNSET)
+
+
+def picture_checks():
+    """The client half: a file off this device, in front of the model.
+
+    Roblox has no file dialog and a script cannot open one, so the picker is built out of what an
+    executor hands over -- `readfile` for a path, `listfiles` for the folder it gave the script --
+    and the road from there is the one scan game already takes: upload once, then name the id on
+    every turn. Read out of ghaith.lua, since there is no Luau here to run.
+    """
+    print("\npicture: a file from this device")
+    source = Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
+    check("the picker is the executor's own file access, not a dialog that cannot exist",
+          [want for want in ('primitive("readfile")', 'primitive("listfiles")')
+           if want not in source], [])
+    check("and an executor that hands over neither is told so",
+          "no readfile" in source, True)
+    check("only picture files are offered", "MIME_BY_EXT[ext]" in source, True)
+    check("so a picture goes up as a picture",
+          source.count('"image/png"') > 0 and source.count('"image/jpeg"') > 0, True)
+    check("base64 is done here, because no executor hands over an encoder",
+          "local function b64(bytes)" in source, True)
+    check("and it is what the upload carries", "data = b64(bytes)" in source, True)
+    check("the file goes up once, to /attach", 'api_retry("POST", "/attach"' in source, True)
+    check("and the turn names the id instead of carrying the file",
+          "if #attached > 0 then body.files = attached end" in source, True)
+    # A local declared further down the file is not in scope for a function defined above it: the
+    # helpers sat in section 2 once, where `SESSION` did not exist yet, so an upload would have
+    # named no session at all and the service could not group it with the chat it belongs to.
+    check("the upload can see the session it belongs to",
+          source.index("local SESSION = session_id()")
+          < source.index("local function attach_upload"), True)
+    check("a picture stays with the chat until it is cleared",
+          "PICS, PENDING = {}, {}" in source, True)
+    check("and the window says so", "attached to every question until CLEAR" in source, True)
+    check("there is a button for it on the rail", 'rail_button("picture"' in source, True)
+    check("the window follows the screen like the others",
+          "local windows = {code_window, console_window, dump_window, pic_window}" in source, True)
+    check("a picture already on the internet needs no file access at all",
+          "game:HttpGet(tostring(url))" in source, True)
+    # The dump is a file now rather than a question: three hundred thousand characters pasted into
+    # a turn is the shape this replaces, and the paste stays as the fallback for a service that
+    # refuses the upload, because a scan that arrives the long way beats one that never arrives.
+    check("scan game sends the dump as a file",
+          'attach_upload("game-dump.txt", dump, "text/plain", true)' in source, True)
+    check("and falls back to pasting it only when that fails",
+          '"GAME DUMP:\\n\\n" .. dump' in source, True)
+    check_true("saying which of the two happened",
+               "characters of game sent as the file" in source)
+    # The one road from this device to the model, and the user is the one who takes it: not one of
+    # the model's own tools can read a file or list a folder, so a script it writes cannot reach
+    # this machine's disk on its own.
+    toolbox = source.split("local TOOLS = {", 1)[1].split("\n}\n", 1)[0]
+    check("no tool of the model's reads this device",
+          [word for word in ("readfile", "listfiles", "read_bytes", "attach_upload")
+           if word in toolbox], [])
 
 
 def main():
@@ -1194,6 +1381,8 @@ def main():
     surface_checks()
     client_checks()
     scan_checks()
+    attach_checks()
+    picture_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:
