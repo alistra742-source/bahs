@@ -24,7 +24,7 @@ Four things worth knowing before reading the code:
     transcript: it is long, and it is not what anybody is waiting for. "copy code" never copies it
     either: the script is the only thing here that is code.
   * The model can call tools on this client by writing a token in its answer -- @@GREP remote@@ or
-    @@GREP@@ remote, both are read. Twenty-nine of them, and every one of them is about the game
+    @@GREP@@ remote, both are read. Thirty-five of them, and every one of them is about the game
     this client is running in rather than about the machine it is running on: the dump, the
     remotes, every script and module the client holds (and the decompiler, for the ones it was
     never sent the source of), greps and string searches, hooks, signals and properties watched,
@@ -1001,6 +1001,8 @@ end
 
 local HOOKED = {}
 local SPY = {}
+-- The values, not the text of them: @@REPLAY@@ sends these back.
+local SPY_CALLS = {}
 
 local function hook(path)
 	local remote = resolve(path)
@@ -1017,6 +1019,12 @@ local function hook(path)
 			for i, value in ipairs(args) do parts[i] = tostring(value) end
 			local line = "[FIRED] " .. path .. " <- " .. table.concat(parts, " | ")
 			table.insert(SPY, line)
+			-- The arguments themselves, so @@REPLAY@@ can send the call again with what the game
+			-- actually passed rather than with the strings this line holds.
+			local held = SPY_CALLS[path]
+			if not held then held = {} SPY_CALLS[path] = held end
+			table.insert(held, args)
+			if #held > 20 then table.remove(held, 1) end
 			log("Remote", line)
 		end)
 	end
@@ -1370,6 +1378,333 @@ local function spy_log()
 	return table.concat(out, "\n")
 end
 
+-- =====================================================================================
+-- what a name is, what needs what, what the game is made of, and the before/after loop
+-- =====================================================================================
+--
+-- The tools above read the game. These six are the ones a *writer* needs: the shape of a thing
+-- before it changes it (@@REFS@@, @@REQUIRE@@, @@CLASSES@@), and the way to find out what its own
+-- script actually did (@@SNAPSHOT@@ before, @@DIFF@@ after, @@REPLAY@@ to send a message again).
+-- Every one of them is still only about this game.
+
+-- Where a name lives: the scripts that mention it, and the instances that carry it.
+--
+-- @@GREP@@ answers "show me the lines"; this answers "what is this thing and who touches it",
+-- which is the question a model is really asking when it greps and then guesses anyway. Counts
+-- and one example line per script rather than every line: a name used forty times in one file is
+-- one entry here, and the entry says whether that file is the one that defines it.
+local function name_map(name)
+	local wanted = tostring(name or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if wanted == "" then return "no name given: @@REFS name@@" end
+	local needle = wanted:lower()
+	local out, users, blind, said = {}, {}, 0, 0
+	for _, d in ipairs(all_scripts()) do
+		local src = source_of(d, 30000)
+		if not src then
+			blind = blind + 1
+		else
+			local hits, first = 0, nil
+			for line in src:gmatch("[^\n]+") do
+				if line:lower():find(needle, 1, true) then
+					hits = hits + 1
+					if not first then first = line end
+				end
+			end
+			if hits > 0 and #users < 40 then
+				local lower = src:lower()
+				local defines = lower:find("function " .. needle, 1, true) ~= nil
+					or lower:find("local " .. needle .. " =", 1, true) ~= nil
+				table.insert(users, string.format("  %s -- %d mention(s)%s", path_of(d), hits,
+					defines and ", and is where it is defined" or ""))
+				said = said + 1
+				if first then table.insert(users, "    e.g. " .. first:sub(1, 160)) end
+			end
+		end
+	end
+	local carries = {}
+	for _, item in ipairs(all_instances()) do
+		local ok, label = pcall(function() return tostring(item.Name) end)
+		if ok and label:lower():find(needle, 1, true) then
+			table.insert(carries, "  [" .. item.ClassName .. "] " .. path_of(item))
+			if #carries >= 25 then break end
+		end
+	end
+	table.insert(out, string.format("REFS %q -- %d script(s) mention it, %d instance(s) are named like it",
+		wanted, said, #carries))
+	if #users > 0 then
+		table.insert(out, "scripts:")
+		for _, line in ipairs(users) do table.insert(out, line) end
+	else
+		table.insert(out, "scripts: none of the readable ones mention it"
+			.. (blind > 0 and (" (" .. blind .. " script(s) here have no source)") or ""))
+	end
+	if #carries > 0 then
+		table.insert(out, "instances named like it:")
+		for _, line in ipairs(carries) do table.insert(out, line) end
+	else
+		table.insert(out, "instances named like it: none")
+	end
+	return table.concat(out, "\n")
+end
+
+-- Every `require(` in a script, read as an expression: the argument is kept as the code wrote it
+-- (`script.Parent.Modules.Knit`), because what it *resolves* to is a guess the model can make
+-- better than this can, and a wrong guess here would be invisible.
+local function require_calls(src)
+	local calls, pos = {}, 1
+	while true do
+		local start = src:find("require", pos, true)
+		if not start then break end
+		local open = src:find("(", start + 7, true)
+		if open and open - (start + 7) <= 2 then
+			local depth, i, limit = 1, open + 1, math.min(#src, open + 200)
+			while i <= limit and depth > 0 do
+				local char = src:sub(i, i)
+				if char == "(" then depth = depth + 1
+				elseif char == ")" then depth = depth - 1 end
+				i = i + 1
+			end
+			if depth == 0 then
+				table.insert(calls, (src:sub(open + 1, i - 2):gsub("%s+", " ")))
+				pos = i
+			else
+				pos = open + 1
+			end
+		else
+			pos = start + 7
+		end
+	end
+	return calls
+end
+
+-- The dependency graph the game never shows you: which script needs which module.
+--
+-- @@REQUIRE@@ alone is the whole graph, and @@REQUIRE name@@ is the two halves of one node -- what
+-- it needs, and who needs it -- which is the difference between editing a library and editing
+-- everything that would break with it.
+local function require_map(word)
+	local needle = tostring(word or ""):lower()
+	local out, total, blind = {}, 0, 0
+	for _, d in ipairs(all_scripts()) do
+		local src = script_source(d, 30000, false)
+		if not src then
+			blind = blind + 1
+		else
+			local from = path_of(d)
+			for _, target in ipairs(require_calls(src)) do
+				total = total + 1
+				if needle == "" or target:lower():find(needle, 1, true)
+					or from:lower():find(needle, 1, true) then
+					if #out < 300 then
+						table.insert(out, "  " .. from .. "  ->  " .. target:sub(1, 120))
+					end
+				end
+			end
+		end
+	end
+	if #out == 0 then
+		return needle == "" and "no require() call in any script this client can read"
+			or ("nothing requires or is required by " .. word
+				.. (blind > 0 and (" (" .. blind .. " script(s) here have no source)") or ""))
+	end
+	local head = needle == "" and ("REQUIRE -- " .. total .. " require() call(s) in the game:")
+		or ("REQUIRE " .. word .. " -- " .. #out .. " of " .. total .. " require() call(s) touch it:")
+	return head .. "\n" .. table.concat(out, "\n")
+end
+
+-- The game counted by class, and where each kind of thing lives. The question this answers is
+-- "what kind of game is this": nine hundred Tools means something different from nine hundred
+-- Parts, and it is the cheapest way to find out before writing anything.
+local function class_census()
+	local counts, total = {}, 0
+	for _, item in ipairs(all_instances()) do
+		local ok, class = pcall(function() return item.ClassName end)
+		if ok and class then
+			total = total + 1
+			local row = counts[class]
+			if not row then
+				row = {n = 0, places = {}, seen = {}}
+				counts[class] = row
+			end
+			row.n = row.n + 1
+			if #row.places < 3 then
+				local node = item
+				for _ = 1, 12 do
+					local ok2, parent = pcall(function() return node.Parent end)
+					if not ok2 or not parent or parent == game then break end
+					node = parent
+				end
+				local where = tostring(node.Name or "game")
+				if not row.seen[where] then
+					row.seen[where] = true
+					table.insert(row.places, where)
+				end
+			end
+		end
+	end
+	local rows = {}
+	for class, row in pairs(counts) do
+		table.insert(rows, {class = class, n = row.n, places = row.places})
+	end
+	table.sort(rows, function(left, right)
+		if left.n ~= right.n then return left.n > right.n end
+		return left.class < right.class
+	end)
+	local out = {string.format("CLASSES -- %d instance(s) in %d class(es), most first:",
+		total, #rows)}
+	for index, row in ipairs(rows) do
+		if index > 60 then
+			table.insert(out, string.format("  ... %d further class(es)", #rows - 60))
+			break
+		end
+		table.insert(out, string.format("  %-22s %6d  -- %s", "[" .. row.class .. "]", row.n,
+			#row.places > 0 and table.concat(row.places, ", ") or "game"))
+	end
+	return table.concat(out, "\n")
+end
+
+-- What the game looks like, written down, so a change can be measured rather than remembered.
+--
+-- This is the loop the rest of the tools cannot close on their own: take a snapshot, let a script
+-- run, then @@DIFF@@ it. What changed is then a fact about the game instead of something the model
+-- has to infer from what its own script printed.
+local SNAPSHOTS = {}
+
+local function signature(item)
+	local class, value = "?", nil
+	local ok, name = pcall(function() return item.ClassName end)
+	if ok then class = tostring(name) end
+	-- Only the classes that exist to hold a value: one property read per instance instead of a
+	-- dozen, which is the difference between a snapshot and a stall on a game with 40,000 parts.
+	if #class >= 5 and class:sub(-5) == "Value" then
+		local ok2, held = pcall(function() return item.Value end)
+		if ok2 and held ~= nil then value = tostring(held) end
+	end
+	return value and (class .. " = " .. value) or class
+end
+
+local function game_signature()
+	local held, count = {}, 0
+	for _, item in ipairs(all_instances()) do
+		local ok, path = pcall(function() return path_of(item) end)
+		if ok and path and held[path] == nil then
+			held[path] = signature(item)
+			count = count + 1
+		end
+	end
+	return held, count
+end
+
+local function snapshot(label)
+	local name = tostring(label or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if name == "" then name = "snap" .. tostring(#SNAPSHOTS + 1) end
+	local held, count = game_signature()
+	SNAPSHOTS[name] = {at = os.time(), held = held, count = count}
+	return string.format("SNAPSHOT %q taken: %d instance(s) as they are now. @@DIFF %s@@ reads what changed.",
+		name, count, name)
+end
+
+local function snapshot_diff(label)
+	local name = tostring(label or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	local was = name ~= "" and SNAPSHOTS[name] or nil
+	if not was then
+		local newest = nil
+		for key, snap in pairs(SNAPSHOTS) do
+			if not newest or snap.at >= newest.at then newest, name = snap, key end
+		end
+		was = newest
+	end
+	if not was then
+		return "nothing has been snapshotted yet: @@SNAPSHOT before@@ records the game as it is now"
+	end
+	local now, now_count = game_signature()
+	local added, gone, changed = {}, {}, {}
+	for path, sig in pairs(now) do
+		local before = was.held[path]
+		if before == nil then
+			table.insert(added, "  + " .. path .. "  [" .. sig .. "]")
+		elseif before ~= sig then
+			table.insert(changed, "  ~ " .. path .. "  " .. before .. "  ->  " .. sig)
+		end
+	end
+	for path, sig in pairs(was.held) do
+		if now[path] == nil then table.insert(gone, "  - " .. path .. "  [" .. sig .. "]") end
+	end
+	table.sort(added)
+	table.sort(gone)
+	table.sort(changed)
+	local out = {string.format("DIFF %q (%ds ago): %d added, %d gone, %d changed -- %d instance(s) then, %d now",
+		name, os.time() - was.at, #added, #gone, #changed, was.count, now_count)}
+	local function block(title, list)
+		if #list == 0 then return end
+		table.insert(out, title)
+		for index, line in ipairs(list) do
+			if index > 60 then
+				table.insert(out, string.format("  ... %d further", #list - 60))
+				break
+			end
+			table.insert(out, line)
+		end
+	end
+	block("added:", added)
+	block("gone:", gone)
+	block("changed:", changed)
+	if #added + #gone + #changed == 0 then
+		table.insert(out, "nothing about the game's shape moved between the two")
+	end
+	return table.concat(out, "\n")
+end
+
+-- Send a message the game sent, again, with the values it really handed over.
+--
+-- @@HOOK@@ records what a remote fired with as text, which is enough to read a protocol and not
+-- enough to use one: a string that said "Part" cannot be sent. This keeps the values themselves
+-- (the last twenty per remote), so a replay is the game's own call with the game's own arguments.
+-- An instance that was destroyed since is the one thing that cannot come back, and that is said
+-- rather than swallowed.
+local function replay(arg)
+	local path = tostring(arg or ""):gsub("^%s+", ""):gsub("%s+$", "")
+	if path == "" then
+		local names = {}
+		for key, held in pairs(SPY_CALLS) do
+			if #held > 0 then table.insert(names, "  " .. key .. " (" .. #held .. " recorded)") end
+		end
+		if #names == 0 then
+			return "nothing has been recorded: @@HOOK path@@ first, and let the game fire that remote"
+		end
+		table.sort(names)
+		return "what has been recorded:\n" .. table.concat(names, "\n")
+			.. "\n@@REPLAY path@@ re-sends what one of them was handed."
+	end
+	local remote = resolve(path)
+	if not remote then return no_such(path) end
+	local held = SPY_CALLS[path]
+	if not held or #held == 0 then
+		return "nothing recorded for " .. path .. " yet: @@HOOK " .. path
+			.. "@@ and let the game fire it"
+	end
+	local out, sent = {}, 0
+	for index, args in ipairs(held) do
+		if sent >= 10 then break end
+		sent = sent + 1
+		local shown = {}
+		for position, value in ipairs(args) do shown[position] = tostring(value) end
+		local text = table.concat(shown, ", ")
+		if remote:IsA("RemoteFunction") then
+			local ok, result = pcall(function() return remote:InvokeServer(table.unpack(args)) end)
+			table.insert(out, string.format("  [%d] InvokeServer(%s) -> %s", index, text,
+				ok and tostring(result) or ("failed: " .. tostring(result))))
+		else
+			local ok, err = pcall(function() remote:FireServer(table.unpack(args)) end)
+			table.insert(out, string.format("  [%d] FireServer(%s) -> %s", index, text,
+				ok and "sent" or ("failed: " .. tostring(err))))
+		end
+	end
+	table.insert(SPY, "[REPLAY] " .. path .. " x" .. sent)
+	return string.format("REPLAY %s -- %d of the %d call(s) recorded for it, with the arguments the game used:",
+		path, sent, #held) .. "\n" .. table.concat(out, "\n")
+end
+
 -- A snippet run here and now, with its return value as well as its prints: the cheapest way for the
 -- model to ask the game a question the dump cannot answer.
 local function exec_snippet(code)
@@ -1410,6 +1745,16 @@ local TOOLS = {
 		run = function(arg) return tree(arg) end},
 	{name = "PROPS", hint = "@@PROPS path@@ the interesting properties of one instance",
 		run = function(arg) return props(arg) end},
+	{name = "REFS", hint = "@@REFS name@@ where a name lives: the scripts that mention it and the instances named it",
+		run = function(arg) return name_map(arg) end},
+	{name = "REQUIRE", hint = "@@REQUIRE name@@ the require() graph: what needs what, or everything touching one name",
+		run = function(arg) return require_map(arg) end},
+	{name = "CLASSES", hint = "the game counted by class and where each kind of thing lives",
+		run = function() return class_census() end},
+	{name = "SNAPSHOT", hint = "@@SNAPSHOT label@@ write the game down as it is now, to measure a change against",
+		run = function(arg) return snapshot(arg) end},
+	{name = "DIFF", hint = "@@DIFF label@@ what changed since that snapshot: instances added, gone, and values moved",
+		run = function(arg) return snapshot_diff(arg) end},
 	{name = "DUMP_STRINGS", hint = "@@DUMP_STRINGS word@@ every string literal in the game's scripts containing word",
 		run = function(arg) return strings(arg) end},
 	{name = "HOOK", hint = "@@HOOK path@@ log what a remote fires with",
@@ -1428,6 +1773,8 @@ local TOOLS = {
 		run = function(arg) return decompile_at(arg) end},
 	{name = "SPY", hint = "what every @@HOOK@@ed remote has fired with since it was hooked",
 		run = function() return spy_log() end},
+	{name = "REPLAY", hint = "@@REPLAY path@@ send what a hooked remote was handed, again, with the values it really got",
+		run = function(arg) return replay(arg) end},
 	{name = "EXEC", hint = "@@EXEC code@@ run a snippet here: what it returned, and what it printed",
 		run = function(arg) return exec_snippet(arg) end},
 	{name = "SELF", hint = "this client: what it can do, and the tools available",
@@ -1465,6 +1812,9 @@ local function tool_brief()
 		"line, then the argument, then @@ alone on a line to close it.",
 		"Everything here reads the game this client is running in -- its scripts, its remotes, its",
 		"values and what it fires -- and never anything on the player's machine.",
+		"A change is measured here rather than guessed at: @@SNAPSHOT label@@ before it, then the",
+		"script, then @@DIFF label@@ -- and @@REPLAY path@@ when the game has to send the same",
+		"message again. What these read is the game's own values, not a copy of them.",
 		"The tokens are not code: never put one inside the script you send back, and never describe",
 		"a call in prose instead of writing it -- a token is run, a sentence about one is not.",
 	}, " "))

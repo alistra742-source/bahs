@@ -19,6 +19,10 @@ you -- ask --> bahs ---- deepseek ------------------------> a plan (not the answ
                  |          |     luau_find    the lines that match, with line numbers
                  |          |     secret_scan  credentials that must not ship
                  |          |     luau_format  re-indent what it assembled
+                 |          |     plan_todo    the list it is working through
+                 |          |     script_versions  the last version that worked, kept
+                 |          |     luau_diff    what an edit actually changed
+                 |          |     consult_planner  one question to the other model
                  |          |
                  |          +-- reads the result, on it goes (AGENT_ROUNDS)
                  |
@@ -79,7 +83,7 @@ module by name *and* imports the app as its last step, so a module that was neve
 `COPY` list fails the build instead of the deployment.
 
 Redeploy. The page should read `api online · bridge qwen.aikit.club · token token accepted ·
-deepseek token accepted · tools 8 on -- luau_check, luau_format, roblox_api... · roblox 682
+deepseek token accepted · tools 12 on -- luau_check, luau_format, roblox_api... · roblox 682
 classes · executor not listening -- run_script says so instead of waiting · model qwen3.8-max,
 thinking on, with the toolbox · mode thinking · Hy kanha`.
 
@@ -105,10 +109,11 @@ service.
 
 ## The tools
 
-The schemas are in `luau.py`; the loop that runs them is `tool_loop` in `server.py`. All eight are
+The schemas are in `luau.py`; the loop that runs them is `tool_loop` in `server.py`. All twelve are
 local to this image — no extra service, no extra key — except that `roblox_api` fetches the Roblox
-API dump the first time it is called, and `web_get` reads a public page with `AGENT_WEB` on. Only
-the writer is given them: **deepseek** mode attaches none.
+API dump the first time it is called, `web_get` reads a public page with `AGENT_WEB` on, and
+`consult_planner` asks the other model a question (its credential is already there; `AGENT_CONSULT=off`
+stops it being asked). Only the writer is given them: **deepseek** mode attaches none.
 
 | Tool | What it is |
 | --- | --- |
@@ -120,6 +125,10 @@ the writer is given them: **deepseek** mode attaches none.
 | `luau_format` | Re-indents by block depth (whitespace only), for a script assembled from pieces |
 | `luau_find` | The lines of a script matching a Lua pattern, numbered, with optional context — how the writer looks at the one part of a long script it is changing |
 | `web_get` | Reads a page as text (Roblox documentation, a DevForum answer, a raw file) and hands it back trimmed. The only way to check how something is *used* rather than whether it exists; `AGENT_WEB=off` switches it off |
+| `plan_todo` | The writer's own list of what the script has to do, kept for the session: write the steps down first, tick them off as they are done, read it back before answering. A long script loses half of itself between tool calls, and this is what it does not lose them to |
+| `script_versions` | Saves the script under a name and hands it back later, so "go back to what worked" does not depend on the model's memory of it. `save`/`load`/`list`/`drop`/`diff`; 12 versions, 60,000 characters each, forgotten with the session |
+| `luau_diff` | Two versions of a script and the lines that differ, with how many were added and removed. The question an edit raises and nothing else answers: did that touch the one line it was meant to |
+| `consult_planner` | The one place a second model is asked on purpose: not a review nobody wanted, but a question the writer chooses mid-script — which of two approaches, what a traceback means. It has not been writing this script and answers only what it is asked, as an ordinary tool result the writer can ignore |
 
 The API dump is fetched once and remembered (`ROBLOX_API_TTL`, six hours). `ROBLOX_API_DUMP` can
 point at a file or a URL instead — that is how the tests run it with no network.
@@ -229,17 +238,26 @@ two passes per turn;
 what the tools found goes back as the next turn, which is the agentic part. A line carrying a token
 is never part of the script.
 
-The 29 tools, and every one of them is about the game this client is running in rather than the
+The 35 tools, and every one of them is about the game this client is running in rather than the
 machine it is running on:
 
 | | |
 | --- | --- |
 | **the game** | `@@DEEPSCAN@@`, `@@REMOTES@@`, `@@TREE path@@`, `@@PROPS path@@`, `@@FIND name@@`, `@@PLAYERS@@` |
+| **what it is made of** | `@@CLASSES@@` (every class counted, and where each kind lives), `@@REFS name@@` (the scripts that mention a name and the instances named it), `@@REQUIRE name@@` (the whole `require()` graph, or the two halves of one module) |
 | **its scripts** | `@@SCRIPTS@@`, `@@MODULES@@`, `@@SOURCE path@@`, `@@DECOMPILE path@@`, `@@GREP word@@`, `@@DUMP_STRINGS word@@` |
-| **watching it** | `@@HOOK path@@`, `@@UNHOOK path@@`, `@@SPY@@`, `@@SIGNAL path Event@@`, `@@WATCH path Property@@` |
+| **watching it** | `@@HOOK path@@`, `@@UNHOOK path@@`, `@@SPY@@`, `@@SIGNAL path Event@@`, `@@WATCH path Property@@`, `@@REPLAY path@@` (send what a hooked remote was handed, again, with the values it really got) |
 | **acting on it** | `@@FIRE path args@@` (fires a remote for real and reads the reply), `@@SET path Property value@@` |
+| **before and after** | `@@SNAPSHOT label@@` (write the game down as it is now), `@@DIFF label@@` (instances added, gone and values moved since) |
 | **inside a function** | `@@HOOKFN path@@`, `@@UPVALUES path@@`, `@@CONSTANTS path@@`, `@@GETGC word@@` |
 | **this client** | `@@EXEC code@@`, `@@RUN@@`, `@@CONSOLE@@`, `@@SELF@@`, `@@ENV word@@`, `@@HTTP url@@` |
+
+`@@SNAPSHOT@@` before and `@@DIFF@@` after is the loop the rest of the tools cannot close on their
+own: what a change did to the game becomes something the model reads rather than something it
+infers from what its own script printed. `@@REPLAY path@@` is the same idea for a protocol — a hook
+that only recorded text could be read, not used, so the arguments themselves are kept (the last
+twenty per remote) and sent back the way the game sent them. An instance destroyed in between is
+the one thing that cannot come back, and the replay says so instead of swallowing it.
 
 A path is read however the model wrote it: `ReplicatedStorage.X`, `game.ReplicatedStorage.X`,
 `game:GetService("ReplicatedStorage").X`, a service name in the wrong case, a bare instance name,
@@ -275,7 +293,7 @@ reads the game is only useful if it can be pointed at something.
 | `POW_MAX_TRIES` | `5000000` | the largest difficulty the proof of work will attempt |
 | `GREETING` | `Hy kanha` | in front of every question; `""` sends it untouched |
 | `AGENT_TOOLS` | `on` | `off` and no tool schemas are attached: the model answers from what it knows |
-| `AGENT_ROUNDS` | `4` | how many tool rounds one turn may take, capped at 12. A round is a model call plus the tools it asked for, so this is the turn's wall-clock as much as its budget — at `8` a curious model could spend nine calls on one question. `0` disables the toolbox as well |
+| `AGENT_ROUNDS` | `6` | how many tool rounds one turn may take, capped at 12. A round is a model call plus the tools it asked for, so this is the turn's wall-clock as much as its budget — write the plan down, look a member up, write the script, check it, diff it, save it is six rounds on its own. `0` disables the toolbox as well |
 | `AGENT_RUN` | `on` | `off` and `run_script` refuses: nothing can be executed, whatever is listening |
 | `RUN_TIMEOUT` | `45` | seconds one `run_script` waits for the executor before giving up (5–300) |
 | `EXECUTOR_IDLE` | `90` | how long after its last poll a client still counts as listening |

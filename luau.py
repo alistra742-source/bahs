@@ -22,15 +22,21 @@ which is what turns "write a script" into "write it, run it, read the error, fix
     secret_scan(script)                     what must not ship in the script
     web_get(url, max_chars)                 read a page: docs, a DevForum answer, a raw file
     run_script(script, timeout)             run it in the connected executor and read the output
+    luau_diff(a, b)                         the lines that differ between two versions
+    plan_todo(action, text, index)          the writer's own list of what to build, and how far it got
+    script_versions(action, name, script)   save the script under a name, and get it back later
+    consult_planner(question, script)       ask the second model one question, when it wants one
 
 The two that look outside the script -- `roblox_api` at the API dump and `web_get` at the open web
 -- are the writer's only way to check something it cannot see from here: there is no Roblox in this
 image, so a member is either in the dump or it is a guess, and how a thing is *used* is either on a
 page it can read or it is a guess too.
 """
-from bridge import env, redact  # the same env(), and the same masking the chain already uses
+from bridge import (env, redact,  # the same env(), and the same masking the chain already uses
+                    as_prompt, deepseek_chat, session_ttl, stream_call, strip_metadata,  # and the same second model
+                    DEEPSEEK, DEEPSEEK_TEMPERATURE, DEEPSEEK_TOKENS)
 
-import html as html_mod, httpx, json, re, threading, time, uuid
+import difflib, html as html_mod, httpx, json, re, threading, time, uuid
 from collections import deque
 from pathlib import Path
 from typing import Optional
@@ -185,6 +191,83 @@ TOOLS = [
                                 "description": "seconds to wait for the run (default 45)"},
                 },
                 "required": ["script"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_todo",
+            "description": ("Your own list of what the script has to do, kept for the whole "
+                            "session. Write the steps down first, tick them off as they are done, "
+                            "and read it back before answering -- it is what keeps a long script "
+                            "from losing half of itself between calls. Actions: add, done, undo, "
+                            "clear, list."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "description": "add | done | undo | clear | list"},
+                    "text": {"type": "string", "description": "the step, or words from one"},
+                    "index": {"type": "integer", "description": "the step by number (1 is first)"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "script_versions",
+            "description": ("Save the script you have under a name and get it back later: keep one "
+                            "that worked before changing it, and the way back does not depend on "
+                            "your memory of it. Actions: save, load, list, drop, diff."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "description": "save | load | list | drop | diff"},
+                    "name": {"type": "string", "description": "what to call it"},
+                    "script": SCRIPT_ARG,
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "luau_diff",
+            "description": ("The difference between two versions of a script, line by line, with "
+                            "the count of lines added and removed. Use it after an edit to see "
+                            "that it touched the one line it was meant to and nothing else."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string", "description": "the script before"},
+                    "b": {"type": "string", "description": "the script after"},
+                    "from": {"type": "string", "description": "what to call the first one"},
+                    "to": {"type": "string", "description": "what to call the second one"},
+                },
+                "required": ["a", "b"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_planner",
+            "description": ("Ask the second model one question in the middle of the work -- which "
+                            "of two approaches, what a traceback means, how a member really "
+                            "behaves. It has not been writing this script and answers only what "
+                            "you ask, in prose. Use it for a decision, not for a review."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "the one question"},
+                    "script": SCRIPT_ARG,
+                },
+                "required": ["question"],
             },
         },
     },
@@ -782,6 +865,241 @@ def executor_state() -> dict:
     return {"ok": bool(live), "clients": live, "waiting": waiting}
 
 
+# --- what the writer keeps for itself: its plan, and the versions of its script -------------
+#
+# The tools either side of this are about a script; these are about *writing* one, which is not
+# done in one breath. A plan written down and ticked off is the difference between working through
+# four things and losing two of them between calls; the versions saved are the difference between
+# going back to what worked and writing it again from memory. Both are per session, both live in
+# this process, and both are forgotten with the session -- there is no database here either.
+#
+# `consult_planner` is the one place a second model is asked on purpose. It is not the reader that
+# used to review every answer (that is gone, and a second opinion nobody asked for is not worth a
+# call): it is a question the writer chooses to ask, answered in prose as an ordinary tool result,
+# which the writer is free to take or leave.
+
+_memory: dict = {"plan": {}, "versions": {}}
+_memory_lock = threading.Lock()
+PLAN_MAX = 12
+VERSION_MAX = 12
+VERSION_CHARS = 60000
+
+
+def _memory_get(session: str) -> dict:
+    """This session's plan and its saved scripts, made on first use and dropped when stale."""
+    key = (session or "")[:64] or "-"
+    now = time.time()
+    with _memory_lock:
+        for store in ("plan", "versions"):
+            for old in [k for k, v in _memory[store].items() if now - v["at"] > session_ttl()]:
+                _memory[store].pop(old, None)
+        plan = _memory["plan"].setdefault(key, {"at": now, "items": []})
+        versions = _memory["versions"].setdefault(key, {"at": now, "saved": {}, "order": []})
+        plan["at"] = versions["at"] = now
+    return {"plan": plan, "versions": versions}
+
+
+def _plan_text(items: list, title: str = "the plan") -> str:
+    if not items:
+        return f"{title} is empty"
+    out = [f"{title} -- {len([i for i in items if i['done']])}/{len(items)} done"]
+    for index, item in enumerate(items, start=1):
+        out.append(f"  {index}. [{'x' if item['done'] else ' '}] {item['text']}")
+    return "\n".join(out)
+
+
+def _plan_pick(items: list, text: str, index: int) -> Optional[dict]:
+    """The item a call means: by number when it gave one, and otherwise by its own words."""
+    if index:
+        return items[index - 1] if 1 <= index <= len(items) else None
+    wanted = " ".join(str(text or "").split()).lower()
+    if not wanted:
+        return None
+    exact = [i for i in items if i["text"].lower() == wanted]
+    if exact:
+        return exact[0]
+    part = [i for i in items if wanted in i["text"].lower()]
+    return part[0] if len(part) == 1 else None
+
+
+def plan_todo(action: str = "", text: str = "", index: int = 0, session: str = "") -> str:
+    """The writer's own list of what it is building, and how far it has got.
+
+    Kept for the session rather than for one turn, because the point of it is the tool round
+    *after* this one: what a call in the middle of a long script needs to know is what is still
+    left. Actions: add, done, undo, clear, list.
+    """
+    items = _memory_get(session)["plan"]["items"]
+    act = " ".join(str(action or "").split()).lower() or ("add" if str(text or "").strip() else "list")
+    if act in ("add", "new", "todo"):
+        line = " ".join(str(text or "").split())[:200]
+        if not line:
+            return "nothing was added: `text` was empty"
+        if len(items) >= PLAN_MAX:
+            return (f"the plan is full ({PLAN_MAX} items): finish one or clear the plan before "
+                    "adding another")
+        items.append({"text": line, "done": False})
+    elif act in ("done", "finish", "tick", "ticked"):
+        found = _plan_pick(items, text, index)
+        if found is None:
+            return _plan_text(items, "no item matched that -- the plan is")
+        found["done"] = True
+    elif act in ("undo", "reopen", "undone"):
+        found = _plan_pick(items, text, index)
+        if found is None:
+            return _plan_text(items, "no item matched that -- the plan is")
+        found["done"] = False
+    elif act in ("clear", "reset", "drop"):
+        items.clear()
+    elif act not in ("list", "show", "get"):
+        return f"unknown action {act!r}: add, done, undo, clear or list"
+    return _plan_text(items)
+
+
+def _versions_text(saved: dict, order: list) -> str:
+    if not saved:
+        return "nothing saved yet: script_versions(save) keeps the script you have"
+    out = [f"{len(saved)} saved version(s), newest last:"]
+    for name in [n for n in order if n in saved]:
+        held = saved[name]
+        out.append(f"  {name}: {len(held['script'].splitlines())} line(s), "
+                   f"{len(held['script'])} char(s), {int(time.time() - held['at'])}s ago")
+    return "\n".join(out)
+
+
+def _version_pick(saved: dict, order: list, name: str) -> Optional[str]:
+    """The saved name a call means: exactly, or by being the only one it could be."""
+    wanted = " ".join(str(name or "").split())
+    if not wanted:
+        return order[-1] if order else None
+    exact = [n for n in order if n.lower() == wanted.lower()]
+    if exact:
+        return exact[0]
+    part = [n for n in order if wanted.lower() in n.lower()]
+    return part[0] if len(part) == 1 else None
+
+
+def script_versions(action: str = "", name: str = "", script: str = "", session: str = "") -> str:
+    """Save the script under a name, get it back later, and see how two of them differ.
+
+    The reason this is a tool and not a habit: the model's own context is the only place the
+    earlier version lived, and a version it has to hold in its head is one it stops looking at.
+    Actions: save, load, list, drop, diff (against the `script` it sent, or the newest other one).
+    """
+    store = _memory_get(session)["versions"]
+    saved, order = store["saved"], store["order"]
+    act = " ".join(str(action or "").split()).lower() or ("save" if str(script or "").strip() else "list")
+    label = " ".join(str(name or "").split())[:60]
+
+    if act in ("save", "keep", "add", "store"):
+        body = str(script or "")
+        if not body.strip():
+            return "nothing was saved: send the script in `script`"
+        if len(body) > VERSION_CHARS:
+            return f"that script is {len(body)} characters, past the {VERSION_CHARS} kept here"
+        key = label or f"v{len(order) + 1}"
+        saved[key] = {"script": body, "at": time.time()}
+        if key not in order:
+            order.append(key)
+        while len(order) > VERSION_MAX:
+            saved.pop(order.pop(0), None)
+        for stale in [n for n in list(saved) if n not in order]:
+            saved.pop(stale, None)
+        return f"saved {key!r} ({len(body.splitlines())} lines)\n" + _versions_text(saved, order)
+
+    if act in ("load", "get", "back", "read"):
+        key = _version_pick(saved, order, label)
+        if key is None:
+            return _versions_text(saved, order) + "\n\n-- no single version matched that name"
+        return f"--- {key} (saved {int(time.time() - saved[key]['at'])}s ago) ---\n{saved[key]['script']}"
+
+    if act in ("drop", "delete", "forget"):
+        key = _version_pick(saved, order, label)
+        if key is None:
+            return _versions_text(saved, order)
+        saved.pop(key, None)
+        order.remove(key)
+        return f"dropped {key!r}\n" + _versions_text(saved, order)
+
+    if act in ("diff", "compare"):
+        key = _version_pick(saved, order, label)
+        if key is None:
+            return _versions_text(saved, order) + "\n\n-- no single version matched that name"
+        other = str(script or "")
+        if not other.strip():
+            rest = [n for n in order if n != key]
+            if not rest:
+                return f"only one version is saved, so there is nothing to compare {key!r} with"
+            other, other_name = saved[rest[-1]]["script"], rest[-1]
+        else:
+            other_name = "the script you sent"
+        return f"--- {key} vs {other_name} ---\n" + unified_diff(saved[key]["script"], other,
+                                                                key, other_name)
+
+    if act not in ("list", "show"):
+        return f"unknown action {act!r}: save, load, list, drop or diff"
+    return _versions_text(saved, order)
+
+
+def unified_diff(a: str, b: str, name_a: str = "before", name_b: str = "after",
+                 context: int = 2, limit: int = 400) -> str:
+    """Two scripts, and the lines that differ between them -- nothing else.
+
+    For the question an edit raises and nothing else answers: did that change touch the one line
+    it was meant to, and did anything else move with it.
+    """
+    lines = list(difflib.unified_diff(str(a or "").splitlines(), str(b or "").splitlines(),
+                                      fromfile=name_a, tofile=name_b, lineterm="", n=context))
+    if not lines:
+        return "identical: the two scripts are the same text, line for line"
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"... {len(lines) - limit} more diff line(s) ..."]
+    added = len([line for line in lines if line.startswith("+") and not line.startswith("+++")])
+    removed = len([line for line in lines if line.startswith("-") and not line.startswith("---")])
+    head = f"{added} line(s) added, {removed} removed"
+    return _text(head, "\n".join(lines))
+
+
+def consult_planner(question: str, script: str = "", session: str = "") -> str:
+    """Ask the planner model one question, when the writer wants a second opinion.
+
+    Not a review of the answer -- nobody asked for one, which is why the automatic second reader is
+    gone -- but a question the writer chooses: which of two approaches, what a traceback means,
+    whether a member behaves the way it assumed. It is answered in prose and handed back as an
+    ordinary tool result, so the writer can ignore it.
+    """
+    asked = " ".join(str(question or "").split())
+    if not asked:
+        return "nothing was asked: send the question in `question`"
+    if not DEEPSEEK.configured:
+        return ("there is no second model on this service: DEEPSEEK_TOKEN is not set, so the "
+                "planner cannot be asked anything")
+    if env("AGENT_CONSULT", default="on").lower() in ("off", "0", "false", "no"):
+        return "asking the planner is switched off on this service (AGENT_CONSULT=off)"
+    held = str(script or "")
+    body = asked + (f"\n\nThe script as it stands:\n\n{held}" if held.strip() else "")
+    messages = [
+        {"role": "system", "content":
+            "You are the planner of a two-model chain: another model is writing the Luau script and "
+            "has asked you one question in the middle of it. Answer that question, in prose, "
+            "briefly and concretely -- the writer needs the decision and the reason, not code, and "
+            "not a review of anything it did not ask about."},
+        {"role": "user", "content": body},
+    ]
+    box = {"finish": None, "usage": None, "tool_calls": [], "raw": "", "meta": ""}
+    pieces: list = []
+    if DEEPSEEK.web is not None:
+        for piece in DEEPSEEK.web.stream(as_prompt(messages), box, deepseek_chat(session)):
+            pieces.append(piece)
+    else:
+        for piece in stream_call(messages, DEEPSEEK_TEMPERATURE, DEEPSEEK, DEEPSEEK_TOKENS, box):
+            pieces.append(piece)
+    answer = strip_metadata("".join(pieces)).strip()
+    if not answer:
+        return f"{DEEPSEEK.model} answered with nothing"
+    return _text(f"{DEEPSEEK.model} says:", answer)
+
+
 # --- the dispatch table ----------------------------------------------------------------------
 
 def _text(title: str, body: str) -> str:
@@ -998,6 +1316,31 @@ def run(name: str, arguments: dict, session: str = "") -> dict:
                     "output": _text("the executor reported an error",
                                     (got["error"] or "no detail")
                                     + ("\nprinted:\n" + got["output"] if got["output"] else ""))}
+        if name == "luau_diff":
+            a, b = str(arguments.get("a") or ""), str(arguments.get("b") or "")
+            if not a.strip() and not b.strip():
+                return {"ok": False, "summary": "nothing to diff",
+                        "output": "send the two scripts in `a` and `b`"}
+            answer = unified_diff(a, b, str(arguments.get("from") or "before"),
+                                  str(arguments.get("to") or "after"))
+            return {"ok": True, "summary": answer.splitlines()[0][:200], "output": answer}
+        if name == "plan_todo":
+            answer = plan_todo(str(arguments.get("action") or ""), str(arguments.get("text") or ""),
+                               int(arguments.get("index") or 0), session)
+            return {"ok": True, "summary": answer.splitlines()[0][:200], "output": answer}
+        if name == "script_versions":
+            answer = script_versions(str(arguments.get("action") or ""),
+                                     str(arguments.get("name") or ""),
+                                     str(arguments.get("script") or ""), session)
+            return {"ok": True, "summary": answer.splitlines()[0][:200], "output": answer}
+        if name == "consult_planner":
+            question = str(arguments.get("question") or "")
+            if not question.strip():
+                return {"ok": False, "summary": "nothing was asked",
+                        "output": "send the question in `question`"}
+            answer = consult_planner(question, str(arguments.get("script") or ""), session)
+            return {"ok": True, "summary": f"{len(answer)} chars from {DEEPSEEK.model}",
+                    "output": answer}
     except Exception as e:  # a broken tool is a tool result, never a dead turn
         return {"ok": False, "summary": f"{name} failed",
                 "output": f"{name} could not run: {e.__class__.__name__}: {e}"}
@@ -1011,6 +1354,8 @@ def tool_state() -> dict:
         "on": tools_enabled(),
         "names": TOOL_NAMES,
         "run": env("AGENT_RUN", default="on"),
+        # The second model is only ever asked on purpose, by the writer's own tool call.
+        "consult": env("AGENT_CONSULT", default="on"),
         "web": env("AGENT_WEB", default="on"),
         "dump_ok": dump["ok"],
         "dump_classes": dump["classes"],

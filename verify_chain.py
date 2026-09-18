@@ -308,7 +308,7 @@ for name in ("QWEN_THINKING", "API_KEY", "AGENT_ROUNDS", "AGENT_TOOLS", "CHAIN_M
 # reload begins from this, not from whatever the section before it happened to leave behind.
 BASE_ENV = {name: os.environ.get(name) for name in (
     "QWEN_URL", "QWEN_TOKEN", "QWEN_THINKING", "AGENT_ROUNDS", "AGENT_TOOLS", "AGENT_RUN",
-    "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL",
+    "API_KEY", "ROBLOX_API_DUMP", "HEARTBEAT", "TOKEN_CHECK_TTL", "SESSION_TTL", "AGENT_CONSULT",
     "CHAIN_MODE", "DEEPSEEK_URL", "DEEPSEEK_TOKEN", "DEEPSEEK_MODEL", "DEEPSEEK_THINKING",
     "CHAT_IDLE",
     "DEEPSEEK_SHAPE", "AGENT_WEB", "SCRIPT_RETRIES", "CHAT_TIMEOUT", "CHAT_IDLE")}
@@ -871,7 +871,12 @@ def mode_checks():
     # --- qwen on its own
     frames, done, started, calls = turn(session="s-qwen", asked_mode="qwen")
     check("qwen mode calls one model", [c["body"]["model"] for c in calls], ["qwen3.8-max"])
-    check("with no plan asked for", any("planner" in system_of(c) for c in calls), False)
+    # Not "the system prompt does not mention a planner": the brief now names the tool the
+    # writer may use to *ask* the second model, so what this is about is that nothing was
+    # asked of it here.
+    check("with no plan asked for",
+          [c["body"]["model"] for c in calls if "deepseek" in str(c["body"].get("model"))],
+          [])
     check("and no plan on any channel", channel(frames, "plan"), "")
 
     # --- deepseek on its own. `plan=""` because here the second model is the writer: the stub
@@ -968,7 +973,8 @@ def surface_checks():
 # reads the game it was executed in, never the player's files.
 GAME_TOOLS = {"DEEPSCAN", "REMOTES", "SCRIPTS", "MODULES", "GREP", "SOURCE", "DECOMPILE",
               "TREE", "PROPS", "FIND", "DUMP_STRINGS", "FIRE", "HOOKFN", "UPVALUES",
-              "CONSTANTS", "GETGC", "ENV", "EXEC", "RUN", "CONSOLE", "PLAYERS", "SELF"}
+              "CONSTANTS", "GETGC", "ENV", "EXEC", "RUN", "CONSOLE", "PLAYERS", "SELF",
+              "REFS", "REQUIRE", "CLASSES", "SNAPSHOT", "DIFF", "REPLAY"}
 DEVICE_TOOLS = {"FILES", "READ", "WRITE", "LISTFILES", "READFILE", "WRITEFILE", "APPEND",
                 "GETCUSTOMASSET", "MAKEFOLDER", "DELETEFILE"}
 
@@ -1030,8 +1036,8 @@ def client_checks():
     check("every game-reading tool is in it", sorted(GAME_TOOLS - set(names)), [])
     check("and nothing that reads or writes the player's machine",
           sorted(DEVICE_TOOLS & set(names)), [])
-    check("the count the header claims is the count there is", len(names), 29)
-    check("and the header claims it in words", "Twenty-nine of them" in source, True)
+    check("the count the header claims is the count there is", len(names), 35)
+    check("and the header claims it in words", "Thirty-five of them" in source, True)
     check("the brief goes out with every turn",
           'MSGS = {{role = "system", content = SYSTEM .. "\\n\\n" .. tool_brief()}}' in source,
           True)
@@ -1369,6 +1375,207 @@ def picture_checks():
     check("no tool of the model's reads this device",
           [word for word in ("readfile", "listfiles", "read_bytes", "attach_upload")
            if word in toolbox], [])
+    # The six that make a turn something other than one guess: the shape of the thing before
+    # it is changed, and what the change actually did afterwards.
+    check("a name can be looked up as a name, not as lines", "name_map" in toolbox, True)
+    check_true("and the answer distinguishes the script that defines it",
+               "and is where it is defined" in source)
+    check_true("the require graph keeps the expression the code wrote",
+               "require_calls(src)" in source and "  ->  " in source)
+    check_true("and reads a require whose argument has parens of its own",
+               "elseif char == \")\" then depth = depth - 1" in source)
+    check_true("the census counts what the game is made of, and where",
+               "instance(s) in %d class(es)" in source)
+    check("a snapshot is kept of the whole game", "local SNAPSHOTS = {}" in source, True)
+    check_true("a diff reports what was added, gone and changed, by name",
+               all(word in source for word in ('"added:"', '"gone:"', '"changed:"')))
+    check_true("and gives the count it just took",
+               "local now, now_count = game_signature()" in source)
+    check("a replay sends the values themselves, not the text of them",
+          "table.insert(held, args)" in source, True)
+    check_true("with a handful kept per remote rather than everything",
+               "if #held > 20 then table.remove(held, 1) end" in source)
+    check("a snapshot reads one property per instance, and only where a value lives",
+          'class:sub(-5) == "Value"' in source, True)
+
+
+# --- the writer's own memory: its plan and its versions --------------------------------------
+
+def memory_checks():
+    print("\nthe plan the writer keeps")
+    reload_with()
+    luau._memory["plan"].clear()
+    luau._memory["versions"].clear()
+    S = "s-plan"
+    check("a new plan is empty", luau.run("plan_todo", {"action": "list"}, session=S)["output"],
+          "the plan is empty")
+    added = luau.run("plan_todo", {"action": "add", "text": "  move   the  character "}, session=S)
+    check("a step is kept as the words it was given, tidied", added["output"].splitlines()[1],
+          "  1. [ ] move the character")
+    check("and nothing is done yet", added["output"].splitlines()[0], "the plan -- 0/1 done")
+    luau.run("plan_todo", {"action": "add", "text": "plant the flag"}, session=S)
+    check("a step can be added with no action named",
+          luau.run("plan_todo", {"text": "read the output"}, session=S)["output"]
+          .splitlines()[0], "the plan -- 0/3 done")
+    check("a step is ticked off by its number",
+          luau.run("plan_todo", {"action": "done", "index": 2}, session=S)["output"]
+          .splitlines()[2], "  2. [x] plant the flag")
+    done = luau.run("plan_todo", {"action": "done", "text": "move the character"}, session=S)
+    check("and by its own words", done["output"].splitlines()[0], "the plan -- 2/3 done")
+    undone = luau.run("plan_todo", {"action": "undo", "text": "plant"}, session=S)
+    check("a step can be reopened", undone["output"].splitlines()[0], "the plan -- 1/3 done")
+    luau.run("plan_todo", {"action": "add", "text": "tidy the loop"}, session=S)
+    luau.run("plan_todo", {"action": "add", "text": "fix the loop"}, session=S)
+    vague = luau.run("plan_todo", {"action": "done", "text": "loop"}, session=S)
+    check_true("words that match two steps pick neither",
+               vague["output"].startswith("no item matched that -- the plan is"))
+    check_true("and the plan comes back with it",
+               "tidy the loop" in vague["output"] and "fix the loop" in vague["output"])
+    check_true("a number that is not there picks nothing either",
+               luau.run("plan_todo", {"action": "done", "index": 99}, session=S)["output"]
+               .startswith("no item matched that -- the plan is"))
+    check("an unknown action says which ones there are",
+          luau.run("plan_todo", {"action": "sing"}, session=S)["output"]
+          .startswith("unknown action 'sing'"), True)
+    check("adding nothing says so",
+          luau.run("plan_todo", {"action": "add", "text": "   "}, session=S)["output"],
+          "nothing was added: `text` was empty")
+    check("another session has its own plan",
+          luau.run("plan_todo", {"action": "list"}, session="s-plan-other")["output"],
+          "the plan is empty")
+    check("and this one kept its own",
+          luau.run("plan_todo", {"action": "list"}, session=S)["output"].splitlines()[0],
+          "the plan -- 1/5 done")
+    for i in range(luau.PLAN_MAX):
+        luau.plan_todo("add", f"step {i}", 0, "s-plan-big")
+    full = luau.plan_todo("add", "one too many", 0, "s-plan-big")
+    check("a plan that is full says so, and says what the ceiling is", full,
+          f"the plan is full ({luau.PLAN_MAX} items): finish one or clear the plan before "
+          "adding another")
+    check("clearing it empties the plan",
+          luau.run("plan_todo", {"action": "clear"}, session="s-plan-big")["output"],
+          "the plan is empty")
+
+    print("\nthe versions of the script it has saved")
+    luau._memory["versions"].clear()
+    W = "s-vers"
+    a = 'local SPEED = 16\nprint(SPEED)\n'
+    b = '-- tweaked\nlocal SPEED = 16\nprint(SPEED)\n'
+    c = '-- tweaked\nlocal SPEED = 100\nprint(SPEED)\n'
+    check("nothing is saved to begin with",
+          luau.run("script_versions", {"action": "list"}, session=W)["output"],
+          "nothing saved yet: script_versions(save) keeps the script you have")
+    check("saving without a name gives it one",
+          luau.run("script_versions", {"action": "save", "script": a}, session=W)["output"]
+          .splitlines()[0], "saved 'v1' (2 lines)")
+    check("the list counts what is held",
+          luau.run("script_versions", {"action": "list"}, session=W)["output"].splitlines()[0],
+          "1 saved version(s), newest last:")
+    luau.run("script_versions", {"action": "save", "name": "alpha", "script": b}, session=W)
+    saved = luau.run("script_versions", {"action": "save", "name": "beta", "script": c}, session=W)
+    check_true("a save says how big the script was",
+               "'beta' (3 lines)" in saved["output"] and f"{len(c)} char(s)" in saved["output"])
+    loaded = luau.run("script_versions", {"action": "load", "name": "beta"}, session=W)
+    check_true("a version comes back with its own text",
+               loaded["output"].splitlines()[0].startswith("--- beta (saved ")
+               and loaded["output"].endswith(c))
+    check_true("a name that only one version could be is enough",
+               luau.run("script_versions", {"action": "load", "name": "alph"}, session=W)["output"]
+               .splitlines()[0].startswith("--- alpha (saved "))
+    missing = luau.run("script_versions", {"action": "load", "name": "zzz"}, session=W)
+    check_true("a name nothing matches says so, and shows what there is",
+               missing["output"].endswith("-- no single version matched that name")
+               and "alpha:" in missing["output"])
+    compared = luau.run("script_versions", {"action": "diff", "name": "alpha"}, session=W)
+    check("a diff with no second script compares the newest other one",
+          compared["output"].splitlines()[0], "--- alpha vs beta ---")
+    check_true("and shows the line that moved",
+               "1 line(s) added, 1 removed" in compared["output"]
+               and "-local SPEED = 16" in compared["output"])
+    against = luau.run("script_versions", {"action": "diff", "name": "alpha", "script": a},
+                       session=W)
+    check("a diff with a second script says whose it is", against["output"].splitlines()[0],
+          "--- alpha vs the script you sent ---")
+    luau.script_versions("save", "solo", a, "s-vers-one")
+    check("one saved version has nothing to compare with",
+          luau.run("script_versions", {"action": "diff", "name": "solo"},
+                   session="s-vers-one")["output"],
+          "only one version is saved, so there is nothing to compare 'solo' with")
+    check("dropping one says which",
+          luau.run("script_versions", {"action": "drop", "name": "beta"}, session=W)["output"]
+          .splitlines()[0], "dropped 'beta'")
+    check_true("and it is gone from the list",
+               "beta:" not in luau.run("script_versions", {"action": "list"}, session=W)["output"])
+    check("an unknown action says which ones there are",
+          luau.run("script_versions", {"action": "sing"}, session=W)["output"]
+          .startswith("unknown action 'sing'"), True)
+    check("saving nothing says so",
+          luau.run("script_versions", {"action": "save", "script": "  "}, session=W)["output"],
+          "nothing was saved: send the script in `script`")
+    huge = luau.run("script_versions", {"action": "save", "name": "big",
+                                        "script": "x" * (luau.VERSION_CHARS + 1)}, session=W)
+    check_true("a script past the size kept here is refused, with the number",
+               f"past the {luau.VERSION_CHARS} kept here" in huge["output"])
+    for i in range(luau.VERSION_MAX + 2):
+        luau.script_versions("save", f"keep{i}", a, "s-vers-many")
+    held = luau.run("script_versions", {"action": "list"}, session="s-vers-many")["output"]
+    check("only the newest few are held", held.splitlines()[0],
+          f"{luau.VERSION_MAX} saved version(s), newest last:")
+    check_true("the oldest one is the one that went",
+               f"keep{luau.VERSION_MAX + 1}:" in held and "keep0:" not in held)
+
+    print("\nthe difference between two scripts")
+    check("two identical scripts have no difference",
+          luau.run("luau_diff", {"a": a, "b": a})["output"],
+          "identical: the two scripts are the same text, line for line")
+    moved = luau.run("luau_diff", {"a": b, "b": c, "from": "before", "to": "after"})
+    check("a changed line is counted", moved["output"].splitlines()[0],
+          "1 line(s) added, 1 removed")
+    check("and the diff names both sides", moved["output"].splitlines()[1:3],
+          ["--- before", "+++ after"])
+    check_true("with the line that went and the one that came",
+               "-local SPEED = 16" in moved["output"] and "+local SPEED = 100" in moved["output"])
+    check("one side empty is every line added",
+          luau.run("luau_diff", {"a": "", "b": b})["output"].splitlines()[0],
+          f"{len(b.splitlines())} line(s) added, 0 removed")
+    check("no scripts at all is refused",
+          luau.run("luau_diff", {"a": "", "b": "  "})["ok"], False)
+    long_a = "\n".join(f"print({i})" for i in range(500)) + "\n"
+    long_b = "\n".join(f"print({i * 2})" for i in range(500)) + "\n"
+    capped = luau.run("luau_diff", {"a": long_a, "b": long_b})["output"]
+    check_true("a diff past the limit says how much did not fit",
+               "more diff line(s) ..." in capped.splitlines()[-1])
+
+    print("\nasking the second model on purpose")
+    check("a question is required",
+          luau.run("consult_planner", {}, session="s-ask")["ok"], False)
+    reload_with(DEEPSEEK_TOKEN=UNSET)
+    check_true("with no second model, the tool says which key is missing",
+               "DEEPSEEK_TOKEN is not set" in
+               luau.run("consult_planner", {"question": "which approach?"}, session="s-ask")["output"])
+    reload_with(AGENT_CONSULT="off")
+    check_true("and it can be switched off on the service",
+               "AGENT_CONSULT=off" in
+               luau.run("consult_planner", {"question": "which approach?"}, session="s-ask")["output"])
+    check("the switch is visible in what the page reads", luau.tool_state()["consult"], "off")
+    reload_with()
+    check("and back on by default", luau.tool_state()["consult"], "on")
+    STUB["plan"] = PLAN
+    asked = luau.run("consult_planner", {"question": "one connection or a loop?",
+                                         "script": a}, session="s-ask")
+    check("the planner really is asked", asked["summary"].split(" chars")[1],
+          f" from {DEEPSEEK_MODEL}")
+    check_true("and its answer is a tool result like any other",
+               asked["output"].splitlines()[0] == f"{DEEPSEEK_MODEL} says:"
+               and "RenderStepped" in asked["output"])
+
+    print("\nthe four tools the writer keeps for itself are wired to their branches")
+    for name in ("plan_todo", "script_versions", "luau_diff", "consult_planner"):
+        check_true(f"{name} is offered to the model", name in luau.TOOL_NAMES)
+        check(f"{name} is stated in the brief the writer reads", name in bridge.TOOL_SYSTEM, True)
+    wired = {name: luau.run(name, {}, session="s-wired")["output"] for name in luau.TOOL_NAMES}
+    check_true("every advertised tool has a branch that answers it",
+               all(out != f"there is no tool '{name}'" for name, out in wired.items()))
 
 
 def main():
@@ -1383,6 +1590,7 @@ def main():
     scan_checks()
     attach_checks()
     picture_checks()
+    memory_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:

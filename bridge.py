@@ -1114,6 +1114,10 @@ You have tools, and using them is part of writing the script:
 * `luau_find` -- the lines of a script that match a pattern, with line numbers, when you need one part of a long script.
 * `luau_format` -- re-indent a script you assembled from pieces.
 * `secret_scan` -- find credentials in the script before it ships.
+* `plan_todo` -- your own list of what the script has to do, written down and ticked off. A long script loses half of itself between calls; this is what it does not lose them to.
+* `script_versions` -- save the script you have under a name and get it back later, so "go back to what worked" does not mean writing it again from memory.
+* `luau_diff` -- the lines that differ between two versions of a script: what an edit actually touched.
+* `consult_planner` -- when you want a decision rather than a review (which approach, what a traceback means), ask the second model. It answers only what you ask.
 
 A picture or a file may be attached to the question -- a screenshot of the game, or a dumped \
 script. What is attached is in front of you with the question: read it, and answer for what it \
@@ -1152,11 +1156,12 @@ members you are sure exist, and prefer the plainly-supported call over the cleve
 
 AGENT_ROUNDS_MAX = 12
 # How many tool rounds one turn may take. A round is one model call plus the tools it asked for, so
-# this is the turn's wall-clock as much as it is its budget: at 8 a curious model could spend nine
-# calls on one question, which is minutes of somebody watching a status line. Four is enough for a
-# script that needs a second look, and the Roblox client runs a further round of tools of its own
-# after every answer besides. Clamped rather than trusted.
-AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="4")), AGENT_ROUNDS_MAX))
+# this is the turn's wall-clock as much as it is its budget: at 12 a curious model could spend
+# thirteen calls on one question, which is minutes of somebody watching a status line. Six is what
+# the toolbox is worth now -- write the plan down, look a member up, write the script, check it,
+# diff it against the last one, save it -- and the Roblox client runs a further round of tools of
+# its own after every answer besides. Clamped rather than trusted.
+AGENT_ROUNDS = max(0, min(int(env("AGENT_ROUNDS", default="6")), AGENT_ROUNDS_MAX))
 # The tool that actually runs a script is the one that can hang (an executor stuck in a wait), so
 # it is bounded separately.
 TOOL_RESULT_MAX = int(env("TOOL_RESULT_MAX", default="20000"))
