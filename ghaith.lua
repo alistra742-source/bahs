@@ -5,7 +5,7 @@ What it is: a panel in the game that talks to POST /chat/stream and GET /chat/re
 keeps the whole conversation, shows the model working while it works, and hands back a finished
 Luau script.
 
-Four things worth knowing before reading the code:
+Five things worth knowing before reading the code:
 
   * The service ships the script with the markdown fence already taken off. It is pasted straight
     into an executor, where a ```lua line is a syntax error, so the answer comes back bare -- a
@@ -23,6 +23,12 @@ Four things worth knowing before reading the code:
     is writing, not working it out. The reasoning itself is never printed, in a pane or in the
     transcript: it is long, and it is not what anybody is waiting for. "copy code" never copies it
     either: the script is the only thing here that is code.
+  * The script is one function, and Luau gives a function 200 local registers. At 230 of them
+    this client stopped compiling -- `Out of local registers ... exceeded limit 200` -- which
+    is a panel that never appears and a console that says nothing about why. The two long
+    stretches of helpers therefore live inside `do ... end`, which gives their locals back
+    when the block closes; only the names the panel calls are declared in front of it. See
+    section 6 before adding a local anywhere near the top.
   * The model can call tools on this client by writing a token in its answer -- @@GREP remote@@ or
     @@GREP@@ remote, both are read. Thirty-five of them, and every one of them is about the game
     this client is running in rather than about the machine it is running on: the dump, the
@@ -522,6 +528,23 @@ local SERVICES = {
 	"Players", "Chat", "TextChatService", "StarterPlayerScripts", "StarterCharacterScripts",
 }
 
+-- =====================================================================================
+-- 6. the register wall
+-- =====================================================================================
+--
+-- Luau gives one function 200 local registers, and this whole script is one function: at 230
+-- locals it stopped compiling entirely -- `Out of local registers when trying to allocate
+-- pic_refresh: exceeded limit 200` -- and a script that does not compile is a script whose
+-- panel never appears, with nothing in the console to say why.
+--
+-- So the two long stretches of helpers below sit inside `do ... end`, which gives their own
+-- locals back when the block closes. Only the names the panel still calls are declared out
+-- here and assigned inside. A local added *inside* the block costs nothing once it ends, so
+-- new helpers belong in there; a new name the panel needs belongs on the list below.
+local deep_scan, tool_brief, MSGS, busy, LSF, PICS, PENDING, MIME_BY_EXT, file_parts, kb,
+      read_bytes, bytes_from_url, attach_upload, image_files, process, copy_code, copy_plain,
+      execute
+do
 local function path_of(instance)
 	local parts, node = {}, instance
 	while node and node ~= game do
@@ -705,7 +728,7 @@ end
 -- is never the part that gets cut. What is cut is counted and said at the end, so a dump that ran
 -- out of room never reads as a game that has nothing more in it. Returns the dump, and the one
 -- line that says what it found.
-local function deep_scan()
+function deep_scan()
 	local counts = {all = 0, script = 0, module = 0, remote = 0, value = 0, cut = 0}
 	local script_box = {lines = {}, used = 0, cap = math.floor(SCAN_BUDGET * 0.6)}
 	local name_box = {lines = {}, used = 0, cap = SCAN_BUDGET - math.floor(SCAN_BUDGET * 0.6)}
@@ -1801,7 +1824,7 @@ local TOOLS = {
 		run = function(arg) return set_property(arg) end},
 }
 
-local function tool_brief()
+function tool_brief()
 	local out = {"TOOLS you can call by writing the token in your answer; the client runs it and sends you the result:"}
 	for _, tool in ipairs(TOOLS) do
 		table.insert(out, "  @@" .. tool.name .. "@@ " .. tool.hint)
@@ -1921,11 +1944,11 @@ local function run_tools(answer)
 end
 
 -- =====================================================================================
--- 6. one turn on the service
+-- 7. one turn on the service
 -- =====================================================================================
 
-local MSGS = {}
-local busy = false
+MSGS = {}
+busy = false
 
 local function session_id()
 	local id = ""
@@ -1953,7 +1976,7 @@ end
 -- many words rather than failing with a mystery.
 local RD  = primitive("readfile")
 local ISF = primitive("isfile")
-local LSF = primitive("listfiles")
+LSF = primitive("listfiles")
 -- Some executors ship a file dialog of their own. Not one of these names is guaranteed, which is
 -- why every one is tried and the list built from the folder is the fallback that always works.
 local PICKS = {
@@ -1961,13 +1984,13 @@ local PICKS = {
 	primitive("selectfile"), primitive("openfiledialog"), primitive("promptforfile"),
 }
 
-local PICS = {}      -- pictures kept attached to every question until they are cleared
-local PENDING = {}   -- files uploaded for the next turn only (scan game's dump)
+PICS = {}      -- pictures kept attached to every question until they are cleared
+PENDING = {}   -- files uploaded for the next turn only (scan game's dump)
 
 -- What the service calls each kind of picture. The extension is what decides it -- a `.png` is a
 -- picture whatever the bytes claim -- and a file that is not one of these goes up as itself, which
 -- is the point of the file box next to the picture list.
-local MIME_BY_EXT = {
+MIME_BY_EXT = {
 	png = "image/png", jpg = "image/jpeg", jpeg = "image/jpeg", jfif = "image/jpeg",
 	gif = "image/gif", webp = "image/webp", bmp = "image/bmp", ico = "image/x-icon",
 	tif = "image/tiff", tiff = "image/tiff",
@@ -1998,20 +2021,20 @@ local function b64(bytes)
 end
 
 -- The name and the extension of a path, whatever separators it was written with.
-local function file_parts(path)
+function file_parts(path)
 	local name = tostring(path or ""):gsub("\\", "/")
 	name = name:match("([^/]*)$") or name
 	return name, (name:match("%.(%w+)$") or ""):lower()
 end
 
-local function kb(bytes)
+function kb(bytes)
 	local n = #bytes
 	return n >= 1048576 and string.format("%.1f MB", n / 1048576) or string.format("%.0f KB", n / 1024)
 end
 
 -- One file off this device, as bytes. Nil and a reason rather than an error: every caller here has
 -- somewhere to say why, and throwing on a path nobody typed correctly is not one of them.
-local function read_bytes(path)
+function read_bytes(path)
 	if type(RD) ~= "function" then
 		return nil, "this executor hands a script no readfile, so it cannot read a file for you"
 	end
@@ -2025,7 +2048,7 @@ local function read_bytes(path)
 end
 
 -- A picture that is already on the internet needs no file access at all.
-local function bytes_from_url(url)
+function bytes_from_url(url)
 	local ok, data = pcall(function() return game:HttpGet(tostring(url)) end)
 	if not ok or type(data) ~= "string" or #data == 0 then
 		return nil, "that URL could not be fetched"
@@ -2035,7 +2058,7 @@ end
 
 -- One file up to the service, and the id it answers with is what every turn after it names. `once`
 -- is for a file that belongs to one question -- the game dump -- while a picture stays attached.
-local function attach_upload(name, bytes, mime, once)
+function attach_upload(name, bytes, mime, once)
 	if type(bytes) ~= "string" or #bytes == 0 then return nil, "there is nothing to upload" end
 	if #bytes > PIC_MAX * 1048576 then
 		return nil, string.format("%s is %s and the service takes up to %d MB",
@@ -2065,7 +2088,7 @@ end
 -- simply finds nothing, and the window says so instead of pretending the folder is empty.
 local FOLDERS = {"", "/", "workspace", "Ghaith", "ghaith", "pictures", "images"}
 
-local function image_files()
+function image_files()
 	if type(LSF) ~= "function" then return {} end
 	local found, seen = {}, {}
 	for _, folder in ipairs(FOLDERS) do
@@ -2235,7 +2258,7 @@ end
 
 -- One thing the user asked for, from start to finish: ask, run the model's own tools, keep the
 -- whole answer, and (when auto is on) run it and feed the console back until it settles.
-local function process(question)
+function process(question)
 	if busy then return end
 	if question == nil or question == "" then return end
 	busy = true
@@ -2299,7 +2322,7 @@ local function process(question)
 end
 
 -- =====================================================================================
--- 7. an error in the console, turned into a turn of its own
+-- 8. an error in the console, turned into a turn of its own
 -- =====================================================================================
 
 -- One console error, one turn. The error is the question; the script that produced it is
@@ -2353,10 +2376,10 @@ error_fix = function(line)
 end
 
 -- =====================================================================================
--- 8. what a turn runs on: the script it just wrote, and the client itself
+-- 9. what a turn runs on: the script it just wrote, and the client itself
 -- =====================================================================================
 
-local function copy_code(code)
+function copy_code(code)
 	local script = only_code(code)
 	if script == "" then
 		UI.bubble("system", "there is no script in that answer to copy")
@@ -2371,7 +2394,7 @@ end
 
 -- Everything that is not a script: the console, the thinking. Copied exactly as it reads, with
 -- nothing taken out of it, because the point of those two windows is that they are what happened.
-local function copy_plain(text)
+function copy_plain(text)
 	local body = tostring(text or "")
 	if body == "" then
 		UI.bubble("system", "there is nothing in that window to copy")
@@ -2384,7 +2407,7 @@ local function copy_plain(text)
 	end
 end
 
-local function execute(code, quiet)
+function execute(code, quiet)
 	local script = only_code(code)
 	if script == "" then
 		UI.bubble("system", "there is no script in that answer to run")
@@ -2398,8 +2421,11 @@ local function execute(code, quiet)
 	return ok
 end
 
+
+end    -- the register block: everything above gives its locals back here
+
 -- =====================================================================================
--- 9. the panel
+-- 10. the panel
 -- =====================================================================================
 
 local C = {
@@ -2760,7 +2786,7 @@ local rail = mk("ScrollingFrame", {
 })
 round(rail, 12)
 outline(rail, C.line, 1, 0.4)
-local rail_list = mk("UIListLayout", {
+mk("UIListLayout", {
 	Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder,
 	FillDirection = L.rail_fill, HorizontalAlignment = L.rail_h, VerticalAlignment = L.rail_v,
 	Parent = rail,
@@ -3088,7 +3114,7 @@ local pic_find = mk("TextButton", {
 	ZIndex = 211, Parent = pic_window,
 })
 round(pic_find, 9)
-local pic_help = mk("TextLabel", {
+mk("TextLabel", {
 	Size = UDim2.new(1, -180, 0, 34), Position = UDim2.new(0, 170, 1, -58), BackgroundTransparency = 1,
 	Text = "", TextColor3 = C.dim, Font = SANS, TextSize = 11, TextWrapped = true,
 	TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 211, Parent = pic_window,
@@ -3387,7 +3413,7 @@ end)
 
 -- picture sits beside scan game: both of them put something in front of the model that is not a
 -- question -- one file for this turn, a picture for every turn until it is cleared.
-local picture_button = rail_button("picture", C.card2, function()
+rail_button("picture", C.card2, function()
 	pic_refresh()
 	pic_window.Visible = true
 	clamp_to_view(pic_window, viewport(), usable_screen())
@@ -3448,7 +3474,10 @@ task.spawn(function()
 		t = t + 0.045
 		orb_gradient.Rotation = (math.sin(t) * 0.5 + 0.5) * 360
 		local view = viewport()
-		local left, top, w, h = corner_of(orb, view)
+		local left, top = corner_of(orb, view)
+		-- The box it is in *now*, before this tick grows or shrinks it: `corner_of` answers where
+		-- the orb was put, not how big it is, so w and h come from the size it still has.
+		local w, h = shown_size(orb, view)
 		local size = busy and (58 + math.sin(t * 3) * 3) or 58
 		orb.Size = UDim2.new(0, size, 0, size)
 		place_corner(orb, left + (w - size) / 2, top + (h - size) / 2, view)
@@ -3457,7 +3486,7 @@ task.spawn(function()
 end)
 
 -- =====================================================================================
--- 10. boot
+-- 11. boot
 -- =====================================================================================
 
 -- --- the screen it landed on ------------------------------------------------------------------

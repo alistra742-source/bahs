@@ -29,9 +29,20 @@ one road from this device to the model -- the user picks the file, the model nev
 And the ceiling on silence: a provider that opens a stream and stops sending ends the turn with
 the silence named in seconds, instead of a turn nobody is ever told about.
 
+And the client itself, run rather than read, on the Luau CLI: roblox_stub.lua is
+enough of Roblox for the panel to be built and its last line printed, which is what a
+compile error and a nil on the way up both look like from the outside.
+
+And the 200-local wall, which is not a slow client but an absent one: Luau gives one function 200
+local registers and the whole client is one function, so a local too far stops the script compiling
+and an executor that cannot compile it runs none of it -- no panel, nothing in the console. The
+count that matters, how many are alive at once, is measured here, and the real Luau compiler is run
+over the file whenever one is installed.
+
 No keys and no network: both models are one local stub, and the Roblox API dump is a fixture.
 """
-import base64, contextlib, html, io, json, os, re, sys, tempfile, threading, time
+import base64, contextlib, html, io, json, os, re, shutil, subprocess, sys, tempfile
+import threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1127,6 +1138,177 @@ def client_checks():
           '(last_note ~= "" and last_note or "nothing")' in source, True)
 
 
+def client_source():
+    """The Roblox client, which is the other half of every tool check below."""
+    return Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
+
+
+def fn_at(source, name):
+    """Where a function is declared: `local function x(` or the plain `function x(`.
+
+    The client wraps its long stretches of helpers in `do ... end` (`register_checks` says why), so
+    a helper the panel still calls is declared in front of that block and assigned inside it: its
+    body is a plain `function name(...)` there, and a check that only knows the `local` form would
+    read past it instead of finding it.
+    """
+    for form in (f"local function {name}(", f"function {name}("):
+        at = source.find(form)
+        if at >= 0:
+            return at
+    raise AssertionError(f"{name} is not declared in ghaith.lua")
+
+
+def fn_body(source, name):
+    """That function's own text: its declaration to the first `end` at the start of a line."""
+    return source[fn_at(source, name):].split("\nend\n", 1)[0]
+
+
+# A reference to one of these names outside the register block is not a reference to the helper of
+# the same name: each is a different variable that lives inside one function -- `props` is a
+# parameter of `mk`, `round` is the counter in `auto_rounds`, `L` is the table `extract` fills.
+SHADOWED = {"props", "round", "L"}
+
+
+def register_checks():
+    """The 200-local wall: the one failure here that is not a broken client but an absent one.
+
+    Luau gives a function 200 local registers, and the whole client is a single function. At 230
+    locals it stopped compiling -- `Out of local registers when trying to allocate pic_refresh:
+    exceeded limit 200` -- and an executor that cannot compile a script runs none of it, so the
+    panel never appeared and the console said nothing about why. Wrapping the long stretches of
+    helpers in `do ... end` gives their locals back when the block closes, and only the names the
+    panel calls are declared in front of it.
+
+    What is checked: that the block is there, that no local declared inside it is named outside it
+    (which is what a panel would do the moment one of those declarations moved), that the count
+    alive at the same time stays clear of the wall, and -- when a Luau compiler is installed -- that
+    the real compiler takes the whole file. The count is the guard that always runs; the compiler
+    is the one that cannot be wrong.
+    """
+    print("\nthe 200-local wall")
+    source = client_source()
+    lines = source.splitlines()
+
+    opener = [i for i, line in enumerate(lines) if line == "do"]
+    closer = [i for i, line in enumerate(lines) if line.startswith("end    -- the register block")]
+    check("the register block is there to give its locals back", (len(opener), len(closer)), (1, 1))
+    if len(opener) != 1 or len(closer) != 1:
+        print("  --   without it there is nothing to measure: the section stops here")
+        return
+    opener, closer = opener[0], closer[0]
+    check("and it closes after it opens", opener < closer, True)
+
+    # Every name a top-level `local` declares, with the line it is declared on. `local a, b = ...`
+    # is two of them, and a `local function` is one.
+    declared = []
+    for i, line in enumerate(lines):
+        made = re.match(r"^local\s+function\s+([A-Za-z_]\w*)", line)
+        if made:
+            declared.append((i, made.group(1)))
+        elif re.match(r"^local\s", line):
+            for part in line[len("local "):].split("=")[0].split(","):
+                if re.match(r"^\s*[A-Za-z_]\w*\s*$", part):
+                    declared.append((i, part.strip()))
+
+    # Alive at once, not declared in total: what the block gives back when it closes is what makes
+    # the difference, and it is the number the compiler refuses past 200.
+    outer = inner = peak = 0
+    for i, _ in declared:
+        if i < opener:
+            outer += 1
+        elif i > closer:
+            inner = 0
+            outer += 1
+        else:
+            inner += 1
+        peak = max(peak, outer + inner)
+    check(f"the panel holds {outer} local(s) to the end, and at most {peak} are alive at once",
+          peak < 200, True)
+    check("with room left for the next feature rather than at the wall", peak <= 185, True)
+
+    # The mistake this section exists for: a local declared inside the block is not in scope for
+    # anything after it, so a helper the panel calls must be declared in front. Comments and
+    # strings are blanked first, because a name in prose is not a call.
+    masked, _ = luau.mask(source)
+    code = masked.splitlines()
+    inside = [name for i, name in declared if opener < i < closer]
+    strays = []
+    for name in sorted(set(inside)):
+        if name in SHADOWED:
+            continue
+        pattern = re.compile(r"(?<![\w.:])" + re.escape(name) + r"\b")
+        hits = [i + 1 for i, line in enumerate(code)
+                if (i > closer or i < opener) and pattern.search(line)]
+        if hits:
+            strays.append(f"{name} (used at {hits[:3]})")
+    check("no local the panel needs is left inside the block", strays, [])
+
+    # And the compiler itself, when this machine has one: `luau-compile` from the Luau releases, or
+    # whatever LUAU_COMPILE points at. Nothing is downloaded here -- a check that needs the network
+    # is a check that fails for the wrong reason.
+    compiler = luau_cli("luau-compile")
+    if not compiler:
+        print("  --   no Luau compiler here (set LUAU_COMPILE or put luau-compile on PATH), so the")
+        print("  --   count above is the guard; the compiler is the one that cannot be wrong")
+        return
+    proc = subprocess.run([compiler, "--null", str(Path(__file__).with_name("ghaith.lua"))],
+                          capture_output=True, text=True)
+    check(f"and {Path(compiler).name} compiles the whole client", proc.returncode, 0)
+    if proc.returncode:
+        print((proc.stdout + proc.stderr).strip())
+
+
+def luau_cli(name):
+    """The Luau CLI, if this machine has one: `LUAU_BIN` points at a release directory or binary.
+
+    Nothing is downloaded here -- a check that needs the network fails for the wrong reason. Get
+    the binaries from https://github.com/luau-lang/luau/releases (luau-ubuntu.zip on Linux) and
+    either put them on PATH or point LUAU_BIN at the folder.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    pointed = os.environ.get("LUAU_BIN", "")
+    if pointed:
+        candidate = os.path.join(pointed, name) if os.path.isdir(pointed) else pointed
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def boot_checks():
+    """Run the client against the stub in roblox_stub.lua, and see it reach its last line.
+
+    The three files are concatenated -- the stub, the client, and one line that pumps the tasks the
+    client deferred -- and the pair is handed to the Luau CLI. What is looked for is the client's
+    own boot line, `Ghaith 2.0 .. <url> .. mode .. writer`, printed with nothing thrown first: the
+    stub covers the panel's half of Roblox (instances, signals, the services, UDim2/Vector2/Color3,
+    Enum, TweenService) and nothing else, so a property Roblox does not have still answers nil, and
+    a client that reads one fails here rather than in the executor.
+    """
+    print("\nthe client, booted for real")
+    compiler = luau_cli("luau")
+    if not compiler:
+        print("  --   no Luau CLI here (set LUAU_BIN or put luau on PATH), so the boot is not run:")
+        print("  --   luau-ubuntu.zip from the luau-lang/luau releases is the whole install")
+        return
+    stub = Path(__file__).with_name("roblox_stub.lua").read_text(encoding="utf-8")
+    client = client_source()
+    tail = '\nprint("boot ok: " .. STUB_STEPS(60) .. " round(s) of deferred work ran")\n'
+    with tempfile.TemporaryDirectory() as folder:
+        runnable = Path(folder) / "boot.lua"
+        runnable.write_text(stub + "\n" + client + tail, encoding="utf-8")
+        done = subprocess.run([compiler, str(runnable)], capture_output=True, text=True,
+                              timeout=120)
+    output = done.stdout + done.stderr
+    check(f"the client runs under {Path(compiler).name}", done.returncode, 0)
+    check("and reaches its own last line", "Ghaith 2.0 · " in output, True)
+    check("with the panel's deferred work running too",
+          "boot ok:" in output, True)
+    if done.returncode != 0 or "boot ok:" not in output:
+        print("\n".join(output.strip().splitlines()[-12:]))
+
+
 def scan_checks():
     """scan game: the whole game written out, and what went out said out loud.
 
@@ -1141,7 +1323,7 @@ def scan_checks():
     """
     print("\nscan game: the whole game")
     source = Path(__file__).with_name("ghaith.lua").read_text(encoding="utf-8")
-    dump = source.split("local function deep_scan()", 1)[1].split("\nend\n", 1)[0]
+    dump = fn_body(source, "deep_scan")
     check_true("the scan was read out of the client", len(dump) > 2000)
 
     # Every service the game has, rather than the sixteen names the first dump knew: a game can
@@ -1350,7 +1532,7 @@ def picture_checks():
     # named no session at all and the service could not group it with the chat it belongs to.
     check("the upload can see the session it belongs to",
           source.index("local SESSION = session_id()")
-          < source.index("local function attach_upload"), True)
+          < fn_at(source, "attach_upload"), True)
     check("a picture stays with the chat until it is cleared",
           "PICS, PENDING = {}, {}" in source, True)
     check("and the window says so", "attached to every question until CLEAR" in source, True)
@@ -1590,7 +1772,9 @@ def main():
     scan_checks()
     attach_checks()
     picture_checks()
+    register_checks()
     memory_checks()
+    boot_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:

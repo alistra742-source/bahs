@@ -259,6 +259,17 @@ that only recorded text could be read, not used, so the arguments themselves are
 twenty per remote) and sent back the way the game sent them. An instance destroyed in between is
 the one thing that cannot come back, and the replay says so instead of swallowing it.
 
+**The panel is one script and Luau gives a function 200 local registers, so the helper stretches
+sit inside `do ... end`.** At 230 locals the whole client stopped compiling —
+`Out of local registers when trying to allocate pic_refresh: exceeded limit 200` — and an executor
+that cannot compile a script runs none of it: not the panel, not the orb, and nothing in the console
+to say why. The block gives its own locals back when it closes, and the names the panel still calls
+(`deep_scan`, `process`, `execute`, the attach helpers, `MSGS`, `busy`, …) are declared in front of
+it and assigned inside. So: a new helper belongs *inside* the block, and a new name the panel needs
+goes on the list in section 6, not declared inside. `verify_chain.py` measures the count that
+actually matters (how many are alive at once) and compiles the file with the real Luau compiler when
+one is installed.
+
 A path is read however the model wrote it: `ReplicatedStorage.X`, `game.ReplicatedStorage.X`,
 `game:GetService("ReplicatedStorage").X`, a service name in the wrong case, a bare instance name,
 and a path that misses a link is completed by name rather than refused. What the tool prints is the
@@ -443,8 +454,24 @@ vision on either transport, and a turn carrying a picture must not lose the ques
 the client, that the picker is the executor's own file access and that no tool of the model's reads
 the device.
 
+And the client is also *run*, not just read: `roblox_stub.lua` is enough of the Roblox API for the
+panel to be built (instances and their signals, the services the client asks for, one camera with a
+viewport, one player with a PlayerGui, `UDim2`/`Vector2`/`Color3`/`TweenInfo`, `Enum`, and a
+`TweenService` whose tweens play at once), and the section concatenates stub + client + one line
+that pumps the deferred tasks, then hands the pair to the Luau CLI. What it looks for is the
+client's own boot line printed with nothing thrown first — which is exactly what a nil on the way
+up, or a script that does not compile, does not do. Two failures came out of that one run: the
+register wall above, and the orb's animation loop reading four values out of a function that returns
+two and dying on its first frame.
+
+Both of those checks want the Luau CLI. Nothing is downloaded — get `luau-ubuntu.zip` from
+[the Luau releases](https://github.com/luau-lang/luau/releases), then either put the binaries on
+`PATH` or point `LUAU_BIN` at the folder. Without them the two checks print what is missing and the
+rest of the suite runs as it always did.
+
 ```bash
 .venv/bin/python verify_chain.py
+LUAU_BIN=/path/to/luau .venv/bin/python verify_chain.py
 ```
 
 The service is six modules, smallest dependency first:
