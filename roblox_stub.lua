@@ -197,14 +197,24 @@ local QUEUE = {}
 
 STUB_STEPS = function(rounds)
 	for round = 1, rounds do
-		local pending, QUEUE = QUEUE, {}
+		-- One round is one step for every live task, and nothing more: what a round spawns -- or
+		-- re-queues by yielding -- waits for the next one. Swapping the buffer is what makes that
+		-- true; a round that picks up what it spawned itself would run a task twice in one round
+		-- and read a status line that a later one has already overwritten.
+		local pending = QUEUE
+		QUEUE = {}
 		if #pending == 0 then return round end
 		for _, item in ipairs(pending) do
 			-- A task that has already finished is skipped rather than resumed again: a deferred
 			-- function that never yields is done after its first round, and resuming it a second
 			-- time is the stub's own fault, not the client's.
 			if coroutine.status(item.co) == "suspended" then
-				local ok, err = coroutine.resume(item.co)
+				-- The first resume carries whatever the caller passed after the function, which is
+				-- what `task.spawn(fn, a)` does in Roblox; every later one carries nothing, which is
+				-- what a task resumed after a yield is handed.
+				local passed = item.args
+				item.args = nil
+				local ok, err = coroutine.resume(item.co, table.unpack(passed or {}))
 				if not ok then error(err, 0) end
 				if coroutine.status(item.co) == "suspended" then table.insert(QUEUE, item) end
 			end
@@ -213,20 +223,23 @@ STUB_STEPS = function(rounds)
 	return rounds
 end
 
+-- `task.spawn(fn, a, b)` hands `a` and `b` to `fn` on its first resume in Roblox, so they are kept
+-- here and passed the same way. A stub that dropped them would hide a caller which only ever names
+-- what it needs as an argument -- which is how a console error reaches the turn that answers it.
+local function later(fn, ...)
+	if type(fn) == "function" then
+		table.insert(QUEUE, {co = coroutine.create(fn), args = table.pack(...)})
+	end
+end
+
 task = setmetatable({
 	wait = function()
 		if coroutine.isyieldable() then coroutine.yield() end
 		return 0
 	end,
-	spawn = function(fn)
-		if type(fn) == "function" then table.insert(QUEUE, {co = coroutine.create(fn)}) end
-	end,
-	defer = function(fn)
-		if type(fn) == "function" then table.insert(QUEUE, {co = coroutine.create(fn)}) end
-	end,
-	delay = function(_, fn)
-		if type(fn) == "function" then table.insert(QUEUE, {co = coroutine.create(fn)}) end
-	end,
+	spawn = function(fn, ...) later(fn, ...) end,
+	defer = function(fn, ...) later(fn, ...) end,
+	delay = function(_, fn, ...) later(fn, ...) end,
 	cancel = function() end,
 }, {__index = function(_, key)
 	return function() return nil end

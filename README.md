@@ -201,6 +201,18 @@ The same error is never asked twice, a turn already running is waited for rather
 and three in a row is the ceiling — a script that fails on every frame would otherwise spend the
 whole conversation on itself. **errors** on the rail turns the watching off.
 
+**And the run you press yourself is one of those errors.** **run** under an answer was the one
+failure nobody could see: the client runs the script with `xpcall` so it can put what went wrong in
+a bubble, which means Roblox never printed it and the executor's own console never saw it either —
+the bubble said it failed, the **console** window stayed empty, and the model was never told. It is
+logged now, exactly like a failure the game printed: it is in **console** where it can be read, and
+with **errors** on it is the same turn of its own for a fix — asked through the same road as a typed
+question, so of whichever model the mode buttons are set to (agent, qwen or deepseek) and not of a
+fixed one — with the status line saying so rather than the old `it failed -- see the console` over an
+empty console. The two runs the model asks for itself, the **@@RUN@@** tool and **auto**, carry their
+result back inside the turn already in flight, so they log the failure without starting a second turn
+behind it.
+
 **scan game sends the whole game, not a selection of it.** The dump it builds has two halves: every
 script and module this client holds, by path, with its text under it — or the line saying this
 client was never sent that text, and which token reads it anyway — and then every other instance in
@@ -487,9 +499,21 @@ the whole dump going up as a file (`attached=160716`), the question staying a li
 size of a whole game (`longest=60070`). It was written because a player cannot describe that
 failure: the panel said nothing, never said it was thinking, and never answered.
 
-Both of those checks want the Luau CLI. Nothing is downloaded — get `luau-ubuntu.zip` from
+The stub does the same for an error the player provokes: the model's answer is a script that raises
+the moment it is run, its own **run** chip is pressed, and what is read afterwards is what the
+**console** window holds (`console=true`), what the status line said (`status=true`), that the model
+was asked at all and with the error itself as the question (`streams=2`, `told=true`), and that the
+turn went out in the mode the client is set to. Two bugs came out of writing that one — and both were
+in the harness rather than the client, which is why it is worth saying: the stub's `task.spawn` threw
+away everything after the function, so a spawn that only ever *names* what it needs (which is how a
+console error reaches the turn that answers it) was handed a nil; and a task spawned during a round
+was picked up in that same round, so the status line a failure sets was overwritten before anything
+could read it. The stub now passes what `task.spawn` is given and a round is one step for every live
+task and no more.
+
+The three runs that want the Luau CLI Nothing is downloaded — get `luau-ubuntu.zip` from
 [the Luau releases](https://github.com/luau-lang/luau/releases), then either put the binaries on
-`PATH` or point `LUAU_BIN` at the folder. Without them the two checks print what is missing and the
+`PATH` or point `LUAU_BIN` at the folder. Without it those three print what is missing and the
 rest of the suite runs as it always did.
 
 ```bash

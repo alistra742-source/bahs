@@ -270,14 +270,17 @@ local function looks_like_error(kind, text)
 	return body:find(ERROR_LINE) ~= nil
 end
 
-local function log(kind, text)
+-- `answered` is for a caller that is already carrying this line to the model itself -- a tool
+-- result, the auto loop's own prompt -- so it is still logged, where it can be read, but does not
+-- start a fix turn on top of the one already in flight.
+local function log(kind, text, answered)
 	table.insert(LOGS, {kind = kind, text = tostring(text), at = os.date("%H:%M:%S")})
 	while #LOGS > 300 do table.remove(LOGS, 1) end
 	if UI.onLog then UI.onLog(LOGS[#LOGS]) end
 	-- An error is handed to the turn below the moment it arrives; a message is just logged. What
 	-- `error_fix` is nil means is that this panel is still being built, which is why a line printed
 	-- before it exists starts nothing.
-	if watch_errors and error_fix and looks_like_error(kind, text) then
+	if not answered and watch_errors and error_fix and looks_like_error(kind, text) then
 		task.spawn(error_fix, tostring(text or ""))
 	end
 end
@@ -514,10 +517,27 @@ end
 -- =====================================================================================
 
 -- (ok, what it printed, or the error and the traceback)
-local function run_script(code)
-	if not LOAD then return false, "there is no loadstring in this executor, so nothing can run" end
+--
+-- This is the one place a failure is *caught* rather than printed, and that is why it has to be
+-- logged by hand: Roblox never saw it (the xpcall did) and the executor's own console never
+-- printed it either, so a script that threw the moment somebody pressed run was in neither --
+-- a bubble said it failed, the console window stayed empty, and the model was never told. Logged,
+-- it is where every other failure is: readable under `.console.`, and, with `.errors.` on, on the
+-- same road to the model for a fix.
+--
+-- `answered` is for a caller that is already carrying this result to the model itself.
+local function run_script(code, answered)
+	if not LOAD then
+		local problem = "there is no loadstring in this executor, so nothing can run"
+		log("Error", problem, answered)
+		return false, problem
+	end
 	local fn, err = LOAD(code)
-	if not fn then return false, "compile error: " .. tostring(err) end
+	if not fn then
+		local problem = "compile error: " .. tostring(err)
+		log("Error", problem, answered)
+		return false, problem
+	end
 	local mark = #LOGS
 	local ok, result = xpcall(fn, function(e)
 		local trace = debug.traceback("", 2)
@@ -526,7 +546,11 @@ local function run_script(code)
 	local printed = console_since(mark, 4000)
 	local body = printed ~= "" and ("\nConsole:\n" .. printed) or "\nConsole: (nothing printed)"
 	if ok then return true, "ran without error" .. body end
-	return false, tostring(result) .. body
+	local problem = tostring(result)
+	-- Logged after the script's own prints were gathered, so the error lands in the console and not
+	-- in the "Console:" block of the answer as well.
+	log("Error", problem, answered)
+	return false, problem .. body
 end
 
 local SERVICES = {
@@ -1872,7 +1896,11 @@ end
 
 run_last = function()
 	if last_code == "" then return "you have not written a script yet" end
-	local ok, out = run_script(last_code)
+		-- The model asked for this run, so its result is this tool's answer and goes back to the
+	-- model in the very turn it is in: `true` keeps the console watcher from starting a
+	-- second fix turn behind that one. The failure is still written into the console, where
+	-- the player can read it.
+	local ok, out = run_script(last_code, true)
 	return (ok and "the script ran without error" or "the script failed") .. "\n" .. out
 end
 
@@ -2255,7 +2283,9 @@ local function auto_rounds()
 	while auto and round < MAXROUNDS do
 		round = round + 1
 		UI.setStatus("running", "auto run " .. round .. " of " .. MAXROUNDS)
-		local ok, output = run_script(last_code)
+		-- `true`: this loop is already asking for the fix, and the failure goes into the
+		-- prompt right below. A console fix turn spawned on top of it would ask it twice.
+		local ok, output = run_script(last_code, true)
 		UI.bubble(ok and "system" or "error",
 			"auto run " .. round .. ": " .. (ok and "no error" or "failed") .. "\n" .. output)
 		local prompt = "RESULT OF RUNNING YOUR SCRIPT (round " .. round .. "):\n\n" .. output
@@ -2440,10 +2470,23 @@ function execute(code, quiet)
 		return
 	end
 	UI.setStatus("running", "executing " .. #script .. " characters")
+	-- Not `answered`: this run is the player's own, so its failure is the console's and,
+	-- with `.errors.` on, the model's. The turn that follows goes through the same
+	-- `process` as a typed question, so it is asked of whichever model the MODE buttons
+	-- are set to -- agent, qwen or deepseek -- and not of a fixed one.
 	local ok, output = run_script(script)
 	if not quiet then UI.bubble(ok and "system" or "error", output) end
-	UI.setStatus(ok and "ready" or "failed", ok and "it ran" or "it failed -- see the console")
+	-- A clean run is what puts the fix budget back, and it goes back before the status
+	-- line says which of the two happened, so the count and the words cannot disagree.
 	if ok then error_fix_rounds, last_error = 0, "" end
+	if ok then
+		UI.setStatus("ready", "it ran")
+	elseif watch_errors then
+		UI.setStatus("failed", "it failed -- the error is in the console (.console.), and"
+			.. " errors: ON sends it to the model for a fix")
+	else
+		UI.setStatus("failed", "it failed -- the error is in the console (.console.)")
+	end
 	return ok
 end
 

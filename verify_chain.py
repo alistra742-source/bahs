@@ -1391,6 +1391,109 @@ def run_checks():
           int(got["longest"]) <= 61000, True)
 
 
+ERROR_DRIVER = '''
+-- The model's answer is a script that raises the moment it is run, and `run` is pressed on its own
+-- chip -- the way a player presses it. What is read afterwards is what the console window holds,
+-- what the status line said, and what the client actually asked the model.
+STUB_GAME(4)
+STUB_ANSWER = "error('boom from the stub')"
+local statuses, seen = {}, {}
+local function absorb()
+	for _, text in ipairs(STUB_TEXTS()) do
+		if #text > 0 and #text <= 200 and not seen[text] then
+			seen[text] = true
+			table.insert(statuses, text)
+		end
+	end
+end
+STUB_PRESS("scan game")
+for round = 1, 400 do
+	STUB_STEPS(1)
+	absorb()
+	if STUB_BUTTON("run") then break end
+end
+STUB_PRESS("run")
+for round = 1, 200 do
+	STUB_STEPS(1)
+	absorb()
+end
+STUB_PRESS("console")
+for round = 1, 5 do STUB_STEPS(1) end
+absorb()
+local streams, mode, question = 0, "", ""
+for _, call in ipairs(STUB_CALLS) do
+	if call.path == "/chat/stream" then
+		streams = streams + 1
+		if call.body then
+			if call.body.mode then mode = tostring(call.body.mode) end
+			for _, message in ipairs(call.body.messages or {}) do
+				-- The stub hands back the request's own table, and the assistant's answer is
+				-- appended to it once the turn is over -- so the question is the newest message
+				-- that is a user's, not simply the last one in the table.
+				if message.role == "user" then question = tostring(message.content) end
+			end
+		end
+	end
+end
+local in_console, said_where = false, false
+for _, text in ipairs(STUB_TEXTS()) do
+	if text:find("[Error]", 1, true) and text:find("boom from the stub", 1, true) then
+		in_console = true
+	end
+end
+for _, text in ipairs(statuses) do
+	if text:find("the error is in the console", 1, true) then said_where = true end
+end
+print(string.format("ERRORREPORT streams=%d mode=%s console=%s status=%s told=%s",
+	streams, mode, tostring(in_console), tostring(said_where),
+	tostring(question:find("boom from the stub", 1, true) ~= nil)))
+'''
+
+
+def error_checks():
+    """A script that throws when the player runs it goes to the console, and back to the model.
+
+    This is the failure that cannot be read out of the source: `run_script` catches the error so it
+    can be shown in a bubble, which means Roblox never printed it and the executor's console never
+    saw it -- pressing run said it failed, the console window stayed empty, and the model was never
+    told what went wrong. So the client is run: the stub's answer is a script that raises, its own
+    `run` chip is pressed, and the one line printed at the end says what the console holds, what
+    the status line said, and what the client asked the model. The mode the fix was asked in is
+    compared against the client's own MODE, because the turn has to go to the model the user chose
+    and not to a fixed one.
+
+    Both halves of this were real. The client never logged the failure at all -- it caught it to put
+    it in a bubble and that was the end of it -- and the stub's `task.spawn` dropped whatever came
+    after the function, so a spawn that only ever names what it needs (which is how the error
+    reaches the turn answering it) was handed a nil. A stub that drops arguments hides that class of
+    bug, so it passes them the way Roblox does now, and this check is what keeps it honest.
+    """
+    print("\na script that throws, run from its own chip")
+    compiler = luau_cli("luau")
+    if not compiler:
+        print("  --   no Luau CLI here (set LUAU_BIN or put luau on PATH), so this is not run")
+        return
+    stub = Path(__file__).with_name("roblox_stub.lua").read_text(encoding="utf-8")
+    source = client_source()
+    with tempfile.TemporaryDirectory() as folder:
+        runnable = Path(folder) / "run.lua"
+        runnable.write_text(stub + "\n" + source + "\n" + ERROR_DRIVER, encoding="utf-8")
+        done = subprocess.run([compiler, str(runnable)], capture_output=True, text=True, timeout=300)
+    output = done.stdout + done.stderr
+    line = next((row for row in output.splitlines() if row.startswith("ERRORREPORT ")), "")
+    check("the client ran a script that throws", bool(line), True)
+    if not line:
+        print("\n".join(output.strip().splitlines()[-12:]))
+        return
+    got = dict(piece.split("=", 1) for piece in line.split()[1:])
+    chosen = re.search(r'(?m)^local MODE\s*=\s*"([^"]+)"', source)
+    check("the run error is in the console window", got["console"], "true")
+    check("the status line said where it went", got["status"], "true")
+    check("and the model was told, as a turn of its own", int(got["streams"]), 2)
+    check("with the error itself as the question", got["told"], "true")
+    check("asked of the mode the client is set to", got["mode"], chosen.group(1) if chosen else "")
+
+
 def scan_checks():
     """scan game: the whole game written out, and what went out said out loud.
 
@@ -1889,6 +1992,7 @@ def main():
     memory_checks()
     boot_checks()
     run_checks()
+    error_checks()
     idle_checks()
     print(f"\n{count[0] - len(failures)}/{count[0]} checks passed")
     if failures:
