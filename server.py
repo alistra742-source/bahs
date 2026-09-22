@@ -1159,15 +1159,24 @@ class KanhaReq(BaseModel):
     provider: str = ""  # accepted for compatibility with the earlier picker
 
 
-KANHA_PROMPT_PATH = Path(__file__).with_name("send.txt")
+KANHA_PROMPT_PATHS = (
+    Path(__file__).with_name("send.txt"),
+    Path.cwd() / "send.txt",
+    Path("/app/send.txt"),
+)
 
 
 def kanha_prompt() -> str:
-    """Load the complete Kanha prompt without exposing it to the browser."""
-    try:
-        return KANHA_PROMPT_PATH.read_text(encoding="utf-8")
-    except OSError as error:
-        raise HTTPException(500, f"send.txt is unavailable: {error}") from error
+    """Load the complete Kanha prompt from common deployment locations."""
+    for path in KANHA_PROMPT_PATHS:
+        try:
+            prompt = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if prompt.strip():
+            return prompt
+    searched = ", ".join(str(path) for path in KANHA_PROMPT_PATHS)
+    raise HTTPException(500, f"send.txt is unavailable; searched: {searched}")
 
 
 @app.get("/kanha/providers")
