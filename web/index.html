@@ -15,6 +15,8 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;background:ra
 .logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#2f81f7,#3fb950);display:grid;place-items:center;font:700 18px ui-monospace,monospace;color:#0b0d12}
 .ttl{font-size:22px;font-weight:650;letter-spacing:-.02em}
 .sub{color:var(--dim);font-size:13px}
+.kanha-link{display:inline-flex;align-items:center;gap:7px;background:#151a23;border:1px solid #314052;border-radius:999px;padding:8px 13px;color:#dce8f5;text-decoration:none;font:600 12px ui-monospace,monospace;transition:border-color .18s,background .18s,transform .18s}
+.kanha-link:hover{background:#1b2634;border-color:#9fe870;transform:translateY(-1px)}
 code{background:#151a23;border:1px solid #222b38;border-radius:6px;padding:1px 5px;font:12px ui-monospace,monospace;color:#c9d3e4}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
 .chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font:12px ui-monospace,monospace}
@@ -77,6 +79,7 @@ footer a{color:var(--blue);text-decoration:none}
         <div class="sub" id="flow">Qwen chat</div>
       </div>
     </div>
+    <a class="kanha-link" href="/kanha" aria-label="Open the Kanha chat">✦ Hy kanha</a>
     <div class="chips" id="chips">__CHIPS__</div>
   </div>
 

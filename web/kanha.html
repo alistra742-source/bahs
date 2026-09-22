@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hy kanha</title>
+<style>
+:root{color-scheme:dark;--bg:#0d1017;--panel:#151a24;--line:#283142;--text:#eef2f8;--muted:#8995aa;--accent:#9fe870}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(800px 500px at 50% -20%,#263b36 0%,transparent 65%),var(--bg);color:var(--text);font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif}
+main{width:min(760px,100%);min-height:100vh;margin:auto;padding:clamp(28px,8vh,86px) 18px 24px;display:flex;flex-direction:column}
+h1{margin:0 0 30px;font-size:clamp(32px,7vw,58px);font-weight:600;letter-spacing:-.06em;text-align:center}
+#conversation{flex:1;display:flex;flex-direction:column;gap:16px;padding:12px 0 28px;overflow:auto}
+.empty{margin:auto;color:var(--muted);font-size:14px;text-align:center}
+.message{max-width:88%;padding:13px 16px;border:1px solid var(--line);border-radius:18px;white-space:pre-wrap;overflow-wrap:anywhere}
+.message.you{align-self:flex-end;background:#1d2c3e;border-color:#36516d}
+.message.kanha{align-self:flex-start;background:var(--panel)}
+.composer{display:flex;gap:10px;align-items:flex-end;position:sticky;bottom:0;padding-top:12px;background:linear-gradient(transparent,var(--bg) 18%)}
+textarea{flex:1;min-height:54px;max-height:180px;resize:vertical;background:var(--panel);border:1px solid var(--line);border-radius:16px;color:var(--text);padding:14px 16px;font:inherit;outline:none}
+textarea:focus{border-color:var(--accent)}
+button{height:54px;padding:0 19px;border:0;border-radius:15px;background:var(--accent);color:#10150f;font-weight:700;font-size:14px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#error{min-height:22px;padding-top:8px;color:#ff9d9d;font-size:13px;text-align:center}
+@media(max-width:520px){main{padding-top:34px}.message{max-width:94%}.composer{gap:7px}button{padding:0 14px}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Hy kanha</h1>
+  <section id="conversation" aria-live="polite">
+    <div class="empty">What’s on your mind?</div>
+  </section>
+  <form class="composer" id="composer">
+    <textarea id="prompt" rows="1" placeholder="Write your prompt..." aria-label="Your prompt"></textarea>
+    <button id="send" type="submit">Send</button>
+  </form>
+  <div id="error" role="status"></div>
+</main>
+<script>
+(function () {
+  var conversation = document.getElementById("conversation");
+  var prompt = document.getElementById("prompt");
+  var send = document.getElementById("send");
+  var error = document.getElementById("error");
+  var messages = [];
+
+  function addMessage(role, text) {
+    var empty = conversation.querySelector(".empty");
+    if (empty) empty.remove();
+    var message = document.createElement("div");
+    message.className = "message " + (role === "user" ? "you" : "kanha");
+    message.textContent = text;
+    conversation.appendChild(message);
+    conversation.scrollTop = conversation.scrollHeight;
+  }
+
+  async function ask() {
+    var text = prompt.value.trim();
+    if (!text || send.disabled) return;
+    prompt.value = "";
+    error.textContent = "";
+    messages.push({role: "user", content: text});
+    addMessage("user", text);
+    send.disabled = true;
+    send.textContent = "...";
+    try {
+      var response = await fetch("/kanha/chat", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({messages: messages})
+      });
+      var data = await response.json();
+      if (!response.ok) throw new Error(data.detail || "Kanha could not answer");
+      messages.push({role: "assistant", content: data.message});
+      addMessage("assistant", data.message);
+    } catch (err) {
+      messages.pop();
+      error.textContent = err.message;
+    } finally {
+      send.disabled = false;
+      send.textContent = "Send";
+      prompt.focus();
+    }
+  }
+
+  document.getElementById("composer").addEventListener("submit", function (event) {
+    event.preventDefault();
+    ask();
+  });
+  prompt.addEventListener("keydown", function (event) {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      ask();
+    }
+  });
+})();
+</script>
+</body>
+</html>

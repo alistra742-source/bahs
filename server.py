@@ -1148,6 +1148,45 @@ def models(_: None = Depends(require_key)):
 
 # --- the page ---------------------------------------------------------------------------
 
+
+class KanhaReq(BaseModel):
+    """A plain conversational turn for the lightweight Kanha side."""
+
+    messages: list
+
+
+@app.get("/kanha", response_class=HTMLResponse)
+async def kanha_page():
+    """Serve the uncluttered, non-Roblox chat surface."""
+    try:
+        return HTMLResponse(INDEX.parent.joinpath("kanha.html").read_text(encoding="utf-8"))
+    except OSError:
+        return HTMLResponse("<h1>Hy kanha</h1><p>kanha.html is missing.</p>", status_code=500)
+
+
+@app.post("/kanha/chat")
+def kanha_chat(req: KanhaReq):
+    """Answer ordinary conversation without the script-only agent pipeline or tool loop."""
+    if not CONFIGURED:
+        raise HTTPException(503, NOT_CONFIGURED)
+    messages = [{"role": "system", "content":
+                 "You are Kanha. Have a natural, helpful conversation. "
+                 "Do not turn ordinary questions into Roblox or programming tasks."}]
+    messages.extend(clean_messages(req.messages)[-40:])
+    body = QWEN.request(messages, 0.7, MAX_TOKENS or 2048, stream=False)
+    try:
+        with httpx.Client(timeout=client_timeout(CHAT_TIMEOUT), follow_redirects=True) as client:
+            response = client.post(QWEN.endpoint(), json=body, headers=QWEN.headers())
+    except httpx.HTTPError as error:
+        raise upstream_error(error, QWEN)
+    if response.status_code >= 400:
+        raise HTTPException(502, failure_reason(response.status_code, response.text, QWEN))
+    answer = message_text(response.text).strip()
+    if not answer:
+        raise HTTPException(502, "Kanha returned an empty answer")
+    return {"message": answer}
+
+
 def chip(ok: bool, name: str, detail: str) -> str:
     """One status chip on the page. The browser refreshes these from /health."""
     return (
