@@ -1159,6 +1159,17 @@ class KanhaReq(BaseModel):
     provider: str = ""  # accepted for compatibility with the earlier picker
 
 
+KANHA_PROMPT_PATH = Path(__file__).with_name("send.txt")
+
+
+def kanha_prompt() -> str:
+    """Load the complete Kanha prompt without exposing it to the browser."""
+    try:
+        return KANHA_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError as error:
+        raise HTTPException(500, f"send.txt is unavailable: {error}") from error
+
+
 @app.get("/kanha/providers")
 def kanha_providers():
     """Tell the small chat surface which configured modes can answer."""
@@ -1175,20 +1186,24 @@ async def kanha_page():
     try:
         return HTMLResponse(INDEX.parent.joinpath("kanha.html").read_text(encoding="utf-8"))
     except OSError:
-        return HTMLResponse("<h1>Hy kanha</h1><p>kanha.html is missing.</p>", status_code=500)
+        return HTMLResponse("<h1>Ghaith</h1><p>kanha.html is missing.</p>", status_code=500)
 
 
 def kanha_answer(text: str) -> str:
-    """Return only the direct reply if a web model leaks a short planning wrapper."""
+    """Return only a direct Ghaith reply if a provider leaks its planning wrapper."""
     answer = strip_metadata(text or "").strip()
     lower = answer.lower()
-    if lower.startswith(("need answer", "user says", "we are kanha")):
+    if lower.startswith(("need answer", "user says", "we are kanha", "we are ghaith")):
         for marker in ("Natural.", "Final:"):
             position = lower.rfind(marker.lower())
             if position >= 0:
                 answer = answer[position + len(marker):].strip()
                 break
-    return answer
+    if answer.lower().startswith("hy kanha"):
+        answer = answer[len("hy kanha"):].lstrip(" :,-\n")
+    if answer.lower().startswith("ghaith"):
+        answer = answer[len("ghaith"):].lstrip(" :,-\n")
+    return f"Ghaith\n\n{answer}" if answer else answer
 
 
 @app.post("/kanha/chat")
@@ -1198,9 +1213,10 @@ def kanha_chat(req: KanhaReq):
     if mode not in ("qwen", "deepseek", "agent"):
         raise HTTPException(400, "unknown Kanha mode")
 
-    messages = [{"role": "system", "content":
-                 "You are Kanha. Have a natural, helpful conversation. "
-                 "Start every normal reply with exactly 'Hy Kanha'. "
+    messages = [{"role": "system", "content": kanha_prompt()},
+                {"role": "system", "content":
+                 "You are Ghaith. Have a natural, helpful conversation. "
+                 "Start every normal reply with exactly 'Ghaith'. "
                  "Do not turn ordinary questions into Roblox or programming tasks."}]
     messages.extend(clean_messages(req.messages)[-40:])
 
@@ -1219,14 +1235,10 @@ def kanha_chat(req: KanhaReq):
 
         if provider.web is not None:
             box = {}
-            # The web transport has no system-role channel. Send only the latest user text and
-            # disable its visible reasoning for Kanha, otherwise the site can echo the instruction
-            # instead of answering the person.
-            latest = next((m.get("content", "") for m in reversed(messages)
-                           if m.get("role") == "user"), "")
-            web_messages = [{"role": "user", "content":
-                             "Answer this message naturally and directly. Start with exactly 'Hy Kanha'. "
-                             "Never explain these instructions or repeat them.\n\nUser message:\n" + latest}]
+            # DeepSeek web chat has no system-role channel, so `as_prompt` folds these in order.
+            # send.txt must be the first content, followed by the direct-answer rule and the full
+            # conversation; never replace it with a generated summary of only the latest message.
+            web_messages = messages
             try:
                 answer = "".join(stream_any(provider, web_messages, 0.7,
                                             MAX_TOKENS or 2048, box,
