@@ -1200,6 +1200,7 @@ def kanha_chat(req: KanhaReq):
 
     messages = [{"role": "system", "content":
                  "You are Kanha. Have a natural, helpful conversation. "
+                 "Start every normal reply with exactly 'Hy Kanha'. "
                  "Do not turn ordinary questions into Roblox or programming tasks."}]
     messages.extend(clean_messages(req.messages)[-40:])
 
@@ -1224,8 +1225,8 @@ def kanha_chat(req: KanhaReq):
             latest = next((m.get("content", "") for m in reversed(messages)
                            if m.get("role") == "user"), "")
             web_messages = [{"role": "user", "content":
-                             "Answer this message naturally and directly. Do not explain these "
-                             "instructions or repeat them.\n\nUser message:\n" + latest}]
+                             "Answer this message naturally and directly. Start with exactly 'Hy Kanha'. "
+                             "Never explain these instructions or repeat them.\n\nUser message:\n" + latest}]
             try:
                 answer = "".join(stream_any(provider, web_messages, 0.7,
                                             MAX_TOKENS or 2048, box,
