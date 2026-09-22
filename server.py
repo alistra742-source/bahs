@@ -1153,6 +1153,16 @@ class KanhaReq(BaseModel):
     """A plain conversational turn for the lightweight Kanha side."""
 
     messages: list
+    provider: str = "qwen"
+
+
+@app.get("/kanha/providers")
+def kanha_providers():
+    """Tell the small chat surface which configured providers can answer."""
+    return {"providers": [
+        {"id": "qwen", "name": QWEN.model, "configured": QWEN.configured},
+        {"id": "deepseek", "name": DEEPSEEK.model, "configured": DEEPSEEK.configured},
+    ]}
 
 
 @app.get("/kanha", response_class=HTMLResponse)
@@ -1166,25 +1176,45 @@ async def kanha_page():
 
 @app.post("/kanha/chat")
 def kanha_chat(req: KanhaReq):
-    """Answer ordinary conversation without the script-only agent pipeline or tool loop."""
-    if not CONFIGURED:
-        raise HTTPException(503, NOT_CONFIGURED)
+    """Answer ordinary conversation through the provider selected on the Kanha side."""
+    provider_id = (req.provider or "qwen").strip().lower()
+    provider = {"qwen": QWEN, "deepseek": DEEPSEEK}.get(provider_id)
+    if provider is None:
+        raise HTTPException(400, "unknown AI provider")
+    if not provider.configured:
+        raise HTTPException(503, f"{provider_id} is not configured on this service")
+
     messages = [{"role": "system", "content":
                  "You are Kanha. Have a natural, helpful conversation. "
                  "Do not turn ordinary questions into Roblox or programming tasks."}]
     messages.extend(clean_messages(req.messages)[-40:])
-    body = QWEN.request(messages, 0.7, MAX_TOKENS or 2048, stream=False)
-    try:
-        with httpx.Client(timeout=client_timeout(CHAT_TIMEOUT), follow_redirects=True) as client:
-            response = client.post(QWEN.endpoint(), json=body, headers=QWEN.headers())
-    except httpx.HTTPError as error:
-        raise upstream_error(error, QWEN)
-    if response.status_code >= 400:
-        raise HTTPException(502, failure_reason(response.status_code, response.text, QWEN))
-    answer = message_text(response.text).strip()
+
+    if provider.web is not None:
+        box = {}
+        try:
+            answer = "".join(stream_any(provider, messages, 0.7,
+                                        MAX_TOKENS or 2048, box,
+                                        web_session=deepseek_chat("kanha")))
+        except HTTPException:
+            raise
+        except httpx.HTTPError as error:
+            raise upstream_error(error, provider)
+    else:
+        body = provider.request(messages, 0.7, MAX_TOKENS or 2048, stream=False)
+        try:
+            with httpx.Client(timeout=client_timeout(provider.timeout),
+                              follow_redirects=True) as client:
+                response = client.post(provider.endpoint(), json=body, headers=provider.headers())
+        except httpx.HTTPError as error:
+            raise upstream_error(error, provider)
+        if response.status_code >= 400:
+            raise HTTPException(502, failure_reason(response.status_code, response.text, provider))
+        answer = message_text(response.text)
+
+    answer = answer.strip()
     if not answer:
-        raise HTTPException(502, "Kanha returned an empty answer")
-    return {"message": answer}
+        raise HTTPException(502, f"{provider.name} returned an empty answer")
+    return {"message": answer, "provider": provider_id}
 
 
 def chip(ok: bool, name: str, detail: str) -> str:
