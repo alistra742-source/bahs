@@ -514,7 +514,7 @@ class DeepSeekWeb:
         return ""
 
     def stream(self, prompt: str, box: Optional[dict] = None,
-               session: Optional[WebSession] = None):
+               session: Optional[WebSession] = None, thinking: Optional[bool] = None):
         """Send one prompt and stream the answer back.
 
         With a session, this is the next message in that chat: the turns before it are already
@@ -543,14 +543,15 @@ class DeepSeekWeb:
                 print(f"[deepseek] the challenge (difficulty {challenge.get('difficulty')}) was not "
                       "solved; this message goes out without the header, which the API answers "
                       "with 40300 MISSING_HEADER", flush=True)
+        use_thinking = self.thinking if thinking is None else thinking
         print(f"[deepseek] sending {len(prompt)} chars (thinking "
-              f"{'on' if self.thinking else 'off'}, search off)", flush=True)
+              f"{'on' if use_thinking else 'off'}, search off)", flush=True)
         payload = {
             "chat_session_id": session.id,
             "parent_message_id": parent,
             "prompt": prompt,
             "ref_file_ids": [],
-            "thinking_enabled": self.thinking,
+            "thinking_enabled": use_thinking,
             "search_enabled": False,
         }
         with self._client() as c:

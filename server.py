@@ -301,7 +301,8 @@ def require_key(x_api_key: Optional[str] = Header(None),
 # stream, and what a failure means -- is in bridge.py, next to the provider itself.
 
 def stream_any(provider, messages: list, temperature: Optional[float], max_tokens: int, box: dict,
-               tools: Optional[list] = None, web_session: object = None):
+               tools: Optional[list] = None, web_session: object = None,
+               web_thinking: Optional[bool] = None):
     """One model call, on whichever transport that provider uses.
 
     Two of the three speak OpenAI-shaped HTTP, and that path is `bridge.stream_call`. The third is
@@ -312,7 +313,8 @@ def stream_any(provider, messages: list, temperature: Optional[float], max_token
     if provider.web is not None:
         pieces: list = []
         try:
-            for piece in provider.web.stream(as_prompt(messages), box, web_session):
+            for piece in provider.web.stream(as_prompt(messages), box, web_session,
+                                             thinking=web_thinking):
                 pieces.append(piece)
                 yield piece
         except httpx.HTTPError as e:
@@ -1176,6 +1178,19 @@ async def kanha_page():
         return HTMLResponse("<h1>Hy kanha</h1><p>kanha.html is missing.</p>", status_code=500)
 
 
+def kanha_answer(text: str) -> str:
+    """Return only the direct reply if a web model leaks a short planning wrapper."""
+    answer = strip_metadata(text or "").strip()
+    lower = answer.lower()
+    if lower.startswith(("need answer", "user says", "we are kanha")):
+        for marker in ("Natural.", "Final:"):
+            position = lower.rfind(marker.lower())
+            if position >= 0:
+                answer = answer[position + len(marker):].strip()
+                break
+    return answer
+
+
 @app.post("/kanha/chat")
 def kanha_chat(req: KanhaReq):
     """Answer ordinary conversation through the provider selected on the Kanha side."""
@@ -1203,10 +1218,19 @@ def kanha_chat(req: KanhaReq):
 
         if provider.web is not None:
             box = {}
+            # The web transport has no system-role channel. Send only the latest user text and
+            # disable its visible reasoning for Kanha, otherwise the site can echo the instruction
+            # instead of answering the person.
+            latest = next((m.get("content", "") for m in reversed(messages)
+                           if m.get("role") == "user"), "")
+            web_messages = [{"role": "user", "content":
+                             "Answer this message naturally and directly. Do not explain these "
+                             "instructions or repeat them.\n\nUser message:\n" + latest}]
             try:
-                answer = "".join(stream_any(provider, messages, 0.7,
+                answer = "".join(stream_any(provider, web_messages, 0.7,
                                             MAX_TOKENS or 2048, box,
-                                            web_session=deepseek_chat("kanha")))
+                                            web_session=deepseek_chat("kanha-direct"),
+                                            web_thinking=False))
             except HTTPException:
                 raise
             except httpx.HTTPError as error:
@@ -1225,7 +1249,7 @@ def kanha_chat(req: KanhaReq):
                                                         response.text, provider))
             answer = message_text(response.text)
 
-    answer = strip_metadata(answer).strip()
+    answer = kanha_answer(answer)
     if not answer:
         raise HTTPException(502, f"{mode} returned an empty answer")
     return {"message": answer, "mode": mode}
