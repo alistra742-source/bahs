@@ -33,6 +33,7 @@ showing a paragraph where the script goes. The exception is a list of calls for 
 client runs those calls and asks its next question with what they found.
 """
 from bridge import *  # noqa: F401,F403 -- the providers, the config and the session stores
+from browser import BrowserUnavailable, browser_manager
 from thoughts import stream_with_thoughts  # the same writer's stream, its thinking kept
 from luau import (TOOLS, TOOL_NAMES, deliver, executor_state, run as run_tool, take_script,
                   tool_state, tools_enabled)  # noqa: F401 -- the toolbox
@@ -1157,6 +1158,7 @@ class KanhaReq(BaseModel):
     messages: list
     mode: str = "qwen"
     provider: str = ""  # accepted for compatibility with the earlier picker
+    files: list[str] = []  # attachment ids uploaded for the newest user message
 
 
 KANHA_PROMPT_PATHS = (
@@ -1179,6 +1181,64 @@ def kanha_prompt() -> str:
     raise HTTPException(500, f"send.txt is unavailable; searched: {searched}")
 
 
+BROWSER_COMMANDS = """Browser commands available in every Kanha prompt:
+%Start% or %Start(https://example.com)% starts an isolated browser.
+%Enter(https://example.com)% navigates it.
+%Click(selector)% clicks the first matching CSS selector.
+%Ss% captures the current browser viewport and sends the photo to the AI.
+%Status% reports the current browser page.
+%Stop% closes the browser session.
+Only these commands are supported; arbitrary JavaScript, shell commands, downloads, and filesystem access are not.
+"""
+
+
+class BrowserCommandReq(BaseModel):
+    session: str = ""
+    command: str
+    url: str = ""
+    selector: str = ""
+
+
+@app.post("/api/kanha/browser")
+def kanha_browser_command(req: BrowserCommandReq):
+    """Execute one explicit browser command and return status or a screenshot attachment."""
+    command = (req.command or "").strip()
+    try:
+        if command in ("%Start%", "%Start"):
+            result = browser_manager.start(req.url or "about:blank")
+            return {"ok": True, "command": command, **result}
+        if command.startswith("%Start(") and command.endswith(")%"):
+            result = browser_manager.start(command[7:-2].strip() or "about:blank")
+            return {"ok": True, "command": command, **result}
+        if not req.session:
+            raise ValueError("start the browser first with %Start%")
+        if command.startswith("%Enter(") and command.endswith(")%"):
+            return {"ok": True, "command": command, **browser_manager.enter(req.session, command[7:-2].strip())}
+        if command.startswith("%Click(") and command.endswith(")%"):
+            return {"ok": True, "command": command, **browser_manager.click(req.session, command[7:-2])}
+        if command == "%Status%":
+            return {"ok": True, "command": command, **browser_manager.status(req.session)}
+        if command == "%Ss%":
+            shot = browser_manager.screenshot(req.session)
+            kept = attach_put("browser-screenshot.png", base64.b64decode(shot.pop("data")), "image/png", "kanha-browser")
+            return {"ok": True, "command": command, "attachment": kept, **shot}
+        if command == "%Stop%":
+            browser_manager.close(req.session)
+            return {"ok": True, "command": command, "session": req.session, "closed": True}
+        raise ValueError("unknown browser command; use %Start%, %Enter(url)%, %Click(selector)%, %Ss%, %Status%, or %Stop%")
+    except BrowserUnavailable as error:
+        raise HTTPException(503, str(error))
+    except ValueError as error:
+        raise HTTPException(400, str(error))
+    except Exception as error:
+        raise HTTPException(502, f"browser command failed: {error}")
+
+
+@app.get("/api/kanha/browser/commands")
+def kanha_browser_commands():
+    return {"commands": BROWSER_COMMANDS}
+
+
 @app.get("/kanha/providers")
 def kanha_providers():
     """Tell the small chat surface which configured modes can answer."""
@@ -1198,6 +1258,37 @@ async def kanha_page():
         return HTMLResponse("<h1>Ghaith</h1><p>kanha.html is missing.</p>", status_code=500)
 
 
+@app.post("/api/kanha/upload")
+def kanha_upload(req: AttachReq):
+    """Upload a file for the normal browser chat without exposing the Roblox client API."""
+    raw = (req.data or "").strip()
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[-1]
+    if not raw:
+        raise HTTPException(400, "data is empty: send the file as base64")
+    try:
+        blob = base64.b64decode(raw, validate=False)
+    except ValueError:
+        raise HTTPException(400, "data is not base64")
+    return attach_put(req.name, blob, req.mime, "kanha-browser")
+
+
+def kanha_output_files(text: str, base_url: str = "") -> list:
+    """Turn fenced code in a reply into short-lived downloadable files."""
+    outputs = []
+    for index, match in enumerate(re.finditer(r"```([A-Za-z0-9_+-]*)\\s*\\n(.*?)```", text or "", re.S), 1):
+        language = (match.group(1) or "txt").lower()
+        extension = {"js": "js", "javascript": "js", "py": "py", "python": "py",
+                     "lua": "lua", "luau": "lua", "json": "json", "html": "html",
+                     "css": "css", "ts": "ts", "typescript": "ts"}.get(language, "txt")
+        content = match.group(2).strip() + "\\n"
+        kept = attach_put(f"ghaith-reply-{index}.{extension}", content.encode("utf-8"),
+                          "text/plain", "kanha-output")
+        kept["url"] = f"{base_url}/attach/{kept['id']}" if base_url else f"/attach/{kept['id']}"
+        outputs.append(kept)
+    return outputs[:8]
+
+
 def kanha_answer(text: str) -> str:
     """Return only a direct Ghaith reply if a provider leaks its planning wrapper."""
     answer = strip_metadata(text or "").strip()
@@ -1215,8 +1306,9 @@ def kanha_answer(text: str) -> str:
     return f"Ghaith\n\n{answer}" if answer else answer
 
 
+@app.post("/api/kanha/chat")
 @app.post("/kanha/chat")
-def kanha_chat(req: KanhaReq):
+def kanha_chat(req: KanhaReq, request: Request):
     """Answer ordinary conversation through the provider selected on the Kanha side."""
     mode = (req.mode or req.provider or "qwen").strip().lower()
     if mode not in ("qwen", "deepseek", "agent"):
@@ -1228,11 +1320,16 @@ def kanha_chat(req: KanhaReq):
                  "Start every normal reply with exactly 'Ghaith'. "
                  "Do not turn ordinary questions into Roblox or programming tasks."}]
     messages.extend(clean_messages(req.messages)[-40:])
+    if req.files:
+        messages[-1] = {**messages[-1], "content": str(messages[-1].get("content", ""))
+                       + "\\n\\nAttached files: " + ", ".join(req.files)}
 
     if mode == "agent":
         if not (QWEN.configured and DEEPSEEK.configured):
             raise HTTPException(503, "Agent mode needs both Qwen and DeepSeek configured")
-        job = start_job(messages[1:], 0.7, "kanha", None, MODE_AGENT, "", [])
+        job = start_job(messages[1:], 0.7, "kanha", None, MODE_AGENT, "", req.files)
+        job.question = text_of(messages[-1].get("content"))
+        job.base_url = str(request.base_url).rstrip("/")
         job.wait(job_wait())
         if job.status == "error":
             raise HTTPException(502, job.error)

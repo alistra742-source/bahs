@@ -43,12 +43,14 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install --with-deps chromium
 
 # Kanha's complete DeepSeek system prompt must be present at runtime.
 COPY send.txt ./send.txt
 COPY server.py ./
 COPY bridge.py ./
+COPY browser.py ./
 COPY state.py ./
 COPY luau.py ./
 COPY pow_solver.py ./

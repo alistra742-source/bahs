@@ -1013,11 +1013,12 @@ def with_attachments(messages: list, attach_ids, base_url: str = "", question: s
     return messages
 
 
-def attach_note(attach_ids) -> str:
+def attach_note(attach_ids, include_text: bool = False) -> str:
     """What a model with no vision is told about the files it cannot see.
 
     DeepSeek is the planner in agent mode and gets this instead, so its plan is written for a
     question that has a picture with it rather than pretending the question was all there was.
+    Browser Kanha chat can include readable document text, while images remain attachment metadata.
     """
     names = []
     for attach_id in list(attach_ids or [])[:ATTACH_MAX]:
@@ -1026,9 +1027,16 @@ def attach_note(attach_ids) -> str:
             names.append(f"{found['name']} ({found['kind']}, {found['bytes'] / 1024:.0f} KB)")
     if not names:
         return ""
-    return ("[The caller attached: " + "; ".join(names) + ". You cannot see attached files, so do "
-            "not describe them or guess at their contents: plan for the question, and say what the "
-            "writer -- which can see them -- should take from them.]")
+    details = ("[The caller attached: " + "; ".join(names) + ". You cannot see images, so do not "
+               "describe or guess at their contents. For readable documents, use the text below.]")
+    if include_text:
+        snippets = []
+        for attach_id in list(attach_ids or [])[:ATTACH_MAX]:
+            found = attach_get(attach_id)
+            if found and found["kind"] == "document" and found["mime"].startswith("text/"):
+                snippets.append(f"\\n\\n--- {found['name']} ---\\n{attach_text(found, 120000)}")
+        details += "".join(snippets)
+    return details
 
 
 def with_note(messages: list, note: str) -> list:
