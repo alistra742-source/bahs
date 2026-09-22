@@ -3,13 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hy kanha</title>
+<title>Hy Kanha</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1017;--panel:#151a24;--line:#283142;--text:#eef2f8;--muted:#8995aa;--accent:#9fe870}
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;background:radial-gradient(800px 500px at 50% -20%,#263b36 0%,transparent 65%),var(--bg);color:var(--text);font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif}
 main{width:min(760px,100%);min-height:100vh;margin:auto;padding:clamp(28px,8vh,86px) 18px 24px;display:flex;flex-direction:column}
-h1{margin:0 0 30px;font-size:clamp(32px,7vw,58px);font-weight:600;letter-spacing:-.06em;text-align:center}
+h1{margin:0 0 18px;font-size:clamp(32px,7vw,58px);font-weight:600;letter-spacing:-.06em;text-align:center}
+.mode{display:block;margin:0 auto 12px;background:var(--panel);border:1px solid var(--line);border-radius:10px;color:var(--text);padding:8px 12px;font:inherit;outline:none}
 #conversation{flex:1;display:flex;flex-direction:column;gap:16px;padding:12px 0 28px;overflow:auto}
 .empty{margin:auto;color:var(--muted);font-size:14px;text-align:center}
 .message{max-width:88%;padding:13px 16px;border:1px solid var(--line);border-radius:18px;white-space:pre-wrap;overflow-wrap:anywhere}
@@ -27,6 +28,11 @@ button:disabled{opacity:.5;cursor:default}
 <body>
 <main>
   <h1>Hy Kanha</h1>
+  <select id="mode" class="mode" aria-label="Choose mode">
+    <option value="qwen">Qwen</option>
+    <option value="deepseek">DeepSeek</option>
+    <option value="agent">Agent</option>
+  </select>
   <section id="conversation" aria-live="polite">
     <div class="empty">What’s on your mind?</div>
   </section>
@@ -42,6 +48,7 @@ button:disabled{opacity:.5;cursor:default}
   var prompt = document.getElementById("prompt");
   var send = document.getElementById("send");
   var error = document.getElementById("error");
+  var mode = document.getElementById("mode");
   var messages = [];
 
   function addMessage(role, text) {
@@ -67,7 +74,7 @@ button:disabled{opacity:.5;cursor:default}
       var response = await fetch("/kanha/chat", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({messages: messages})
+        body: JSON.stringify({messages: messages, mode: mode.value})
       });
       var data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Kanha could not answer");
