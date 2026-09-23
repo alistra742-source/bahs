@@ -92,6 +92,52 @@ class BrowserManager:
         data = self._run(session_id, lambda page: page.screenshot(type="png", full_page=False))
         return {**self.status(session_id), "mime": "image/png", "data": base64.b64encode(data).decode("ascii")}
 
+    # The whole point of a screenshot for a model that cannot hover: the clickable things on the
+    # page, with a selector it can hand straight to %Click(...)% and the words it can tell them
+    # apart by. Built in the page's own DOM, so the selectors are real -- everything visible,
+    # buttons and links and the form fields that take a click, in the order they are on the page.
+    _SELECTOR_JS = """
+    () => {
+      const nodes = Array.from(document.querySelectorAll(
+        'a[href], button, input, select, textarea, [role=button], [onclick], [tabindex]'));
+      const out = [];
+      for (const el of nodes) {
+        if (out.length >= 120) break;
+        const box = el.getBoundingClientRect();
+        if (box.width < 2 || box.height < 2) continue;
+        if (el.getAttribute('aria-hidden') === 'true' || el.disabled) continue;
+        const label = (el.innerText || el.value || el.getAttribute('aria-label')
+                       || el.getAttribute('placeholder') || el.getAttribute('title') || '')
+          .trim().replace(/\s+/g, ' ').slice(0, 60);
+        out.push({label: label, selector: out_selector(el)});
+      }
+      function out_selector(el) {
+        const tag = el.tagName.toLowerCase();
+        const id = el.id;
+        if (id) return '#' + CSS.escape(id);
+        const name = el.getAttribute('name');
+        const testid = el.getAttribute('data-testid') || el.getAttribute('data-test');
+        if (testid) return tag + '[data-testid="' + testid + '"]';
+        if (name) return tag + '[name="' + name + '"]';
+        const parent = el.parentElement;
+        if (!parent) return tag;
+        const same = Array.from(parent.children).filter(c =>
+          c.tagName === el.tagName);
+        const index = same.indexOf(el) + 1;
+        const parent_sel = out_selector(parent);
+        return parent_sel + ' > ' + tag + ':nth-child(' + index + ')';
+      }
+      return out;
+    }
+    """
+
+    def selectors(self, session_id: str) -> dict:
+        """Every clickable element on the page, as the selector and the words it carries."""
+        async def action(page):
+            return await page.evaluate(self._SELECTOR_JS)
+        found = self._run(session_id, action) or []
+        return {**self.status(session_id), "count": len(found), "selectors": found[:120]}
+
     def close(self, session_id: str) -> None:
         with self._lock:
             session = self._sessions.pop(session_id, None)

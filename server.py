@@ -1185,6 +1185,7 @@ BROWSER_COMMANDS = """Browser commands available in every Kanha prompt:
 %Start% or %Start(https://example.com)% starts an isolated browser.
 %Enter(https://example.com)% navigates it.
 %Click(selector)% clicks the first matching CSS selector.
+%Sels% lists every clickable element on the current page, as the selector and its label -- read it, then %Click% one.
 %Ss% captures the current browser viewport and sends the photo to the AI.
 %Status% reports the current browser page.
 %Stop% closes the browser session.
@@ -1216,6 +1217,8 @@ def kanha_browser_command(req: BrowserCommandReq):
             return {"ok": True, "command": command, **browser_manager.enter(req.session, command[7:-2].strip())}
         if command.startswith("%Click(") and command.endswith(")%"):
             return {"ok": True, "command": command, **browser_manager.click(req.session, command[7:-2])}
+        if command == "%Sels%":
+            return {"ok": True, "command": command, **browser_manager.selectors(req.session)}
         if command == "%Status%":
             return {"ok": True, "command": command, **browser_manager.status(req.session)}
         if command == "%Ss%":
@@ -1225,7 +1228,7 @@ def kanha_browser_command(req: BrowserCommandReq):
         if command == "%Stop%":
             browser_manager.close(req.session)
             return {"ok": True, "command": command, "session": req.session, "closed": True}
-        raise ValueError("unknown browser command; use %Start%, %Enter(url)%, %Click(selector)%, %Ss%, %Status%, or %Stop%")
+        raise ValueError("unknown browser command; use %Start%, %Enter(url)%, %Click(selector)%, %Sels%, %Ss%, %Status%, or %Stop%")
     except BrowserUnavailable as error:
         raise HTTPException(503, str(error))
     except ValueError as error:
@@ -1276,12 +1279,12 @@ def kanha_upload(req: AttachReq):
 def kanha_output_files(text: str, base_url: str = "") -> list:
     """Turn fenced code in a reply into short-lived downloadable files."""
     outputs = []
-    for index, match in enumerate(re.finditer(r"```([A-Za-z0-9_+-]*)\\s*\\n(.*?)```", text or "", re.S), 1):
+    for index, match in enumerate(re.finditer(r"```([A-Za-z0-9_+-]*)\s*\n(.*?)```", text or "", re.S), 1):
         language = (match.group(1) or "txt").lower()
         extension = {"js": "js", "javascript": "js", "py": "py", "python": "py",
                      "lua": "lua", "luau": "lua", "json": "json", "html": "html",
                      "css": "css", "ts": "ts", "typescript": "ts"}.get(language, "txt")
-        content = match.group(2).strip() + "\\n"
+        content = match.group(2).strip() + "\n"
         kept = attach_put(f"ghaith-reply-{index}.{extension}", content.encode("utf-8"),
                           "text/plain", "kanha-output")
         kept["url"] = f"{base_url}/attach/{kept['id']}" if base_url else f"/attach/{kept['id']}"
@@ -1292,6 +1295,9 @@ def kanha_output_files(text: str, base_url: str = "") -> list:
 def kanha_answer(text: str) -> str:
     """Return only a direct Ghaith reply if a provider leaks its planning wrapper."""
     answer = strip_metadata(text or "").strip()
+    # The writers reason inside <thinking> tags, and a tag never belongs to the reader: cut the
+    # whole block out before anything else looks at the answer.
+    answer = re.sub(r"<thinking>.*?</thinking>", "", answer, flags=re.S | re.I).strip()
     lower = answer.lower()
     if lower.startswith(("need answer", "user says", "we are kanha", "we are ghaith")):
         for marker in ("Natural.", "Final:"):
@@ -1299,10 +1305,11 @@ def kanha_answer(text: str) -> str:
             if position >= 0:
                 answer = answer[position + len(marker):].strip()
                 break
-    if answer.lower().startswith("hy kanha"):
-        answer = answer[len("hy kanha"):].lstrip(" :,-\n")
-    if answer.lower().startswith("ghaith"):
-        answer = answer[len("ghaith"):].lstrip(" :,-\n")
+    # The models address the caller as the greeting asks -- "[Ghaith] ..." -- and a reader is
+    # given the plain reply: every marker the model put on comes off here, whatever follows it.
+    answer = re.sub(r"^\[?hy kanha\]?\s*", "", answer, flags=re.I)
+    answer = re.sub(r"^\[?ghaith\]?\s*[:,-]?\s*", "", answer, flags=re.I)
+    # One greeting, put on exactly once, here: the page and the prompt both stay out of it.
     return f"Ghaith\n\n{answer}" if answer else answer
 
 
@@ -1317,19 +1324,22 @@ def kanha_chat(req: KanhaReq, request: Request):
     messages = [{"role": "system", "content": kanha_prompt()},
                 {"role": "system", "content":
                  "You are Ghaith. Have a natural, helpful conversation. "
-                 "Start every normal reply with exactly 'Ghaith'. "
                  "Do not turn ordinary questions into Roblox or programming tasks."}]
     messages.extend(clean_messages(req.messages)[-40:])
     if req.files:
         messages[-1] = {**messages[-1], "content": str(messages[-1].get("content", ""))
-                       + "\\n\\nAttached files: " + ", ".join(req.files)}
+                       + "\\n\\n[The caller attached: " + ", ".join(req.files) + ".]"}
 
+    base_url = request_base(request)
     if mode == "agent":
         if not (QWEN.configured and DEEPSEEK.configured):
             raise HTTPException(503, "Agent mode needs both Qwen and DeepSeek configured")
-        job = start_job(messages[1:], 0.7, "kanha", None, MODE_AGENT, "", req.files)
-        job.question = text_of(messages[-1].get("content"))
-        job.base_url = str(request.base_url).rstrip("/")
+        job = start_job(messages[1:], 0.7, "kanha", None, MODE_AGENT, "", req.files,
+                        request=request)
+        # start_job attaches to the question as the model will read it -- greeting and all --
+        # so set it off the turns it built rather than off the raw message, or a picture the
+        # caller sent would ride on a turn the provider never sees.
+        job.question = last_user_text(job.turns)
         job.wait(job_wait())
         if job.status == "error":
             raise HTTPException(502, job.error)
@@ -1344,7 +1354,9 @@ def kanha_chat(req: KanhaReq, request: Request):
             # DeepSeek web chat has no system-role channel, so `as_prompt` folds these in order.
             # send.txt must be the first content, followed by the direct-answer rule and the full
             # conversation; never replace it with a generated summary of only the latest message.
-            web_messages = messages
+            # It has no vision either, so what was attached arrives as its words rather than as a
+            # file the transport cannot read.
+            web_messages = with_note(messages, attach_note(req.files, include_text=True))
             try:
                 answer = "".join(stream_any(provider, web_messages, 0.7,
                                             MAX_TOKENS or 2048, box,
@@ -1355,7 +1367,13 @@ def kanha_chat(req: KanhaReq, request: Request):
             except httpx.HTTPError as error:
                 raise upstream_error(error, provider)
         else:
-            body = provider.request(messages, 0.7, MAX_TOKENS or 2048, stream=False)
+            # Qwen reads the file itself -- a picture as a data URI, a document as a URL it
+            # fetches from this service. DeepSeek's API transport has neither vision nor a
+            # fetcher, so it is told what is attached and handed the words instead.
+            outgoing = (with_attachments(messages, req.files, base_url)
+                        if provider in QWEN_PROVIDERS
+                        else with_note(messages, attach_note(req.files, include_text=True)))
+            body = provider.request(outgoing, 0.7, MAX_TOKENS or 2048, stream=False)
             try:
                 with httpx.Client(timeout=client_timeout(provider.timeout),
                                   follow_redirects=True) as client:
@@ -1371,7 +1389,7 @@ def kanha_chat(req: KanhaReq, request: Request):
     answer = kanha_answer(answer)
     if not answer:
         raise HTTPException(502, f"{mode} returned an empty answer")
-    return {"message": answer, "mode": mode}
+    return {"message": answer, "mode": mode, "files": kanha_output_files(answer, base_url)}
 
 
 def chip(ok: bool, name: str, detail: str) -> str:
