@@ -382,7 +382,17 @@ class RateMeter:
     ``recent`` is what the dashboard shows, because a scan that slows down
     halfway should report the slowdown rather than the flattering average of
     everything before it.
+
+    Both rates divide by an elapsed time, and a batch of checks that lands in
+    the same instant -- or a scan that finishes before its first second -- makes
+    that divisor ~0 and reports thousands of checks a second. The divisor is
+    therefore floored at ``_MIN_RATE_SPAN``: a rate is never a number the clock
+    cannot support.
     """
+
+    # Shortest span a reported rate may be computed over. Below this the count
+    # is divided by this instead, capping the figure at a plausible value.
+    _MIN_RATE_SPAN = 0.2
 
     def __init__(self, window: float = 5.0) -> None:
         self.started = time.perf_counter()
@@ -407,12 +417,11 @@ class RateMeter:
         if not self._marks:
             return 0.0
         span = time.perf_counter() - self._marks[0]
-        return len(self._marks) / span if span > 0 else float(len(self._marks))
+        return len(self._marks) / max(span, self._MIN_RATE_SPAN)
 
     @property
     def average(self) -> float:
-        elapsed = self.elapsed
-        return self.count / elapsed if elapsed > 0 else 0.0
+        return self.count / max(self.elapsed, self._MIN_RATE_SPAN)
 
 
 # --- the batch ------------------------------------------------------------
