@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 from checker import CheckResult
 from config import (
+    FAIL_COOLDOWN,
+    MAX_DEAD_REMEMBERED,
     MAX_FAILURES,
     MAX_LATENCY_MS,
     STALE_AFTER,
@@ -71,6 +73,14 @@ class ProxyStore:
     def __init__(self, path: str) -> None:
         self.path = path
         self.records: dict[str, ProxyRecord] = {}
+        # Cumulative, survives restarts. total_seen counts distinct proxies ever
+        # tracked; total_checks counts every validation run, dead or alive.
+        self.total_seen = 0
+        self.total_checks = 0
+        # proxy key -> unix timestamp of the last time it failed. Kept for
+        # FAIL_COOLDOWN so a scrape that re-offers a host we just proved dead
+        # does not spend another timeout on it.
+        self.dead: dict[str, float] = {}
 
     # --- mutation ---------------------------------------------------------
     def upsert(self, result: CheckResult, now: float | None = None) -> ProxyRecord:
@@ -86,6 +96,8 @@ class ProxyStore:
                 last_checked=now,
             )
             self.records[result.proxy] = record
+            self.total_seen += 1
+        self.total_checks += 1
 
         record.last_checked = now
         if result.ok:
@@ -138,11 +150,30 @@ class ProxyStore:
         drop = [
             key
             for key, rec in self.records.items()
-            if rec.fail_count >= MAX_FAILURES or (now - rec.last_checked) > STALE_AFTER
+            if rec.fail_count >= MAX_FAILURES
+            # A proxy that has never once answered is dropped on its first
+            # failure. Re-checking it every cycle would spend the whole
+            # timeout budget on hosts that are already known dead.
+            or (rec.last_ok is None and rec.fail_count >= 1)
+            or (now - rec.last_checked) > STALE_AFTER
         ]
         for key in drop:
             del self.records[key]
+        self.remember_dead(drop, now)
         return len(drop)
+
+    def remember_dead(self, keys: Iterable[str], now: float | None = None) -> None:
+        """Record failed proxies so the next scrape can skip them for a while."""
+        if FAIL_COOLDOWN <= 0:
+            return
+        now = now if now is not None else time.time()
+        for key in keys:
+            self.dead[key] = now
+        if len(self.dead) > MAX_DEAD_REMEMBERED:
+            # Oldest failures are the most likely to have recovered; forget them
+            # first so the list cannot grow without bound.
+            for key in sorted(self.dead, key=self.dead.get)[: len(self.dead) - MAX_DEAD_REMEMBERED]:
+                del self.dead[key]
 
     # --- query ------------------------------------------------------------
     def query(
@@ -181,6 +212,9 @@ class ProxyStore:
             by_proto[r.protocol] = by_proto.get(r.protocol, 0) + 1
         return {
             "total_tracked": len(self.records),
+            "total_seen": self.total_seen,
+            "total_checks": self.total_checks,
+            "dead_remembered": len(self.dead),
             "alive": len(alive),
             "by_platform": by_platform,
             "by_anonymity": by_anon,
@@ -192,9 +226,14 @@ class ProxyStore:
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        payload = {
+            "counters": {"total_seen": self.total_seen, "total_checks": self.total_checks},
+            "records": {k: asdict(v) for k, v in self.records.items()},
+            "dead": {k: round(v, 1) for k, v in self.dead.items()},
+        }
         tmp = f"{self.path}.tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({k: asdict(v) for k, v in self.records.items()}, handle)
+            json.dump(payload, handle)
         os.replace(tmp, self.path)
 
     def load(self) -> None:
@@ -206,15 +245,54 @@ class ProxyStore:
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("store load failed (%s); starting empty", exc)
             return
-        for key, payload in raw.items():
+        if not isinstance(raw, dict):
+            log.warning("store file is not an object; starting empty")
+            return
+        # Files written before counters existed are a bare map of records.
+        if "records" in raw:
+            records = raw.get("records") or {}
+            counters = raw.get("counters") or {}
+            self.total_seen = int(counters.get("total_seen") or 0)
+            self.total_checks = int(counters.get("total_checks") or 0)
+            remembered = raw.get("dead") or {}
+            if isinstance(remembered, dict):
+                self.dead = {str(k): float(v) for k, v in remembered.items()
+                             if isinstance(v, (int, float))}
+        else:
+            records = raw
+        if not isinstance(records, dict):
+            log.warning("store records are not an object; starting empty")
+            return
+        for key, payload in records.items():
             try:
                 self.records[key] = ProxyRecord(**payload)
             except TypeError:
                 continue
-        log.info("store loaded: %d records", len(self.records))
+        # A file from before the counters existed still knows how many it holds.
+        self.total_seen = max(self.total_seen, len(self.records))
+        self.total_checks = max(self.total_checks, self.total_seen)
+        log.info("store loaded: %d records, %d seen, %d checks",
+                 len(self.records), self.total_seen, self.total_checks)
 
-    def candidate_proxies(self, fresh: Iterable[str]) -> list[str]:
-        """Newly scraped proxies merged with still-tracked ones, for a re-validate pass."""
-        known = set(self.records.keys())
-        merged = list(dict.fromkeys([*fresh, *known]))
-        return merged
+    def candidate_proxies(self, fresh: Iterable[str], now: float | None = None) -> list[str]:
+        """Known-good proxies first, then new ones, then known-dead.
+
+        A cycle re-validates the working set before it spends budget on a fresh
+        scrape, so the served list refills in the first seconds of a cycle
+        instead of only at the end of it. Hosts remembered as dead inside
+        FAIL_COOLDOWN are dropped from the incoming scrape entirely -- a free
+        list hands back the same dead addresses every time, and checking them
+        again is what made a cycle slow.
+        """
+        now = now if now is not None else time.time()
+        alive: list[str] = []
+        dead: list[str] = []
+        for key, rec in self.records.items():
+            (alive if rec.fail_count == 0 and rec.last_ok is not None else dead).append(key)
+
+        def cooling(key: str) -> bool:
+            at = self.dead.get(key)
+            return at is not None and (now - at) < FAIL_COOLDOWN
+
+        fresh_live = [k for k in dict.fromkeys(fresh) if not cooling(k)]
+        return list(dict.fromkeys([*alive, *fresh_live, *dead]))

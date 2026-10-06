@@ -155,34 +155,39 @@ async def check_proxy(proxy: str, direct_ip: str | None) -> CheckResult:
             timeout=timeout,
             follow_redirects=True,
         ) as client:
+            # Judge and platform probes are independent, so both start at once:
+            # an alive proxy pays one round trip instead of two. The judge is
+            # still the gate -- a proxy it rejects has its probes cancelled
+            # rather than awaited, so a dead host costs only the connect timeout.
             started = time.perf_counter()
-            payload: object = {}
-            judge_error = ""
+            probes = asyncio.create_task(probe_all(client, timeout))
             try:
-                resp = await client.get(JUDGE_URL, timeout=timeout)
-                resp.raise_for_status()
-                payload = resp.json() if _is_json(resp) else {}
-                if not payload:
-                    payload = {"origin": _origin_from_text(resp.text) or None}
-            except httpx.HTTPError as exc:
-                judge_error = f"judge:{type(exc).__name__}"
+                payload: object = {}
+                try:
+                    resp = await client.get(JUDGE_URL, timeout=timeout)
+                    resp.raise_for_status()
+                    payload = resp.json() if _is_json(resp) else {}
+                    if not payload:
+                        payload = {"origin": _origin_from_text(resp.text) or None}
+                except httpx.HTTPError as exc:
+                    result.error = f"judge:{type(exc).__name__}"
+                    return result
 
-            latency_ms = (time.perf_counter() - started) * 1000.0
-
-            if judge_error:
-                result.error = judge_error
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                headers = _headers_of(payload)
+                exit_ip = _origin_of(payload)
+                result.latency_ms = latency_ms
+                result.exit_ip = exit_ip
+                result.anonymity = classify_anonymity(headers, exit_ip, direct_ip)
+                result.ok = True
+                result.platforms = await probes
                 return result
-
-            headers = _headers_of(payload)
-            exit_ip = _origin_of(payload)
-            result.latency_ms = latency_ms
-            result.exit_ip = exit_ip
-            result.anonymity = classify_anonymity(headers, exit_ip, direct_ip)
-            result.ok = True
-
-            # Platform probes share the same client/proxy connection.
-            result.platforms = await probe_all(client, timeout)
-            return result
+            except Exception as exc:  # pragma: no cover - guard against library surprises
+                result.error = f"unexpected:{type(exc).__name__}"
+                return result
+            finally:
+                if not probes.done():
+                    probes.cancel()
     except httpx.HTTPError as exc:
         result.error = f"transport:{type(exc).__name__}"
         return result

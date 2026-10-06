@@ -148,23 +148,32 @@ def best(
     return {"count": len(rows), "proxies": [_row(r) for r in rows]}
 
 
+# Every proxy is probed against exactly this many platforms (platforms.PLATFORMS).
+PLATFORM_COUNT = 3
+
+
 @app.get("/proxies")
 def proxies(
     platform: str | None = Query(None, pattern="^(discord|guns\\.lol|instagram)$"),
     anonymity: str | None = Query(None, pattern="^(elite|anonymous|transparent)$"),
     protocol: str | None = Query(None, pattern="^(http|https|socks4|socks5)$"),
     min_score: float = Query(0.0, ge=0.0, le=100.0),
+    all_platforms: bool = Query(False),
     limit: int = Query(100, ge=1, le=1000),
     format: str = Query("json", pattern="^(json|txt)$"),
 ):
+    # The pass-all filter runs before the limit, so asking for the proxies that
+    # pass every platform does not silently return fewer than `limit`.
     rows = store.query(
         platform=platform,
         anonymity=anonymity,
         protocol=protocol,
         min_score=min_score,
-        limit=limit,
+        limit=10_000 if all_platforms else limit,
         alive_only=True,
     )
+    if all_platforms:
+        rows = [r for r in rows if r.platforms_passed == PLATFORM_COUNT][:limit]
     if format == "txt":
         return PlainTextResponse("\n".join(r.proxy for r in rows))
     return {"count": len(rows), "proxies": [_row(r) for r in rows]}

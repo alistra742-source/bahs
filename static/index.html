@@ -95,7 +95,7 @@ a{color:var(--blue)}
       <button class="go" id="btn-start">Start</button>
       <button class="stop" id="btn-stop">Stop</button>
       <button class="primary" id="btn-refresh">Refresh now</button>
-      <button class="ghost" id="btn-export">Export .txt</button>
+      <button class="ghost" id="btn-export">Download .txt</button>
     </div>
     <div class="grid">
       <div class="stat"><div class="k">tracked</div><div class="v" id="s-total">—</div></div>
@@ -106,6 +106,8 @@ a{color:var(--blue)}
       <div class="stat"><div class="k">elite</div><div class="v" id="s-elite">—</div></div>
       <div class="stat"><div class="k">anonymous</div><div class="v" id="s-anon">—</div></div>
       <div class="stat"><div class="k">cycles</div><div class="v" id="s-cycles">—</div></div>
+      <div class="stat"><div class="k">total ever</div><div class="v" id="s-seen">—</div></div>
+      <div class="stat"><div class="k">checks run</div><div class="v" id="s-checks">—</div></div>
     </div>
   </div>
 
@@ -144,6 +146,15 @@ a{color:var(--blue)}
       <input id="f-limit" type="number" min="1" max="1000" value="100" style="width:82px">
       <button class="ghost" id="btn-apply">Apply</button>
       <span class="hint" id="auto-hint">auto-refresh: 10s</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span class="hint">copy working list</span>
+      <button class="mini copybtn" data-platform="">all</button>
+      <button class="mini copybtn" data-platform="discord">discord</button>
+      <button class="mini copybtn" data-platform="guns.lol">guns.lol</button>
+      <button class="mini copybtn" data-platform="instagram">instagram</button>
+      <button class="mini" id="btn-copy-all3">passes all 3</button>
+      <span class="msg" id="copy-msg"></span>
     </div>
     <div class="tablewrap">
       <table>
@@ -225,6 +236,8 @@ async function loadStatus() {
   $("s-elite").textContent = st.by_anonymity.elite || 0;
   $("s-anon").textContent = st.by_anonymity.anonymous || 0;
   $("s-cycles").textContent = s.cycles;
+  $("s-seen").textContent = st.total_seen === undefined ? "—" : st.total_seen;
+  $("s-checks").textContent = st.total_checks === undefined ? "—" : st.total_checks;
 
   if (s.last_error) $("ctl-msg").textContent = "last error: " + s.last_error;
 }
@@ -260,7 +273,7 @@ async function loadList() {
     const actions = document.createElement("td");
     const copy = document.createElement("button");
     copy.className = "mini"; copy.textContent = "copy";
-    copy.onclick = () => navigator.clipboard.writeText(r.proxy);
+    copy.onclick = () => copyText(r.proxy);
     const del = document.createElement("button");
     del.className = "mini"; del.textContent = "remove";
     del.onclick = () => removeProxy(r.proxy);
@@ -332,6 +345,54 @@ async function exportTxt() {
     $("list-msg").textContent = e.message;
   }
 }
+
+// Clipboard needs a secure context; fall back to a hidden textarea so the
+// buttons still work over plain http (a local run, a tunnelled preview).
+async function copyText(text) {
+  if (!text) throw new Error("nothing to copy");
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
+function copyMsg(text, bad) {
+  $("copy-msg").textContent = text;
+  $("copy-msg").className = bad ? "msg bad" : "msg ok";
+}
+
+// One button per platform: copy exactly the proxies that passed that target,
+// in the same filters the table is showing.
+async function copyList(params, label) {
+  const q = new URLSearchParams(params);
+  q.set("format", "txt");
+  q.set("limit", $("f-limit").value || "100");
+  if ($("f-anon").value) q.set("anonymity", $("f-anon").value);
+  if ($("f-proto").value) q.set("protocol", $("f-proto").value);
+  try {
+    const text = (await api("/proxies?" + q.toString())).trim();
+    if (!text) {
+      copyMsg("nothing passing " + label + " yet", true);
+      return;
+    }
+    await copyText(text);
+    copyMsg("copied " + text.split("\n").length + " for " + label);
+  } catch (e) {
+    copyMsg(e.message, true);
+  }
+}
+
+document.querySelectorAll(".copybtn").forEach((b) => {
+  b.onclick = () => copyList(b.dataset.platform ? { platform: b.dataset.platform } : {}, b.dataset.platform || "any platform");
+});
+$("btn-copy-all3").onclick = () => copyList({ all_platforms: "true" }, "all 3");
 
 $("btn-start").onclick = () => post("/start");
 $("btn-stop").onclick = () => post("/stop");

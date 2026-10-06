@@ -41,12 +41,14 @@ The repository root **is** the service. In Railway:
 | `AUTO_START` | `1` | start the refresh loop at boot; `0` waits for the Start button / `POST /start` |
 | `REFRESH_ON_START` | `1` | run a cycle immediately at boot |
 | `MAX_CANDIDATES` | `20000` | proxies validated per cycle |
-| `MAX_CONCURRENCY` | `250` | simultaneous proxy checks |
-| `MAX_FAILURES` | `3` | consecutive failures before a proxy is dropped |
+| `MAX_CONCURRENCY` | `800` | simultaneous proxy checks — the main speed lever (~3200 sockets at peak) |
+| `MAX_FAILURES` | `2` | consecutive failures before a proxy is dropped (a never-alive proxy goes on its first failure) |
 | `STORE_SAVE_EVERY` | `200` | persist the store every N validated proxies, so a long cycle is durable mid-run |
 | `PROGRESS_EVERY` | `500` | log a progress line every N validated proxies |
-| `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `5` / `8` | per-request seconds |
-| `JUDGE_TIMEOUT` | `12` | hard ceiling per proxy check |
+| `FAIL_COOLDOWN` | `21600` | a failed proxy is skipped for this many seconds even if a scrape offers it again; `0` disables |
+| `MAX_DEAD_REMEMBERED` | `200000` | ceiling on the skip list, oldest forgotten first |
+| `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `2.5` / `5` | per-request seconds — a dead proxy costs its connect timeout, so these dominate cycle time |
+| `JUDGE_TIMEOUT` | `7` | hard ceiling per proxy check |
 | `MAX_LATENCY_MS` | `4000` | latency beyond this scores zero |
 | `W_ANONYMITY` / `W_LATENCY` / `W_PLATFORM` | `0.35` / `0.25` / `0.40` | score weights |
 | `STORE_PATH` | `data/proxies.json` | point at a volume mount for durability |
@@ -63,8 +65,30 @@ The repository root **is** the service. In Railway:
 - **Validated proxies** — the ranked list with filters (platform, anonymity,
   protocol, min score, limit), per-row platform dots, latency, score bar,
   copy and remove, plus `Purge dead` / `Purge all` and `Export .txt`.
-- **Stats** — tracked, alive, per-platform, per-anonymity, cycles.
+- **Stats** — tracked, alive, per-platform, per-anonymity, cycles, plus two
+  cumulative counters that survive restarts: `total seen` (distinct proxies ever
+  tracked) and `checks run` (every validation performed).
+- **Copy the working list** — one button per target (`all`, `discord`,
+  `guns.lol`, `instagram`, `passes all 3`) copies the matching proxies as plain
+  `ip:port` lines, honouring the anonymity/protocol/limit filters on screen.
 - No login: the API is open, so the dashboard needs no key.
+
+### Why a cycle is fast
+
+Three things keep the wall clock down, in order of impact:
+
+1. **Dead proxies are not re-checked.** A proxy that has never once answered is
+   dropped on its first failure and remembered for `FAIL_COOLDOWN`. Free lists
+   hand back the same dead addresses on every scrape, so without this every
+   cycle re-checked the same ~20k corpses; with it, a repeat cycle validates
+   only the alive set plus genuinely new hosts (measured: 10 offered → 1
+   checked on a repeat scrape).
+2. **One round trip per alive proxy.** The judge and the three platform probes
+   start together; a proxy the judge rejects has its probes cancelled rather
+   than awaited.
+3. **Short connect timeouts and high concurrency** — see `CONNECT_TIMEOUT` and
+   `MAX_CONCURRENCY` above. A cycle over N candidates costs roughly
+   `N / MAX_CONCURRENCY` connection attempts.
 
 ## API
 
@@ -84,8 +108,9 @@ POST   /refresh                 queue a single scrape+validate cycle
 
 `GET /proxies` query parameters: `platform` (`discord` | `guns.lol` |
 `instagram`), `anonymity` (`elite` | `anonymous` | `transparent`), `protocol`
-(`http` | `https` | `socks4` | `socks5`), `min_score` (0–100), `limit`
-(1–1000), `format` (`json` | `txt`).
+(`http` | `https` | `socks4` | `socks5`), `min_score` (0–100),
+`all_platforms` (true = only proxies that passed every target, applied before
+`limit`), `limit` (1–1000), `format` (`json` | `txt`).
 
 ```bash
 # top 50 elite proxies that pass Discord, as plain ip:port lines

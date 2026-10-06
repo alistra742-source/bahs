@@ -51,22 +51,39 @@ REFRESH_ON_START: bool = _int("REFRESH_ON_START", 1) == 1
 
 # Max proxies handed to the validator per cycle, after de-duplication.
 MAX_CANDIDATES: int = _int("MAX_CANDIDATES", 20000)
-# Simultaneous in-flight proxy checks. Each check is cheap but network-bound.
-MAX_CONCURRENCY: int = _int("MAX_CONCURRENCY", 250)
-# A proxy that fails this many consecutive checks is dropped from the store.
-MAX_FAILURES: int = _int("MAX_FAILURES", 3)
+# Simultaneous in-flight proxy checks. Each check is network-bound, so this is
+# the main speed lever: a cycle over N candidates takes roughly N/concurrency
+# connection attempts. Each check holds up to four sockets at once (the judge
+# plus three platform probes), so raise this with an eye on the process's
+# open-file limit -- 800 is ~3200 sockets at peak.
+MAX_CONCURRENCY: int = _int("MAX_CONCURRENCY", 800)
+# A proxy that fails this many consecutive checks is dropped. A proxy that has
+# *never* been alive is dropped on its first failure instead (see store.prune),
+# which is what keeps the second cycle small: dead scraped hosts do not come
+# back to burn timeouts again.
+MAX_FAILURES: int = _int("MAX_FAILURES", 2)
 # Persist the store every N validated proxies during a cycle, and log progress
 # at the same cadence. A cycle can run for many minutes; without these the
 # process holds everything in memory until the last proxy and the dashboard
 # shows nothing in the meantime.
 STORE_SAVE_EVERY: int = _int("STORE_SAVE_EVERY", 200)
 PROGRESS_EVERY: int = _int("PROGRESS_EVERY", 500)
+# A proxy that just failed is remembered as dead for this long, so the next
+# scrape does not hand the same dead host straight back to the validator. This
+# is the difference between every cycle re-checking ~20k dead hosts and a cycle
+# checking only what is alive plus what is genuinely new. 0 disables it.
+FAIL_COOLDOWN: int = _int("FAIL_COOLDOWN", 6 * 3600)
+# Ceiling on the dead list; the oldest entries are forgotten first.
+MAX_DEAD_REMEMBERED: int = _int("MAX_DEAD_REMEMBERED", 200000)
 
 # --- Timeouts (seconds) ----------------------------------------------------
-CONNECT_TIMEOUT: float = _float("CONNECT_TIMEOUT", 5.0)
-READ_TIMEOUT: float = _float("READ_TIMEOUT", 8.0)
+# Short on purpose. A dead proxy costs its connect timeout, and most of a free
+# list is dead, so these two numbers dominate cycle time. Lower them and the
+# cycle gets faster; raise them and more slow-but-alive proxies survive.
+CONNECT_TIMEOUT: float = _float("CONNECT_TIMEOUT", 2.5)
+READ_TIMEOUT: float = _float("READ_TIMEOUT", 5.0)
 # Whole-judge timeout including connect; hard ceiling per proxy.
-JUDGE_TIMEOUT: float = _float("JUDGE_TIMEOUT", 12.0)
+JUDGE_TIMEOUT: float = _float("JUDGE_TIMEOUT", 7.0)
 # Ceiling on a source-list download.
 SOURCE_TIMEOUT: float = _float("SOURCE_TIMEOUT", 20.0)
 
