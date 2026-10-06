@@ -100,11 +100,17 @@ The repository root **is** the service. In Railway:
 - **Copy the working list** — one button per target (`all`, `discord`,
   `guns.lol`, `instagram`, `passes all 3`) copies the matching proxies as plain
   `ip:port` lines, honouring the anonymity/protocol/limit filters on screen.
-- **Sniper · pattern scan** — pick the platforms, then either paste names (one
-  per line, `@` optional) and press `Check names`, or build patterns —
+- **Sniper · random 4-character scan** — nothing has to be typed. The panel
+  opens with the random four-character set already loaded — 4 letters (`4L`),
+  4 numbers (`4N`) and 4-letter `OG` words — and `Random 4L · 4N · OG` reseeds
+  that set and scans it in one click. It *samples* rather than enumerates,
+  because the 4-character alphanumeric space alone is 62⁴ = 14.7M names.
+  Typing is still possible: paste names (one per line, `@` optional) and press
+  `Check names` (an empty box draws random names for you), add a pattern —
   `OG words` / `letters` / `alphanumeric` / `numbers` with a length and a count
-  each — and press `Scan at max rate`. `Generate` fills the box so the list can
-  be inspected or edited first. Verdicts stream in one line at a time with the
+  each — and press `Scan at max rate`, or press `Generate` to fill the box so
+  the list can be inspected or edited first. Verdicts stream in one line at a
+  time with the
   status, the reason, the proxy used and the latency, while the bar under the
   box shows `checked / total` and the completed-checks-per-second rate.
   `Copy available` takes the names that came back free, and each free row has a
