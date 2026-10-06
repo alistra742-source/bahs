@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>proxy-scraper — validated proxies</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#11151d;--line:#202836;--txt:#e6e8ef;--dim:#9aa4b8;--blue:#79c0ff;--green:#3fb950;--red:#f85149;--amber:#d29922}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(900px 520px at 10% -10%,rgba(47,129,247,.18),transparent 60%),radial-gradient(700px 420px at 100% 0,rgba(63,185,80,.10),transparent 55%)}
+.wrap{position:relative;max-width:1180px;margin:0 auto;padding:30px 18px 56px}
+.top{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#2f81f7,#3fb950);display:grid;place-items:center;font:700 17px ui-monospace,monospace;color:#0b0d12}
+.ttl{font-size:22px;font-weight:650;letter-spacing:-.02em}
+.sub{color:var(--dim);font-size:13px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font:12px ui-monospace,monospace}
+.chip .led{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
+.chip.on .led{background:var(--green);box-shadow:0 0 8px rgba(63,185,80,.6)}
+.chip.bad .led{background:var(--red);box-shadow:0 0 8px rgba(248,81,73,.6)}
+.chip.busy .led{background:var(--amber);box-shadow:0 0 8px rgba(210,153,34,.6)}
+.chip .name{text-transform:uppercase;letter-spacing:.07em;color:#cbd5e5;font-weight:600}
+.chip .detail{color:var(--dim)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:16px}
+.ph{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}
+h2{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em}
+.hint,.msg{color:var(--dim);font:12px ui-monospace,monospace}
+.msg.bad{color:var(--red)}
+.msg.ok{color:var(--green)}
+input,select{background:#0e131b;border:1px solid var(--line);border-radius:9px;color:var(--txt);padding:9px 11px;font:13px ui-monospace,monospace;outline:none}
+input:focus,select:focus{border-color:#2f81f7}
+button{border:1px solid transparent;border-radius:9px;padding:9px 15px;font:600 13px inherit;cursor:pointer;color:#fff;transition:transform .15s,opacity .15s}
+button:disabled{opacity:.45;cursor:default}
+button:not(:disabled):hover{transform:translateY(-1px)}
+.primary{background:linear-gradient(135deg,#2f81f7,#1f6feb)}
+.go{background:linear-gradient(135deg,#2ea043,#238636)}
+.stop{background:#3d1d1d;border-color:#5c2b2b;color:#ffb4b4}
+.ghost{background:#151a23;border-color:var(--line);color:#c9d3e4}
+.mini{background:#151a23;border:1px solid var(--line);color:#c9d3e4;padding:5px 10px;font-size:12px;border-radius:8px}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin-top:12px}
+.stat{background:#0e131b;border:1px solid var(--line);border-radius:11px;padding:11px 13px}
+.stat .k{color:var(--dim);font:11px ui-monospace,monospace;text-transform:uppercase;letter-spacing:.06em}
+.stat .v{font:650 21px ui-monospace,monospace;margin-top:3px}
+table{width:100%;border-collapse:collapse;font:12.5px ui-monospace,monospace}
+th{text-align:left;color:var(--dim);font-weight:600;padding:8px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.05em;font-size:11px;white-space:nowrap}
+td{padding:8px 8px;border-bottom:1px solid #171d27;white-space:nowrap}
+tr:hover td{background:#0e131b}
+.mono{font:12.5px ui-monospace,monospace}
+.pill{display:inline-block;border-radius:999px;padding:2px 9px;font:600 11px ui-monospace,monospace;border:1px solid var(--line)}
+.pill.elite{color:#8ff0a4;border-color:#26502f;background:#0f2417}
+.pill.anonymous{color:#f0d38f;border-color:#514326;background:#241f0f}
+.pill.transparent{color:#ffb4b4;border-color:#5c2b2b;background:#241010}
+.pill.unknown{color:var(--dim)}
+.dots{display:inline-flex;gap:4px}
+.dot{width:9px;height:9px;border-radius:50%;background:#232b38;display:inline-block}
+.dot.ok{background:var(--green)}
+.dot.bad{background:var(--red)}
+.score{font-weight:650}
+.bar{height:5px;border-radius:3px;background:#232b38;overflow:hidden;width:62px;display:inline-block;vertical-align:middle;margin-left:7px}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950)}
+.tablewrap{overflow:auto;margin-top:6px}
+.empty{color:var(--dim);font:13px ui-monospace,monospace;padding:26px 8px;text-align:center}
+.foot{color:var(--dim);font:12px ui-monospace,monospace;margin-top:18px;display:flex;gap:14px;flex-wrap:wrap}
+.spinner{width:12px;height:12px;border:2px solid #2f81f7;border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+a{color:var(--blue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="brand">
+      <div class="logo">px</div>
+      <div>
+        <div class="ttl">proxy-scraper</div>
+        <div class="sub">validated high-anonymity proxies · Discord · guns.lol · Instagram</div>
+      </div>
+    </div>
+    <div class="chips">
+      <div class="chip" id="chip-state"><span class="led"></span><span class="name">scheduler</span><span class="detail" id="state-detail">…</span></div>
+      <div class="chip" id="chip-alive"><span class="led"></span><span class="name">alive</span><span class="detail" id="alive-detail">…</span></div>
+      <div class="chip" id="chip-cycle"><span class="led"></span><span class="name">cycle</span><span class="detail" id="cycle-detail">…</span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <h2>Control</h2>
+      <span class="msg" id="ctl-msg"></span>
+    </div>
+    <div class="row">
+      <button class="go" id="btn-start">Start</button>
+      <button class="stop" id="btn-stop">Stop</button>
+      <button class="primary" id="btn-refresh">Refresh now</button>
+      <button class="ghost" id="btn-export">Export .txt</button>
+      <span class="hint">key</span>
+      <input id="apikey" type="password" placeholder="X-API-Key (if set)" style="width:200px" autocomplete="off">
+    </div>
+    <div class="grid">
+      <div class="stat"><div class="k">tracked</div><div class="v" id="s-total">—</div></div>
+      <div class="stat"><div class="k">alive</div><div class="v" id="s-alive">—</div></div>
+      <div class="stat"><div class="k">discord</div><div class="v" id="s-discord">—</div></div>
+      <div class="stat"><div class="k">guns.lol</div><div class="v" id="s-guns">—</div></div>
+      <div class="stat"><div class="k">instagram</div><div class="v" id="s-insta">—</div></div>
+      <div class="stat"><div class="k">elite</div><div class="v" id="s-elite">—</div></div>
+      <div class="stat"><div class="k">anonymous</div><div class="v" id="s-anon">—</div></div>
+      <div class="stat"><div class="k">cycles</div><div class="v" id="s-cycles">—</div></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <h2>Validated proxies</h2>
+      <div class="row">
+        <span class="msg" id="list-msg"></span>
+        <button class="mini" id="btn-purge-dead">Purge dead</button>
+        <button class="mini" id="btn-purge-all">Purge all</button>
+      </div>
+    </div>
+    <div class="row">
+      <select id="f-platform">
+        <option value="">all platforms</option>
+        <option value="discord">discord</option>
+        <option value="guns.lol">guns.lol</option>
+        <option value="instagram">instagram</option>
+      </select>
+      <select id="f-anon">
+        <option value="">any anonymity</option>
+        <option value="elite">elite</option>
+        <option value="anonymous">anonymous</option>
+        <option value="transparent">transparent</option>
+      </select>
+      <select id="f-proto">
+        <option value="">any protocol</option>
+        <option value="http">http</option>
+        <option value="https">https</option>
+        <option value="socks4">socks4</option>
+        <option value="socks5">socks5</option>
+      </select>
+      <span class="hint">min score</span>
+      <input id="f-score" type="number" min="0" max="100" value="0" style="width:78px">
+      <span class="hint">limit</span>
+      <input id="f-limit" type="number" min="1" max="1000" value="100" style="width:82px">
+      <button class="ghost" id="btn-apply">Apply</button>
+      <span class="hint" id="auto-hint">auto-refresh: 10s</span>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>proxy</th><th>proto</th><th>anon</th><th>latency</th><th>platforms</th><th>score</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="empty" style="display:none">no validated proxies match — press Refresh now</div>
+  </div>
+
+  <div class="foot">
+    <span>GET /proxies · GET /best · DELETE /proxies · POST /start /stop /refresh</span>
+  </div>
+</div>
+
+<script>
+const PLATFORMS = ["discord", "guns.lol", "instagram"];
+const $ = (id) => document.getElementById(id);
+const KEY_STORE = "proxy_scraper_key";
+let pollList = null;
+
+$("apikey").value = localStorage.getItem(KEY_STORE) || "";
+$("apikey").addEventListener("change", () => {
+  localStorage.setItem(KEY_STORE, $("apikey").value.trim());
+  loadAll();
+});
+
+function headers(extra) {
+  const h = Object.assign({}, extra || {});
+  const k = $("apikey").value.trim();
+  if (k) h["X-API-Key"] = k;
+  return h;
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, Object.assign({}, opts, { headers: headers(opts && opts.headers) }));
+  if (res.status === 401) throw new Error("401 — set the X-API-Key");
+  if (!res.ok) {
+    let detail = res.status + "";
+    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    throw new Error(detail);
+  }
+  const ctype = res.headers.get("content-type") || "";
+  return ctype.includes("json") ? res.json() : res.text();
+}
+
+function fmtMs(v) {
+  return v === null || v === undefined ? "—" : Math.round(v) + " ms";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function dots(platforms) {
+  return '<span class="dots">' + PLATFORMS.map((p) => {
+    const r = platforms && platforms[p];
+    const cls = r && r.ok ? "ok" : r ? "bad" : "";
+    return `<span class="dot ${cls}" title="${p}: ${r ? (r.ok ? "ok" : esc(r.reason || "fail")) : "not tested"}"></span>`;
+  }).join("") + "</span>";
+}
+
+// --- status ---------------------------------------------------------------
+async function loadStatus() {
+  const health = await api("/health");
+  const s = health.scheduler, st = health.store;
+
+  const stateChip = $("chip-state");
+  stateChip.className = "chip " + (s.running ? "busy" : s.enabled ? "on" : "bad");
+  $("state-detail").textContent = s.running ? "running a cycle" : s.enabled ? "on" : "stopped";
+  $("btn-start").disabled = s.enabled;
+  $("btn-stop").disabled = !s.enabled;
+
+  const aliveChip = $("chip-alive");
+  aliveChip.className = "chip " + (st.alive > 0 ? "on" : "");
+  $("alive-detail").textContent = st.alive + " / " + st.total_tracked;
+
+  const cyc = $("chip-cycle");
+  cyc.className = "chip " + (s.last_error ? "bad" : s.cycles ? "on" : "");
+  $("cycle-detail").textContent = s.last_error
+    ? "error"
+    : s.last_duration_s !== null && s.last_duration_s !== undefined
+      ? s.cycles + " · " + s.last_duration_s + "s"
+      : "waiting";
+
+  $("s-total").textContent = st.total_tracked;
+  $("s-alive").textContent = st.alive;
+  $("s-discord").textContent = st.by_platform["discord"] || 0;
+  $("s-guns").textContent = st.by_platform["guns.lol"] || 0;
+  $("s-insta").textContent = st.by_platform["instagram"] || 0;
+  $("s-elite").textContent = st.by_anonymity.elite || 0;
+  $("s-anon").textContent = st.by_anonymity.anonymous || 0;
+  $("s-cycles").textContent = s.cycles;
+
+  if (s.last_error) $("ctl-msg").textContent = "last error: " + s.last_error;
+}
+
+// --- list -----------------------------------------------------------------
+async function loadList() {
+  const params = new URLSearchParams();
+  const platform = $("f-platform").value;
+  const anon = $("f-anon").value;
+  const proto = $("f-proto").value;
+  if (platform) params.set("platform", platform);
+  if (anon) params.set("anonymity", anon);
+  if (proto) params.set("protocol", proto);
+  params.set("min_score", $("f-score").value || "0");
+  params.set("limit", $("f-limit").value || "100");
+
+  const data = await api("/proxies?" + params.toString());
+  const rows = data.proxies || [];
+  const tbody = $("rows");
+  tbody.innerHTML = "";
+  $("empty").style.display = rows.length ? "none" : "block";
+  $("list-msg").textContent = rows.length + " shown";
+
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      `<td class="mono">${esc(r.proxy)}</td>` +
+      `<td>${esc(r.protocol)}</td>` +
+      `<td><span class="pill ${esc(r.anonymity)}">${esc(r.anonymity)}</span></td>` +
+      `<td>${fmtMs(r.latency_ms)}</td>` +
+      `<td>${dots(r.platforms)}</td>` +
+      `<td><span class="score">${r.score.toFixed(1)}</span><span class="bar"><i style="width:${Math.max(0, Math.min(100, r.score))}%"></i></span></td>`;
+    const actions = document.createElement("td");
+    const copy = document.createElement("button");
+    copy.className = "mini"; copy.textContent = "copy";
+    copy.onclick = () => navigator.clipboard.writeText(r.proxy);
+    const del = document.createElement("button");
+    del.className = "mini"; del.textContent = "remove";
+    del.onclick = () => removeProxy(r.proxy);
+    actions.append(copy, del);
+    tr.appendChild(actions);
+    tbody.appendChild(tr);
+  }
+}
+
+async function loadAll() {
+  try {
+    await loadStatus();
+  } catch (e) {
+    $("ctl-msg").textContent = e.message;
+    $("ctl-msg").className = "msg bad";
+  }
+  try {
+    await loadList();
+    $("list-msg").className = "msg";
+  } catch (e) {
+    $("list-msg").textContent = e.message;
+    $("list-msg").className = "msg bad";
+    $("rows").innerHTML = "";
+  }
+}
+
+// --- actions --------------------------------------------------------------
+async function post(path) {
+  $("ctl-msg").className = "msg";
+  $("ctl-msg").textContent = "working…";
+  try {
+    await api(path, { method: "POST" });
+    $("ctl-msg").className = "msg ok";
+    $("ctl-msg").textContent = "ok";
+  } catch (e) {
+    $("ctl-msg").className = "msg bad";
+    $("ctl-msg").textContent = e.message;
+  }
+  loadAll();
+}
+
+async function removeProxy(proxy) {
+  try {
+    await api("/proxies?proxy=" + encodeURIComponent(proxy), { method: "DELETE" });
+    loadAll();
+  } catch (e) {
+    $("list-msg").className = "msg bad";
+    $("list-msg").textContent = e.message;
+  }
+}
+
+async function exportTxt() {
+  const params = new URLSearchParams();
+  const platform = $("f-platform").value;
+  if (platform) params.set("platform", platform);
+  if ($("f-anon").value) params.set("anonymity", $("f-anon").value);
+  params.set("limit", $("f-limit").value || "100");
+  params.set("format", "txt");
+  try {
+    const text = await api("/proxies?" + params.toString());
+    const blob = new Blob([text], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "proxies.txt";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {
+    $("list-msg").className = "msg bad";
+    $("list-msg").textContent = e.message;
+  }
+}
+
+$("btn-start").onclick = () => post("/start");
+$("btn-stop").onclick = () => post("/stop");
+$("btn-refresh").onclick = () => post("/refresh");
+$("btn-export").onclick = exportTxt;
+$("btn-apply").onclick = loadList;
+$("btn-purge-dead").onclick = () => post("/proxies/purge?scope=dead");
+$("btn-purge-all").onclick = () => {
+  if (confirm("Remove every tracked proxy?")) post("/proxies/purge?scope=all");
+};
+["f-platform", "f-anon", "f-proto"].forEach((id) => $(id).addEventListener("change", loadList));
+
+loadAll();
+setInterval(loadStatus, 4000);
+setInterval(loadList, 10000);
+</script>
+</body>
+</html>

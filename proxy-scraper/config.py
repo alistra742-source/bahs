@@ -47,6 +47,8 @@ API_KEY: str = _str("API_KEY", "")
 # --- Scrape / validate cadence --------------------------------------------
 # Seconds between full refresh cycles: scrape sources, re-validate, prune.
 REFRESH_INTERVAL: int = _int("REFRESH_INTERVAL", 1800)
+# Start the refresh loop at boot. 0 leaves it stopped until /start is called.
+AUTO_START: bool = _int("AUTO_START", 1) == 1
 # Run one refresh immediately at boot instead of waiting a full interval.
 REFRESH_ON_START: bool = _int("REFRESH_ON_START", 1) == 1
 

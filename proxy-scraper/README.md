@@ -40,6 +40,7 @@ The `proxy-scraper/` directory is a self-contained service. In Railway:
 | `PORT` | `8080` | injected by Railway |
 | `API_KEY` | — | if set, `/proxies`, `/best`, `/stats`, `/refresh` require `X-API-Key` |
 | `REFRESH_INTERVAL` | `1800` | seconds between refresh cycles |
+| `AUTO_START` | `1` | start the refresh loop at boot; `0` waits for the Start button / `POST /start` |
 | `REFRESH_ON_START` | `1` | run a cycle immediately at boot |
 | `MAX_CANDIDATES` | `20000` | proxies validated per cycle |
 | `MAX_CONCURRENCY` | `250` | simultaneous proxy checks |
@@ -52,15 +53,34 @@ The `proxy-scraper/` directory is a self-contained service. In Railway:
 | `STALE_AFTER` | `3 × REFRESH_INTERVAL` | drop proxies not validated within this window |
 | `JUDGE_URL` | `https://httpbin.org/get` | must return `origin` + `headers` |
 
+## Dashboard
+
+`GET /` serves a single-page dashboard over the same API:
+
+- **Start / Stop** — start and stop the background refresh loop. State is shown
+  live; `Stop` cancels an in-flight cycle. `Refresh now` queues one cycle
+  without touching the loop state.
+- **Validated proxies** — the ranked list with filters (platform, anonymity,
+  protocol, min score, limit), per-row platform dots, latency, score bar,
+  copy and remove, plus `Purge dead` / `Purge all` and `Export .txt`.
+- **Stats** — tracked, alive, per-platform, per-anonymity, cycles.
+- If `API_KEY` is set, paste it into the dashboard's key field; it is kept in
+  `localStorage` and sent as `X-API-Key`.
+
 ## API
 
 ```
-GET  /                          service info
-GET  /health                    scheduler + store status (open)
-GET  /stats                     store statistics
-GET  /proxies                   filtered, ranked list
-GET  /best                      top proxies passing every platform
-POST /refresh                   queue a scrape+validate cycle
+GET    /                        dashboard (HTML)
+GET    /info                    service info
+GET    /health                  scheduler + store status (open)
+GET    /stats                   store statistics
+GET    /proxies                 filtered, ranked list
+GET    /best                    top proxies passing every platform
+DELETE /proxies?proxy=          remove one tracked proxy
+POST   /proxies/purge?scope=    drop dead (default) or all proxies
+POST   /start                   start the refresh loop
+POST   /stop                    stop the refresh loop
+POST   /refresh                 queue a single scrape+validate cycle
 ```
 
 `GET /proxies` query parameters: `platform` (`discord` | `guns.lol` |
@@ -76,8 +96,16 @@ curl -s "https://<domain>/proxies?platform=discord&anonymity=elite&limit=50&form
 # the best of the best: pass Discord + guns.lol + Instagram
 curl -s "https://<domain>/best?limit=25" -H "X-API-Key: $API_KEY"
 
+# start / stop the background loop
+curl -s -X POST "https://<domain>/start" -H "X-API-Key: $API_KEY"
+curl -s -X POST "https://<domain>/stop"  -H "X-API-Key: $API_KEY"
+
 # force a refresh off-schedule
 curl -s -X POST "https://<domain>/refresh" -H "X-API-Key: $API_KEY"
+
+# manage the validated set
+curl -s -X DELETE "https://<domain>/proxies?proxy=http%3A%2F%2F1.2.3.4%3A8080" -H "X-API-Key: $API_KEY"
+curl -s -X POST "https://<domain>/proxies/purge?scope=dead" -H "X-API-Key: $API_KEY"
 ```
 
 ### Scoring

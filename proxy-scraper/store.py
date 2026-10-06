@@ -113,6 +113,25 @@ class ProxyStore:
         record.score = compute_score(record)
         return record
 
+    def remove(self, proxy: str) -> bool:
+        """Delete one proxy by its canonical key. Returns True if it existed."""
+        return self.records.pop(proxy, None) is not None
+
+    def purge(self, scope: str = "dead") -> int:
+        """Drop proxies: ``dead`` (never validated or failing) or ``all``."""
+        if scope == "all":
+            count = len(self.records)
+            self.records.clear()
+            return count
+        dead = [
+            key
+            for key, rec in self.records.items()
+            if rec.fail_count > 0 or rec.last_ok is None
+        ]
+        for key in dead:
+            del self.records[key]
+        return len(dead)
+
     def prune(self, now: float | None = None) -> int:
         """Drop proxies that are dead beyond MAX_FAILURES or stale. Returns count dropped."""
         now = now if now is not None else time.time()

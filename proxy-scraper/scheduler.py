@@ -29,8 +29,11 @@ class RefreshManager:
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
+        self._stop.set()
         self.direct_ip: str | None = None
 
+        # enabled = the operator has pressed Start; running = a cycle is in flight.
+        self.enabled = False
         self.running = False
         self.cycles = 0
         self.last_started: float | None = None
@@ -106,22 +109,29 @@ class RefreshManager:
                 await self.run_cycle()
 
     def start(self) -> None:
+        """Begin the periodic loop (idempotent)."""
+        self.enabled = True
         if self._task is None or self._task.done():
             self._stop.clear()
             self._task = asyncio.create_task(self._loop())
 
     async def stop(self) -> None:
+        """Halt the periodic loop. Any in-flight cycle is cancelled."""
+        self.enabled = False
         self._stop.set()
         if self._task is not None:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                log.warning("scheduler loop ended with an error", exc_info=True)
             self._task = None
 
     def status(self) -> dict[str, Any]:
         return {
+            "enabled": self.enabled,
             "running": self.running,
             "cycles": self.cycles,
             "interval_s": REFRESH_INTERVAL,
