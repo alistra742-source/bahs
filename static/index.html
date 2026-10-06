@@ -177,7 +177,7 @@ a{color:var(--blue)}
 
   <div class="panel">
     <div class="ph">
-      <h2>Sniper</h2>
+      <h2>Sniper &middot; pattern scan</h2>
       <div class="row">
         <span class="msg" id="snipe-msg"></span>
         <button class="mini" id="btn-snipe-copy">Copy available</button>
@@ -189,15 +189,38 @@ a{color:var(--blue)}
       <label class="chk"><input type="checkbox" class="snipe-pf" value="guns.lol" checked> guns.lol</label>
       <label class="chk"><input type="checkbox" class="snipe-pf" value="instagram" checked> instagram</label>
       <span class="hint">concurrency</span>
-      <input id="snipe-conc" type="number" min="1" max="200" value="24" style="width:74px">
+      <input id="snipe-conc" type="number" min="1" max="2000" value="256" style="width:78px">
       <button class="primary" id="btn-snipe">Check names</button>
+      <button class="go" id="btn-scan">Scan at max rate</button>
       <span class="hint">runs through the validated proxies</span>
     </div>
+    <div class="row" style="margin-top:10px">
+      <span class="hint">pattern</span>
+      <select id="gen-pattern">
+        <option value="words">OG words</option>
+        <option value="letters">letters</option>
+        <option value="alnum">alphanumeric</option>
+        <option value="numbers">numbers</option>
+      </select>
+      <span class="hint">length</span>
+      <input id="gen-length" type="number" min="1" max="32" value="4" style="width:66px">
+      <span class="hint">count</span>
+      <input id="gen-count" type="number" min="1" max="20000" value="500" style="width:86px">
+      <button class="mini" id="btn-gen-add">Add pattern</button>
+      <button class="ghost" id="btn-gen-run">Generate</button>
+      <button class="mini" id="btn-gen-clear">Clear patterns</button>
+    </div>
+    <div class="row" id="gen-chips" style="margin-top:8px"><span class="hint">no patterns yet &mdash; add one, or type names below</span></div>
     <textarea id="snipe-names" rows="3" placeholder="usernames, one per line - @ is optional"></textarea>
+    <div class="row" style="margin-top:8px">
+      <span class="hint" id="scan-rate">idle</span>
+      <div class="bar" style="width:240px"><i id="scan-bar" style="width:0%"></i></div>
+      <span class="hint" id="scan-progress"></span>
+    </div>
     <div class="tablewrap">
       <table>
         <thead>
-          <tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>latency</th></tr>
+          <tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>latency</th><th></th></tr>
         </thead>
         <tbody id="snipe-rows"></tbody>
       </table>
@@ -434,6 +457,7 @@ $("btn-copy-all3").onclick = () => copyList({ all_platforms: "true" }, "all 3");
 // Results arrive as NDJSON, one verdict per line, so rows appear as each name
 // is answered instead of all at once at the end of the batch.
 let lastSnipes = [];
+let scanTotal = 0;
 
 function snipeMsg(text, bad) {
   $("snipe-msg").textContent = text;
@@ -449,6 +473,16 @@ function appendSnipe(r) {
     `<td class="hint">${esc(r.detail || "")}</td>` +
     `<td class="hint">${esc(r.proxy || "-")}</td>` +
     `<td>${fmtMs(r.latency_ms)}</td>`;
+  const actions = document.createElement("td");
+  if (r.status === "available") {
+    const b = document.createElement("button");
+    b.className = "mini";
+    b.textContent = "claim";
+    b.title = "where to register " + r.username + " on " + r.platform;
+    b.onclick = () => openClaim(r.platform, r.username);
+    actions.appendChild(b);
+  }
+  tr.appendChild(actions);
   $("snipe-rows").appendChild(tr);
   $("snipe-empty").style.display = "none";
 }
@@ -459,21 +493,144 @@ async function errorText(res) {
   return detail;
 }
 
-function snipeBody(names, platforms) {
-  return JSON.stringify({
-    usernames: names,
-    platforms: platforms,
-    concurrency: Number($("snipe-conc").value) || 32,
-    stream: true,
-  });
+// A name is only claimable from a signed-in account, so this copies the name,
+// asks the API where to register it, and opens that page. Nothing here creates
+// accounts.
+async function openClaim(platform, username) {
+  try {
+    const info = await api("/claim?platform=" + encodeURIComponent(platform) +
+                           "&username=" + encodeURIComponent(username));
+    await copyText(username);
+    snipeMsg("copied " + username + " - opening " + platform + " registration");
+    window.open(info.url, "_blank", "noopener");
+  } catch (e) {
+    snipeMsg(e.message, true);
+  }
 }
 
-async function runSnipe() {
-  const names = $("snipe-names").value
+// One NDJSON reader for both /snipe and /scan: every line goes to onLine.
+async function streamResults(url, body, onLine) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.body) {
+    const data = await res.json();
+    (data.results || []).forEach((row) => onLine(Object.assign({ type: "result" }, row)));
+    onLine({ type: "done", checked: data.checked, available_count: data.available_count, pool_size: data.pool_size });
+    return;
+  }
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch (e) { continue; }
+      onLine(msg);
+    }
+  }
+}
+
+function selectedPlatforms() {
+  return [...document.querySelectorAll(".snipe-pf:checked")].map((c) => c.value);
+}
+
+function namesInBox() {
+  return $("snipe-names").value
     .split(/[\n,]/)
     .map((s) => s.trim().replace(/^@/, ""))
     .filter(Boolean);
-  const platforms = [...document.querySelectorAll(".snipe-pf:checked")].map((c) => c.value);
+}
+
+function scanRate(text) { $("scan-rate").textContent = text; }
+
+function scanProgress(done, total) {
+  $("scan-progress").textContent = total ? done + " / " + total : "";
+  $("scan-bar").style.width = total ? Math.min(100, (done / total) * 100) + "%" : "0%";
+}
+
+function beginRun() {
+  lastSnipes = [];
+  $("snipe-rows").innerHTML = "";
+  $("snipe-empty").style.display = "none";
+  $("btn-snipe").disabled = true;
+  $("btn-scan").disabled = true;
+  scanRate("0.0/s");
+  scanProgress(0, 0);
+}
+
+function endRun() {
+  $("btn-snipe").disabled = false;
+  $("btn-scan").disabled = false;
+}
+
+// --- pattern builder ------------------------------------------------------
+let genPatterns = [];
+
+function renderGenChips() {
+  const box = $("gen-chips");
+  box.innerHTML = "";
+  if (!genPatterns.length) {
+    box.innerHTML = '<span class="hint">no patterns yet - add one, or type names below</span>';
+    return;
+  }
+  genPatterns.forEach((p, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip on";
+    chip.innerHTML =
+      `<span class="name">${esc(p.pattern)}</span>` +
+      `<span class="detail">${p.length} chars, ${p.count} names</span>`;
+    const x = document.createElement("button");
+    x.className = "mini";
+    x.textContent = "x";
+    x.onclick = () => { genPatterns.splice(i, 1); renderGenChips(); };
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
+}
+
+function addGenPattern() {
+  const pattern = $("gen-pattern").value;
+  const length = Math.max(1, Math.min(32, Number($("gen-length").value) || 1));
+  const count = Math.max(1, Number($("gen-count").value) || 1);
+  genPatterns.push({ pattern: pattern, length: length, count: count });
+  renderGenChips();
+}
+
+async function generateNames() {
+  if (!genPatterns.length) {
+    snipeMsg("add a pattern first", true);
+    return;
+  }
+  try {
+    const data = await api("/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        patterns: genPatterns.map((p) => ({ pattern: p.pattern, length: p.length, limit: p.count })),
+        limit: 0,
+      }),
+    });
+    $("snipe-names").value = data.usernames.join("\n");
+    snipeMsg("generated " + data.count + " names - press Scan at max rate");
+  } catch (e) {
+    snipeMsg(e.message, true);
+  }
+}
+
+async function runSnipe() {
+  const names = namesInBox();
+  const platforms = selectedPlatforms();
   if (!names.length) {
     snipeMsg("type some usernames first", true);
     return;
@@ -482,74 +639,104 @@ async function runSnipe() {
     snipeMsg("pick at least one platform", true);
     return;
   }
-
-  $("btn-snipe").disabled = true;
-  lastSnipes = [];
-  $("snipe-rows").innerHTML = "";
-  $("snipe-empty").style.display = "none";
+  beginRun();
   let checked = 0, available = 0, summary = "";
   const started = Date.now();
-  const tick = (extra) => {
+  const tick = () => {
     const secs = ((Date.now() - started) / 1000).toFixed(1);
-    snipeMsg(available + " available · " + checked + " checked · " + secs + "s" + (extra ? " · " + extra : ""));
+    snipeMsg(available + " available, " + checked + " checked, " + secs + "s");
   };
   tick();
-
   try {
-    const res = await fetch("/snipe", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: snipeBody(names, platforms),
-    });
-    if (!res.ok) throw new Error(await errorText(res));
-
-    // No streaming support: fall back to the buffered JSON response.
-    if (!res.body) {
-      const data = await res.json();
-      lastSnipes = data.available || [];
-      (data.results || []).forEach(appendSnipe);
-      snipeMsg(data.available_count + " available of " + data.checked + " checks · pool " + data.pool_size);
-      return;
-    }
-
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch (e) { continue; }
-        if (msg.type === "done") {
-          summary =
-            msg.available_count + " available of " + msg.checked + " checks · pool " +
-            msg.pool_size + (msg.resting ? " (" + msg.resting + " resting)" : "") +
-            " · " + Math.round(msg.duration_ms) + " ms";
-          continue;
-        }
-        if (msg.type !== "result") continue;
+    await streamResults("/snipe", {
+      usernames: names,
+      platforms: platforms,
+      concurrency: Number($("snipe-conc").value) || 32,
+      stream: true,
+    }, (msg) => {
+      if (msg.type === "result") {
         checked++;
         if (msg.status === "available") { available++; lastSnipes.push(msg); }
         appendSnipe(msg);
+      } else if (msg.type === "done") {
+        summary = msg.available_count + " available of " + msg.checked + " checks, pool " + msg.pool_size;
       }
       tick();
-    }
-    if (summary) snipeMsg(summary);
-    else tick("done");
+    });
+    if (summary) snipeMsg(summary); else tick();
   } catch (e) {
     snipeMsg(e.message, true);
   } finally {
-    $("btn-snipe").disabled = false;
+    endRun();
+  }
+}
+
+// The bulk path: generate from the patterns, then check everything through the
+// validated proxies while reporting the completed-checks rate.
+async function runScan() {
+  const names = namesInBox();
+  const platforms = selectedPlatforms();
+  const patterns = genPatterns.map((p) => ({ pattern: p.pattern, length: p.length, limit: p.count }));
+  if (!names.length && !patterns.length) {
+    snipeMsg("type names or add a pattern first", true);
+    return;
+  }
+  if (!platforms.length) {
+    snipeMsg("pick at least one platform", true);
+    return;
+  }
+  beginRun();
+  let checked = 0, available = 0, summary = "";
+  const started = Date.now();
+  try {
+    await streamResults("/scan", {
+      usernames: names,
+      patterns: patterns,
+      platforms: platforms,
+      concurrency: Number($("snipe-conc").value) || 256,
+      stream: true,
+    }, (msg) => {
+      if (msg.type === "start") {
+        scanTotal = msg.names;
+        scanProgress(0, scanTotal);
+        const per = Object.keys(msg.platform_pool)
+          .map((k) => msg.platform_pool[k] + " " + k).join(", ");
+        snipeMsg("scanning " + msg.names + " names on " + msg.platforms.length + " platforms, pool " +
+                 msg.pool_size + " (" + per + "), target " + msg.target_rate + "/s");
+      } else if (msg.type === "result") {
+        checked++;
+        if (msg.status === "available") { available++; lastSnipes.push(msg); }
+        appendSnipe(msg);
+        scanProgress(checked, scanTotal);
+        if (checked % 25 === 0) {
+          const secs = ((Date.now() - started) / 1000).toFixed(1);
+          snipeMsg(available + " available, " + checked + " checked, " + secs + "s");
+        }
+      } else if (msg.type === "progress") {
+        scanRate(msg.per_second.toFixed(1) + "/s");
+      } else if (msg.type === "done") {
+        scanRate(msg.per_second.toFixed(1) + "/s");
+        scanProgress(msg.checked, msg.checked);
+        summary = msg.available_count + " available of " + msg.checked + " checks at " +
+          msg.per_second.toFixed(1) + " checks/s " +
+          (msg.target_met ? "(target " + msg.target_rate + " met)" : "(below target " + msg.target_rate + ")") +
+          ", " + (msg.duration_ms / 1000).toFixed(1) + "s";
+      }
+    });
+    if (summary) snipeMsg(summary);
+  } catch (e) {
+    snipeMsg(e.message, true);
+  } finally {
+    endRun();
   }
 }
 
 $("btn-snipe").onclick = runSnipe;
+$("btn-scan").onclick = runScan;
+$("btn-gen-add").onclick = addGenPattern;
+$("btn-gen-run").onclick = generateNames;
+$("btn-gen-clear").onclick = () => { genPatterns = []; renderGenChips(); };
+renderGenChips();
 $("btn-snipe-copy").onclick = async () => {
   if (!lastSnipes.length) {
     snipeMsg("no available names to copy yet", true);

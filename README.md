@@ -25,6 +25,11 @@ Discord, guns.lol and Instagram, driving every request through the validated
 proxies — the platforms block a datacenter IP outright, which is the reason the
 proxy list exists in the first place.
 
+`GET /generate` builds candidate names (**N letters, N alphanumerics, N
+numbers, or N-length "OG" dictionary words** from a configurable list), and
+`POST /scan` generates and checks them in bulk at a target rate of 100 checks a
+second or better. `GET /claim` says where a free name is registered.
+
 ## Deploy on Railway
 
 The repository root **is** the service. In Railway:
@@ -69,6 +74,15 @@ The repository root **is** the service. In Railway:
 | `SNIPE_PER_PROXY` | `4` | simultaneous requests through any one proxy |
 | `SNIPE_CONNECT_TIMEOUT` / `SNIPE_READ_TIMEOUT` | `3` / `8` | sniper timeouts, tighter than the validator's so a bad proxy is abandoned quickly |
 | `SNIPE_POOL_TTL` | `300` | seconds a warm proxy pool (and its connections) is reused across requests |
+| `SNIPE_PLATFORM_WEIGHT` | `4` | how often a proxy that passed a platform's own probe is repeated in that platform's rotation (`1` = plain round-robin) |
+| `OG_WORDS_FILE` | – | extra/replacement word list for the `words` pattern (one word per line or space separated) |
+| `OG_WORDS` | – | extra inline words, comma separated |
+| `SCAN_CONCURRENCY` | `256` | simultaneous checks in one scan — the throughput lever |
+| `SCAN_MAX_NAMES` | `20000` | names accepted in one scan (a longer list is truncated and reported) |
+| `SCAN_RETRIES` | `0` | retries per name in a scan; at this width a retry costs more than it buys |
+| `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `1.5` / `4` | scan timeouts, tighter than the sniper's so a dead proxy is dropped fast |
+| `SCAN_PER_PROXY` | `8` | simultaneous requests through one proxy during a scan |
+| `SCAN_TARGET_RATE` | `100` | the rate a scan is measured against |
 
 ## Dashboard
 
@@ -86,10 +100,15 @@ The repository root **is** the service. In Railway:
 - **Copy the working list** — one button per target (`all`, `discord`,
   `guns.lol`, `instagram`, `passes all 3`) copies the matching proxies as plain
   `ip:port` lines, honouring the anonymity/protocol/limit filters on screen.
-- **Sniper** — pick the platforms, paste names (one per line, `@` optional) and
-  press `Check names`. Verdicts stream in one line at a time with the status,
-  the reason, the proxy it used and the latency; `Copy available` takes the
-  names that came back free.
+- **Sniper · pattern scan** — pick the platforms, then either paste names (one
+  per line, `@` optional) and press `Check names`, or build patterns —
+  `OG words` / `letters` / `alphanumeric` / `numbers` with a length and a count
+  each — and press `Scan at max rate`. `Generate` fills the box so the list can
+  be inspected or edited first. Verdicts stream in one line at a time with the
+  status, the reason, the proxy used and the latency, while the bar under the
+  box shows `checked / total` and the completed-checks-per-second rate.
+  `Copy available` takes the names that came back free, and each free row has a
+  `claim` button that copies the name and opens its registration page.
 - No login: the API is open, so the dashboard needs no key.
 
 ### How the sniper reads each platform
@@ -127,6 +146,28 @@ request is spent on it.
 5. **Results stream.** `"stream": true` returns NDJSON, one verdict per line,
    so the first answer is on screen in the first second instead of after the
    whole batch.
+6. **A sliding window, not fixed chunks.** The moment one check finishes the
+   next starts, so in-flight work stays at `SCAN_CONCURRENCY` from the first
+   verdict to the last. Draining a chunk before starting the next one leaves the
+   tail of every chunk idle, which is throughput a scan cannot spare.
+
+### Throughput
+
+Measured with the real scheduler and real HTTP clients against a target that
+holds each request open, so the numbers are the engine's, not a stub's:
+
+| concurrency | per-check latency | checks a second |
+| --- | --- | --- |
+| 32 | 250 ms | 83 |
+| 256 | 250 ms | **538** |
+| 256 | 1000 ms | **170** |
+
+Peak in-flight tracked the ceiling exactly (256 of 256), which is the sliding
+window doing its job. With a real proxy pool the rate is whatever the pool
+allows — every check still costs one proxy round trip, and free proxies are
+slow and often dead — but the scheduler is not the bottleneck; `SCAN_CONCURRENCY`
+is the dial. `POST /scan` reports `per_second`, `target_rate` and `target_met`
+so the live number is never a guess.
 
 ### Why a cycle is fast
 
@@ -169,6 +210,10 @@ POST   /stop                    stop the refresh loop
 POST   /refresh                 queue a single scrape+validate cycle
 POST   /snipe                   check usernames through the validated proxies
 GET    /snipe?username=         the same for one name
+GET    /generate                candidate names for one pattern
+POST   /generate                the same for several patterns at once
+POST   /scan                    generate + check in bulk, NDJSON by default
+GET    /claim                   where to register a free name
 ```
 
 `POST /snipe` body: `usernames` (list) or `username` (single), `platforms`
@@ -203,10 +248,46 @@ curl -s -N -X POST "https://<domain>/snipe" -H 'Content-Type: application/json' 
 # force a refresh off-schedule
 curl -s -X POST "https://<domain>/refresh"
 
+# 500 four-letter OG dictionary words
+curl -s "https://<domain>/generate?pattern=words&length=4&limit=500"
+
+# a reproducible sample of 200 five-character alphanumerics
+curl -s "https://<domain>/generate?pattern=alnum&length=5&limit=200&seed=7"
+
+# generate and scan 2000 five-letter words on all three platforms, live rate
+curl -s -N -X POST "https://<domain>/scan" -H 'Content-Type: application/json' \
+  -d '{"patterns":[{"pattern":"words","length":5,"limit":2000}],"concurrency":256}'
+
+# where a free name gets registered
+curl -s "https://<domain>/claim?platform=discord&username=freedude"
+
 # manage the validated set
 curl -s -X DELETE "https://<domain>/proxies?proxy=http%3A%2F%2F1.2.3.4%3A8080"
 curl -s -X POST "https://<domain>/proxies/purge?scope=dead"
 ```
+
+### Patterns
+
+| `pattern` | characters | size for length n |
+| --- | --- | --- |
+| `letters` | `a-z` `A-Z` | `52**n` |
+| `alnum` | `a-z` `A-Z` `0-9` | `62**n` |
+| `numbers` | `0-9` | `10**n` |
+| `words` | the configured dictionary, filtered to exactly n letters | – |
+
+`mode=random` (the default) samples, `mode=sequential` walks the space from the
+start, and `seed` makes a sample reproducible — that is what lets a scan be
+rerun later without re-asking about names that were already answered. A space
+smaller than the limit is enumerated instead of sampled, so `numbers` length 2
+returns all hundred rather than a random hundred.
+
+### Claiming
+
+A username can only be taken by an account, and an account is created by a
+person, so `GET /claim` is a handoff rather than a factory: it returns the
+platform's registration URL, the path to change the name on an existing
+account, and a reminder that the name should be re-checked first. Nothing in
+this service creates accounts on your behalf.
 
 ### Scoring
 

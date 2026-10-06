@@ -105,6 +105,35 @@ SNIPE_RETRIES: int = _int("SNIPE_RETRIES", 2)
 SNIPE_MAX_NAMES: int = _int("SNIPE_MAX_NAMES", 200)
 # How many validated proxies the sniper may rotate over.
 SNIPE_POOL: int = _int("SNIPE_POOL", 400)
+# How many times a proxy that already passed a platform's probe is repeated in
+# that platform's rotation, so a big scan prefers proven hosts without starving
+# the rest of the pool. 1 disables the preference (plain round-robin).
+SNIPE_PLATFORM_WEIGHT: int = _int("SNIPE_PLATFORM_WEIGHT", 4)
+
+# --- Username generation ---------------------------------------------------
+# "OG" words for the `words` pattern. The bundled wordlists/og.txt is always
+# used; OG_WORDS_FILE adds (or replaces it with) a bigger list -- one word per
+# line or space separated, # comments ignored -- and OG_WORDS adds inline words.
+OG_WORDS_FILE: str = _str("OG_WORDS_FILE", "")
+OG_WORDS: str = _str("OG_WORDS", "")
+
+# --- Bulk scan -------------------------------------------------------------
+# A scan is the snipe loop run at throughput: many names per platform, driven
+# by the same validated pool. These defaults exist to hold >=100 completed
+# checks a second, which needs ~100x the per-check latency in flight.
+SCAN_CONCURRENCY: int = _int("SCAN_CONCURRENCY", 256)
+# Ceiling on names accepted in one scan (before the platform multiplier).
+SCAN_MAX_NAMES: int = _int("SCAN_MAX_NAMES", 20000)
+# A scan does not retry by default: at this width a retry costs more throughput
+# than the verdict it buys, and the pool cooldown already spreads the load.
+SCAN_RETRIES: int = _int("SCAN_RETRIES", 0)
+# Tighter than the sniper's, because in a scan a dead proxy is pure lost time.
+SCAN_CONNECT_TIMEOUT: float = _float("SCAN_CONNECT_TIMEOUT", 1.5)
+SCAN_READ_TIMEOUT: float = _float("SCAN_READ_TIMEOUT", 4.0)
+# Simultaneous requests per proxy during a scan.
+SCAN_PER_PROXY: int = _int("SCAN_PER_PROXY", 8)
+# The rate a scan aims for; reported against in /scan and on the dashboard.
+SCAN_TARGET_RATE: int = _int("SCAN_TARGET_RATE", 100)
 # A proxy that blocks or errors is rested this long, so a retry lands on a
 # different host instead of the one that just refused the name. 0 disables it.
 SNIPE_PROXY_COOLDOWN: float = _float("SNIPE_PROXY_COOLDOWN", 60.0)

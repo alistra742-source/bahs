@@ -41,6 +41,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
@@ -122,15 +123,26 @@ class ProxyPool:
         per_platform: dict[str, Iterable[str]] | None = None,
         cooldown: float = SNIPE_PROXY_COOLDOWN,
         per_proxy: int = 4,
+        timeout: httpx.Timeout | None = None,
+        platform_weight: int = 1,
     ) -> None:
         self._all = list(dict.fromkeys(proxies))
         known = set(self._all)
-        self._by_platform = {
-            name: [p for p in dict.fromkeys((per_platform or {}).get(name, ())) if p in known]
-            for name in PLATFORMS
-        }
+        # A platform's proven proxies are repeated `platform_weight` times and the
+        # rest of the pool follows, so rotation prefers them *and* still uses the
+        # whole pool. Restricting a 256-wide scan to the ~25 proxies that passed
+        # one platform's probe would cap it at 25 x per_proxy in flight.
+        weight = max(1, platform_weight)
+        self._by_platform: dict[str, list[str]] = {}
+        self._platform_counts: dict[str, int] = {}
+        for name in PLATFORMS:
+            passers = [p for p in dict.fromkeys((per_platform or {}).get(name, ())) if p in known]
+            others = [p for p in self._all if p not in set(passers)]
+            self._by_platform[name] = passers * weight + others
+            self._platform_counts[name] = len(passers)
         self._cooldown = max(0.0, cooldown)
         self._per_proxy = max(1, per_proxy)
+        self._timeout = timeout or _timeout()
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._resting: dict[str, float] = {}
         self._cursor = 0
@@ -139,7 +151,8 @@ class ProxyPool:
         return len(self._all)
 
     def platform_size(self, platform: str) -> int:
-        return len(self._by_platform.get(platform, ()))
+        """Distinct validated proxies that passed this platform's probe."""
+        return self._platform_counts.get(platform, 0)
 
     def next(self, platform: str | None = None) -> str | None:
         """The next proxy to use, preferring one already proven for ``platform``."""
@@ -165,7 +178,7 @@ class ProxyPool:
         if client is None:
             client = httpx.AsyncClient(
                 proxy=proxy,
-                timeout=_timeout(),
+                timeout=self._timeout,
                 follow_redirects=True,
                 limits=httpx.Limits(
                     max_connections=self._per_proxy,
@@ -359,6 +372,45 @@ def normalize_platforms(platforms: list[str] | None) -> list[str]:
     return [p for p in PLATFORMS if p.lower() in wanted] or list(PLATFORMS)
 
 
+class RateMeter:
+    """Counts completed checks and reports both the trailing and overall rate.
+
+    ``recent`` is what the dashboard shows, because a scan that slows down
+    halfway should report the slowdown rather than the flattering average of
+    everything before it.
+    """
+
+    def __init__(self, window: float = 5.0) -> None:
+        self.started = time.perf_counter()
+        self.window = window
+        self.count = 0
+        self._marks: deque[float] = deque()
+
+    def tick(self, n: int = 1) -> None:
+        now = time.perf_counter()
+        self.count += n
+        self._marks.append(now)
+        cutoff = now - self.window
+        while self._marks and self._marks[0] < cutoff:
+            self._marks.popleft()
+
+    @property
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.started
+
+    @property
+    def recent(self) -> float:
+        if not self._marks:
+            return 0.0
+        span = time.perf_counter() - self._marks[0]
+        return len(self._marks) / span if span > 0 else float(len(self._marks))
+
+    @property
+    def average(self) -> float:
+        elapsed = self.elapsed
+        return self.count / elapsed if elapsed > 0 else 0.0
+
+
 # --- the batch ------------------------------------------------------------
 async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResult:
     """One name on one platform, through the next proxy the pool hands out."""
@@ -393,6 +445,12 @@ async def iter_snipes(
     point of having a pool. A definitive answer (available/taken/invalid) is
     never retried. Names that cannot be valid on any of the three platforms are
     rejected before a request is spent on them.
+
+    The scheduler is a sliding window, not fixed chunks: the moment one check
+    finishes another starts, so in-flight work stays at ``concurrency`` from the
+    first result to the last. Waiting for a whole chunk to drain instead leaves
+    the tail of every chunk idle, which is exactly the throughput a scan cannot
+    spare.
     """
     queue: list[tuple[str, str]] = []
     for username in usernames:
@@ -406,7 +464,6 @@ async def iter_snipes(
 
     sem = asyncio.Semaphore(max(1, concurrency))
     window = max(1, concurrency * window_factor)
-    offset = 0
 
     async def one(platform: str, username: str) -> SnipeResult:
         async with sem:
@@ -418,16 +475,23 @@ async def iter_snipes(
                     continue
                 return result
 
-    # Outstanding tasks are bounded to `window` so a thousand names cannot spawn
-    # a task each, while one semaphore keeps in-flight requests at the ceiling.
-    while offset < len(queue):
-        chunk = queue[offset : offset + window]
-        offset += len(chunk)
-        tasks = [asyncio.create_task(one(p, u)) for p, u in chunk]
-        try:
-            for finished in asyncio.as_completed(tasks):
-                yield await finished
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
+    # Outstanding tasks are bounded to `window` so a hundred thousand checks
+    # cannot spawn a task each, while one semaphore keeps in-flight requests at
+    # the ceiling.
+    pending: dict[asyncio.Task, None] = {}
+    offset = 0
+    try:
+        while offset < len(queue) or pending:
+            while offset < len(queue) and len(pending) < window:
+                platform, username = queue[offset]
+                offset += 1
+                pending[asyncio.create_task(one(platform, username))] = None
+            if not pending:
+                break
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                del pending[task]
+                yield task.result()
+    finally:
+        for task in pending:
+            task.cancel()

@@ -14,21 +14,32 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import generator
 import sniper
 from config import (
     AUTO_START,
     LOG_LEVEL,
     PORT,
     REFRESH_INTERVAL,
+    SCAN_CONCURRENCY,
+    SCAN_CONNECT_TIMEOUT,
+    SCAN_MAX_NAMES,
+    SCAN_PER_PROXY,
+    SCAN_READ_TIMEOUT,
+    SCAN_RETRIES,
+    SCAN_TARGET_RATE,
     SNIPE_CONCURRENCY,
     SNIPE_MAX_NAMES,
     SNIPE_PER_PROXY,
+    SNIPE_PLATFORM_WEIGHT,
     SNIPE_POOL,
     SNIPE_POOL_TTL,
+    SNIPE_PROXY_COOLDOWN,
     SNIPE_RETRIES,
     STORE_PATH,
 )
@@ -113,6 +124,10 @@ def info() -> dict:
             "POST /refresh": "queue a single scrape+validate cycle",
             "POST /snipe": "check usernames on Discord / guns.lol / Instagram through validated proxies (JSON, or NDJSON with stream=true)",
             "GET /snipe": "the same for one ?username=",
+            "GET /generate": "candidate usernames: letters | alnum | numbers | words, by length",
+            "POST /generate": "the same for several patterns at once",
+            "POST /scan": "generate and check in bulk at a target rate, NDJSON with stream=true",
+            "GET /claim": "the registration route for a name on a platform",
         },
     }
 
@@ -229,13 +244,18 @@ class SnipeRequest(BaseModel):
     stream: bool = False
 
 
-# One warm pool, shared by every request, so the second batch of names skips the
-# handshakes the first one paid. Rebuilt when it goes stale or the store empties.
-_pool_state: dict[str, object] = {"pool": None, "built": 0.0}
+# One warm pool per mode, shared by every request, so the second batch of names
+# skips the handshakes the first one paid. Rebuilt when it goes stale or the
+# store empties. "scan" gets its own, with tighter timeouts and wider per-proxy
+# concurrency, so a scan never reconfigures the pool a single check is using.
+_pool_state: dict[str, dict[str, object]] = {
+    "snipe": {"pool": None, "built": 0.0},
+    "scan": {"pool": None, "built": 0.0},
+}
 _pool_lock = asyncio.Lock()
 
 
-def _build_pool() -> sniper.ProxyPool:
+def _build_pool(scan: bool = False) -> sniper.ProxyPool:
     """Pool the validated proxies, and note which target each one already passed."""
     rows = store.query(alive_only=True, limit=1_000_000)
     proxies = [r.proxy for r in rows[:SNIPE_POOL]]
@@ -243,21 +263,42 @@ def _build_pool() -> sniper.ProxyPool:
         name: [r.proxy for r in rows if r.platforms.get(name, {}).get("ok")][:SNIPE_POOL]
         for name in sniper.PLATFORMS
     }
-    return sniper.ProxyPool(proxies, per_platform=per_platform, per_proxy=SNIPE_PER_PROXY)
+    if scan:
+        timeout = httpx.Timeout(
+            connect=SCAN_CONNECT_TIMEOUT,
+            read=SCAN_READ_TIMEOUT,
+            write=SCAN_READ_TIMEOUT,
+            pool=SCAN_READ_TIMEOUT,
+        )
+        return sniper.ProxyPool(
+            proxies,
+            per_platform=per_platform,
+            per_proxy=SCAN_PER_PROXY,
+            timeout=timeout,
+            platform_weight=SNIPE_PLATFORM_WEIGHT,
+        )
+    return sniper.ProxyPool(
+        proxies,
+        per_platform=per_platform,
+        per_proxy=SNIPE_PER_PROXY,
+        platform_weight=SNIPE_PLATFORM_WEIGHT,
+    )
 
 
-async def _snipe_pool() -> sniper.ProxyPool:
+async def _pool(mode: str = "snipe") -> sniper.ProxyPool:
+    scan = mode == "scan"
     async with _pool_lock:
-        pool = _pool_state["pool"]
-        age = time.time() - float(_pool_state["built"])  # type: ignore[arg-type]
+        state = _pool_state[mode]
+        pool = state["pool"]
+        age = time.time() - float(state["built"])  # type: ignore[arg-type]
         if isinstance(pool, sniper.ProxyPool) and len(pool) and age < SNIPE_POOL_TTL:
             return pool
-        fresh = _build_pool()
+        fresh = _build_pool(scan)
         if isinstance(pool, sniper.ProxyPool) and pool is not fresh:
             # Retire the old connections in the background; nobody waits on it.
             asyncio.create_task(pool.aclose())
-        _pool_state["pool"] = fresh
-        _pool_state["built"] = time.time()
+        state["pool"] = fresh
+        state["built"] = time.time()
         return fresh
 
 
@@ -288,7 +329,7 @@ def _snipe_row(result: sniper.SnipeResult) -> dict:
 async def _snipe_ready(req: SnipeRequest) -> tuple[list[str], list[str], sniper.ProxyPool, int, int]:
     """Validate the request and fetch the pool before anything streams."""
     names = _names_of(req)
-    pool = await _snipe_pool()
+    pool = await _pool("snipe")
     if len(pool) == 0:
         raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
     platforms = sniper.normalize_platforms(req.platforms)
@@ -390,6 +431,258 @@ async def snipe_one(
         "available_count": len(available),
         "available": available,
         "results": rows,
+    }
+
+
+# --- generation -----------------------------------------------------------
+class PatternSpec(BaseModel):
+    """One generator request: a pattern, a length, and how many to draw."""
+
+    pattern: str
+    length: int
+    limit: int | None = None
+    mode: str = "random"
+
+
+class GenerateRequest(BaseModel):
+    patterns: list[PatternSpec] = Field(default_factory=list)
+    pattern: str | None = None
+    length: int | None = None
+    limit: int = 500
+    seed: int | None = None
+    mode: str = "random"
+    words: list[str] | None = None
+
+
+def _generate(req: GenerateRequest) -> dict:
+    specs = [spec.model_dump() for spec in req.patterns]
+    if not specs:
+        if not req.pattern or not req.length:
+            raise HTTPException(400, "give pattern+length, or a list of patterns")
+        specs = [
+            {"pattern": req.pattern, "length": req.length, "limit": req.limit, "mode": req.mode}
+        ]
+    try:
+        names = generator.generate_many(
+            specs, limit=req.limit, seed=req.seed, words=req.words
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"count": len(names), "patterns": specs, "seed": req.seed, "usernames": names}
+
+
+@app.get("/generate")
+def generate_one(
+    pattern: str = Query(..., pattern="^(letters|alnum|numbers|words)$"),
+    length: int = Query(..., ge=1, le=32),
+    limit: int = Query(500, ge=1, le=100000),
+    seed: int | None = Query(None),
+    mode: str = Query("random", pattern="^(random|sequential)$"),
+) -> dict:
+    """Candidate usernames for one pattern: letters, alnum, numbers or words."""
+    return _generate(
+        GenerateRequest(pattern=pattern, length=length, limit=limit, seed=seed, mode=mode)
+    )
+
+
+@app.post("/generate")
+def generate_many(req: GenerateRequest) -> dict:
+    """The same for several patterns at once, optionally with an inline word list."""
+    return _generate(req)
+
+
+# --- bulk scan ------------------------------------------------------------
+class ScanRequest(BaseModel):
+    """Generate (and/or supply) names, then check them at throughput."""
+
+    platforms: list[str] | None = None
+    usernames: list[str] = Field(default_factory=list)
+    patterns: list[PatternSpec] = Field(default_factory=list)
+    limit: int = 2000
+    seed: int | None = None
+    words: list[str] | None = None
+    concurrency: int | None = None
+    retries: int | None = None
+    stream: bool = False
+
+
+def _scan_names(req: ScanRequest) -> tuple[list[str], bool]:
+    names: list[str] = []
+    for raw in req.usernames:
+        name = (raw or "").strip().lstrip("@")
+        if name and name not in names:
+            names.append(name)
+    if req.patterns:
+        try:
+            drawn = generator.generate_many(
+                [spec.model_dump() for spec in req.patterns],
+                limit=req.limit,
+                seed=req.seed,
+                words=req.words,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        for name in drawn:
+            if name not in names:
+                names.append(name)
+    if not names:
+        raise HTTPException(400, "give usernames, or at least one pattern to generate")
+    if len(names) > SCAN_MAX_NAMES:
+        return names[:SCAN_MAX_NAMES], True
+    return names, False
+
+
+async def _scan_stream(
+    names: list[str],
+    platforms: list[str],
+    pool: sniper.ProxyPool,
+    concurrency: int,
+    retries: int,
+    truncated: bool,
+) -> AsyncIterator[str]:
+    """NDJSON: one verdict per line, a rate line every ~100 checks, then a summary."""
+    meter = sniper.RateMeter()
+    checked = 0
+    available = 0
+    last_report = 0.0
+    yield json.dumps(
+        {
+            "type": "start",
+            "names": len(names),
+            "truncated": truncated,
+            "platforms": platforms,
+            "pool_size": len(pool),
+            "platform_pool": {name: pool.platform_size(name) for name in platforms},
+            "concurrency": concurrency,
+            "target_rate": SCAN_TARGET_RATE,
+        }
+    ) + "\n"
+
+    async for result in sniper.iter_snipes(
+        names, platforms, pool, concurrency=concurrency, retries=retries
+    ):
+        meter.tick()
+        checked += 1
+        if result.status == "available":
+            available += 1
+        yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+        now = time.perf_counter()
+        if checked % 100 == 0 and (now - last_report) >= 0.5:
+            last_report = now
+            yield json.dumps(
+                {
+                    "type": "progress",
+                    "checked": checked,
+                    "per_second": round(meter.recent, 1),
+                    "average_per_second": round(meter.average, 1),
+                    "available_count": available,
+                    "elapsed_s": round(meter.elapsed, 2),
+                }
+            ) + "\n"
+
+    rate = meter.average
+    yield json.dumps(
+        {
+            "type": "done",
+            "names": len(names),
+            "platforms": platforms,
+            "pool_size": len(pool),
+            "checked": checked,
+            "available_count": available,
+            "per_second": round(rate, 1),
+            "recent_per_second": round(meter.recent, 1),
+            "target_rate": SCAN_TARGET_RATE,
+            "target_met": rate >= SCAN_TARGET_RATE,
+            "duration_ms": round(meter.elapsed * 1000, 1),
+        }
+    ) + "\n"
+
+
+@app.post("/scan")
+async def scan(req: ScanRequest):
+    """Bulk-check generated names, through the validated proxies, at a target rate.
+
+    NDJSON by default so a long scan can be watched live; ``"stream": false``
+    buffers the same data into one JSON document.
+    """
+    names, truncated = _scan_names(req)
+    pool = await _pool("scan")
+    if len(pool) == 0:
+        raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
+    platforms = sniper.normalize_platforms(req.platforms)
+    concurrency = max(1, req.concurrency or SCAN_CONCURRENCY)
+    retries = SCAN_RETRIES if req.retries is None else max(0, req.retries)
+
+    if not req.stream:
+        results = [
+            result
+            async for result in sniper.iter_snipes(
+                names, platforms, pool, concurrency=concurrency, retries=retries
+            )
+        ]
+        rows = [_snipe_row(r) for r in results]
+        available = [r for r in rows if r["status"] == "available"]
+        return {
+            "names": len(names),
+            "truncated": truncated,
+            "platforms": platforms,
+            "pool_size": len(pool),
+            "checked": len(rows),
+            "available_count": len(available),
+            "available": available,
+            "results": rows,
+        }
+
+    return StreamingResponse(
+        _scan_stream(names, platforms, pool, concurrency, retries, truncated),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+# --- claiming -------------------------------------------------------------
+# A name can only be taken by an account, and an account is created by a person.
+# So "claim" here is the route to the platform's own registration, not a bulk
+# account factory: automating signups is what gets an IP range banned and is not
+# something this service will do.
+CLAIM_TARGETS: dict[str, dict[str, str]] = {
+    "discord": {
+        "register_url": "https://discord.com/register",
+        "existing_account": "User Settings > My Account > Username",
+        "note": "Discord adopts a username at signup, or changes it from an existing account's settings.",
+    },
+    "guns.lol": {
+        "register_url": "https://guns.lol/register",
+        "existing_account": "Dashboard > Settings > Username",
+        "note": "guns.lol assigns the handle when you register.",
+    },
+    "instagram": {
+        "register_url": "https://www.instagram.com/accounts/emailsignup/",
+        "existing_account": "Settings > Edit profile > Username",
+        "note": "Instagram assigns the handle at signup.",
+    },
+}
+
+
+@app.get("/claim")
+def claim(
+    platform: str = Query(..., pattern="^(discord|guns\\.lol|instagram)$"),
+    username: str = Query(..., min_length=1, max_length=32),
+) -> dict:
+    """Where to register a name the scan just reported as free."""
+    target = CLAIM_TARGETS[platform]
+    return {
+        "platform": platform,
+        "username": username.strip().lstrip("@"),
+        "url": target["register_url"],
+        "existing_account": target["existing_account"],
+        "note": target["note"],
+        "automated": False,
+        "detail": (
+            "Claiming is a signed-in action on the platform: the name is taken by "
+            "creating an account, which this service does not do for you. Confirm "
+            "the name is still free, then register it yourself at the URL above."
+        ),
     }
 
 
