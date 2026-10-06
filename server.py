@@ -24,6 +24,7 @@ import sniper
 from config import (
     AUTO_START,
     LOG_LEVEL,
+    MIN_ALIVE,
     PORT,
     REFRESH_INTERVAL,
     SCAN_CONCURRENCY,
@@ -302,6 +303,37 @@ async def _pool(mode: str = "snipe") -> sniper.ProxyPool:
         return fresh
 
 
+def _status_counts(rows: list[dict]) -> dict[str, int]:
+    """How the verdicts broke down, so a wall of errors is a number, not a guess."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("status") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+async def _prepare_pool(mode: str) -> tuple[sniper.ProxyPool, str]:
+    """The pool for a run, plus a note when it is too thin to be useful.
+
+    Below ``MIN_ALIVE`` a run cannot answer anything: every check comes back an
+    error and the caller just sees a table of nothing. A fresh deploy with no
+    mounted volume starts from an empty store, which is exactly that case. So a
+    refresh is queued and the reason is handed back for the dashboard to show,
+    instead of letting the run fail silently.
+    """
+    pool = await _pool(mode)
+    if len(pool) == 0:
+        raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
+    if len(pool) < MIN_ALIVE:
+        note = (
+            f"only {len(pool)} validated proxies alive -- a refresh was queued; "
+            "checks may come back as errors until the pool refills"
+        )
+        await manager.trigger()
+        return pool, note
+    return pool, ""
+
+
 def _names_of(req: SnipeRequest) -> list[str]:
     names: list[str] = []
     for raw in [*req.usernames, req.username or ""]:
@@ -326,16 +358,16 @@ def _snipe_row(result: sniper.SnipeResult) -> dict:
     }
 
 
-async def _snipe_ready(req: SnipeRequest) -> tuple[list[str], list[str], sniper.ProxyPool, int, int]:
+async def _snipe_ready(
+    req: SnipeRequest,
+) -> tuple[list[str], list[str], sniper.ProxyPool, int, int, str]:
     """Validate the request and fetch the pool before anything streams."""
     names = _names_of(req)
-    pool = await _pool("snipe")
-    if len(pool) == 0:
-        raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
+    pool, note = await _prepare_pool("snipe")
     platforms = sniper.normalize_platforms(req.platforms)
     concurrency = max(1, req.concurrency or SNIPE_CONCURRENCY)
     retries = SNIPE_RETRIES if req.retries is None else max(0, req.retries)
-    return names, platforms, pool, concurrency, retries
+    return names, platforms, pool, concurrency, retries, note
 
 
 async def _snipe_ndjson(
@@ -344,6 +376,7 @@ async def _snipe_ndjson(
     pool: sniper.ProxyPool,
     concurrency: int,
     retries: int,
+    note: str = "",
 ) -> AsyncIterator[str]:
     """One JSON verdict per line, then a summary line.
 
@@ -354,10 +387,14 @@ async def _snipe_ndjson(
     started = time.perf_counter()
     checked = 0
     available = 0
+    counts: dict[str, int] = {}
+    if note:
+        yield json.dumps({"type": "note", "pool_note": note, "pool_size": len(pool)}) + "\n"
     async for result in sniper.iter_snipes(
         names, platforms, pool, concurrency=concurrency, retries=retries
     ):
         checked += 1
+        counts[result.status] = counts.get(result.status, 0) + 1
         available += 1 if result.status == "available" else 0
         yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
     yield json.dumps(
@@ -366,6 +403,8 @@ async def _snipe_ndjson(
             "names": len(names),
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_note": note,
+            "by_status": counts,
             "resting": pool.resting(),
             "checked": checked,
             "available_count": available,
@@ -381,10 +420,10 @@ async def snipe_batch(req: SnipeRequest):
     JSON by default; ``"stream": true`` returns the same data as NDJSON, one
     result per line, so a big batch lands incrementally.
     """
-    names, platforms, pool, concurrency, retries = await _snipe_ready(req)
+    names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
     if req.stream:
         return StreamingResponse(
-            _snipe_ndjson(names, platforms, pool, concurrency, retries),
+            _snipe_ndjson(names, platforms, pool, concurrency, retries, note),
             media_type="application/x-ndjson",
             # Nothing between here and the browser may buffer the stream.
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
@@ -401,6 +440,8 @@ async def snipe_batch(req: SnipeRequest):
         "names": len(names),
         "platforms": platforms,
         "pool_size": len(pool),
+        "pool_note": note,
+        "by_status": _status_counts(rows),
         "checked": len(rows),
         "available_count": len(available),
         "available": available,
@@ -415,7 +456,7 @@ async def snipe_one(
 ):
     """Same thing for one name, from the query string."""
     req = SnipeRequest(username=username, platforms=platform)
-    names, platforms, pool, concurrency, retries = await _snipe_ready(req)
+    names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
     rows = [
         _snipe_row(r)
         async for r in sniper.iter_snipes(
@@ -427,6 +468,8 @@ async def snipe_one(
         "names": len(names),
         "platforms": platforms,
         "pool_size": len(pool),
+        "pool_note": note,
+        "by_status": _status_counts(rows),
         "checked": len(rows),
         "available_count": len(available),
         "available": available,
@@ -539,12 +582,14 @@ async def _scan_stream(
     concurrency: int,
     retries: int,
     truncated: bool,
+    note: str = "",
 ) -> AsyncIterator[str]:
     """NDJSON: one verdict per line, a rate line every ~100 checks, then a summary."""
     meter = sniper.RateMeter()
     checked = 0
     available = 0
     last_report = 0.0
+    counts: dict[str, int] = {}
     yield json.dumps(
         {
             "type": "start",
@@ -552,6 +597,7 @@ async def _scan_stream(
             "truncated": truncated,
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_note": note,
             "platform_pool": {name: pool.platform_size(name) for name in platforms},
             "concurrency": concurrency,
             "target_rate": SCAN_TARGET_RATE,
@@ -563,6 +609,7 @@ async def _scan_stream(
     ):
         meter.tick()
         checked += 1
+        counts[result.status] = counts.get(result.status, 0) + 1
         if result.status == "available":
             available += 1
         yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
@@ -587,6 +634,8 @@ async def _scan_stream(
             "names": len(names),
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_note": note,
+            "by_status": counts,
             "checked": checked,
             "available_count": available,
             "per_second": round(rate, 1),
@@ -606,9 +655,7 @@ async def scan(req: ScanRequest):
     buffers the same data into one JSON document.
     """
     names, truncated = _scan_names(req)
-    pool = await _pool("scan")
-    if len(pool) == 0:
-        raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
+    pool, note = await _prepare_pool("scan")
     platforms = sniper.normalize_platforms(req.platforms)
     concurrency = max(1, req.concurrency or SCAN_CONCURRENCY)
     retries = SCAN_RETRIES if req.retries is None else max(0, req.retries)
@@ -627,6 +674,8 @@ async def scan(req: ScanRequest):
             "truncated": truncated,
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_note": note,
+            "by_status": _status_counts(rows),
             "checked": len(rows),
             "available_count": len(available),
             "available": available,
@@ -634,7 +683,7 @@ async def scan(req: ScanRequest):
         }
 
     return StreamingResponse(
-        _scan_stream(names, platforms, pool, concurrency, retries, truncated),
+        _scan_stream(names, platforms, pool, concurrency, retries, truncated, note),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

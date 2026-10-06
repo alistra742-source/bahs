@@ -12,8 +12,10 @@ from typing import Any
 
 from checker import get_direct_ip, iter_checks
 from config import (
+    LOW_POOL_INTERVAL,
     MAX_CANDIDATES,
     MAX_CONCURRENCY,
+    MIN_ALIVE,
     PROGRESS_EVERY,
     REFRESH_INTERVAL,
     REFRESH_ON_START,
@@ -120,12 +122,24 @@ class RefreshManager:
             return
         asyncio.create_task(self.run_cycle())
 
+    def next_wait(self) -> float:
+        """Seconds until the next cycle.
+
+        A pool below ``MIN_ALIVE`` cannot answer a scan -- every check comes
+        back an error -- so while it is that thin the loop retries on
+        ``LOW_POOL_INTERVAL`` instead of sleeping a full interval on a list that
+        cannot check anything. A fresh deploy with no mounted volume starts
+        empty, which is exactly that case.
+        """
+        alive = self.store.stats()["alive"]
+        return LOW_POOL_INTERVAL if alive < MIN_ALIVE else REFRESH_INTERVAL
+
     async def _loop(self) -> None:
         if REFRESH_ON_START:
             await self.run_cycle()
         while not self._stop.is_set():
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=REFRESH_INTERVAL)
+                await asyncio.wait_for(self._stop.wait(), timeout=self.next_wait())
             except asyncio.TimeoutError:
                 await self.run_cycle()
 

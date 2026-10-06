@@ -83,6 +83,8 @@ The repository root **is** the service. In Railway:
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `1.5` / `4` | scan timeouts, tighter than the sniper's so a dead proxy is dropped fast |
 | `SCAN_PER_PROXY` | `8` | simultaneous requests through one proxy during a scan |
 | `SCAN_TARGET_RATE` | `100` | the rate a scan is measured against |
+| `MIN_ALIVE` | `15` | below this many alive proxies a run cannot answer, so it queues a refresh and reports the pool as thin |
+| `LOW_POOL_INTERVAL` | `300` | seconds between refresh cycles while alive is below `MIN_ALIVE` (instead of `REFRESH_INTERVAL`) |
 
 ## Dashboard
 
@@ -112,7 +114,11 @@ The repository root **is** the service. In Railway:
   the list can be inspected or edited first. Verdicts stream in one line at a
   time with the
   status, the reason, the proxy used and the latency, while the bar under the
-  box shows `checked / total` and the completed-checks-per-second rate.
+  box shows `checked / total` in **checks** (names × platforms) and the
+  completed-checks-per-second rate. A run where most checks errored says so —
+  the pool is thin or dead, not the names — and a pool below `MIN_ALIVE` queues
+  a refresh and shows the reason instead of silently returning a table of
+  nothing.
   `Copy available` takes the names that came back free, and each free row has a
   `claim` button that copies the name and opens its registration page.
 - No login: the API is open, so the dashboard needs no key.
@@ -323,4 +329,8 @@ uvicorn server:app --host 0.0.0.0 --port 8080
   guns.lol and Instagram. Expect the `platforms_passed == 3` set to be small
   and volatile; that is the honest signal, not a bug.
 - The store is in-memory with JSON persistence. On Railway, mount a volume or
-  the list rebuilds from scratch on each deploy.
+  the list rebuilds from scratch on each deploy. Until it refills — a cycle
+  takes minutes and most free proxies are dead — a run reports the pool as thin
+  and queues a refresh, and the refresh loop retries every `LOW_POOL_INTERVAL`
+  while alive is below `MIN_ALIVE` rather than sleeping a full interval on a
+  list that cannot check anything.

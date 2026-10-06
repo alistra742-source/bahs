@@ -210,13 +210,17 @@ class ProxyPool:
 
 # --- Discord --------------------------------------------------------------
 async def check_discord(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    # A proxy whose SOCKS handshake fails raises the proxy library's own
+    # ProtocolError, which is *not* an httpx.HTTPError; catching only httpx
+    # errors lets it escape as "unexpected:ProtocolError" and hides the proxy as
+    # the cause. Catch broadly and report the exception's own name.
     try:
         resp = await client.post(
             DISCORD_ATTEMPT,
             json={"username": username},
             headers={"Content-Type": "application/json", "User-Agent": DISCORD_UA},
         )
-    except httpx.HTTPError as exc:
+    except Exception as exc:
         return SnipeResult(username, "discord", "error", type(exc).__name__)
 
     if resp.status_code == 200:
@@ -288,7 +292,7 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
     )
     try:
         resp = await client.send(request, stream=True)
-    except httpx.HTTPError as exc:
+    except Exception as exc:
         return SnipeResult(username, "guns.lol", "error", type(exc).__name__)
 
     verdict: SnipeResult | None = None
@@ -309,7 +313,7 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
                     break
                 if len(head) >= MAX_HEAD_BYTES:
                     break
-    except httpx.HTTPError as exc:
+    except Exception as exc:
         await resp.aclose()
         return SnipeResult(username, "guns.lol", "error", type(exc).__name__)
 
@@ -339,7 +343,7 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> SnipeResu
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     try:
         resp = await client.get(url, headers=headers)
-    except httpx.HTTPError as exc:
+    except Exception as exc:
         return SnipeResult(username, "instagram", "error", type(exc).__name__)
 
     if resp.status_code == 404:

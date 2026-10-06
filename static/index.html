@@ -520,7 +520,7 @@ async function streamResults(url, body, onLine) {
   if (!res.body) {
     const data = await res.json();
     (data.results || []).forEach((row) => onLine(Object.assign({ type: "result" }, row)));
-    onLine({ type: "done", checked: data.checked, available_count: data.available_count, pool_size: data.pool_size });
+    onLine({ type: "done", checked: data.checked, available_count: data.available_count, pool_size: data.pool_size, pool_note: data.pool_note, by_status: data.by_status });
     return;
   }
   const reader = res.body.getReader();
@@ -684,6 +684,7 @@ async function runSnipe() {
         appendSnipe(msg);
       } else if (msg.type === "done") {
         summary = msg.available_count + " available of " + msg.checked + " checks, pool " + msg.pool_size;
+        if (msg.pool_note) summary += " - " + msg.pool_note;
       }
       tick();
     });
@@ -719,12 +720,18 @@ async function runScan() {
       stream: true,
     }, (msg) => {
       if (msg.type === "start") {
-        scanTotal = msg.names;
+        // Every name is checked on every platform, so the bar's total is
+        // checks, not names (names x platforms).
+        scanTotal = msg.names * (msg.platforms.length || 1);
         scanProgress(0, scanTotal);
         const per = Object.keys(msg.platform_pool)
           .map((k) => msg.platform_pool[k] + " " + k).join(", ");
-        snipeMsg("scanning " + msg.names + " names on " + msg.platforms.length + " platforms, pool " +
-                 msg.pool_size + " (" + per + "), target " + msg.target_rate + "/s");
+        if (msg.pool_note) {
+          snipeMsg(msg.pool_note);
+        } else {
+          snipeMsg("scanning " + msg.names + " names on " + msg.platforms.length + " platforms, pool " +
+                   msg.pool_size + " (" + per + "), target " + msg.target_rate + "/s");
+        }
       } else if (msg.type === "result") {
         checked++;
         if (msg.status === "available") { available++; lastSnipes.push(msg); }
@@ -743,6 +750,14 @@ async function runScan() {
           msg.per_second.toFixed(1) + " checks/s " +
           (msg.target_met ? "(target " + msg.target_rate + " met)" : "(below target " + msg.target_rate + ")") +
           ", " + (msg.duration_ms / 1000).toFixed(1) + "s";
+        // A run where most checks errored is the pool's fault, not the
+        // names': say so instead of showing a table of nothing.
+        const st = msg.by_status || {};
+        const errs = (st.error || 0) + (st.blocked || 0);
+        if (errs && errs >= msg.checked * 0.5) {
+          summary += " - " + errs + " of " + msg.checked +
+            " errored: the validated pool is thin or dead, a refresh was queued";
+        }
       }
     });
     if (summary) snipeMsg(summary);

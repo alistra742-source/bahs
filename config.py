@@ -148,6 +148,15 @@ SNIPE_READ_TIMEOUT: float = _float("SNIPE_READ_TIMEOUT", 8.0)
 # before it is rebuilt from the store. Reuse is what skips the handshake.
 SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)
 
+# --- Pool health -----------------------------------------------------------
+# Below this many alive proxies a scan cannot produce verdicts -- every check
+# comes back an error -- so a refresh is queued whenever a request finds the
+# pool this thin, and the refresh loop shortens its wait to LOW_POOL_INTERVAL
+# until the pool recovers. A deploy with no mounted volume starts from an empty
+# store, which is exactly when this matters.
+MIN_ALIVE: int = _int("MIN_ALIVE", 15)
+LOW_POOL_INTERVAL: int = _int("LOW_POOL_INTERVAL", 300)
+
 # --- Persistence -----------------------------------------------------------
 # Point STORE_PATH at a Railway volume mount for durability across deploys.
 STORE_PATH: str = _str("STORE_PATH", "data/proxies.json")
