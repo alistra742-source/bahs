@@ -54,6 +54,12 @@ tr:hover td{background:#0e131b}
 .pill.anonymous{color:#f0d38f;border-color:#514326;background:#241f0f}
 .pill.transparent{color:#ffb4b4;border-color:#5c2b2b;background:#241010}
 .pill.unknown{color:var(--dim)}
+.pill.available{color:#8ff0a4;border-color:#26502f;background:#0f2417}
+.pill.taken{color:#ffb4b4;border-color:#5c2b2b;background:#241010}
+.pill.invalid{color:#f0d38f;border-color:#514326;background:#241f0f}
+.pill.blocked,.pill.error{color:var(--dim)}
+label.chk{display:inline-flex;align-items:center;gap:6px;font:12px ui-monospace,monospace;color:#cbd5e5}
+label.chk input{width:auto;padding:0;margin:0}
 .dots{display:inline-flex;gap:4px}
 .dot{width:9px;height:9px;border-radius:50%;background:#232b38;display:inline-block}
 .dot.ok{background:var(--green)}
@@ -167,6 +173,36 @@ a{color:var(--blue)}
       </table>
     </div>
     <div class="empty" id="empty" style="display:none">no validated proxies match — press Refresh now</div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <h2>Sniper</h2>
+      <div class="row">
+        <span class="msg" id="snipe-msg"></span>
+        <button class="mini" id="btn-snipe-copy">Copy available</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="hint">platforms</span>
+      <label class="chk"><input type="checkbox" class="snipe-pf" value="discord" checked> discord</label>
+      <label class="chk"><input type="checkbox" class="snipe-pf" value="guns.lol" checked> guns.lol</label>
+      <label class="chk"><input type="checkbox" class="snipe-pf" value="instagram" checked> instagram</label>
+      <span class="hint">concurrency</span>
+      <input id="snipe-conc" type="number" min="1" max="200" value="24" style="width:74px">
+      <button class="primary" id="btn-snipe">Check names</button>
+      <span class="hint">runs through the validated proxies</span>
+    </div>
+    <textarea id="snipe-names" rows="3" placeholder="usernames, one per line - @ is optional"></textarea>
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>latency</th></tr>
+        </thead>
+        <tbody id="snipe-rows"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="snipe-empty">nothing checked yet</div>
   </div>
 
   <div class="foot">
@@ -393,6 +429,140 @@ document.querySelectorAll(".copybtn").forEach((b) => {
   b.onclick = () => copyList(b.dataset.platform ? { platform: b.dataset.platform } : {}, b.dataset.platform || "any platform");
 });
 $("btn-copy-all3").onclick = () => copyList({ all_platforms: "true" }, "all 3");
+
+// --- sniper ---------------------------------------------------------------
+// Results arrive as NDJSON, one verdict per line, so rows appear as each name
+// is answered instead of all at once at the end of the batch.
+let lastSnipes = [];
+
+function snipeMsg(text, bad) {
+  $("snipe-msg").textContent = text;
+  $("snipe-msg").className = bad ? "msg bad" : "msg ok";
+}
+
+function appendSnipe(r) {
+  const tr = document.createElement("tr");
+  tr.innerHTML =
+    `<td class="mono">${esc(r.username)}</td>` +
+    `<td>${esc(r.platform)}</td>` +
+    `<td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>` +
+    `<td class="hint">${esc(r.detail || "")}</td>` +
+    `<td class="hint">${esc(r.proxy || "-")}</td>` +
+    `<td>${fmtMs(r.latency_ms)}</td>`;
+  $("snipe-rows").appendChild(tr);
+  $("snipe-empty").style.display = "none";
+}
+
+async function errorText(res) {
+  let detail = res.status + "";
+  try { detail = (await res.json()).detail || detail; } catch (e) {}
+  return detail;
+}
+
+function snipeBody(names, platforms) {
+  return JSON.stringify({
+    usernames: names,
+    platforms: platforms,
+    concurrency: Number($("snipe-conc").value) || 32,
+    stream: true,
+  });
+}
+
+async function runSnipe() {
+  const names = $("snipe-names").value
+    .split(/[\n,]/)
+    .map((s) => s.trim().replace(/^@/, ""))
+    .filter(Boolean);
+  const platforms = [...document.querySelectorAll(".snipe-pf:checked")].map((c) => c.value);
+  if (!names.length) {
+    snipeMsg("type some usernames first", true);
+    return;
+  }
+  if (!platforms.length) {
+    snipeMsg("pick at least one platform", true);
+    return;
+  }
+
+  $("btn-snipe").disabled = true;
+  lastSnipes = [];
+  $("snipe-rows").innerHTML = "";
+  $("snipe-empty").style.display = "none";
+  let checked = 0, available = 0, summary = "";
+  const started = Date.now();
+  const tick = (extra) => {
+    const secs = ((Date.now() - started) / 1000).toFixed(1);
+    snipeMsg(available + " available · " + checked + " checked · " + secs + "s" + (extra ? " · " + extra : ""));
+  };
+  tick();
+
+  try {
+    const res = await fetch("/snipe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: snipeBody(names, platforms),
+    });
+    if (!res.ok) throw new Error(await errorText(res));
+
+    // No streaming support: fall back to the buffered JSON response.
+    if (!res.body) {
+      const data = await res.json();
+      lastSnipes = data.available || [];
+      (data.results || []).forEach(appendSnipe);
+      snipeMsg(data.available_count + " available of " + data.checked + " checks · pool " + data.pool_size);
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch (e) { continue; }
+        if (msg.type === "done") {
+          summary =
+            msg.available_count + " available of " + msg.checked + " checks · pool " +
+            msg.pool_size + (msg.resting ? " (" + msg.resting + " resting)" : "") +
+            " · " + Math.round(msg.duration_ms) + " ms";
+          continue;
+        }
+        if (msg.type !== "result") continue;
+        checked++;
+        if (msg.status === "available") { available++; lastSnipes.push(msg); }
+        appendSnipe(msg);
+      }
+      tick();
+    }
+    if (summary) snipeMsg(summary);
+    else tick("done");
+  } catch (e) {
+    snipeMsg(e.message, true);
+  } finally {
+    $("btn-snipe").disabled = false;
+  }
+}
+
+$("btn-snipe").onclick = runSnipe;
+$("btn-snipe-copy").onclick = async () => {
+  if (!lastSnipes.length) {
+    snipeMsg("no available names to copy yet", true);
+    return;
+  }
+  const text = lastSnipes.map((r) => r.platform + " " + r.username).join("\n");
+  try {
+    await copyText(text);
+    snipeMsg("copied " + lastSnipes.length + " available");
+  } catch (e) {
+    snipeMsg(e.message, true);
+  }
+};
 
 $("btn-start").onclick = () => post("/start");
 $("btn-stop").onclick = () => post("/stop");

@@ -20,6 +20,11 @@ What it does each cycle:
 5. **Score + persist** — each proxy gets a 0–100 score from anonymity, latency
    and platform pass rate, ranked, pruned, and written to disk.
 
+On top of that list, **`POST /snipe` checks whether a username is free** on
+Discord, guns.lol and Instagram, driving every request through the validated
+proxies — the platforms block a datacenter IP outright, which is the reason the
+proxy list exists in the first place.
+
 ## Deploy on Railway
 
 The repository root **is** the service. In Railway:
@@ -56,6 +61,14 @@ The repository root **is** the service. In Railway:
 | `JUDGE_URL` | `https://httpbin.org/get` | must return `origin` + `headers` |
 | `JUDGE_FALLBACKS` | `httpbingo.org/get`, `eu.httpbin.org/get`, `postman-echo.com/get` | the rest of the judge pool, tried in rotation |
 | `JUDGE_PER_ENDPOINT` | `60` | simultaneous judge requests allowed against any one endpoint |
+| `SNIPE_CONCURRENCY` | `32` | simultaneous name checks in one snipe request |
+| `SNIPE_RETRIES` | `2` | how many times a blocked or proxy-failed name is retried on another proxy |
+| `SNIPE_MAX_NAMES` | `200` | ceiling on names per snipe request |
+| `SNIPE_POOL` | `400` | how many validated proxies the sniper rotates over |
+| `SNIPE_PROXY_COOLDOWN` | `60` | seconds a proxy that blocked or errored is rested; `0` disables |
+| `SNIPE_PER_PROXY` | `4` | simultaneous requests through any one proxy |
+| `SNIPE_CONNECT_TIMEOUT` / `SNIPE_READ_TIMEOUT` | `3` / `8` | sniper timeouts, tighter than the validator's so a bad proxy is abandoned quickly |
+| `SNIPE_POOL_TTL` | `300` | seconds a warm proxy pool (and its connections) is reused across requests |
 
 ## Dashboard
 
@@ -73,7 +86,47 @@ The repository root **is** the service. In Railway:
 - **Copy the working list** — one button per target (`all`, `discord`,
   `guns.lol`, `instagram`, `passes all 3`) copies the matching proxies as plain
   `ip:port` lines, honouring the anonymity/protocol/limit filters on screen.
+- **Sniper** — pick the platforms, paste names (one per line, `@` optional) and
+  press `Check names`. Verdicts stream in one line at a time with the status,
+  the reason, the proxy it used and the latency; `Copy available` takes the
+  names that came back free.
 - No login: the API is open, so the dashboard needs no key.
+
+### How the sniper reads each platform
+
+Every rule below was read off the live site rather than assumed:
+
+| Platform | Request | Free | Taken | Never available |
+| --- | --- | --- | --- | --- |
+| Discord | `POST /api/v9/unique-username/username-attempt-unauthed` | `200 {"taken":false}` | `200 {"taken":true}` | `400` is a **validation** refusal (reserved word, bad length), reported as `invalid`, never as free |
+| guns.lol | `GET /{name}` | the site's default page, no profile block | page carries `profile-page-json-ld` with `"identifier":"<name>"` | — |
+| Instagram | `GET /api/v1/users/web_profile_info/?username=` with `x-ig-app-id` | `404` | `200` with a user object | `401`/`429`/`302` are blocks and are reported as `blocked`, not guessed at |
+
+`blocked` and `error` are the only statuses that say nothing about the name, so
+they are the only ones retried (on another proxy, up to `SNIPE_RETRIES`). A name
+that the strictest of the three platforms could not accept is rejected before a
+request is spent on it.
+
+### Why a snipe batch is fast
+
+1. **A warm client per proxy.** One `httpx` client per proxy carries the whole
+   batch, so the proxy CONNECT tunnel and the TLS session to each target are
+   paid once instead of once per name. Measured against the real targets through
+   a proxy: **1.66× faster and 12 connections down to 10** for a 12-check batch,
+   and the gap widens with proxy latency, since that is what the saving is.
+2. **The pool is shared and remembered.** The pool is built once and reused
+   across requests (`SNIPE_POOL_TTL`), and a proxy that blocks or errors is
+   rested for `SNIPE_PROXY_COOLDOWN`. A retry therefore lands on a different,
+   healthy host instead of the one that just refused it.
+3. **Proxies are matched to the platform.** A Discord check prefers a proxy
+   that already passed the Discord probe, so fewer requests come back blocked.
+4. **Only the bytes that answer the question.** The guns.lol page is 22–40 KB
+   of Next.js payload; both signals it turns on land inside the first 9 KB, so
+   the response is read to the verdict and the remainder drained in the
+   background to keep the connection warm.
+5. **Results stream.** `"stream": true` returns NDJSON, one verdict per line,
+   so the first answer is on screen in the first second instead of after the
+   whole batch.
 
 ### Why a cycle is fast
 
@@ -114,7 +167,13 @@ POST   /proxies/purge?scope=    drop dead (default) or all proxies
 POST   /start                   start the refresh loop
 POST   /stop                    stop the refresh loop
 POST   /refresh                 queue a single scrape+validate cycle
+POST   /snipe                   check usernames through the validated proxies
+GET    /snipe?username=         the same for one name
 ```
+
+`POST /snipe` body: `usernames` (list) or `username` (single), `platforms`
+(`discord` | `guns.lol` | `instagram`, default all three), `concurrency`,
+`retries`, and `stream` (NDJSON instead of one JSON document).
 
 `GET /proxies` query parameters: `platform` (`discord` | `guns.lol` |
 `instagram`), `anonymity` (`elite` | `anonymous` | `transparent`), `protocol`
@@ -132,6 +191,14 @@ curl -s "https://<domain>/best?limit=25"
 # start / stop the background loop
 curl -s -X POST "https://<domain>/start"
 curl -s -X POST "https://<domain>/stop"
+
+# is this name free on all three, through the validated proxies?
+curl -s -X POST "https://<domain>/snipe" -H 'Content-Type: application/json' \
+  -d '{"username":"zzq7x9k2v4m8n3"}'
+
+# a batch, streamed as NDJSON, one verdict per line
+curl -s -N -X POST "https://<domain>/snipe" -H 'Content-Type: application/json' \
+  -d '{"usernames":["newname","oldname"],"platforms":["discord"],"stream":true}'
 
 # force a refresh off-schedule
 curl -s -X POST "https://<domain>/refresh"

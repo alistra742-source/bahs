@@ -95,6 +95,30 @@ W_ANONYMITY: float = _float("W_ANONYMITY", 0.35)
 W_LATENCY: float = _float("W_LATENCY", 0.25)
 W_PLATFORM: float = _float("W_PLATFORM", 0.40)
 
+# --- Username sniping ------------------------------------------------------
+# Simultaneous name checks. Each check is one in-flight request through one
+# validated proxy, so this is bounded by the pool as much as by the network.
+SNIPE_CONCURRENCY: int = _int("SNIPE_CONCURRENCY", 32)
+# How many times a blocked or proxy-failed name is retried on another proxy.
+SNIPE_RETRIES: int = _int("SNIPE_RETRIES", 2)
+# Ceiling on names accepted in one request.
+SNIPE_MAX_NAMES: int = _int("SNIPE_MAX_NAMES", 200)
+# How many validated proxies the sniper may rotate over.
+SNIPE_POOL: int = _int("SNIPE_POOL", 400)
+# A proxy that blocks or errors is rested this long, so a retry lands on a
+# different host instead of the one that just refused the name. 0 disables it.
+SNIPE_PROXY_COOLDOWN: float = _float("SNIPE_PROXY_COOLDOWN", 60.0)
+# Simultaneous requests allowed through any single proxy. The sniper keeps one
+# warm client per proxy, so this is the client's own connection-pool ceiling.
+SNIPE_PER_PROXY: int = _int("SNIPE_PER_PROXY", 4)
+# Sniper timeouts. A validated proxy is known to answer, so these are tighter
+# than the validator's: the point is to fail over to the next proxy quickly.
+SNIPE_CONNECT_TIMEOUT: float = _float("SNIPE_CONNECT_TIMEOUT", 3.0)
+SNIPE_READ_TIMEOUT: float = _float("SNIPE_READ_TIMEOUT", 8.0)
+# Seconds a warm proxy pool (and its connections) is reused across requests
+# before it is rebuilt from the store. Reuse is what skips the handshake.
+SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)
+
 # --- Persistence -----------------------------------------------------------
 # Point STORE_PATH at a Railway volume mount for durability across deploys.
 STORE_PATH: str = _str("STORE_PATH", "data/proxies.json")

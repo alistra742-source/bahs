@@ -6,14 +6,32 @@ scrape is never run inline on a request: /refresh queues a cycle and returns
 immediately, so a slow source list can never time out a caller.
 """
 
+import asyncio
+import json
 import logging
 import os
+import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
-from config import AUTO_START, LOG_LEVEL, PORT, REFRESH_INTERVAL, STORE_PATH
+import sniper
+from config import (
+    AUTO_START,
+    LOG_LEVEL,
+    PORT,
+    REFRESH_INTERVAL,
+    SNIPE_CONCURRENCY,
+    SNIPE_MAX_NAMES,
+    SNIPE_PER_PROXY,
+    SNIPE_POOL,
+    SNIPE_POOL_TTL,
+    SNIPE_RETRIES,
+    STORE_PATH,
+)
 from scheduler import RefreshManager
 from store import ProxyStore
 
@@ -93,6 +111,8 @@ def info() -> dict:
             "POST /start": "start the refresh loop",
             "POST /stop": "stop the refresh loop",
             "POST /refresh": "queue a single scrape+validate cycle",
+            "POST /snipe": "check usernames on Discord / guns.lol / Instagram through validated proxies (JSON, or NDJSON with stream=true)",
+            "GET /snipe": "the same for one ?username=",
         },
     }
 
@@ -194,6 +214,183 @@ def purge_proxies(scope: str = Query("dead", pattern="^(dead|all)$")) -> dict:
     removed = store.purge(scope)
     store.save()
     return {"scope": scope, "removed": removed, "store": store.stats()}
+
+
+# --- username sniping -----------------------------------------------------
+class SnipeRequest(BaseModel):
+    """A batch of names, or a single one, against one or more platforms."""
+
+    usernames: list[str] = Field(default_factory=list)
+    username: str | None = None
+    platforms: list[str] | None = None
+    concurrency: int | None = None
+    retries: int | None = None
+    # Stream each verdict as its own NDJSON line instead of buffering the batch.
+    stream: bool = False
+
+
+# One warm pool, shared by every request, so the second batch of names skips the
+# handshakes the first one paid. Rebuilt when it goes stale or the store empties.
+_pool_state: dict[str, object] = {"pool": None, "built": 0.0}
+_pool_lock = asyncio.Lock()
+
+
+def _build_pool() -> sniper.ProxyPool:
+    """Pool the validated proxies, and note which target each one already passed."""
+    rows = store.query(alive_only=True, limit=1_000_000)
+    proxies = [r.proxy for r in rows[:SNIPE_POOL]]
+    per_platform = {
+        name: [r.proxy for r in rows if r.platforms.get(name, {}).get("ok")][:SNIPE_POOL]
+        for name in sniper.PLATFORMS
+    }
+    return sniper.ProxyPool(proxies, per_platform=per_platform, per_proxy=SNIPE_PER_PROXY)
+
+
+async def _snipe_pool() -> sniper.ProxyPool:
+    async with _pool_lock:
+        pool = _pool_state["pool"]
+        age = time.time() - float(_pool_state["built"])  # type: ignore[arg-type]
+        if isinstance(pool, sniper.ProxyPool) and len(pool) and age < SNIPE_POOL_TTL:
+            return pool
+        fresh = _build_pool()
+        if isinstance(pool, sniper.ProxyPool) and pool is not fresh:
+            # Retire the old connections in the background; nobody waits on it.
+            asyncio.create_task(pool.aclose())
+        _pool_state["pool"] = fresh
+        _pool_state["built"] = time.time()
+        return fresh
+
+
+def _names_of(req: SnipeRequest) -> list[str]:
+    names: list[str] = []
+    for raw in [*req.usernames, req.username or ""]:
+        name = (raw or "").strip().lstrip("@")
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        raise HTTPException(400, "give at least one username")
+    if len(names) > SNIPE_MAX_NAMES:
+        raise HTTPException(400, f"at most {SNIPE_MAX_NAMES} names per request")
+    return names
+
+
+def _snipe_row(result: sniper.SnipeResult) -> dict:
+    return {
+        "username": result.username,
+        "platform": result.platform,
+        "status": result.status,
+        "detail": result.detail,
+        "proxy": result.proxy,
+        "latency_ms": round(result.latency_ms, 2) if result.latency_ms is not None else None,
+    }
+
+
+async def _snipe_ready(req: SnipeRequest) -> tuple[list[str], list[str], sniper.ProxyPool, int, int]:
+    """Validate the request and fetch the pool before anything streams."""
+    names = _names_of(req)
+    pool = await _snipe_pool()
+    if len(pool) == 0:
+        raise HTTPException(503, "no validated proxies yet -- run a refresh cycle first")
+    platforms = sniper.normalize_platforms(req.platforms)
+    concurrency = max(1, req.concurrency or SNIPE_CONCURRENCY)
+    retries = SNIPE_RETRIES if req.retries is None else max(0, req.retries)
+    return names, platforms, pool, concurrency, retries
+
+
+async def _snipe_ndjson(
+    names: list[str],
+    platforms: list[str],
+    pool: sniper.ProxyPool,
+    concurrency: int,
+    retries: int,
+) -> AsyncIterator[str]:
+    """One JSON verdict per line, then a summary line.
+
+    A large batch runs for tens of seconds; streaming means the first answer is
+    visible in the first second and no proxy or gateway has to hold the whole
+    response open.
+    """
+    started = time.perf_counter()
+    checked = 0
+    available = 0
+    async for result in sniper.iter_snipes(
+        names, platforms, pool, concurrency=concurrency, retries=retries
+    ):
+        checked += 1
+        available += 1 if result.status == "available" else 0
+        yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+    yield json.dumps(
+        {
+            "type": "done",
+            "names": len(names),
+            "platforms": platforms,
+            "pool_size": len(pool),
+            "resting": pool.resting(),
+            "checked": checked,
+            "available_count": available,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+    ) + "\n"
+
+
+@app.post("/snipe")
+async def snipe_batch(req: SnipeRequest):
+    """Check names against the platforms, through validated proxies.
+
+    JSON by default; ``"stream": true`` returns the same data as NDJSON, one
+    result per line, so a big batch lands incrementally.
+    """
+    names, platforms, pool, concurrency, retries = await _snipe_ready(req)
+    if req.stream:
+        return StreamingResponse(
+            _snipe_ndjson(names, platforms, pool, concurrency, retries),
+            media_type="application/x-ndjson",
+            # Nothing between here and the browser may buffer the stream.
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+    results = [
+        result
+        async for result in sniper.iter_snipes(
+            names, platforms, pool, concurrency=concurrency, retries=retries
+        )
+    ]
+    rows = [_snipe_row(r) for r in results]
+    available = [r for r in rows if r["status"] == "available"]
+    return {
+        "names": len(names),
+        "platforms": platforms,
+        "pool_size": len(pool),
+        "checked": len(rows),
+        "available_count": len(available),
+        "available": available,
+        "results": rows,
+    }
+
+
+@app.get("/snipe")
+async def snipe_one(
+    username: str = Query(..., min_length=1, max_length=32),
+    platform: list[str] | None = Query(None),
+):
+    """Same thing for one name, from the query string."""
+    req = SnipeRequest(username=username, platforms=platform)
+    names, platforms, pool, concurrency, retries = await _snipe_ready(req)
+    rows = [
+        _snipe_row(r)
+        async for r in sniper.iter_snipes(
+            names, platforms, pool, concurrency=concurrency, retries=retries
+        )
+    ]
+    available = [r for r in rows if r["status"] == "available"]
+    return {
+        "names": len(names),
+        "platforms": platforms,
+        "pool_size": len(pool),
+        "checked": len(rows),
+        "available_count": len(available),
+        "available": available,
+        "results": rows,
+    }
 
 
 if __name__ == "__main__":  # pragma: no cover - container runs uvicorn directly
