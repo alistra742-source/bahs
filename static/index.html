@@ -96,8 +96,6 @@ a{color:var(--blue)}
       <button class="stop" id="btn-stop">Stop</button>
       <button class="primary" id="btn-refresh">Refresh now</button>
       <button class="ghost" id="btn-export">Export .txt</button>
-      <span class="hint">key</span>
-      <input id="apikey" type="password" placeholder="X-API-Key (if set)" style="width:200px" autocomplete="off">
     </div>
     <div class="grid">
       <div class="stat"><div class="k">tracked</div><div class="v" id="s-total">—</div></div>
@@ -168,25 +166,9 @@ a{color:var(--blue)}
 <script>
 const PLATFORMS = ["discord", "guns.lol", "instagram"];
 const $ = (id) => document.getElementById(id);
-const KEY_STORE = "proxy_scraper_key";
-let pollList = null;
-
-$("apikey").value = localStorage.getItem(KEY_STORE) || "";
-$("apikey").addEventListener("change", () => {
-  localStorage.setItem(KEY_STORE, $("apikey").value.trim());
-  loadAll();
-});
-
-function headers(extra) {
-  const h = Object.assign({}, extra || {});
-  const k = $("apikey").value.trim();
-  if (k) h["X-API-Key"] = k;
-  return h;
-}
 
 async function api(path, opts) {
-  const res = await fetch(path, Object.assign({}, opts, { headers: headers(opts && opts.headers) }));
-  if (res.status === 401) throw new Error("401 — set the X-API-Key");
+  const res = await fetch(path, opts || {});
   if (!res.ok) {
     let detail = res.status + "";
     try { detail = (await res.json()).detail || detail; } catch (e) {}

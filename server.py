@@ -10,10 +10,10 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, PlainTextResponse
 
-from config import API_KEY, AUTO_START, LOG_LEVEL, PORT, REFRESH_INTERVAL, STORE_PATH
+from config import AUTO_START, LOG_LEVEL, PORT, REFRESH_INTERVAL, STORE_PATH
 from scheduler import RefreshManager
 from store import ProxyStore
 
@@ -53,11 +53,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="proxy-scraper", version="1.1.0", lifespan=lifespan)
-
-
-def require_key(x_api_key: str | None = Header(default=None)) -> None:
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
 
 def _row(record) -> dict:
@@ -108,7 +103,7 @@ def health() -> dict:
     return {"status": "ok", "scheduler": manager.status(), "store": store.stats()}
 
 
-@app.get("/stats", dependencies=[Depends(require_key)])
+@app.get("/stats")
 def stats() -> dict:
     return {"scheduler": manager.status(), "store": store.stats()}
 
@@ -116,19 +111,19 @@ def stats() -> dict:
 # --- start / stop ---------------------------------------------------------
 # async: manager.start() schedules a task on the running loop, which a sync
 # route executed in a threadpool would not have.
-@app.post("/start", dependencies=[Depends(require_key)])
+@app.post("/start")
 async def start() -> dict:
     manager.start()
     return {"enabled": manager.enabled, "scheduler": manager.status()}
 
 
-@app.post("/stop", dependencies=[Depends(require_key)])
+@app.post("/stop")
 async def stop() -> dict:
     await manager.stop()
     return {"enabled": manager.enabled, "scheduler": manager.status()}
 
 
-@app.post("/refresh", dependencies=[Depends(require_key)])
+@app.post("/refresh")
 async def refresh() -> dict:
     if manager.running:
         return {"queued": False, "reason": "cycle already running", "scheduler": manager.status()}
@@ -137,7 +132,7 @@ async def refresh() -> dict:
 
 
 # --- proxy queries --------------------------------------------------------
-@app.get("/best", dependencies=[Depends(require_key)])
+@app.get("/best")
 def best(
     limit: int = Query(25, ge=1, le=500),
     anonymity: str | None = Query(None, pattern="^(elite|anonymous|transparent)$"),
@@ -153,7 +148,7 @@ def best(
     return {"count": len(rows), "proxies": [_row(r) for r in rows]}
 
 
-@app.get("/proxies", dependencies=[Depends(require_key)])
+@app.get("/proxies")
 def proxies(
     platform: str | None = Query(None, pattern="^(discord|guns\\.lol|instagram)$"),
     anonymity: str | None = Query(None, pattern="^(elite|anonymous|transparent)$"),
@@ -176,7 +171,7 @@ def proxies(
 
 
 # --- proxy management -----------------------------------------------------
-@app.delete("/proxies", dependencies=[Depends(require_key)])
+@app.delete("/proxies")
 def remove_proxy(proxy: str = Query(..., min_length=1)) -> dict:
     removed = store.remove(proxy)
     if not removed:
@@ -185,7 +180,7 @@ def remove_proxy(proxy: str = Query(..., min_length=1)) -> dict:
     return {"removed": proxy, "store": store.stats()}
 
 
-@app.post("/proxies/purge", dependencies=[Depends(require_key)])
+@app.post("/proxies/purge")
 def purge_proxies(scope: str = Query("dead", pattern="^(dead|all)$")) -> dict:
     removed = store.purge(scope)
     store.save()

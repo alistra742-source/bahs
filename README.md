@@ -37,7 +37,6 @@ The repository root **is** the service. In Railway:
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PORT` | `8080` | injected by Railway |
-| `API_KEY` | — | if set, `/proxies`, `/best`, `/stats`, `/refresh` require `X-API-Key` |
 | `REFRESH_INTERVAL` | `1800` | seconds between refresh cycles |
 | `AUTO_START` | `1` | start the refresh loop at boot; `0` waits for the Start button / `POST /start` |
 | `REFRESH_ON_START` | `1` | run a cycle immediately at boot |
@@ -65,8 +64,7 @@ The repository root **is** the service. In Railway:
   protocol, min score, limit), per-row platform dots, latency, score bar,
   copy and remove, plus `Purge dead` / `Purge all` and `Export .txt`.
 - **Stats** — tracked, alive, per-platform, per-anonymity, cycles.
-- If `API_KEY` is set, paste it into the dashboard's key field; it is kept in
-  `localStorage` and sent as `X-API-Key`.
+- No login: the API is open, so the dashboard needs no key.
 
 ## API
 
@@ -91,22 +89,21 @@ POST   /refresh                 queue a single scrape+validate cycle
 
 ```bash
 # top 50 elite proxies that pass Discord, as plain ip:port lines
-curl -s "https://<domain>/proxies?platform=discord&anonymity=elite&limit=50&format=txt" \
-  -H "X-API-Key: $API_KEY"
+curl -s "https://<domain>/proxies?platform=discord&anonymity=elite&limit=50&format=txt"
 
 # the best of the best: pass Discord + guns.lol + Instagram
-curl -s "https://<domain>/best?limit=25" -H "X-API-Key: $API_KEY"
+curl -s "https://<domain>/best?limit=25"
 
 # start / stop the background loop
-curl -s -X POST "https://<domain>/start" -H "X-API-Key: $API_KEY"
-curl -s -X POST "https://<domain>/stop"  -H "X-API-Key: $API_KEY"
+curl -s -X POST "https://<domain>/start"
+curl -s -X POST "https://<domain>/stop"
 
 # force a refresh off-schedule
-curl -s -X POST "https://<domain>/refresh" -H "X-API-Key: $API_KEY"
+curl -s -X POST "https://<domain>/refresh"
 
 # manage the validated set
-curl -s -X DELETE "https://<domain>/proxies?proxy=http%3A%2F%2F1.2.3.4%3A8080" -H "X-API-Key: $API_KEY"
-curl -s -X POST "https://<domain>/proxies/purge?scope=dead" -H "X-API-Key: $API_KEY"
+curl -s -X DELETE "https://<domain>/proxies?proxy=http%3A%2F%2F1.2.3.4%3A8080"
+curl -s -X POST "https://<domain>/proxies/purge?scope=dead"
 ```
 
 ### Scoring

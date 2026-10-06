@@ -41,9 +41,6 @@ HOST: str = _str("HOST", "0.0.0.0")
 PORT: int = _int("PORT", 8080)
 LOG_LEVEL: str = _str("LOG_LEVEL", "info")
 
-# Optional bearer key. Unset means the read API is open (status/health always are).
-API_KEY: str = _str("API_KEY", "")
-
 # --- Scrape / validate cadence --------------------------------------------
 # Seconds between full refresh cycles: scrape sources, re-validate, prune.
 REFRESH_INTERVAL: int = _int("REFRESH_INTERVAL", 1800)
