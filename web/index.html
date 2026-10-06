@@ -18,12 +18,14 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;background:ra
 .kanha-link{display:inline-flex;align-items:center;gap:7px;background:#151a23;border:1px solid #314052;border-radius:999px;padding:8px 13px;color:#dce8f5;text-decoration:none;font:600 12px ui-monospace,monospace;transition:border-color .18s,background .18s,transform .18s}
 .kanha-link:hover{background:#1b2634;border-color:#9fe870;transform:translateY(-1px)}
 code{background:#151a23;border:1px solid #222b38;border-radius:6px;padding:1px 5px;font:12px ui-monospace,monospace;color:#c9d3e4}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font:12px ui-monospace,monospace}
+.chips{display:flex;flex-wrap:wrap;gap:8px;max-width:100%}
+/* max-width/flex-wrap keep a long detail (a provider error can run 300 chars) inside the
+   viewport instead of stretching the pill past the screen edge. */
+.chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font:12px ui-monospace,monospace;max-width:100%;flex-wrap:wrap}
 .chip .led{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px rgba(63,185,80,.6);flex:none}
 .chip.bad .led{background:var(--red);box-shadow:0 0 8px rgba(248,81,73,.6)}
-.chip .name{text-transform:uppercase;letter-spacing:.07em;color:#cbd5e5;font-weight:600}
-.chip .detail{color:var(--dim)}
+.chip .name{text-transform:uppercase;letter-spacing:.07em;color:#cbd5e5;font-weight:600;flex:none}
+.chip .detail{color:var(--dim);min-width:0;overflow-wrap:anywhere}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:16px}
 .ph{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}
 label{font-size:13px;font-weight:600;color:#cbd5e5}

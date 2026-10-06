@@ -1394,8 +1394,10 @@ def kanha_chat(req: KanhaReq, request: Request):
 
 def chip(ok: bool, name: str, detail: str) -> str:
     """One status chip on the page. The browser refreshes these from /health."""
+    # The detail can be a whole sentence (a provider's refusal, the fix for it), and on a phone
+    # it wraps inside the pill rather than widening it. title carries it whole for a pointer.
     return (
-        f'<div class="chip {"ok" if ok else "bad"}" data-chip="{name}">'
+        f'<div class="chip {"ok" if ok else "bad"}" data-chip="{name}" title="{html.escape(detail)}">'
         f'<span class="led"></span><span class="name">{html.escape(name)}</span>'
         f'<span class="detail">{html.escape(detail)}</span></div>'
     )
