@@ -54,6 +54,8 @@ The repository root **is** the service. In Railway:
 | `STORE_PATH` | `data/proxies.json` | point at a volume mount for durability |
 | `STALE_AFTER` | `3 × REFRESH_INTERVAL` | drop proxies not validated within this window |
 | `JUDGE_URL` | `https://httpbin.org/get` | must return `origin` + `headers` |
+| `JUDGE_FALLBACKS` | `httpbingo.org/get`, `eu.httpbin.org/get`, `postman-echo.com/get` | the rest of the judge pool, tried in rotation |
+| `JUDGE_PER_ENDPOINT` | `60` | simultaneous judge requests allowed against any one endpoint |
 
 ## Dashboard
 
@@ -75,7 +77,7 @@ The repository root **is** the service. In Railway:
 
 ### Why a cycle is fast
 
-Three things keep the wall clock down, in order of impact:
+Four things keep the wall clock down, in order of impact:
 
 1. **Dead proxies are not re-checked.** A proxy that has never once answered is
    dropped on its first failure and remembered for `FAIL_COOLDOWN`. Free lists
@@ -86,7 +88,15 @@ Three things keep the wall clock down, in order of impact:
 2. **One round trip per alive proxy.** The judge and the three platform probes
    start together; a proxy the judge rejects has its probes cancelled rather
    than awaited.
-3. **Short connect timeouts and high concurrency** — see `CONNECT_TIMEOUT` and
+3. **The judge is a pool, not one host.** A single httpbin instance loses about
+   40% of requests once ~400 are in flight against it (measured), and a failed
+   judge request is indistinguishable from a dead proxy — it reads as *nothing
+   is alive*. Checks rotate across `JUDGE_URLS`, each endpoint capped by
+   `JUDGE_PER_ENDPOINT`, and a judge that answers 429/5xx hands the check to the
+   next one. A proxy that will not connect is *not* retried against another
+   judge: that is the proxy's fault and rotating would just pay the timeout
+   again.
+4. **Short connect timeouts and high concurrency** — see `CONNECT_TIMEOUT` and
    `MAX_CONCURRENCY` above. A cycle over N candidates costs roughly
    `N / MAX_CONCURRENCY` connection attempts.
 

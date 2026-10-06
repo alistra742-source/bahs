@@ -105,12 +105,20 @@ STALE_AFTER: int = _int("STALE_AFTER", 3 * REFRESH_INTERVAL)
 # Returns the client IP as seen by the target plus the request headers it
 # received -- one request yields both exit IP and forwarding-header evidence.
 JUDGE_URL: str = _str("JUDGE_URL", "https://httpbin.org/get")
-# Fallback judges tried in order if the primary is unreachable directly.
+# Tried in rotation. One httpbin instance starts failing roughly 40% of
+# requests once ~400 are in flight at once, and a failed judge request is
+# indistinguishable from a dead proxy -- it reads as "nothing is alive".
 JUDGE_FALLBACKS: list[str] = [
     u.strip()
     for u in _str(
         "JUDGE_FALLBACKS",
-        "https://httpbin.org/headers,https://postman-echo.com/get",
+        "https://httpbingo.org/get,https://eu.httpbin.org/get,https://postman-echo.com/get",
     ).split(",")
     if u.strip()
 ]
+# The pool actually used: primary first, duplicates dropped.
+JUDGE_URLS: list[str] = list(dict.fromkeys([JUDGE_URL, *JUDGE_FALLBACKS]))
+# Simultaneous judge requests allowed against any single endpoint. Measured:
+# 50 in flight answers cleanly, 400 loses ~40% of requests to connect timeouts,
+# so this stays well below the knee.
+JUDGE_PER_ENDPOINT: int = _int("JUDGE_PER_ENDPOINT", 60)

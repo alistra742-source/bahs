@@ -7,6 +7,7 @@ the target received -- the two facts anonymity turns on.
 """
 
 import asyncio
+import itertools
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -16,9 +17,9 @@ import httpx
 
 from config import (
     CONNECT_TIMEOUT,
-    JUDGE_FALLBACKS,
+    JUDGE_PER_ENDPOINT,
     JUDGE_TIMEOUT,
-    JUDGE_URL,
+    JUDGE_URLS,
     READ_TIMEOUT,
 )
 from platforms import PlatformResult, probe_all
@@ -41,6 +42,28 @@ FORWARD_HEADERS = (
 )
 
 HTTPX_SCHEME = {"http": "http", "https": "http", "socks4": "socks4", "socks5": "socks5"}
+
+# One semaphore per judge endpoint, and a rotating cursor so consecutive checks
+# do not all pick the same one. Created lazily inside a running loop.
+_judge_sems: dict[str, asyncio.Semaphore] = {}
+_judge_cursor = itertools.count()
+
+
+def _judge_order() -> list[str]:
+    """The judge pool starting at the next endpoint in rotation."""
+    urls = JUDGE_URLS
+    if not urls:
+        return []
+    start = next(_judge_cursor) % len(urls)
+    return urls[start:] + urls[:start]
+
+
+def _judge_sem(url: str) -> asyncio.Semaphore:
+    sem = _judge_sems.get(url)
+    if sem is None:
+        sem = asyncio.Semaphore(max(1, JUDGE_PER_ENDPOINT))
+        _judge_sems[url] = sem
+    return sem
 
 
 @dataclass
@@ -114,7 +137,7 @@ def classify_anonymity(headers: dict[str, str], exit_ip: str | None, direct_ip: 
 
 async def get_direct_ip() -> str | None:
     """The validator's own public IP, for transparency comparison."""
-    urls = [JUDGE_URL, *JUDGE_FALLBACKS]
+    urls = JUDGE_URLS
     timeout = httpx.Timeout(JUDGE_TIMEOUT, connect=10.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         for url in urls:
@@ -163,14 +186,31 @@ async def check_proxy(proxy: str, direct_ip: str | None) -> CheckResult:
             probes = asyncio.create_task(probe_all(client, timeout))
             try:
                 payload: object = {}
-                try:
-                    resp = await client.get(JUDGE_URL, timeout=timeout)
-                    resp.raise_for_status()
-                    payload = resp.json() if _is_json(resp) else {}
-                    if not payload:
-                        payload = {"origin": _origin_from_text(resp.text) or None}
-                except httpx.HTTPError as exc:
-                    result.error = f"judge:{type(exc).__name__}"
+                judge_error = "judge:no-endpoint"
+                # Rotate across the pool. A judge answering 429/5xx is the
+                # judge's fault, so the next one is tried; a proxy that will
+                # not connect is the proxy's fault, and rotating would just
+                # pay the connect timeout again.
+                for judge_url in _judge_order():
+                    async with _judge_sem(judge_url):
+                        try:
+                            resp = await client.get(judge_url, timeout=timeout)
+                            resp.raise_for_status()
+                            payload = resp.json() if _is_json(resp) else {}
+                            if not payload:
+                                payload = {"origin": _origin_from_text(resp.text) or None}
+                            judge_error = ""
+                            break
+                        except httpx.HTTPStatusError as exc:
+                            judge_error = f"judge:{type(exc).__name__}:{exc.response.status_code}"
+                            payload = {}
+                            continue
+                        except httpx.HTTPError as exc:
+                            judge_error = f"judge:{type(exc).__name__}"
+                            payload = {}
+                            break
+                if judge_error:
+                    result.error = judge_error
                     return result
 
                 latency_ms = (time.perf_counter() - started) * 1000.0
