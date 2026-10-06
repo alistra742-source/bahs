@@ -58,6 +58,12 @@ MAX_CANDIDATES: int = _int("MAX_CANDIDATES", 20000)
 MAX_CONCURRENCY: int = _int("MAX_CONCURRENCY", 250)
 # A proxy that fails this many consecutive checks is dropped from the store.
 MAX_FAILURES: int = _int("MAX_FAILURES", 3)
+# Persist the store every N validated proxies during a cycle, and log progress
+# at the same cadence. A cycle can run for many minutes; without these the
+# process holds everything in memory until the last proxy and the dashboard
+# shows nothing in the meantime.
+STORE_SAVE_EVERY: int = _int("STORE_SAVE_EVERY", 200)
+PROGRESS_EVERY: int = _int("PROGRESS_EVERY", 500)
 
 # --- Timeouts (seconds) ----------------------------------------------------
 CONNECT_TIMEOUT: float = _float("CONNECT_TIMEOUT", 5.0)

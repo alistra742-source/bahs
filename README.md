@@ -44,6 +44,8 @@ The repository root **is** the service. In Railway:
 | `MAX_CANDIDATES` | `20000` | proxies validated per cycle |
 | `MAX_CONCURRENCY` | `250` | simultaneous proxy checks |
 | `MAX_FAILURES` | `3` | consecutive failures before a proxy is dropped |
+| `STORE_SAVE_EVERY` | `200` | persist the store every N validated proxies, so a long cycle is durable mid-run |
+| `PROGRESS_EVERY` | `500` | log a progress line every N validated proxies |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `5` / `8` | per-request seconds |
 | `JUDGE_TIMEOUT` | `12` | hard ceiling per proxy check |
 | `MAX_LATENCY_MS` | `4000` | latency beyond this scores zero |

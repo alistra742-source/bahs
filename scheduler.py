@@ -10,12 +10,14 @@ import logging
 import time
 from typing import Any
 
-from checker import check_many, get_direct_ip
+from checker import get_direct_ip, iter_checks
 from config import (
     MAX_CANDIDATES,
     MAX_CONCURRENCY,
+    PROGRESS_EVERY,
     REFRESH_INTERVAL,
     REFRESH_ON_START,
+    STORE_SAVE_EVERY,
 )
 from sources import fetch_all
 from store import ProxyStore
@@ -59,9 +61,23 @@ class RefreshManager:
                 candidates = self.store.candidate_proxies(fresh)[:MAX_CANDIDATES]
                 self.last_candidates = len(candidates)
 
-                results = await check_many(candidates, self.direct_ip, MAX_CONCURRENCY)
-                for result in results:
+                # Store each verdict as it lands: a cycle over 20k candidates runs for many
+                # minutes, and the dashboard must fill while it runs rather than after it ends.
+                checked = 0
+                async for result in iter_checks(candidates, self.direct_ip, MAX_CONCURRENCY):
                     self.store.upsert(result)
+                    checked += 1
+                    if checked % STORE_SAVE_EVERY == 0:
+                        self.store.save()
+                    if checked % PROGRESS_EVERY == 0:
+                        stats = self.store.stats()
+                        log.info(
+                            "validated %d/%d -- %d alive, %d pass all platforms",
+                            checked,
+                            len(candidates),
+                            stats["alive"],
+                            stats["by_platform"]["discord"],
+                        )
 
                 dropped = self.store.prune()
                 self.store.save()
@@ -90,6 +106,11 @@ class RefreshManager:
                 log.exception("refresh cycle failed")
                 return {"error": self.last_error}
             finally:
+                # A cancelled cycle (Stop pressed mid-run) keeps what it already validated.
+                try:
+                    self.store.save()
+                except OSError:
+                    log.warning("could not persist the store at the end of the cycle", exc_info=True)
                 self.running = False
                 self.last_finished = time.time()
 

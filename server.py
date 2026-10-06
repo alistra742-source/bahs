@@ -21,6 +21,11 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs one INFO line per request and a validation cycle issues tens of
+# thousands of them, which buries the progress lines that matter. Errors still
+# surface at WARNING and above.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("proxy-scraper.server")
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")

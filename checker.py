@@ -9,6 +9,7 @@ the target received -- the two facts anonymity turns on.
 import asyncio
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import httpx
@@ -190,11 +191,39 @@ async def check_proxy(proxy: str, direct_ip: str | None) -> CheckResult:
         return result
 
 
-async def check_many(proxies: list[str], direct_ip: str | None, concurrency: int) -> list[CheckResult]:
-    sem = asyncio.Semaphore(concurrency)
+async def iter_checks(
+    proxies: list[str], direct_ip: str | None, concurrency: int, window_factor: int = 4
+) -> AsyncIterator[CheckResult]:
+    """Yield each verdict the moment it lands, in completion order.
 
-    async def run(proxy: str) -> CheckResult:
+    A cycle can span tens of thousands of candidates and many minutes. Yielding
+    per proxy lets the caller store and serve results as they arrive instead of
+    holding an empty list until the last proxy is checked. Outstanding tasks are
+    bounded to ``concurrency * window_factor`` so a huge input cannot spawn a
+    task per proxy, and one wide semaphore keeps the in-flight count at the
+    configured ceiling across window boundaries.
+    """
+    total = len(proxies)
+    if total == 0:
+        return
+    sem = asyncio.Semaphore(max(1, concurrency))
+    window = max(1, concurrency * window_factor)
+
+    async def one(proxy: str) -> CheckResult:
         async with sem:
             return await check_proxy(proxy, direct_ip)
 
-    return await asyncio.gather(*(run(p) for p in proxies))
+    for start in range(0, total, window):
+        chunk = proxies[start : start + window]
+        tasks = [asyncio.create_task(one(p)) for p in chunk]
+        try:
+            for finished in asyncio.as_completed(tasks):
+                yield await finished
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+
+async def check_many(proxies: list[str], direct_ip: str | None, concurrency: int) -> list[CheckResult]:
+    return [result async for result in iter_checks(proxies, direct_ip, concurrency)]
