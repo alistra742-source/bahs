@@ -1,5 +1,0 @@
-fastapi
-uvicorn[standard]
-# httpx[socks] pulls in socksio, which is what makes socks4:// and socks5://
-# proxy URLs work at all -- without it httpx refuses the scheme.
-httpx[socks]

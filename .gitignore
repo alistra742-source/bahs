@@ -1,6 +1,5 @@
+# Runtime proxy store (recreated by the scheduler); mount a volume for prod.
+data/
 __pycache__/
 *.pyc
 .venv/
-# The sha3 module pow_solver.py fetches for DeepSeek's proof of work: the Dockerfile puts it in the
-# image at build time, and running pow_solver.py locally drops a copy here.
-sha3_wasm_bg.wasm
