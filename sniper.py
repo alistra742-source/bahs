@@ -1,61 +1,67 @@
-"""Username availability checks for Discord, guns.lol and Instagram.
+"""Username availability checks for Discord, guns.lol, Instagram and TikTok.
 
-Every check goes out through a **validated** proxy from the store, because all
-three targets rate-limit or block by IP -- which is the whole reason the proxy
-list exists. Three things make a batch of names fast:
+Every check goes out through a proxy from the stored list, because all four
+targets rate-limit or block by IP. Four things make a batch of names fast:
 
 * **A warm client per proxy.** The proxy CONNECT tunnel and the TLS handshake to
-  the target are paid once and then reused across names (httpx keeps a
-  per-host keep-alive pool). Creating a client per name -- and so re-tunnelling
-  and re-handshaking every time -- is the single biggest cost in a batch.
+  the target are paid once and then reused across names (httpx keeps a per-host
+  keep-alive pool). Creating a client per name -- and so re-tunnelling and
+  re-handshaking every time -- is the single biggest cost in a batch.
+* **A bounded number of warm clients.** One client per proxy is only cheap up to
+  a point; past ``SNIPE_MAX_CLIENTS`` the least recently used one is closed, so
+  a 100k-line list cannot turn into an fd and buffer leak.
 * **A pool that remembers what just refused.** A proxy that blocks or errors is
-  rested for ``SNIPE_PROXY_COOLDOWN``, so a retry lands on a different, healthy
-  host instead of the one that just failed. Proxies already proven against a
-  platform are preferred for that platform.
+  rested for ``SNIPE_PROXY_COOLDOWN``, so a retry lands on a different host, and
+  one that keeps failing is retired for the rest of the run.
 * **Only the bytes that answer the question.** A profile page is tens of KB of
-  Next.js payload; the ``<title>`` the check turns on is inside the first few
-  KB, so the body is streamed and abandoned there.
+  framework payload; the marker the check turns on is inside the first few KB,
+  so the body is streamed and abandoned there.
 
-The three endpoints, and what each answer means, were read off the live sites
+The four endpoints, and what each answer means, were read off the live sites
 rather than assumed:
 
 * **Discord** -- the unauthenticated signup form's own endpoint,
   ``POST /api/v9/unique-username/username-attempt-unauthed``. It answers
-  ``{\"taken\": true|false}``. A 400 carries a *validation* error (a reserved
+  ``{"taken": true|false}``. A 400 carries a *validation* error (a reserved
   word, bad length) and must never be read as "available".
 * **guns.lol** -- ``GET /{name}`` always returns 200 (it is a Next.js app), so
   the status is useless. A live profile embeds a Schema.org block
-  (``profile-page-json-ld``, with ``"identifier": "<name>"``) at 8-9 KB, and a
-  free name instead renders the site's default page. The ``<title>`` works too
-  (``@name | guns.lol`` vs. the default title) but the edge cache streams it at
-  4 KB or at 38 KB depending on the render, so the marker is the primary
-  signal and the title is the confirmation.
+  (``profile-page-json-ld``) at 8-9 KB; a free name renders the site's default
+  page without it. Measured: taken 34 KB with the marker, free 21 KB without.
 * **Instagram** -- ``GET /api/v1/users/web_profile_info/?username=`` with the
   web app's own ``x-ig-app-id``. 200 with a user object = taken, 404 =
   available, and 429/401/302 = blocked, which is reported as such rather than
   guessed at. A datacenter IP is refused outright, which is exactly what the
-  proxy pool is for.
+  proxy list is for.
+* **TikTok** -- ``GET /oembed?url=.../@name``. The full profile page is useless
+  for this: from a datacenter IP TikTok answers 200 with a generic shell whose
+  body is the same whether or not the account exists. oEmbed does distinguish
+  (measured): a live handle returns 200 with an ``author_name``, a free one
+  returns 400 with ``{"message":"Something went wrong","code":400}`` -- 45
+  bytes, so it is also by far the cheapest of the four.
 """
 
 import asyncio
 import logging
 import re
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 
 import httpx
 
 from config import (
-    SNIPE_CONNECT_TIMEOUT,
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    SNIPE_MAX_CLIENTS,
+    SNIPE_PER_PROXY,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
-    SNIPE_READ_TIMEOUT,
     SSL_CONTEXT,
 )
 
-log = logging.getLogger("proxy-scraper.sniper")
+log = logging.getLogger("bahs.sniper")
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -65,30 +71,37 @@ IG_APP_ID = "936619743392459"
 DISCORD_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) discord/1.0"
 
 DISCORD_ATTEMPT = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
+TIKTOK_OEMBED = "https://www.tiktok.com/oembed"
 GUNS_DEFAULT_TITLE = "guns.lol: Everything you want, right here."
 GUNS_TITLE_RE = re.compile(r"^\s*@[^|]{1,64}\|\s*guns\.lol\s*$", re.I)
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 # A live profile embeds its own Schema.org block; a free name renders the site's
-# default page without it. Measured over repeated requests this marker lands at
-# 8-9 KB on every taken profile, while the <title> of the same page lands at
-# 4 KB or 38 KB depending on which way the edge cache streamed it -- which is
-# why the marker, not the title, is the primary signal here.
+# default page without it.
 GUNS_PROFILE_MARKER = b"profile-page-json-ld"
 GUNS_IDENTIFIER_RE = re.compile(r'"identifier"\s*:\s*"([^"]{1,64})"')
 
-# How much of a profile page to read. Both signals above land well inside this
-# while the page itself runs 22-40 KB, so the head is most of the transfer.
+# How much of a profile page to read. Both guns.lol signals land well inside
+# this while the page itself runs 21-40 KB, so the head is most of the transfer.
 MAX_HEAD_BYTES = 16 * 1024
 
-# 1-32 of the characters the strictest of the three accepts. Anything else is
+# 1-32 of the characters the strictest of the four accepts. Anything else is
 # rejected before a request is spent on it.
 NAME_RE = re.compile(r"^[A-Za-z0-9._]{1,32}$")
 
-PLATFORMS = ("discord", "guns.lol", "instagram")
+PLATFORMS = ("discord", "guns.lol", "instagram", "tiktok")
 
 # The statuses that are an answer. Everything else is worth another proxy.
 FINAL_STATUSES = ("available", "taken", "invalid")
+
+
+def default_timeout() -> httpx.Timeout:
+    return httpx.Timeout(
+        connect=CONNECT_TIMEOUT,
+        read=READ_TIMEOUT,
+        write=READ_TIMEOUT,
+        pool=READ_TIMEOUT,
+    )
 
 
 @dataclass
@@ -105,52 +118,30 @@ class SnipeResult:
         return self.status == "available"
 
 
-def _timeout() -> httpx.Timeout:
-    return httpx.Timeout(
-        connect=SNIPE_CONNECT_TIMEOUT,
-        read=SNIPE_READ_TIMEOUT,
-        write=SNIPE_READ_TIMEOUT,
-        pool=SNIPE_READ_TIMEOUT,
-    )
-
-
 class ProxyPool:
-    """The validated proxies a batch rotates over, plus their kept-alive clients.
+    """The proxies a run rotates over, plus their kept-alive clients.
 
-    ``len(pool) == 0`` means the store has nothing alive; callers report that as
-    "no validated proxies yet" rather than silently going direct. There is no
-    lock on ``next``/``client``: they never await, so on the single event loop
-    they cannot interleave.
+    ``len(pool) == 0`` means the stored list is empty; callers report that as
+    "no proxies saved yet" rather than silently going direct. There is no lock
+    on ``next``/``client``: they never await, so on the single event loop they
+    cannot interleave.
     """
 
     def __init__(
         self,
         proxies: Iterable[str],
-        per_platform: dict[str, Iterable[str]] | None = None,
         cooldown: float = SNIPE_PROXY_COOLDOWN,
-        per_proxy: int = 4,
+        per_proxy: int = SNIPE_PER_PROXY,
         timeout: httpx.Timeout | None = None,
-        platform_weight: int = 1,
         fail_limit: int = SNIPE_PROXY_FAIL_LIMIT,
+        max_clients: int = SNIPE_MAX_CLIENTS,
     ) -> None:
         self._all = list(dict.fromkeys(proxies))
-        known = set(self._all)
-        # A platform's proven proxies are repeated `platform_weight` times and the
-        # rest of the pool follows, so rotation prefers them *and* still uses the
-        # whole pool. Restricting a 256-wide scan to the ~25 proxies that passed
-        # one platform's probe would cap it at 25 x per_proxy in flight.
-        weight = max(1, platform_weight)
-        self._by_platform: dict[str, list[str]] = {}
-        self._platform_counts: dict[str, int] = {}
-        for name in PLATFORMS:
-            passers = [p for p in dict.fromkeys((per_platform or {}).get(name, ())) if p in known]
-            others = [p for p in self._all if p not in set(passers)]
-            self._by_platform[name] = passers * weight + others
-            self._platform_counts[name] = len(passers)
         self._cooldown = max(0.0, cooldown)
         self._per_proxy = max(1, per_proxy)
-        self._timeout = timeout or _timeout()
-        self._clients: dict[str, httpx.AsyncClient] = {}
+        self._timeout = timeout or default_timeout()
+        self._max_clients = max(1, max_clients)
+        self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
         self._resting: dict[str, float] = {}
         self._fails: dict[str, int] = {}
         # A proxy retired mid-run is never handed out again: one that has failed
@@ -163,39 +154,31 @@ class ProxyPool:
     def __len__(self) -> int:
         return len(self._all)
 
-    def platform_size(self, platform: str) -> int:
-        """Distinct validated proxies that passed this platform's probe."""
-        return self._platform_counts.get(platform, 0)
+    def next(self) -> str | None:
+        """The next proxy to use, walking the rotation from a cursor.
 
-    def next(self, platform: str | None = None) -> str | None:
-        """The next proxy to use, preferring one already proven for ``platform``.
-
-        A cursor walks the rotation and skips resting/retired entries in place.
-        The previous form rebuilt a filtered copy of the whole pool on every
-        call -- O(n) per check, tens of millions of operations over a wide
-        scan. Walking from the cursor is O(resting) in the common case and only
-        reaches O(n) when nearly everything is resting, which is itself the
-        signal that the pool is dead.
+        The cursor skips resting and retired entries in place. Rebuilding a
+        filtered copy of the pool on every call is O(n) per check -- tens of
+        millions of operations over a wide run -- so this walks instead, which
+        is O(resting) in the common case and only reaches O(n) when nearly
+        everything is resting, which is itself the signal that the pool is dead.
         """
         now = time.time()
-        for group in (self._by_platform.get(platform or "", ()), self._all):
-            n = len(group)
-            if not n:
-                continue
-            start = self._cursor % n
-            for offset in range(n):
-                idx = start + offset
-                if idx >= n:
-                    idx -= n
-                proxy = group[idx]
-                if proxy in self._retired:
-                    continue
-                if self._resting.get(proxy, 0.0) > now:
-                    continue
-                self._cursor = idx + 1
-                return proxy
-        if not self._all:
+        n = len(self._all)
+        if not n:
             return None
+        start = self._cursor % n
+        for offset in range(n):
+            idx = start + offset
+            if idx >= n:
+                idx -= n
+            proxy = self._all[idx]
+            if proxy in self._retired:
+                continue
+            if self._resting.get(proxy, 0.0) > now:
+                continue
+            self._cursor = idx + 1
+            return proxy
         usable = [p for p in self._all if p not in self._retired]
         if not usable:
             return None
@@ -206,31 +189,45 @@ class ProxyPool:
         """The kept-alive client for one proxy, created on first use.
 
         One client per proxy carries every platform, so the tunnel and the TLS
-        session to each target are established once per batch, not once per name.
+        session to each target are established once per run, not once per name.
+        Past ``max_clients`` the least recently used client is dropped: a list
+        with 100k entries must not become 100k open pools.
         """
         client = self._clients.get(proxy)
-        if client is None:
-            client = httpx.AsyncClient(
-                proxy=proxy,
-                timeout=self._timeout,
-                follow_redirects=True,
-                limits=httpx.Limits(
-                    max_connections=self._per_proxy,
-                    max_keepalive_connections=self._per_proxy,
-                ),
-                # Shared context: a pool is one client per proxy, and a
-                # per-client SSLContext would cost ~1.25 MB x pool size.
-                verify=SSL_CONTEXT,
-            )
-            self._clients[proxy] = client
+        if client is not None:
+            self._clients.move_to_end(proxy)
+            return client
+        if len(self._clients) >= self._max_clients:
+            _evicted, stale = self._clients.popitem(last=False)
+            self._close_later(stale)
+        client = httpx.AsyncClient(
+            proxy=proxy,
+            timeout=self._timeout,
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=self._per_proxy,
+                max_keepalive_connections=self._per_proxy,
+            ),
+            # Shared context: a pool is one client per proxy, and a per-client
+            # SSLContext would cost ~1.25 MB x pool size.
+            verify=SSL_CONTEXT,
+        )
+        self._clients[proxy] = client
         return client
+
+    @staticmethod
+    def _close_later(client: httpx.AsyncClient) -> None:
+        """Close a client without awaiting -- callers of ``client()`` are sync."""
+        try:
+            asyncio.get_running_loop().create_task(client.aclose())
+        except RuntimeError:  # pragma: no cover - no loop, nothing to close onto
+            pass
 
     def report(self, proxy: str, ok: bool) -> None:
         """Remember whether a proxy just behaved, so retries avoid a bad one.
 
         A proxy that keeps failing is retired for the rest of the run; a single
-        failure only rests it. The distinction matters on a free list, where
-        plenty of hosts answer one probe and then die.
+        failure only rests it.
         """
         if ok:
             self._resting.pop(proxy, None)
@@ -244,10 +241,7 @@ class ProxyPool:
             if client is not None:
                 # Free the sockets immediately; a retired proxy's warm pool is
                 # dead weight against the process fd budget.
-                try:
-                    asyncio.get_running_loop().create_task(client.aclose())
-                except RuntimeError:  # pragma: no cover - no loop, nothing to close onto
-                    pass
+                self._close_later(client)
         elif self._cooldown > 0:
             self._resting[proxy] = time.time() + self._cooldown
 
@@ -259,8 +253,11 @@ class ProxyPool:
         now = time.time()
         return sum(1 for until in self._resting.values() if until > now)
 
+    def retired(self) -> int:
+        return len(self._retired)
+
     async def aclose(self) -> None:
-        clients, self._clients = list(self._clients.values()), {}
+        clients, self._clients = list(self._clients.values()), OrderedDict()
         for client in clients:
             try:
                 await client.aclose()
@@ -365,7 +362,7 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
             verdict = SnipeResult(username, "guns.lol", "error", f"status {resp.status_code}")
         else:
             # Stop the moment the page has said which it is; the remaining tens
-            # of KB are Next.js payload this check has no use for.
+            # of KB are framework payload this check has no use for.
             async for chunk in resp.aiter_bytes():
                 head.extend(chunk)
                 verdict = _guns_verdict(username, head)
@@ -388,7 +385,9 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
     text = head.decode("utf-8", errors="ignore")
     match = TITLE_RE.search(text)
     if match:
-        return SnipeResult(username, "guns.lol", "error", f"unexpected title: {match.group(1).strip()[:60]}")
+        return SnipeResult(
+            username, "guns.lol", "error", f"unexpected title: {match.group(1).strip()[:60]}"
+        )
     return SnipeResult(username, "guns.lol", "error", f"no title in the first {len(head) // 1024} KB")
 
 
@@ -422,10 +421,53 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> SnipeResu
     return SnipeResult(username, "instagram", "taken", str(user.get("username") or ""))
 
 
+# --- TikTok ---------------------------------------------------------------
+async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    """oEmbed answers 200 for a live handle and 400 for a free one.
+
+    Anything else -- a 403, a 429, an HTML body, an empty one -- is reported as
+    blocked or an error rather than as an answer, because the whole point of the
+    proxy list is that a datacenter IP gets a shell page whose body does not
+    distinguish the two cases.
+    """
+    headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*"}
+    try:
+        resp = await client.get(
+            TIKTOK_OEMBED,
+            params={"url": f"https://www.tiktok.com/@{username}"},
+            headers=headers,
+        )
+    except Exception as exc:
+        return SnipeResult(username, "tiktok", "error", type(exc).__name__)
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+
+    if resp.status_code == 200:
+        if not isinstance(body, dict):
+            return SnipeResult(username, "tiktok", "error", "unreadable body")
+        author = str(body.get("author_name") or "")
+        if author:
+            return SnipeResult(username, "tiktok", "taken", author)
+        return SnipeResult(username, "tiktok", "error", "no author_name in oembed body")
+    if resp.status_code == 400:
+        # oEmbed's "no such user" answer. Only trust it as *free* when it is the
+        # shape oEmbed actually returns for a missing handle.
+        if isinstance(body, dict) and not body.get("author_name"):
+            return SnipeResult(username, "tiktok", "available", "oembed 400")
+        return SnipeResult(username, "tiktok", "error", "unexpected 400 body")
+    if resp.status_code in (403, 429):
+        return SnipeResult(username, "tiktok", "blocked", f"status {resp.status_code}")
+    return SnipeResult(username, "tiktok", "error", f"status {resp.status_code}")
+
+
 CHECKERS = {
     "discord": check_discord,
     "guns.lol": check_guns,
     "instagram": check_instagram,
+    "tiktok": check_tiktok,
 }
 
 
@@ -439,12 +481,12 @@ def normalize_platforms(platforms: list[str] | None) -> list[str]:
 class RateMeter:
     """Counts completed checks and reports both the trailing and overall rate.
 
-    ``recent`` is what the dashboard shows, because a scan that slows down
+    ``recent`` is what the dashboard shows, because a run that slows down
     halfway should report the slowdown rather than the flattering average of
     everything before it.
 
     Both rates divide by an elapsed time, and a batch of checks that lands in
-    the same instant -- or a scan that finishes before its first second -- makes
+    the same instant -- or a run that finishes before its first second -- makes
     that divisor ~0 and reports thousands of checks a second. The divisor is
     therefore floored at ``_MIN_RATE_SPAN``: a rate is never a number the clock
     cannot support.
@@ -487,9 +529,9 @@ class RateMeter:
 # --- the batch ------------------------------------------------------------
 async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResult:
     """One name on one platform, through the next proxy the pool hands out."""
-    proxy = pool.next(platform)
+    proxy = pool.next()
     if proxy is None:
-        detail = "pool exhausted this run" if len(pool) else "no validated proxies"
+        detail = "proxies exhausted this run" if len(pool) else "no proxies saved"
         return SnipeResult(username, platform, "error", detail)
     started = time.perf_counter()
     try:
@@ -508,7 +550,7 @@ async def iter_snipes(
     usernames: list[str],
     platforms: list[str],
     pool: ProxyPool,
-    concurrency: int = 32,
+    concurrency: int = 64,
     retries: int = 2,
     window_factor: int = 4,
     stop: asyncio.Event | None = None,
@@ -517,14 +559,14 @@ async def iter_snipes(
 
     A name the platform refused (blocked) or the proxy could not carry (error)
     is retried on a different proxy, up to ``retries`` -- that is the whole
-    point of having a pool. A definitive answer (available/taken/invalid) is
-    never retried. Names that cannot be valid on any of the three platforms are
-    rejected before a request is spent on them.
+    point of having a list. A definitive answer (available/taken/invalid) is
+    never retried. Names that cannot be valid are rejected before a request is
+    spent on them.
 
     The scheduler is a sliding window, not fixed chunks: the moment one check
     finishes another starts, so in-flight work stays at ``concurrency`` from the
     first result to the last. Waiting for a whole chunk to drain instead leaves
-    the tail of every chunk idle, which is exactly the throughput a scan cannot
+    the tail of every chunk idle, which is exactly the throughput a run cannot
     spare.
 
     ``stop`` is the run's cancel token. When it is set the dispatch loop stops

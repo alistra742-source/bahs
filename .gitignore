@@ -1,4 +1,5 @@
-# Runtime proxy store (recreated by the scheduler); mount a volume for prod.
+# The saved proxy list (recreated on first save); point STORE_PATH at a mounted
+# volume to keep it across deploys.
 data/
 __pycache__/
 *.pyc

@@ -3,516 +3,717 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>proxy-scraper — validated proxies</title>
+<title>bahs — username availability</title>
 <style>
-:root{color-scheme:dark;--bg:#0b0d12;--panel:#11151d;--line:#202836;--txt:#e6e8ef;--dim:#9aa4b8;--blue:#79c0ff;--green:#3fb950;--red:#f85149;--amber:#d29922}
+:root{
+  color-scheme:dark;
+  --bg:#080a0f; --panel:#0f131b; --panel2:#0b0f16; --line:#1d2534; --line2:#28313f;
+  --txt:#e8ebf2; --dim:#8b96ab; --dim2:#606b80;
+  --blue:#4c8dff; --green:#2fd07a; --red:#ff5c5c; --amber:#f0b429; --purple:#a880ff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(900px 520px at 10% -10%,rgba(47,129,247,.18),transparent 60%),radial-gradient(700px 420px at 100% 0,rgba(63,185,80,.10),transparent 55%)}
-.wrap{position:relative;max-width:1180px;margin:0 auto;padding:30px 18px 56px}
-.top{display:flex;flex-wrap:wrap;gap:16px;align-items:center;justify-content:space-between}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{width:38px;height:38px;border-radius:11px;background:linear-gradient(135deg,#2f81f7,#3fb950);display:grid;place-items:center;font:700 17px ui-monospace,monospace;color:#0b0d12}
-.ttl{font-size:22px;font-weight:650;letter-spacing:-.02em}
-.sub{color:var(--dim);font-size:13px}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg);color:var(--txt);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+  -webkit-text-size-adjust:100%;
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+  background:
+    radial-gradient(760px 420px at 8% -8%,rgba(76,141,255,.16),transparent 62%),
+    radial-gradient(620px 380px at 98% -4%,rgba(47,208,122,.10),transparent 60%),
+    radial-gradient(900px 600px at 50% 110%,rgba(168,128,255,.07),transparent 65%);
+}
+.app{position:relative;z-index:1;max-width:1320px;margin:0 auto;padding:26px 18px 120px}
+
+/* --- header --- */
+header.top{display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:13px;min-width:0}
+.logo{
+  width:42px;height:42px;border-radius:13px;flex:none;display:grid;place-items:center;
+  background:linear-gradient(135deg,#4c8dff,#2fd07a);color:#06090e;
+  font:800 18px var(--mono);box-shadow:0 6px 24px -8px rgba(76,141,255,.8)
+}
+h1{margin:0;font-size:21px;font-weight:680;letter-spacing:-.03em}
+h1 span{color:var(--dim);font-weight:400}
+.sub{color:var(--dim);font-size:12.5px;font-family:var(--mono);margin-top:1px}
 .chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{display:flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font:12px ui-monospace,monospace}
-.chip .led{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
-.chip.on .led{background:var(--green);box-shadow:0 0 8px rgba(63,185,80,.6)}
-.chip.bad .led{background:var(--red);box-shadow:0 0 8px rgba(248,81,73,.6)}
-.chip.busy .led{background:var(--amber);box-shadow:0 0 8px rgba(210,153,34,.6)}
-.chip .name{text-transform:uppercase;letter-spacing:.07em;color:#cbd5e5;font-weight:600}
-.chip .detail{color:var(--dim)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin-top:16px}
-.ph{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:10px}
-h2{margin:0;font-size:15px;font-weight:650;letter-spacing:-.01em}
-.hint,.msg{color:var(--dim);font:12px ui-monospace,monospace}
-.msg.bad{color:var(--red)}
+.chip{
+  display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);
+  border-radius:999px;padding:7px 13px;font:12px var(--mono);white-space:nowrap
+}
+.chip .led{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:none;transition:background .2s}
+.chip.on .led{background:var(--green);box-shadow:0 0 9px rgba(47,208,122,.75)}
+.chip.warn .led{background:var(--amber);box-shadow:0 0 9px rgba(240,180,41,.7)}
+.chip.bad .led{background:var(--red);box-shadow:0 0 9px rgba(255,92,92,.7)}
+.chip .k{color:var(--dim2);text-transform:uppercase;letter-spacing:.09em;font-size:10.5px;font-weight:700}
+.chip .v{color:#cfd7e6;font-weight:600}
+
+/* --- layout --- */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.card{
+  background:linear-gradient(180deg,rgba(255,255,255,.018),transparent 40%),var(--panel);
+  border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:16px
+}
+.ch{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:12px}
+.ch h2{margin:0;font-size:14.5px;font-weight:660;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
+.ch h2 .n{
+  width:20px;height:20px;border-radius:7px;display:grid;place-items:center;font:700 10.5px var(--mono);
+  background:#16202f;color:var(--blue);border:1px solid #22304a
+}
+.hint{color:var(--dim);font:11.5px var(--mono)}
+.hint.dim2{color:var(--dim2)}
+.row{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
+.row.tight{gap:7px}
+.spacer{flex:1 1 auto}
+
+/* --- controls --- */
+button{
+  border:1px solid transparent;border-radius:10px;padding:9px 15px;font:640 13px inherit;cursor:pointer;
+  color:#fff;background:#1a2230;transition:transform .13s,filter .13s,opacity .13s;white-space:nowrap
+}
+button:disabled{opacity:.4;cursor:not-allowed}
+button:not(:disabled):hover{transform:translateY(-1px);filter:brightness(1.12)}
+button:not(:disabled):active{transform:translateY(0)}
+.primary{background:linear-gradient(135deg,#3f7dff,#2757d6)}
+.go{background:linear-gradient(135deg,#22b96a,#17904f)}
+.stopbtn{background:#34161a;border-color:#5b2630;color:#ffb3b3}
+.ghost{background:#141a24;border-color:var(--line2);color:#c6d0e0}
+.mini{background:#141a24;border:1px solid var(--line2);color:#c6d0e0;padding:5px 10px;font-size:11.5px;border-radius:8px}
+.danger{background:#241318;border:1px solid #4d2229;color:#ffa1a1}
+input,select,textarea{
+  background:var(--panel2);border:1px solid var(--line);border-radius:10px;color:var(--txt);
+  padding:9px 11px;font:13px var(--mono);outline:none;transition:border-color .15s
+}
+input:focus,select:focus,textarea:focus{border-color:#31517f}
+textarea{width:100%;resize:vertical;line-height:1.5}
+input[type=number]{width:82px}
+label.f{display:inline-flex;align-items:center;gap:6px;font:11.5px var(--mono);color:var(--dim)}
+
+/* --- platform toggles --- */
+.pfs{display:flex;flex-wrap:wrap;gap:8px}
+.pf{
+  display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);
+  border-radius:11px;padding:9px 13px;cursor:pointer;font:600 12.5px var(--mono);color:var(--dim);
+  transition:border-color .15s,color .15s,background .15s;user-select:none
+}
+.pf input{display:none}
+.pf .dot{width:8px;height:8px;border-radius:50%;background:var(--dim2);transition:all .15s}
+.pf.on{color:#eaf0fa;border-color:#31517f;background:#111a29}
+.pf.on .dot{background:var(--green);box-shadow:0 0 8px rgba(47,208,122,.8)}
+
+/* --- dropzone --- */
+.drop{
+  border:1.5px dashed var(--line2);border-radius:12px;padding:16px;text-align:center;color:var(--dim);
+  font:12px var(--mono);cursor:pointer;transition:border-color .15s,background .15s,color .15s;background:var(--panel2)
+}
+.drop:hover,.drop.over{border-color:#31517f;background:#101827;color:#cfd7e6}
+
+/* --- stats --- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:9px;margin-top:12px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:10px 12px}
+.stat .k{color:var(--dim2);font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.08em;font-weight:700}
+.stat .v{font:660 19px var(--mono);margin-top:3px;letter-spacing:-.02em}
+.stat .v.green{color:var(--green)}
+.stat .v.blue{color:var(--blue)}
+.stat .v.amber{color:var(--amber)}
+
+/* --- progress --- */
+.bar{height:6px;border-radius:99px;background:#182130;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4c8dff,#2fd07a);transition:width .25s ease}
+
+/* --- tables --- */
+.tw{overflow:auto;margin-top:12px;border:1px solid var(--line);border-radius:12px;max-height:420px}
+.tw.tall{max-height:560px}
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+th{
+  position:sticky;top:0;z-index:1;background:#0d121a;text-align:left;color:var(--dim2);font-weight:700;
+  padding:9px 10px;border-bottom:1px solid var(--line);font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap
+}
+td{padding:7px 10px;border-bottom:1px solid #141a24;white-space:nowrap;color:#d3dae7}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#0d131d}
+td.wrap{white-space:normal;word-break:break-all;color:var(--dim);min-width:150px}
+td.num{text-align:right;color:var(--dim)}
+.pill{
+  display:inline-block;border-radius:99px;padding:2px 9px;font:700 10.5px var(--mono);
+  border:1px solid var(--line);letter-spacing:.02em
+}
+.pill.available{color:#8ff0b4;border-color:#1d5133;background:#0c2116}
+.pill.taken{color:#ffb3b3;border-color:#5b2630;background:#221014}
+.pill.invalid{color:#f5cd7a;border-color:#54401a;background:#241d0e}
+.pill.blocked{color:#c0b0ff;border-color:#3d3566;background:#171430}
+.pill.error{color:var(--dim);border-color:var(--line2);background:#12171f}
+.filter{display:inline-flex;gap:6px;flex-wrap:wrap}
+.filter button{
+  background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:5px 11px;
+  font:600 11.5px var(--mono);border-radius:99px
+}
+.filter button.on{background:#111a29;border-color:#31517f;color:#e6ecf7}
+.empty{color:var(--dim2);font:12.5px var(--mono);padding:26px 12px;text-align:center}
+.fnote{color:var(--dim2);font:11px var(--mono);margin-top:8px}
+.msg{font:12px var(--mono);color:var(--dim)}
 .msg.ok{color:var(--green)}
-input,select{background:#0e131b;border:1px solid var(--line);border-radius:9px;color:var(--txt);padding:9px 11px;font:13px ui-monospace,monospace;outline:none}
-input:focus,select:focus{border-color:#2f81f7}
-button{border:1px solid transparent;border-radius:9px;padding:9px 15px;font:600 13px inherit;cursor:pointer;color:#fff;transition:transform .15s,opacity .15s}
-button:disabled{opacity:.45;cursor:default}
-button:not(:disabled):hover{transform:translateY(-1px)}
-.primary{background:linear-gradient(135deg,#2f81f7,#1f6feb)}
-.go{background:linear-gradient(135deg,#2ea043,#238636)}
-.stop{background:#3d1d1d;border-color:#5c2b2b;color:#ffb4b4}
-.ghost{background:#151a23;border-color:var(--line);color:#c9d3e4}
-.mini{background:#151a23;border:1px solid var(--line);color:#c9d3e4;padding:5px 10px;font-size:12px;border-radius:8px}
-.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:10px;margin-top:12px}
-.stat{background:#0e131b;border:1px solid var(--line);border-radius:11px;padding:11px 13px}
-.stat .k{color:var(--dim);font:11px ui-monospace,monospace;text-transform:uppercase;letter-spacing:.06em}
-.stat .v{font:650 21px ui-monospace,monospace;margin-top:3px}
-table{width:100%;border-collapse:collapse;font:12.5px ui-monospace,monospace}
-th{text-align:left;color:var(--dim);font-weight:600;padding:8px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.05em;font-size:11px;white-space:nowrap}
-td{padding:8px 8px;border-bottom:1px solid #171d27;white-space:nowrap}
-tr:hover td{background:#0e131b}
-.mono{font:12.5px ui-monospace,monospace}
-.pill{display:inline-block;border-radius:999px;padding:2px 9px;font:600 11px ui-monospace,monospace;border:1px solid var(--line)}
-.pill.elite{color:#8ff0a4;border-color:#26502f;background:#0f2417}
-.pill.anonymous{color:#f0d38f;border-color:#514326;background:#241f0f}
-.pill.transparent{color:#ffb4b4;border-color:#5c2b2b;background:#241010}
-.pill.unknown{color:var(--dim)}
-.pill.available{color:#8ff0a4;border-color:#26502f;background:#0f2417}
-.pill.taken{color:#ffb4b4;border-color:#5c2b2b;background:#241010}
-.pill.invalid{color:#f0d38f;border-color:#514326;background:#241f0f}
-.pill.blocked,.pill.error{color:var(--dim)}
-label.chk{display:inline-flex;align-items:center;gap:6px;font:12px ui-monospace,monospace;color:#cbd5e5}
-label.chk input{width:auto;padding:0;margin:0}
-.dots{display:inline-flex;gap:4px}
-.dot{width:9px;height:9px;border-radius:50%;background:#232b38;display:inline-block}
-.dot.ok{background:var(--green)}
-.dot.bad{background:var(--red)}
-.score{font-weight:650}
-.bar{height:5px;border-radius:3px;background:#232b38;overflow:hidden;width:62px;display:inline-block;vertical-align:middle;margin-left:7px}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,#2f81f7,#3fb950)}
-.tablewrap{overflow:auto;margin-top:6px}
-.empty{color:var(--dim);font:13px ui-monospace,monospace;padding:26px 8px;text-align:center}
-.foot{color:var(--dim);font:12px ui-monospace,monospace;margin-top:18px;display:flex;gap:14px;flex-wrap:wrap}
-.spinner{width:12px;height:12px;border:2px solid #2f81f7;border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-2px}
+.msg.bad{color:var(--red)}
+.spin{width:11px;height:11px;border:2px solid var(--blue);border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-1px}
 @keyframes sp{to{transform:rotate(360deg)}}
+.mono{font-family:var(--mono)}
 a{color:var(--blue)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#1e2836;border-radius:99px;border:2px solid var(--panel)}
+::-webkit-scrollbar-thumb:hover{background:#2b3849}
+
+/* --- run bar --- */
+.runbar{
+  position:fixed;left:0;right:0;bottom:0;z-index:20;border-top:1px solid var(--line);
+  background:rgba(9,12,18,.9);backdrop-filter:blur(12px);padding:10px 18px
+}
+.runbar .in{max-width:1320px;margin:0 auto;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.runbar .metric{display:flex;align-items:baseline;gap:6px;font:12px var(--mono)}
+.runbar .metric b{font-size:15px;font-weight:700}
+.runbar .metric span{color:var(--dim2);text-transform:uppercase;font-size:10.5px;letter-spacing:.08em;font-weight:700}
+.logline{color:var(--dim);font:11.5px var(--mono);flex:1 1 240px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="top">
+<div class="app">
+
+  <header class="top">
     <div class="brand">
-      <div class="logo">px</div>
+      <div class="logo">bh</div>
       <div>
-        <div class="ttl">proxy-scraper</div>
-        <div class="sub">validated high-anonymity proxies · Discord · guns.lol · Instagram</div>
+        <h1>bahs <span>· username availability</span></h1>
+        <div class="sub">discord · guns.lol · instagram · tiktok — through your own proxy list</div>
       </div>
     </div>
     <div class="chips">
-      <div class="chip" id="chip-state"><span class="led"></span><span class="name">scheduler</span><span class="detail" id="state-detail">…</span></div>
-      <div class="chip" id="chip-alive"><span class="led"></span><span class="name">alive</span><span class="detail" id="alive-detail">…</span></div>
-      <div class="chip" id="chip-cycle"><span class="led"></span><span class="name">cycle</span><span class="detail" id="cycle-detail">…</span></div>
+      <div class="chip" id="chip-proxies"><span class="led"></span><span class="k">proxies</span><span class="v" id="c-proxies">—</span></div>
+      <div class="chip" id="chip-run"><span class="led"></span><span class="k">run</span><span class="v" id="c-run">idle</span></div>
+      <div class="chip" id="chip-fd"><span class="led"></span><span class="k">status</span><span class="v" id="c-status">…</span></div>
     </div>
-  </div>
+  </header>
 
-  <div class="panel">
-    <div class="ph">
-      <h2>Control</h2>
-      <span class="msg" id="ctl-msg"></span>
-    </div>
-    <div class="row">
-      <button class="go" id="btn-start">Start</button>
-      <button class="stop" id="btn-stop">Stop</button>
-      <button class="primary" id="btn-refresh">Refresh now</button>
-      <button class="ghost" id="btn-export">Download .txt</button>
-    </div>
-    <div class="grid">
-      <div class="stat"><div class="k">tracked</div><div class="v" id="s-total">—</div></div>
-      <div class="stat"><div class="k">alive</div><div class="v" id="s-alive">—</div></div>
-      <div class="stat"><div class="k">discord</div><div class="v" id="s-discord">—</div></div>
-      <div class="stat"><div class="k">guns.lol</div><div class="v" id="s-guns">—</div></div>
-      <div class="stat"><div class="k">instagram</div><div class="v" id="s-insta">—</div></div>
-      <div class="stat"><div class="k">elite</div><div class="v" id="s-elite">—</div></div>
-      <div class="stat"><div class="k">anonymous</div><div class="v" id="s-anon">—</div></div>
-      <div class="stat"><div class="k">cycles</div><div class="v" id="s-cycles">—</div></div>
-      <div class="stat"><div class="k">total ever</div><div class="v" id="s-seen">—</div></div>
-      <div class="stat"><div class="k">checks run</div><div class="v" id="s-checks">—</div></div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>Validated proxies</h2>
-      <div class="row">
-        <span class="msg" id="list-msg"></span>
-        <button class="mini" id="btn-purge-dead">Purge dead</button>
-        <button class="mini" id="btn-purge-all">Purge all</button>
+  <!-- 1 · proxies -->
+  <section class="card">
+    <div class="ch">
+      <h2><span class="n">1</span> Proxy list</h2>
+      <div class="row tight">
+        <span class="msg" id="pr-msg"></span>
+        <button class="mini" id="btn-pr-download">Download .txt</button>
+        <button class="mini danger" id="btn-pr-clear">Clear list</button>
       </div>
     </div>
-    <div class="row">
-      <select id="f-platform">
-        <option value="">all platforms</option>
-        <option value="discord">discord</option>
-        <option value="guns.lol">guns.lol</option>
-        <option value="instagram">instagram</option>
-      </select>
-      <select id="f-anon">
-        <option value="">any anonymity</option>
-        <option value="elite">elite</option>
-        <option value="anonymous">anonymous</option>
-        <option value="transparent">transparent</option>
-      </select>
-      <select id="f-proto">
-        <option value="">any protocol</option>
-        <option value="http">http</option>
-        <option value="https">https</option>
-        <option value="socks4">socks4</option>
-        <option value="socks5">socks5</option>
-      </select>
-      <span class="hint">min score</span>
-      <input id="f-score" type="number" min="0" max="100" value="0" style="width:78px">
-      <span class="hint">limit</span>
-      <input id="f-limit" type="number" min="1" max="1000" value="100" style="width:82px">
-      <button class="ghost" id="btn-apply">Apply</button>
-      <span class="hint" id="auto-hint">auto-refresh: 10s</span>
-    </div>
-    <div class="row" style="margin-top:10px">
-      <span class="hint">copy working list</span>
-      <button class="mini copybtn" data-platform="">all</button>
-      <button class="mini copybtn" data-platform="discord">discord</button>
-      <button class="mini copybtn" data-platform="guns.lol">guns.lol</button>
-      <button class="mini copybtn" data-platform="instagram">instagram</button>
-      <button class="mini" id="btn-copy-all3">passes all 3</button>
-      <span class="msg" id="copy-msg"></span>
-    </div>
-    <div class="tablewrap">
-      <table>
-        <thead>
-          <tr>
-            <th>proxy</th><th>proto</th><th>anon</th><th>latency</th><th>platforms</th><th>score</th><th></th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-    <div class="empty" id="empty" style="display:none">no validated proxies match — press Refresh now</div>
-  </div>
 
-  <div class="panel">
-    <div class="ph">
-      <h2>Sniper &middot; pattern scan</h2>
-      <div class="row">
-        <span class="msg" id="snipe-msg"></span>
-        <button class="mini" id="btn-snipe-copy">Copy available</button>
+    <div class="grid2" style="gap:14px">
+      <div>
+        <div class="drop" id="drop">
+          <input type="file" id="file" accept=".txt,.csv,text/plain,text/csv" hidden>
+          <div id="drop-text">Drop a <b>.txt</b> here, or click to choose a file</div>
+        </div>
+        <textarea id="pr-text" rows="6" spellcheck="false"
+          placeholder="…or paste here, one per line:
+1.2.3.4:8080
+socks5://user:pass@5.6.7.8:1080
+host.example.com:3128:user:pass"></textarea>
+        <div class="row" style="margin-top:10px">
+          <button class="go" id="btn-pr-append">Add to list</button>
+          <button class="primary" id="btn-pr-replace">Replace list</button>
+          <span class="hint" id="pr-count">loading…</span>
+        </div>
+        <div class="fnote">
+          Formats: <code>host:port</code> · <code>scheme://host:port</code> · <code>user:pass@host:port</code> ·
+          <code>host:port:user:pass</code> · <code>[ipv6]:port</code>. Bare entries are read as <b>http</b>.
+          Duplicates are dropped, unreadable lines are reported and skipped.
+        </div>
+      </div>
+      <div>
+        <div class="stats" id="pr-stats"></div>
+        <div class="fnote" style="margin-top:12px">
+          Nothing is validated up front and nothing is scraped: this list <i>is</i> the pool.
+          A host that is dead shows up as an error on the name it was used for and gets
+          retired for the rest of the run.
+        </div>
+        <div class="tw" style="max-height:300px;margin-top:12px">
+          <table>
+            <thead><tr><th>proxy</th><th>scheme</th><th></th></tr></thead>
+            <tbody id="pr-rows"></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:9px">
+          <span class="hint" id="pr-shown"></span>
+          <span class="spacer"></span>
+          <button class="mini" id="btn-pr-more">Load more</button>
+        </div>
       </div>
     </div>
-    <div class="row">
-      <span class="hint">platforms</span>
-      <label class="chk"><input type="checkbox" class="snipe-pf" value="discord" checked> discord</label>
-      <label class="chk"><input type="checkbox" class="snipe-pf" value="guns.lol" checked> guns.lol</label>
-      <label class="chk"><input type="checkbox" class="snipe-pf" value="instagram" checked> instagram</label>
-      <span class="hint">concurrency</span>
-      <input id="snipe-conc" type="number" min="1" max="2000" value="256" style="width:78px">
-      <button class="primary" id="btn-snipe">Check names</button>
-      <button class="go" id="btn-scan">Scan at max rate</button>
-      <button class="stop" id="btn-run-stop" disabled>Stop run</button>
-      <span class="hint">runs through the validated proxies</span>
+  </section>
+
+  <!-- 2 · names -->
+  <section class="card">
+    <div class="ch">
+      <h2><span class="n">2</span> Usernames</h2>
+      <span class="hint" id="nm-count">0 names</span>
     </div>
-    <div class="row" style="margin-top:10px">
-      <span class="hint">pattern</span>
-      <select id="gen-pattern">
-        <option value="words">OG words</option>
-        <option value="letters">letters</option>
-        <option value="alnum">alphanumeric</option>
-        <option value="numbers">numbers</option>
-      </select>
-      <span class="hint">length</span>
-      <input id="gen-length" type="number" min="1" max="32" value="4" style="width:66px">
-      <span class="hint">count</span>
-      <input id="gen-count" type="number" min="1" max="20000" value="500" style="width:86px">
+    <div class="row tight" style="margin-bottom:10px">
+      <label class="f">pattern
+        <select id="gen-pattern">
+          <option value="words">OG words</option>
+          <option value="letters">letters</option>
+          <option value="alnum">alphanumeric</option>
+          <option value="numbers">numbers</option>
+        </select>
+      </label>
+      <label class="f">length <input id="gen-length" type="number" min="1" max="32" value="4"></label>
+      <label class="f">count <input id="gen-count" type="number" min="1" max="20000" value="500"></label>
       <button class="mini" id="btn-gen-add">Add pattern</button>
       <button class="ghost" id="btn-gen-run">Generate</button>
       <button class="mini" id="btn-gen-clear">Clear patterns</button>
-      <button class="go" id="btn-gen-random">Random 4L &middot; 4N &middot; OG</button>
+      <span class="spacer"></span>
+      <button class="go" id="btn-gen-random">🎲 Random 4L · 4N · OG</button>
     </div>
-    <div class="row" id="gen-chips" style="margin-top:8px"><span class="hint">no patterns yet &mdash; add one, or type names below</span></div>
-    <textarea id="snipe-names" rows="3" placeholder="optional - leave this empty and press Random 4L / 4N / OG to pick names instead"></textarea>
-    <div class="row" style="margin-top:8px">
-      <span class="hint" id="scan-rate">idle</span>
-      <div class="bar" style="width:240px"><i id="scan-bar" style="width:0%"></i></div>
-      <span class="hint" id="scan-progress"></span>
+    <div class="row tight" id="gen-chips" style="margin-bottom:10px"></div>
+    <textarea id="nm-text" rows="7" spellcheck="false"
+      placeholder="One name per line (or comma separated). Leave empty and press “Random 4L · 4N · OG” to draw names instead."></textarea>
+    <div class="row" style="margin-top:9px">
+      <span class="hint" id="nm-hint">names are de-duplicated and checked on every platform you pick below</span>
     </div>
-    <div class="tablewrap">
+  </section>
+
+  <!-- 3 · run -->
+  <section class="card">
+    <div class="ch">
+      <h2><span class="n">3</span> Run</h2>
+      <span class="msg" id="run-msg"></span>
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      <div class="pfs" id="pfs"></div>
+    </div>
+    <div class="row">
+      <label class="f">concurrency <input id="run-conc" type="number" min="1" max="4000" value="256"></label>
+      <label class="f">retries <input id="run-retries" type="number" min="0" max="5" value="2"></label>
+      <label class="f">watch rate <input id="run-target" type="number" min="1" max="100000" value="100"></label>
+      <span class="spacer"></span>
+      <button class="go" id="btn-run">Check names</button>
+      <button class="primary" id="btn-scan">Scan generated</button>
+      <button class="stopbtn" id="btn-stop" disabled>Stop run</button>
+    </div>
+    <div class="bar"><i id="run-bar"></i></div>
+
+    <div class="ch" style="margin-top:16px">
+      <h2 style="font-size:13.5px">Results</h2>
+      <div class="row tight">
+        <div class="filter" id="filter">
+          <button data-f="all" class="on">all</button>
+          <button data-f="available">available</button>
+          <button data-f="taken">taken</button>
+          <button data-f="invalid">invalid</button>
+          <button data-f="blocked">blocked</button>
+          <button data-f="error">error</button>
+        </div>
+        <button class="mini" id="btn-copy-avail">Copy available</button>
+        <button class="mini" id="btn-export">Export .csv</button>
+        <button class="mini" id="btn-rows-clear">Clear</button>
+      </div>
+    </div>
+    <div class="tw tall">
       <table>
-        <thead>
-          <tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>latency</th><th></th></tr>
-        </thead>
-        <tbody id="snipe-rows"></tbody>
+        <thead><tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>ms</th><th></th></tr></thead>
+        <tbody id="rs-rows"></tbody>
       </table>
     </div>
-    <div class="empty" id="snipe-empty">nothing checked yet</div>
-  </div>
+    <div class="empty" id="rs-empty">nothing checked yet</div>
+    <div class="fnote" id="rs-note"></div>
+  </section>
 
-  <div class="foot">
-    <span>GET /proxies · GET /best · DELETE /proxies · POST /start /stop /refresh</span>
+  <div class="fnote" style="margin-top:6px">
+    API: <span class="mono">POST /proxies</span> · <span class="mono">POST /proxies/upload</span> ·
+    <span class="mono">POST /snipe</span> · <span class="mono">POST /scan</span> ·
+    <span class="mono">POST /snipe/stop</span> · <span class="mono">GET /info</span>
+  </div>
+</div>
+
+<div class="runbar">
+  <div class="in">
+    <div class="metric"><b id="m-rate">0.0</b><span>checks/s</span></div>
+    <div class="metric"><b id="m-done">0</b><span>checked</span></div>
+    <div class="metric"><b id="m-avail" class="mono" style="color:var(--green)">0</b><span>available</span></div>
+    <div class="metric"><b id="m-elapsed">0s</b><span>elapsed</span></div>
+    <div class="metric"><b id="m-pool">0</b><span>pool alive</span></div>
+    <div class="logline" id="m-log">ready</div>
   </div>
 </div>
 
 <script>
-const PLATFORMS = ["discord", "guns.lol", "instagram"];
 const $ = (id) => document.getElementById(id);
+const PLATFORM_DEFAULT = ["discord", "guns.lol", "instagram", "tiktok"];
+const RENDER_CAP = 1200;          // rows kept in the DOM at once
+let PLATFORMS = PLATFORM_DEFAULT.slice();
+
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+const fmtMs = (v) => (v === null || v === undefined ? "—" : Math.round(v) + "");
 
 async function api(path, opts) {
   const res = await fetch(path, opts || {});
   if (!res.ok) {
-    let detail = res.status + "";
-    try { detail = (await res.json()).detail || detail; } catch (e) {}
+    let detail = "HTTP " + res.status;
+    try { const j = await res.json(); if (j && j.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (e) {}
     throw new Error(detail);
   }
-  const ctype = res.headers.get("content-type") || "";
-  return ctype.includes("json") ? res.json() : res.text();
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("json") ? res.json() : res.text();
 }
-
-function fmtMs(v) {
-  return v === null || v === undefined ? "—" : Math.round(v) + " ms";
+function postJSON(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 }
-
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function msg(el, text, kind) {
+  el.textContent = text || "";
+  el.className = "msg" + (kind ? " " + kind : "");
 }
-
-function dots(platforms) {
-  return '<span class="dots">' + PLATFORMS.map((p) => {
-    const r = platforms && platforms[p];
-    const cls = r && r.ok ? "ok" : r ? "bad" : "";
-    return `<span class="dot ${cls}" title="${p}: ${r ? (r.ok ? "ok" : esc(r.reason || "fail")) : "not tested"}"></span>`;
-  }).join("") + "</span>";
-}
-
-// --- status ---------------------------------------------------------------
-async function loadStatus() {
-  const health = await api("/health");
-  const s = health.scheduler, st = health.store;
-
-  const stateChip = $("chip-state");
-  stateChip.className = "chip " + (s.running ? "busy" : s.enabled ? "on" : "bad");
-  $("state-detail").textContent = s.running ? "running a cycle" : s.enabled ? "on" : "stopped";
-  $("btn-start").disabled = s.enabled;
-  $("btn-stop").disabled = !s.enabled;
-
-  const aliveChip = $("chip-alive");
-  aliveChip.className = "chip " + (st.alive > 0 ? "on" : "");
-  $("alive-detail").textContent = st.alive + " / " + st.total_tracked;
-
-  const cyc = $("chip-cycle");
-  cyc.className = "chip " + (s.last_error ? "bad" : s.cycles ? "on" : "");
-  $("cycle-detail").textContent = s.last_error
-    ? "error"
-    : s.last_duration_s !== null && s.last_duration_s !== undefined
-      ? s.cycles + " · " + s.last_duration_s + "s"
-      : "waiting";
-
-  $("s-total").textContent = st.total_tracked;
-  $("s-alive").textContent = st.alive;
-  $("s-discord").textContent = st.by_platform["discord"] || 0;
-  $("s-guns").textContent = st.by_platform["guns.lol"] || 0;
-  $("s-insta").textContent = st.by_platform["instagram"] || 0;
-  $("s-elite").textContent = st.by_anonymity.elite || 0;
-  $("s-anon").textContent = st.by_anonymity.anonymous || 0;
-  $("s-cycles").textContent = s.cycles;
-  $("s-seen").textContent = st.total_seen === undefined ? "—" : st.total_seen;
-  $("s-checks").textContent = st.total_checks === undefined ? "—" : st.total_checks;
-
-  if (s.last_error) $("ctl-msg").textContent = "last error: " + s.last_error;
-}
-
-// --- list -----------------------------------------------------------------
-async function loadList() {
-  const params = new URLSearchParams();
-  const platform = $("f-platform").value;
-  const anon = $("f-anon").value;
-  const proto = $("f-proto").value;
-  if (platform) params.set("platform", platform);
-  if (anon) params.set("anonymity", anon);
-  if (proto) params.set("protocol", proto);
-  params.set("min_score", $("f-score").value || "0");
-  params.set("limit", $("f-limit").value || "100");
-
-  const data = await api("/proxies?" + params.toString());
-  const rows = data.proxies || [];
-  const tbody = $("rows");
-  tbody.innerHTML = "";
-  $("empty").style.display = rows.length ? "none" : "block";
-  $("list-msg").textContent = rows.length + " shown";
-
-  for (const r of rows) {
-    const tr = document.createElement("tr");
-    tr.innerHTML =
-      `<td class="mono">${esc(r.proxy)}</td>` +
-      `<td>${esc(r.protocol)}</td>` +
-      `<td><span class="pill ${esc(r.anonymity)}">${esc(r.anonymity)}</span></td>` +
-      `<td>${fmtMs(r.latency_ms)}</td>` +
-      `<td>${dots(r.platforms)}</td>` +
-      `<td><span class="score">${r.score.toFixed(1)}</span><span class="bar"><i style="width:${Math.max(0, Math.min(100, r.score))}%"></i></span></td>`;
-    const actions = document.createElement("td");
-    const copy = document.createElement("button");
-    copy.className = "mini"; copy.textContent = "copy";
-    copy.onclick = () => copyText(r.proxy);
-    const del = document.createElement("button");
-    del.className = "mini"; del.textContent = "remove";
-    del.onclick = () => removeProxy(r.proxy);
-    actions.append(copy, del);
-    tr.appendChild(actions);
-    tbody.appendChild(tr);
-  }
-}
-
-async function loadAll() {
-  try {
-    await loadStatus();
-  } catch (e) {
-    $("ctl-msg").textContent = e.message;
-    $("ctl-msg").className = "msg bad";
-  }
-  try {
-    await loadList();
-    $("list-msg").className = "msg";
-  } catch (e) {
-    $("list-msg").textContent = e.message;
-    $("list-msg").className = "msg bad";
-    $("rows").innerHTML = "";
-  }
-}
-
-// --- actions --------------------------------------------------------------
-async function post(path) {
-  $("ctl-msg").className = "msg";
-  $("ctl-msg").textContent = "working…";
-  try {
-    await api(path, { method: "POST" });
-    $("ctl-msg").className = "msg ok";
-    $("ctl-msg").textContent = "ok";
-  } catch (e) {
-    $("ctl-msg").className = "msg bad";
-    $("ctl-msg").textContent = e.message;
-  }
-  loadAll();
-}
-
-async function removeProxy(proxy) {
-  try {
-    await api("/proxies?proxy=" + encodeURIComponent(proxy), { method: "DELETE" });
-    loadAll();
-  } catch (e) {
-    $("list-msg").className = "msg bad";
-    $("list-msg").textContent = e.message;
-  }
-}
-
-async function exportTxt() {
-  const params = new URLSearchParams();
-  const platform = $("f-platform").value;
-  if (platform) params.set("platform", platform);
-  if ($("f-anon").value) params.set("anonymity", $("f-anon").value);
-  params.set("limit", $("f-limit").value || "100");
-  params.set("format", "txt");
-  try {
-    const text = await api("/proxies?" + params.toString());
-    const blob = new Blob([text], { type: "text/plain" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "proxies.txt";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  } catch (e) {
-    $("list-msg").className = "msg bad";
-    $("list-msg").textContent = e.message;
-  }
-}
-
-// Clipboard needs a secure context; fall back to a hidden textarea so the
-// buttons still work over plain http (a local run, a tunnelled preview).
 async function copyText(text) {
   if (!text) throw new Error("nothing to copy");
-  if (navigator.clipboard && window.isSecureContext) {
-    return navigator.clipboard.writeText(text);
-  }
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
   const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  document.execCommand("copy");
-  document.body.removeChild(ta);
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); } finally { document.body.removeChild(ta); }
+}
+function download(name, text, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: type || "text/plain" }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
 }
 
-function copyMsg(text, bad) {
-  $("copy-msg").textContent = text;
-  $("copy-msg").className = bad ? "msg bad" : "msg ok";
-}
+/* ── 1 · proxies ─────────────────────────────────────────────────────── */
+let prOffset = 0, prLimit = 60, prTotal = 0;
 
-// One button per platform: copy exactly the proxies that passed that target,
-// in the same filters the table is showing.
-async function copyList(params, label) {
-  const q = new URLSearchParams(params);
-  q.set("format", "txt");
-  q.set("limit", $("f-limit").value || "100");
-  if ($("f-anon").value) q.set("anonymity", $("f-anon").value);
-  if ($("f-proto").value) q.set("protocol", $("f-proto").value);
+async function loadProxies(reset) {
+  if (reset) { prOffset = 0; $("pr-rows").innerHTML = ""; }
   try {
-    const text = (await api("/proxies?" + q.toString())).trim();
-    if (!text) {
-      copyMsg("nothing passing " + label + " yet", true);
-      return;
+    const data = await api("/proxies?limit=" + prLimit + "&offset=" + prOffset);
+    prTotal = data.count;
+    renderProxyStats(data.stats);
+    const rows = $("pr-rows");
+    for (const p of data.proxies) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td class="mono wrap">${esc(p)}</td><td class="num">${esc(p.split("://")[0])}</td>`;
+      const act = document.createElement("td");
+      act.style.textAlign = "right";
+      const copy = document.createElement("button");
+      copy.className = "mini"; copy.textContent = "copy";
+      copy.onclick = () => copyText(p);
+      const del = document.createElement("button");
+      del.className = "mini danger"; del.textContent = "remove";
+      del.style.marginLeft = "6px";
+      del.onclick = async () => {
+        try { await api("/proxies?proxy=" + encodeURIComponent(p), { method: "DELETE" }); loadProxies(true); }
+        catch (e) { msg($("pr-msg"), e.message, "bad"); }
+      };
+      act.append(copy, del);
+      tr.appendChild(act);
+      rows.appendChild(tr);
     }
-    await copyText(text);
-    copyMsg("copied " + text.split("\n").length + " for " + label);
+    prOffset += data.proxies.length;
+    $("pr-shown").textContent = prTotal
+      ? "showing " + Math.min(prOffset, prTotal) + " of " + prTotal
+      : "";
+    $("btn-pr-more").disabled = prOffset >= prTotal;
+    $("pr-count").textContent = prTotal + (prTotal === 1 ? " proxy stored" : " proxies stored");
+    $("c-proxies").textContent = prTotal;
+    $("chip-proxies").className = "chip " + (prTotal ? "on" : "warn");
+    if (!prTotal) {
+      $("pr-rows").innerHTML = '<tr><td colspan="3" class="empty">no proxies yet — paste a list or drop a .txt above</td></tr>';
+    }
   } catch (e) {
-    copyMsg(e.message, true);
+    msg($("pr-msg"), e.message, "bad");
   }
 }
 
-document.querySelectorAll(".copybtn").forEach((b) => {
-  b.onclick = () => copyList(b.dataset.platform ? { platform: b.dataset.platform } : {}, b.dataset.platform || "any platform");
-});
-$("btn-copy-all3").onclick = () => copyList({ all_platforms: "true" }, "all 3");
+function renderProxyStats(st) {
+  const by = st.by_scheme || {};
+  const order = ["http", "https", "socks4", "socks5"];
+  const cls = { http: "blue", https: "blue", socks4: "green", socks5: "green" };
+  $("pr-stats").innerHTML =
+    order.map((k) => `<div class="stat"><div class="k">${k}</div><div class="v ${cls[k]}">${by[k] || 0}</div></div>`).join("") +
+    `<div class="stat"><div class="k">total</div><div class="v">${st.count || 0}</div></div>` +
+    `<div class="stat"><div class="k">with auth</div><div class="v">${st.with_auth || 0}</div></div>`;
+}
 
-// --- sniper ---------------------------------------------------------------
-// Results arrive as NDJSON, one verdict per line, so rows appear as each name
-// is answered instead of all at once at the end of the batch.
-let lastSnipes = [];
+async function savePaste(mode) {
+  const text = $("pr-text").value;
+  if (!text.trim()) { msg($("pr-msg"), "paste some proxies first", "bad"); return; }
+  msg($("pr-msg"), '<span class="spin"></span> saving…');
+  $("pr-msg").innerHTML = '<span class="spin"></span> saving…';
+  try {
+    const out = await postJSON("/proxies", { text: text, mode: mode });
+    const bits = [out.added + " " + (mode === "replace" ? "stored" : "added")];
+    if (out.duplicates) bits.push(out.duplicates + " duplicate");
+    if (out.rejected && out.rejected.length) bits.push(out.rejected.length + "+ rejected");
+    msg($("pr-msg"), bits.join(" · ") + " — " + out.stored.count + " total", "ok");
+    $("pr-text").value = "";
+    loadProxies(true);
+  } catch (e) {
+    msg($("pr-msg"), e.message, "bad");
+  }
+}
+
+function bindFileInput() {
+  const drop = $("drop"), input = $("file");
+  drop.onclick = () => input.click();
+  input.onchange = () => { if (input.files && input.files[0]) readFile(input.files[0]); input.value = ""; };
+  ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+  ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+  drop.addEventListener("drop", (e) => {
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) readFile(f);
+  });
+}
+
+function readFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const text = String(reader.result || "");
+    const box = $("pr-text");
+    box.value = box.value.trim() ? box.value.replace(/\s*$/, "\n") + text : text;
+    const lines = text.split(/\r?\n/).filter((l) => l.trim()).length;
+    $("drop-text").innerHTML = `<b>${esc(file.name)}</b> — ${lines} line${lines === 1 ? "" : "s"} loaded into the box below`;
+    msg($("pr-msg"), "read " + file.name + " — press Add to list", "ok");
+  };
+  reader.onerror = () => msg($("pr-msg"), "could not read that file", "bad");
+  reader.readAsText(file);
+}
+
+/* ── 2 · names ───────────────────────────────────────────────────────── */
+let genPatterns = [];
+
+function renderPatterns() {
+  const box = $("gen-chips");
+  box.innerHTML = "";
+  if (!genPatterns.length) {
+    box.innerHTML = '<span class="hint dim2">no patterns — add one, or press “Random 4L · 4N · OG”</span>';
+    return;
+  }
+  genPatterns.forEach((p, i) => {
+    const chip = document.createElement("span");
+    chip.className = "chip on";
+    chip.innerHTML = `<span class="k">${esc(p.pattern)}</span><span class="v">${p.length} chars × ${p.count}</span>`;
+    const x = document.createElement("button");
+    x.className = "mini"; x.textContent = "×"; x.style.marginLeft = "4px";
+    x.onclick = () => { genPatterns.splice(i, 1); renderPatterns(); };
+    chip.appendChild(x);
+    box.appendChild(chip);
+  });
+}
+
+function readPatterns() {
+  const pattern = $("gen-pattern").value;
+  const length = Math.max(1, Math.min(32, Number($("gen-length").value) || 4));
+  const count = Math.max(1, Math.min(20000, Number($("gen-count").value) || 500));
+  return { pattern, length, limit: count };
+}
+
+// The one-click set: 4 letters, 4 numbers and 4-letter OG words. The
+// 4-character alphanumeric space is 14.7M names, so a run samples it instead of
+// enumerating it — which is why "random" is the default mode.
+function randomPatterns() {
+  const count = Math.max(1, Math.min(20000, Number($("gen-count").value) || 500));
+  return ["letters", "numbers", "words"].map((pattern) => ({ pattern, length: 4, limit: count }));
+}
+
+async function generateInto(box) {
+  if (!genPatterns.length) genPatterns = randomPatterns();
+  renderPatterns();
+  const data = await postJSON("/generate", { patterns: genPatterns, limit: 0 });
+  box.value = data.usernames.join("\n");
+  box.dispatchEvent(new Event("input"));
+  return data.count;
+}
+
+async function generateNames() {
+  try {
+    const n = await generateInto($("nm-text"));
+    msg($("run-msg"), "generated " + n + " random names", "ok");
+  } catch (e) { msg($("run-msg"), e.message, "bad"); }
+}
+
+function namesInBox() {
+  const seen = new Set();
+  return $("nm-text").value
+    .split(/[\n,]/)
+    .map((s) => s.trim().replace(/^@/, ""))
+    .filter((s) => { if (!s || seen.has(s)) return false; seen.add(s); return true; });
+}
+
+function refreshNameCount() {
+  $("nm-count").textContent = namesInBox().length + " names";
+}
+
+/* ── 3 · platforms ───────────────────────────────────────────────────── */
+function buildPlatforms(list) {
+  PLATFORMS = list && list.length ? list : PLATFORM_DEFAULT;
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem("bahs.platforms") || "[]"); } catch (e) {}
+  const on = new Set(saved.filter((p) => PLATFORMS.includes(p)));
+  if (!on.size) PLATFORMS.forEach((p) => on.add(p));
+  const box = $("pfs");
+  box.innerHTML = "";
+  for (const p of PLATFORMS) {
+    const label = document.createElement("label");
+    label.className = "pf" + (on.has(p) ? " on" : "");
+    label.innerHTML = `<span class="dot"></span>${esc(p)}<input type="checkbox" value="${esc(p)}"${on.has(p) ? " checked" : ""}>`;
+    label.querySelector("input").onchange = (e) => {
+      e.target.checked ? on.add(p) : on.delete(p);
+      label.classList.toggle("on", e.target.checked);
+      try { localStorage.setItem("bahs.platforms", JSON.stringify([...on])); } catch (err) {}
+    };
+    box.appendChild(label);
+  }
+}
+
+function selectedPlatforms() {
+  const picked = [...document.querySelectorAll(".pf.on input")].map((i) => i.value);
+  return picked.length ? picked : PLATFORMS.slice();
+}
+
+/* ── results ─────────────────────────────────────────────────────────── */
+let results = [];
+let filter = "all";
 let scanTotal = 0;
 
-function snipeMsg(text, bad) {
-  $("snipe-msg").textContent = text;
-  $("snipe-msg").className = bad ? "msg bad" : "msg ok";
-}
-
-function appendSnipe(r) {
+function statusRow(r, i) {
   const tr = document.createElement("tr");
+  tr.style.cursor = r.status === "available" ? "pointer" : "default";
   tr.innerHTML =
     `<td class="mono">${esc(r.username)}</td>` +
-    `<td>${esc(r.platform)}</td>` +
+    `<td class="num">${esc(r.platform)}</td>` +
     `<td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>` +
-    `<td class="hint">${esc(r.detail || "")}</td>` +
-    `<td class="hint">${esc(r.proxy || "-")}</td>` +
-    `<td>${fmtMs(r.latency_ms)}</td>`;
-  const actions = document.createElement("td");
+    `<td class="wrap">${esc(r.detail || "")}</td>` +
+    `<td class="wrap">${esc(r.proxy || "—")}</td>` +
+    `<td class="num">${fmtMs(r.latency_ms)}</td>`;
+  const act = document.createElement("td");
+  act.style.textAlign = "right";
   if (r.status === "available") {
-    const b = document.createElement("button");
-    b.className = "mini";
-    b.textContent = "claim";
-    b.title = "where to register " + r.username + " on " + r.platform;
-    b.onclick = () => openClaim(r.platform, r.username);
-    actions.appendChild(b);
+    const claim = document.createElement("button");
+    claim.className = "mini go"; claim.textContent = "claim";
+    claim.title = "copy the name and open " + r.platform + " registration";
+    claim.onclick = (ev) => { ev.stopPropagation(); openClaim(r.platform, r.username); };
+    act.appendChild(claim);
   }
-  tr.appendChild(actions);
-  $("snipe-rows").appendChild(tr);
-  $("snipe-empty").style.display = "none";
+  tr.appendChild(act);
+  return tr;
 }
 
-async function errorText(res) {
-  let detail = res.status + "";
-  try { detail = (await res.json()).detail || detail; } catch (e) {}
-  return detail;
+function matchesFilter(r) { return filter === "all" || r.status === filter; }
+
+function renderResults() {
+  const tbody = $("rs-rows");
+  tbody.innerHTML = "";
+  const shown = results.filter(matchesFilter).slice(-RENDER_CAP).reverse();
+  for (const r of shown) tbody.appendChild(statusRow(r));
+  $("rs-empty").style.display = shown.length ? "none" : "block";
+  $("rs-empty").textContent = results.length
+    ? "no results match the “" + filter + "” filter"
+    : "nothing checked yet";
+  updateMetricNote();
 }
 
-// A name is only claimable from a signed-in account, so this copies the name,
-// asks the API where to register it, and opens that page. Nothing here creates
-// accounts.
+// Cheap enough to run on every result: one textContent write, not a 1200-row
+// rebuild.
+function updateMetricNote() {
+  const avail = results.filter((r) => r.status === "available").length;
+  $("rs-note").textContent = results.length
+    ? results.length + " checks this session · " + avail + " available · " +
+      results.filter(matchesFilter).length + " match “" + filter + "”"
+    : "";
+}
+
+function pushResult(r) {
+  results.push(r);
+  const tbody = $("rs-rows");
+  if (matchesFilter(r)) {
+    tbody.insertBefore(statusRow(r), tbody.firstChild);
+    while (tbody.childElementCount > RENDER_CAP) tbody.removeChild(tbody.lastElementChild);
+    $("rs-empty").style.display = "none";
+  }
+  updateMetricNote();
+}
+
 async function openClaim(platform, username) {
   try {
-    const info = await api("/claim?platform=" + encodeURIComponent(platform) +
-                           "&username=" + encodeURIComponent(username));
+    const info = await api("/claim?platform=" + encodeURIComponent(platform) + "&username=" + encodeURIComponent(username));
     await copyText(username);
-    snipeMsg("copied " + username + " - opening " + platform + " registration");
+    msg($("run-msg"), "copied “" + username + "” — opening " + platform + " registration", "ok");
     window.open(info.url, "_blank", "noopener");
-  } catch (e) {
-    snipeMsg(e.message, true);
-  }
+  } catch (e) { msg($("run-msg"), e.message, "bad"); }
 }
 
+/* ── the run ─────────────────────────────────────────────────────────── */
+let runAbort = null, runStopPath = "", runTimer = null, runStarted = 0, runCount = 0, runAvail = 0, runTarget = 100;
+
+function clearResults() {
+  results = [];
+  runCount = 0; runAvail = 0;
+  $("rs-rows").innerHTML = "";
+  $("rs-empty").style.display = "block";
+  $("rs-note").textContent = "";
+}
+
+function bar(done, total) {
+  $("run-bar").style.width = total ? Math.min(100, (done / total) * 100) + "%" : "0%";
+}
+
+function setLog(text) { $("m-log").textContent = text; }
+
+function updateMetrics(rate) {
+  const secs = runStarted ? (Date.now() - runStarted) / 1000 : 0;
+  $("m-done").textContent = runCount;
+  $("m-avail").textContent = runAvail;
+  $("m-elapsed").textContent = secs < 10 ? secs.toFixed(1) + "s" : Math.round(secs) + "s";
+  if (rate !== undefined && rate !== null) $("m-rate").textContent = Number(rate).toFixed(1);
+}
+
+function beginRun(stopPath, kind) {
+  clearResults();
+  runAbort = new AbortController();
+  runStopPath = stopPath;
+  runStarted = Date.now();
+  runTarget = Math.max(1, Number($("run-target").value) || 100);
+  $("btn-run").disabled = true;
+  $("btn-scan").disabled = true;
+  $("btn-stop").disabled = false;
+  $("c-run").textContent = kind + " running";
+  $("chip-run").className = "chip warn";
+  $("m-pool").textContent = "—";
+  bar(0, 0);
+  updateMetrics(0);
+  if (runTimer) clearInterval(runTimer);
+  runTimer = setInterval(() => updateMetrics(), 250);
+}
+
+function endRun() {
+  $("btn-run").disabled = false;
+  $("btn-scan").disabled = false;
+  $("btn-stop").disabled = true;
+  $("c-run").textContent = "idle";
+  $("chip-run").className = "chip " + (runCount ? "on" : "");
+  runAbort = null; runStopPath = "";
+  if (runTimer) { clearInterval(runTimer); runTimer = null; }
+  updateMetrics();
+  renderResults();
+}
+
+const isAbort = (e) => e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
+
 // One NDJSON reader for both /snipe and /scan: every line goes to onLine.
-// `signal` is the run's AbortController: aborting it drops the response reader
-// instantly, and the server's own stop endpoint cancels the checks behind it.
+// `signal` is the run's AbortController — aborting it drops the response reader
+// instantly, and the stop endpoint cancels the checks behind it.
 async function streamResults(url, body, onLine, signal) {
   const res = await fetch(url, {
     method: "POST",
@@ -520,11 +721,15 @@ async function streamResults(url, body, onLine, signal) {
     body: JSON.stringify(body),
     signal: signal,
   });
-  if (!res.ok) throw new Error(await errorText(res));
+  if (!res.ok) {
+    let detail = "HTTP " + res.status;
+    try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
+    throw new Error(detail);
+  }
   if (!res.body) {
     const data = await res.json();
     (data.results || []).forEach((row) => onLine(Object.assign({ type: "result" }, row)));
-    onLine({ type: "done", checked: data.checked, available_count: data.available_count, pool_size: data.pool_size, pool_note: data.pool_note, by_status: data.by_status });
+    onLine(Object.assign({ type: "done" }, data));
     return;
   }
   const reader = res.body.getReader();
@@ -539,313 +744,211 @@ async function streamResults(url, body, onLine, signal) {
       const line = buf.slice(0, nl).trim();
       buf = buf.slice(nl + 1);
       if (!line) continue;
-      let msg;
-      try { msg = JSON.parse(line); } catch (e) { continue; }
-      onLine(msg);
+      let m; try { m = JSON.parse(line); } catch (e) { continue; }
+      onLine(m);
     }
   }
 }
 
-function selectedPlatforms() {
-  return [...document.querySelectorAll(".snipe-pf:checked")].map((c) => c.value);
-}
-
-function namesInBox() {
-  return $("snipe-names").value
-    .split(/[\n,]/)
-    .map((s) => s.trim().replace(/^@/, ""))
-    .filter(Boolean);
-}
-
-function scanRate(text) { $("scan-rate").textContent = text; }
-
-function scanProgress(done, total) {
-  $("scan-progress").textContent = total ? done + " / " + total : "";
-  $("scan-bar").style.width = total ? Math.min(100, (done / total) * 100) + "%" : "0%";
-}
-
-// The live run's abort controller and the server-side endpoint that cancels it.
-// Both are needed: the abort frees the browser reader, the POST makes the
-// server stop dispatching and cancel its in-flight checks.
-let runAbort = null;
-let runStopPath = "";
-
-function beginRun(stopPath) {
-  lastSnipes = [];
-  $("snipe-rows").innerHTML = "";
-  $("snipe-empty").style.display = "none";
-  $("btn-snipe").disabled = true;
-  $("btn-scan").disabled = true;
-  $("btn-run-stop").disabled = false;
-  runAbort = new AbortController();
-  runStopPath = stopPath;
-  scanRate("0.0/s");
-  scanProgress(0, 0);
-}
-
-function endRun() {
-  $("btn-snipe").disabled = false;
-  $("btn-scan").disabled = false;
-  $("btn-run-stop").disabled = true;
-  runAbort = null;
-  runStopPath = "";
-}
-
-function isAbort(e) {
-  return e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
-}
-
-// Tell the server to stop, then drop the reader. The server response to
-// /snipe/stop names the runs it signalled, so a stop that hit nothing is
-// visible rather than silent.
+// Tell the server to stop, then drop the reader. The response names the runs it
+// signalled, so a stop that hit nothing is visible rather than silent.
 async function stopRun() {
-  $("btn-run-stop").disabled = true;
-  snipeMsg("stopping…");
+  $("btn-stop").disabled = true;
+  msg($("run-msg"), "stopping…");
   const path = runStopPath;
   if (path) {
     try {
       const out = await api(path, { method: "POST" });
       const n = (out.stopped || []).length;
-      snipeMsg(n ? "stop sent to " + n + " run" + (n === 1 ? "" : "s") : "no run was still active");
-    } catch (e) {
-      snipeMsg("stop request failed: " + e.message, true);
-    }
+      setLog(n ? "stop signalled to " + n + " run" + (n === 1 ? "" : "s") : "no run was still active");
+    } catch (e) { msg($("run-msg"), "stop failed: " + e.message, "bad"); }
   }
   if (runAbort) runAbort.abort();
 }
 
-// --- pattern builder ------------------------------------------------------
-// The four-character set the panel opens with: 4 letters (4L), 4 numbers (4N)
-// and 4-letter "OG" words. Random is what makes it feasible at all -- the
-// 4-character alphanumeric space alone is 62^4 = 14.7M names -- so a scan
-// samples it instead of enumerating it, and nothing has to be typed by hand.
-function randomFourPatterns() {
-  const count = Math.max(1, Math.min(20000, Number($("gen-count").value) || 500));
-  return ["letters", "numbers", "words"].map((pattern) => ({
-    pattern: pattern,
-    length: 4,
-    count: count,
-  }));
+function summarize(d, label) {
+  const st = d.by_status || {};
+  const bits = [d.available_count + " available of " + d.checked + " checks"];
+  const parts = Object.keys(st).sort().map((k) => st[k] + " " + k);
+  if (parts.length) bits.push(parts.join(", "));
+  if (d.pool_size !== undefined) bits.push("pool " + d.pool_alive + "/" + d.pool_size + " alive");
+  if (d.pool_note) bits.push(d.pool_note);
+  if (d.pool_retired) bits.push(d.pool_retired + " retired");
+  if (d.stopped) bits.push("stopped early");
+  return label + ": " + bits.join(" · ");
 }
 
-let genPatterns = randomFourPatterns();
-
-function renderGenChips() {
-  const box = $("gen-chips");
-  box.innerHTML = "";
-  if (!genPatterns.length) {
-    box.innerHTML = '<span class="hint">no patterns - press "Random 4L / 4N / OG"</span>';
-    return;
-  }
-  genPatterns.forEach((p, i) => {
-    const chip = document.createElement("span");
-    chip.className = "chip on";
-    chip.innerHTML =
-      `<span class="name">${esc(p.pattern)}</span>` +
-      `<span class="detail">${p.length} chars, ${p.count} names</span>`;
-    const x = document.createElement("button");
-    x.className = "mini";
-    x.textContent = "x";
-    x.onclick = () => { genPatterns.splice(i, 1); renderGenChips(); };
-    chip.appendChild(x);
-    box.appendChild(chip);
-  });
-}
-
-function addGenPattern() {
-  const pattern = $("gen-pattern").value;
-  const length = Math.max(1, Math.min(32, Number($("gen-length").value) || 1));
-  const count = Math.max(1, Number($("gen-count").value) || 1);
-  genPatterns.push({ pattern: pattern, length: length, count: count });
-  renderGenChips();
-}
-
-async function generateNames() {
-  if (!genPatterns.length) genPatterns = randomFourPatterns();
-  renderGenChips();
-  try {
-    const data = await api("/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        patterns: genPatterns.map((p) => ({ pattern: p.pattern, length: p.length, limit: p.count })),
-        limit: 0,
-      }),
-    });
-    $("snipe-names").value = data.usernames.join("\n");
-    snipeMsg("generated " + data.count + " random names - press Scan at max rate");
-    return true;
-  } catch (e) {
-    snipeMsg(e.message, true);
-    return false;
-  }
-}
-
-// The one-click path: reseed the random four-character patterns and scan them
-// straight away, so no name ever has to be typed.
-async function randomRun() {
-  genPatterns = randomFourPatterns();
-  $("snipe-names").value = "";
-  renderGenChips();
-  await runScan();
+function handleResult(m) {
+  runCount++;
+  if (m.status === "available") runAvail++;
+  pushResult(m);
+  if (runCount % 5 === 0) { updateMetrics(); bar(runCount, scanTotal); }
 }
 
 async function runSnipe() {
   let names = namesInBox();
   const platforms = selectedPlatforms();
-  if (!platforms.length) {
-    snipeMsg("pick at least one platform", true);
-    return;
-  }
   if (!names.length) {
-    // Nothing typed: draw the random four-character names instead of asking.
-    if (!(await generateNames())) return;
-    names = namesInBox();
+    try { await generateInto($("nm-text")); names = namesInBox(); }
+    catch (e) { msg($("run-msg"), e.message, "bad"); return; }
   }
-  beginRun("/snipe/stop");
-  let checked = 0, available = 0, summary = "";
-  const started = Date.now();
-  const tick = () => {
-    const secs = ((Date.now() - started) / 1000).toFixed(1);
-    snipeMsg(available + " available, " + checked + " checked, " + secs + "s");
-  };
-  tick();
+  if (!platforms.length) { msg($("run-msg"), "pick at least one platform", "bad"); return; }
+  beginRun("/snipe/stop", "check");
+  scanTotal = names.length * platforms.length;
+  $("run-msg").innerHTML = '<span class="spin"></span> checking ' + names.length + " names on " + platforms.length + " platforms";
+  setLog("checking " + names.length + " names on " + platforms.join(", "));
+  let done = null;
   try {
     await streamResults("/snipe", {
       usernames: names,
       platforms: platforms,
-      concurrency: Number($("snipe-conc").value) || 32,
+      concurrency: Number($("run-conc").value) || 64,
+      retries: Number($("run-retries").value),
       stream: true,
-    }, (msg) => {
-      if (msg.type === "result") {
-        checked++;
-        if (msg.status === "available") { available++; lastSnipes.push(msg); }
-        appendSnipe(msg);
-      } else if (msg.type === "done") {
-        summary = msg.available_count + " available of " + msg.checked + " checks, pool " + msg.pool_size;
-        if (msg.pool_note) summary += " - " + msg.pool_note;
-      }
-      tick();
+    }, (m) => {
+      if (m.type === "result") handleResult(m);
+      else if (m.type === "note") { msg($("run-msg"), m.pool_note, "bad"); setLog(m.pool_note); }
+      else if (m.type === "done") { done = m; }
     }, runAbort ? runAbort.signal : undefined);
-    if (summary) snipeMsg(summary); else tick();
+    if (done) {
+      msg($("run-msg"), summarize(done, "done"), done.available_count ? "ok" : "");
+      setLog(summarize(done, "done"));
+    }
   } catch (e) {
-    if (isAbort(e)) snipeMsg("stopped", false);
-    else snipeMsg(e.message, true);
-  } finally {
-    endRun();
-  }
+    if (isAbort(e)) { msg($("run-msg"), "stopped after " + runCount + " checks"); setLog("stopped"); }
+    else { msg($("run-msg"), e.message, "bad"); setLog("error: " + e.message); }
+  } finally { endRun(); }
 }
 
-// The bulk path: generate from the patterns, then check everything through the
-// validated proxies while reporting the completed-checks rate.
 async function runScan() {
-  const names = namesInBox();
   const platforms = selectedPlatforms();
-  if (!genPatterns.length) genPatterns = randomFourPatterns();
-  renderGenChips();
+  if (!genPatterns.length) genPatterns = randomPatterns();
+  renderPatterns();
   const patterns = genPatterns.map((p) => ({ pattern: p.pattern, length: p.length, limit: p.count }));
-  if (!platforms.length) {
-    snipeMsg("pick at least one platform", true);
-    return;
-  }
-  beginRun("/scan/stop");
-  let checked = 0, available = 0, summary = "";
-  const started = Date.now();
+  beginRun("/scan/stop", "scan");
+  $("run-msg").innerHTML = '<span class="spin"></span> scanning ' + patterns.length + " patterns…";
+  let done = null, expect = 0;
   try {
     await streamResults("/scan", {
-      usernames: names,
+      usernames: namesInBox(),
       patterns: patterns,
       platforms: platforms,
-      concurrency: Number($("snipe-conc").value) || 256,
+      concurrency: Number($("run-conc").value) || 256,
+      retries: Number($("run-retries").value),
       stream: true,
-    }, (msg) => {
-      if (msg.type === "start") {
-        // Every name is checked on every platform, so the bar's total is
-        // checks, not names (names x platforms).
-        scanTotal = msg.names * (msg.platforms.length || 1);
-        scanProgress(0, scanTotal);
-        const per = Object.keys(msg.platform_pool)
-          .map((k) => msg.platform_pool[k] + " " + k).join(", ");
-        if (msg.pool_note) {
-          snipeMsg(msg.pool_note);
-        } else {
-          snipeMsg("scanning " + msg.names + " names on " + msg.platforms.length + " platforms, pool " +
-                   msg.pool_size + " (" + per + "), target " + msg.target_rate + "/s");
-        }
-      } else if (msg.type === "result") {
-        checked++;
-        if (msg.status === "available") { available++; lastSnipes.push(msg); }
-        appendSnipe(msg);
-        scanProgress(checked, scanTotal);
-        if (checked % 25 === 0) {
-          const secs = ((Date.now() - started) / 1000).toFixed(1);
-          snipeMsg(available + " available, " + checked + " checked, " + secs + "s");
-        }
-      } else if (msg.type === "progress") {
-        scanRate(msg.per_second.toFixed(1) + "/s");
-      } else if (msg.type === "done") {
-        scanRate(msg.per_second.toFixed(1) + "/s");
-        scanProgress(msg.checked, msg.checked);
-        summary = msg.available_count + " available of " + msg.checked + " checks at " +
-          msg.per_second.toFixed(1) + " checks/s " +
-          (msg.target_met ? "(target " + msg.target_rate + " met)" : "(below target " + msg.target_rate + ")") +
-          ", " + (msg.duration_ms / 1000).toFixed(1) + "s";
-        // A run where most checks errored is the pool's fault, not the
-        // names': say so instead of showing a table of nothing.
-        const st = msg.by_status || {};
-        const errs = (st.error || 0) + (st.blocked || 0);
-        if (errs && errs >= msg.checked * 0.5) {
-          summary += " - " + errs + " of " + msg.checked +
-            " errored: the validated pool is thin or dead, a refresh was queued";
-        }
-        if (msg.stopped) summary += " - stopped early";
-      }
+    }, (m) => {
+      if (m.type === "start") {
+        expect = m.names * (m.platforms.length || 1);
+        scanTotal = expect;
+        setLog("scanning " + m.names + " names × " + m.platforms.length + " platforms = " + expect + " checks · pool " + m.pool_size);
+        if (m.pool_note) { msg($("run-msg"), m.pool_note, "bad"); }
+      } else if (m.type === "result") {
+        handleResult(m);
+      } else if (m.type === "progress") {
+        updateMetrics(m.per_second);
+        const behind = m.per_second < runTarget;
+        $("m-rate").style.color = behind ? "var(--amber)" : "var(--green)";
+        setLog(m.checked + " checks · " + m.per_second.toFixed(1) + "/s · " + m.available_count + " available");
+      } else if (m.type === "done") { done = m; }
     }, runAbort ? runAbort.signal : undefined);
-    if (summary) snipeMsg(summary);
+    if (done) {
+      $("m-rate").style.color = done.target_met ? "var(--green)" : "var(--amber)";
+      msg($("run-msg"), summarize(done, "scan finished") + " · " + done.per_second + "/s", done.available_count ? "ok" : "");
+      setLog(summarize(done, "scan finished"));
+      bar(done.checked, done.checked);
+    }
   } catch (e) {
-    if (isAbort(e)) snipeMsg("stopped", false);
-    else snipeMsg(e.message, true);
-  } finally {
-    endRun();
+    if (isAbort(e)) { msg($("run-msg"), "stopped after " + runCount + " checks"); setLog("stopped"); }
+    else { msg($("run-msg"), e.message, "bad"); setLog("error: " + e.message); }
+  } finally { endRun(); }
+}
+
+/* ── wiring ──────────────────────────────────────────────────────────── */
+$("btn-pr-append").onclick = () => savePaste("append");
+$("btn-pr-replace").onclick = () => {
+  if (confirm("Replace the whole stored list with what is in the box?")) savePaste("replace");
+};
+$("btn-pr-clear").onclick = async () => {
+  if (!confirm("Remove every stored proxy?")) return;
+  try { const out = await api("/proxies/clear", { method: "POST" }); msg($("pr-msg"), "cleared " + out.removed, "ok"); loadProxies(true); }
+  catch (e) { msg($("pr-msg"), e.message, "bad"); }
+};
+$("btn-pr-download").onclick = async () => {
+  if (!prTotal) { msg($("pr-msg"), "nothing stored to download", "bad"); return; }
+  try { download("proxies.txt", await api("/proxies?format=txt"), "text/plain"); }
+  catch (e) { msg($("pr-msg"), e.message, "bad"); }
+};
+$("btn-pr-more").onclick = () => loadProxies(false);
+
+$("btn-gen-add").onclick = () => { genPatterns.push(readPatterns()); renderPatterns(); };
+$("btn-gen-clear").onclick = () => { genPatterns = []; renderPatterns(); };
+$("btn-gen-run").onclick = generateNames;
+$("btn-gen-random").onclick = async () => {
+  genPatterns = randomPatterns();
+  $("nm-text").value = "";
+  renderPatterns();
+  try {
+    const n = await generateInto($("nm-text"));
+    msg($("run-msg"), "drew " + n + " random names — press Check names or Scan generated", "ok");
+  } catch (e) { msg($("run-msg"), e.message, "bad"); }
+};
+
+$("btn-run").onclick = runSnipe;
+$("btn-scan").onclick = runScan;
+$("btn-stop").onclick = stopRun;
+$("btn-rows-clear").onclick = () => { clearResults(); renderResults(); };
+$("btn-copy-avail").onclick = async () => {
+  const rows = results.filter((r) => r.status === "available");
+  if (!rows.length) { msg($("run-msg"), "no available names yet", "bad"); return; }
+  try {
+    await copyText(rows.map((r) => r.platform + " " + r.username).join("\n"));
+    msg($("run-msg"), "copied " + rows.length + " available", "ok");
+  } catch (e) { msg($("run-msg"), e.message, "bad"); }
+};
+$("btn-export").onclick = () => {
+  if (!results.length) { msg($("run-msg"), "nothing to export", "bad"); return; }
+  const head = "username,platform,status,detail,proxy,latency_ms";
+  const body = results.map((r) =>
+    [r.username, r.platform, r.status, (r.detail || "").replace(/"/g, '""'), r.proxy || "", r.latency_ms ?? ""]
+      .map((v) => `"${v}"`).join(",")).join("\n");
+  download("bahs-results.csv", head + "\n" + body, "text/csv");
+};
+document.querySelectorAll("#filter button").forEach((b) => {
+  b.onclick = () => {
+    filter = b.dataset.f;
+    document.querySelectorAll("#filter button").forEach((x) => x.classList.toggle("on", x === b));
+    renderResults();
+  };
+});
+$("nm-text").addEventListener("input", refreshNameCount);
+
+async function pollHealth() {
+  try {
+    const h = await api("/health");
+    const p = h.proxies || {};
+    $("c-proxies").textContent = p.count || 0;
+    $("chip-proxies").className = "chip " + (p.count ? "on" : "warn");
+    const active = (h.runs && h.runs.active) || 0;
+    if (active && !runAbort) { $("c-run").textContent = active + " running"; $("chip-run").className = "chip warn"; }
+    else if (!runAbort) { $("c-run").textContent = "idle"; $("chip-run").className = "chip " + (runCount ? "on" : ""); }
+    $("c-status").textContent = "ok";
+    $("chip-fd").className = "chip on";
+  } catch (e) {
+    $("c-status").textContent = "unreachable";
+    $("chip-fd").className = "chip bad";
   }
 }
 
-$("btn-snipe").onclick = runSnipe;
-$("btn-scan").onclick = runScan;
-$("btn-run-stop").onclick = stopRun;
-$("btn-gen-add").onclick = addGenPattern;
-$("btn-gen-run").onclick = generateNames;
-$("btn-gen-random").onclick = randomRun;
-$("btn-gen-clear").onclick = () => { genPatterns = []; renderGenChips(); };
-renderGenChips();
-$("btn-snipe-copy").onclick = async () => {
-  if (!lastSnipes.length) {
-    snipeMsg("no available names to copy yet", true);
-    return;
-  }
-  const text = lastSnipes.map((r) => r.platform + " " + r.username).join("\n");
-  try {
-    await copyText(text);
-    snipeMsg("copied " + lastSnipes.length + " available");
-  } catch (e) {
-    snipeMsg(e.message, true);
-  }
-};
-
-$("btn-start").onclick = () => post("/start");
-$("btn-stop").onclick = () => post("/stop");
-$("btn-refresh").onclick = () => post("/refresh");
-$("btn-export").onclick = exportTxt;
-$("btn-apply").onclick = loadList;
-$("btn-purge-dead").onclick = () => post("/proxies/purge?scope=dead");
-$("btn-purge-all").onclick = () => {
-  if (confirm("Remove every tracked proxy?")) post("/proxies/purge?scope=all");
-};
-["f-platform", "f-anon", "f-proto"].forEach((id) => $(id).addEventListener("change", loadList));
-
-loadAll();
-setInterval(loadStatus, 4000);
-setInterval(loadList, 10000);
+(async function init() {
+  try { const info = await api("/info"); buildPlatforms(info.platforms); }
+  catch (e) { buildPlatforms(null); }
+  renderPatterns();
+  bindFileInput();
+  refreshNameCount();
+  await loadProxies(true);
+  await pollHealth();
+  setInterval(pollHealth, 5000);
+})();
 </script>
 </body>
 </html>
