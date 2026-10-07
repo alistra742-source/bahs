@@ -153,6 +153,11 @@ PLATFORMS = (
 # The statuses that are an answer: a verdict about the name.
 FINAL_STATUSES = ("available", "taken", "invalid")
 
+# Not a verdict and not a name: a status the scheduler emits while it has nothing
+# to dispatch, so a run that is waiting on a resting pool says so instead of
+# going quiet. Callers must drop these -- they are not rows.
+WAITING_STATUS = "waiting"
+
 # How a result reflects on the proxy that carried it.
 OUTCOME_OK = "ok"            # the check produced a verdict
 OUTCOME_BLOCKED = "blocked"  # the platform refused: not the proxy's fault
@@ -568,9 +573,22 @@ class ProxyPool:
         return f"no proxy from the list of {total} could be used"
 
     def blocked_reason(self) -> str:
-        """Why a run stopped with proxies alive but none usable."""
+        """Why a run stopped with proxies alive but none usable.
+
+        Two different situations end up here and they are not the same sentence:
+        a platform refusing the whole list is a throttle, while every proxy
+        resting on its own transport errors is the other thing. Blaming a
+        platform that never answered anything sends the user to the wrong fix.
+        """
         counts = self.blocked_by()
-        platform = max(counts, key=lambda k: counts[k]) if counts else "the platform"
+        if not counts:
+            return (
+                f"every proxy is resting after a transport error, so the run was stopped "
+                f"after {POOL_EMPTY_STREAK} waits. Nothing here says the list is dead -- the "
+                f"hosts are not answering, and each is rested {int(self._cooldown)}s between "
+                "attempts. Fewer simultaneous checks, or a list that answers, is what fixes it."
+            )
+        platform = max(counts, key=lambda k: counts[k])
         extra = f" (it asked for {self.retry_after:.0f}s)" if self.retry_after else ""
         return (
             f"{platform} refused every proxy in the list, so the run was stopped after "
@@ -1117,7 +1135,16 @@ async def iter_snipes(
     of "your list is exhausted".
     """
     sem = asyncio.Semaphore(max(1, concurrency))
-    window = max(1, concurrency * window_factor)
+    # The window is how many checks may be dispatched but not yet finished.
+    #
+    # It must not exceed what the pool can carry. This loop creates tasks without
+    # awaiting, so `pool.usable()` is still the reading from before the first of
+    # them ran: a one-proxy list at concurrency 256 happily queued a thousand
+    # checks, the proxy rested after its first failure, and every queued check
+    # after that came back "proxies exhausted this run". Measured on one dead
+    # proxy: 192 of 256 rows were that message, and at concurrency 256 the run
+    # finished the whole list without ever saying why.
+    window = max(1, min(concurrency * window_factor, max(1, pool.alive() * pool.per_proxy)))
 
     async def one(platform: str, username: str) -> SnipeResult | None:
         async with sem:
@@ -1142,6 +1169,9 @@ async def iter_snipes(
     empty_streak = 0
     answered = 0
     skipped = 0
+    # Results that could not be checked at all because the pool had nothing to
+    # hand out. A pool miss means the pool is the problem, not the name.
+    misses = 0
     stop_task: asyncio.Task | None = None
     if stop is not None:
         stop_task = asyncio.create_task(stop.wait())
@@ -1158,7 +1188,17 @@ async def iter_snipes(
                 if result is not None:
                     empty_streak = 0
                     answered += 1 if result.answered else 0
+                    if result.detail in POOL_MISS_DETAILS:
+                        misses += 1
                     yield result
+
+            # Every proxy gone means nothing else can be dispatched, so the run
+            # stops and says so rather than working through the rest of the name
+            # list against a pool that is not there. Checked only once a pool
+            # miss has been seen, because alive() walks the whole list.
+            if misses and pool.alive() == 0:
+                pool.stop_reason = pool.exhausted_reason()
+                break
 
             # Any platform that has now refused the whole pool is sat out with
             # the reason the platform gave. The run continues on the platforms
@@ -1203,9 +1243,28 @@ async def iter_snipes(
                 if pool.alive() == 0:
                     pool.stop_reason = pool.exhausted_reason()
                     break
-                if not await pool.wait_usable(POOL_WAIT_MAX, stop):
+                # Wait for a resting proxy, announcing it while we do. Every
+                # proxy sitting out is the one state where the run produces
+                # nothing at all, and a dashboard that goes silent for twenty
+                # seconds while it happens is indistinguishable from one that has
+                # frozen -- which is exactly how it was reported.
+                deadline = time.monotonic() + POOL_WAIT_MAX
+                while pool.usable() == 0 and pool.alive() > 0:
                     if stop is not None and stop.is_set():
                         break
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    yield SnipeResult(
+                        "",
+                        "",
+                        WAITING_STATUS,
+                        f"no proxy free -- {pool.resting()} resting, waiting up to {left:.0f}s for one to come back",
+                    )
+                    await asyncio.sleep(0.5)
+                if stop is not None and stop.is_set():
+                    break
+                if pool.usable() == 0:
                     empty_streak += 1
                     if empty_streak >= POOL_EMPTY_STREAK:
                         pool.stop_reason = pool.blocked_reason()
@@ -1226,7 +1285,12 @@ async def iter_snipes(
                 if result is not None:
                     empty_streak = 0
                     answered += 1 if result.answered else 0
+                    if result.detail in POOL_MISS_DETAILS:
+                        misses += 1
                     yield result
+            if misses and pool.alive() == 0:
+                pool.stop_reason = pool.exhausted_reason()
+                break
             pool.pause_blocked(platforms)
             if platforms and all(pool.is_paused(p) for p in platforms):
                 pool.stop_reason = pool.blocked_reason()

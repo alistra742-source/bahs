@@ -157,7 +157,7 @@ SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)
 # platform just refused it -- a run waits this long for the soonest one to come
 # back before giving up and saying why. Only *resting* proxies are waited for;
 # a list that is retired in full ends the run immediately.
-POOL_WAIT_MAX: float = _float("POOL_WAIT_MAX", 20.0)
+POOL_WAIT_MAX: float = _float("POOL_WAIT_MAX", 10.0)
 # Consecutive empty waits before the run stops. A transient throttle recovers on
 # the first or second wait; a global rate limit does not recover at all, and
 # without this the run would sit there trading waits with the platform forever

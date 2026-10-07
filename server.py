@@ -550,6 +550,10 @@ class _Tally:
     ) -> None:
         self.names = names
         self.platforms = platforms
+        # A run costs names x platforms, not names. Reporting progress against
+        # the name count alone showed 0% on a run that was a third of the way
+        # through, because every name is checked once per platform.
+        self.total_checks = max(1, names * max(1, len(platforms)))
         self.alerter = alerter
         self.meter = sniper.RateMeter()
         self.checked = 0
@@ -592,7 +596,9 @@ class _Tally:
         return {
             "checked": self.checked,
             "names": self.names,
-            "progress": round(self.checked / self.names, 4) if self.names else 0.0,
+            "total_checks": self.total_checks,
+            "platforms_count": len(self.platforms),
+            "progress": round(self.checked / self.total_checks, 4),
             "per_second": round(self.meter.recent, 1),
             "average_per_second": round(self.meter.average, 1),
             "available_count": self.available,
@@ -609,6 +615,11 @@ class _Tally:
             "by_status": self.by_status,
             "by_platform": self.by_platform,
             "checked": self.checked,
+            # Without this the dashboard's bar and percentage reset to zero on
+            # the final line, which is the one everybody looks at.
+            "names": self.names,
+            "total_checks": self.total_checks,
+            "progress": round(self.checked / self.total_checks, 4),
             "available_count": self.available,
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
@@ -725,12 +736,17 @@ async def _snipe_ndjson(
             retries=retries,
             stop=run.stop if run else None,
         ):
+            if result.status == sniper.WAITING_STATUS:
+                # Not a row: the run is parked waiting for a proxy, and saying so
+                # is what keeps the dashboard from looking frozen.
+                yield json.dumps({"type": "waiting", "detail": result.detail, **tally.progress()}) + "\n"
+                continue
             tally.add(result)
             if run:
                 run.checked = tally.checked
             yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
             now = time.perf_counter()
-            if tally.checked % 50 == 0 and (now - last_report) >= 0.25:
+            if tally.checked % 10 == 0 and (now - last_report) >= 0.12:
                 last_report = now
                 yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
                 await _flush_alerts(alerter)
@@ -782,6 +798,7 @@ async def snipe_batch(req: SnipeRequest):
                 retries=retries,
                 stop=run.stop,
             )
+            if result.status != sniper.WAITING_STATUS
         ]
     finally:
         run.finish()
@@ -831,6 +848,7 @@ async def snipe_one(
                 retries=retries,
                 stop=run.stop,
             )
+            if r.status != sniper.WAITING_STATUS
         ]
     finally:
         run.finish()
@@ -1074,12 +1092,15 @@ async def _scan_stream(
             retries=retries,
             stop=run.stop if run else None,
         ):
+            if result.status == sniper.WAITING_STATUS:
+                yield json.dumps({"type": "waiting", "detail": result.detail, **tally.progress()}) + "\n"
+                continue
             tally.add(result)
             if run:
                 run.checked = tally.checked
             yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
             now = time.perf_counter()
-            if tally.checked % 100 == 0 and (now - last_report) >= 0.5:
+            if tally.checked % 10 == 0 and (now - last_report) >= 0.12:
                 last_report = now
                 yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
                 await _flush_alerts(alerter)
@@ -1144,6 +1165,7 @@ async def scan(req: ScanRequest):
                     retries=retries,
                     stop=run.stop,
                 )
+                if result.status != sniper.WAITING_STATUS
             ]
         finally:
             run.finish()

@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bahs — username availability</title>
+<!-- Inline so the dashboard makes no request the server has no route for. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0b10'/%3E%3Crect x='7' y='7' width='18' height='18' rx='6' fill='%236c5ce7'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#0a0b10; --panel:#12141c; --panel2:#171a24; --line:#232735; --line2:#2e3346;
@@ -44,7 +46,57 @@ h1{font-size:21px;margin:0 0 3px;letter-spacing:-.2px}
 .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);margin:0 0 14px;font-weight:600}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-@media(max-width:1100px){.grid2{grid-template-columns:1fr}.shell{grid-template-columns:64px 1fr}.brand b,.brand span,.nav .tag{display:none}.nav button{justify-content:center}}
+/* Two layouts: a sidebar on a desktop, a sticky top bar on a phone. The old
+   rule collapsed the column to 64px and hid the brand but kept the nav labels,
+   so on a phone the labels spilled over the content. */
+@media(max-width:900px){
+  .shell{grid-template-columns:1fr}
+  .grid2{grid-template-columns:1fr}
+  .side{position:sticky;top:0;height:auto;flex-direction:row;align-items:center;gap:6px;
+        padding:8px 10px;border-right:0;border-bottom:1px solid var(--line);
+        background:rgba(10,11,16,.95);backdrop-filter:blur(10px);z-index:6;overflow-x:auto}
+  .side::-webkit-scrollbar{display:none}
+  .brand{padding:0 4px 0 0;flex:none}
+  .brand b,.brand span{display:none}
+  .nav{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;flex:1}
+  .nav button{padding:9px 2px;font-size:12px;white-space:nowrap;justify-content:center;gap:0}
+  .nav .ico{display:none}
+  .nav .tag{display:none}
+  .side .foot{display:none}
+  main{padding:15px 12px 104px}
+  h1{font-size:18px}
+  .sub{font-size:12.5px;margin-bottom:15px}
+  .card{padding:13px;border-radius:12px;margin-bottom:12px}
+  .tiles{grid-template-columns:repeat(auto-fit,minmax(94px,1fr));gap:7px}
+  .tile{padding:9px 10px}
+  .tile .v{font-size:18px}
+  .bucketrow{grid-template-columns:24px repeat(4,1fr);gap:4px;margin-bottom:6px}
+  .bucket{padding:6px 5px;border-radius:8px}
+  .bucket .k{font-size:11px}
+  .bucket .n{font-size:8.4px;letter-spacing:-.3px}
+  .bucket .d{display:none}
+  .bucket .x{display:none}
+  .bhead{font-size:8.5px;letter-spacing:0}
+  .bucketrow .len{font-size:13px}
+  .sticky{left:0;padding:8px 12px;gap:11px;flex-wrap:wrap;font-size:11px}
+  .toast{right:10px;left:10px;bottom:78px;align-items:stretch}
+  table{font-size:11.5px}
+  td,th{padding:6px 7px}
+  .scroll{max-height:none}
+  .log{max-height:230px}
+  button.btn{padding:8px 12px;font-size:12.5px}
+  .row{gap:8px}
+}
+@media(min-width:901px){
+  .sticky{left:220px}
+}
+/* A wide table scrolls sideways rather than squashing its columns into nothing. */
+.scroll{overflow:auto;-webkit-overflow-scrolling:touch}
+table{min-width:520px}
+#platTable{min-width:0}
+.reswrap{position:relative}
+.reswrap::after{content:"";position:absolute;top:0;right:0;bottom:0;width:26px;pointer-events:none;
+  background:linear-gradient(90deg,transparent,rgba(10,11,16,.85))}
 /* ---------- controls ---------- */
 button.btn{all:unset;cursor:pointer;padding:9px 15px;border-radius:9px;font-weight:600;font-size:13px;text-align:center;transition:.12s;border:1px solid var(--line2);color:var(--text)}
 button.btn:hover{border-color:var(--acc);background:rgba(108,92,231,.12)}
@@ -78,7 +130,7 @@ input[type=range]{width:100%;accent-color:var(--acc)}
 .bucket:hover{border-color:var(--acc)}
 .bucket.on{border-color:var(--acc);background:linear-gradient(135deg,rgba(108,92,231,.25),rgba(0,224,184,.09))}
 .bucket .k{font-family:var(--mono);font-size:12.5px;font-weight:700;color:var(--text)}
-.bucket .n{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:2px}
+.bucket .n{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:2px;overflow:hidden;white-space:nowrap}
 .bucket .d{font-size:10px;color:var(--dim2);margin-top:3px}
 .bucket.redun{opacity:.4}
 .bucket .x{position:absolute;top:5px;right:7px;font-size:9px;color:var(--warn);font-family:var(--mono)}
@@ -118,7 +170,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
 .log{font-family:var(--mono);font-size:11.5px;max-height:190px;overflow:auto;background:#0a0c12;border:1px solid var(--line);border-radius:10px;padding:11px}
 .log div{padding:2px 0;color:var(--dim)}
 .log .ok{color:var(--ok)}.log .bad{color:var(--bad)}.log .warn{color:var(--warn)}
-.sticky{position:fixed;left:220px;right:0;bottom:0;z-index:5;background:rgba(10,11,16,.9);backdrop-filter:blur(9px);border-top:1px solid var(--line);padding:11px 30px;display:none;gap:22px;align-items:center;font-family:var(--mono);font-size:12px}
+.sticky{position:fixed;right:0;bottom:0;z-index:5;background:rgba(10,11,16,.9);backdrop-filter:blur(9px);border-top:1px solid var(--line);padding:11px 30px;display:none;gap:22px;align-items:center;font-family:var(--mono);font-size:12px}
 .sticky.on{display:flex}
 .sticky b{color:var(--acc2)}
 .toast{position:fixed;right:20px;bottom:20px;z-index:20;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
@@ -156,8 +208,8 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
           <div class="row" style="margin-top:14px;justify-content:space-between">
             <div class="mono" style="font-size:13px">Selected: <b id="selCount" style="color:var(--acc2)">0</b> names</div>
             <div class="row" style="gap:6px">
-              <button class="btn ghost" id="pickShort">3·4</button>
-              <button class="btn ghost" id="pickNil">clear</button>
+              <button class="btn ghost" id="pickShort" title="Select letters, digits and words at lengths 3 and 4">quick 3+4</button>
+              <button class="btn ghost" id="pickNil" title="Deselect everything">clear</button>
             </div>
           </div>
           <div id="redundant"></div>
@@ -197,7 +249,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
       <div class="grid2">
         <div class="card">
           <h2>Per platform</h2>
-          <div class="scroll"><table id="platTable"><tbody></tbody></table></div>
+          <div class="scroll"><table id="platTable"><tbody><tr><td class="empty">Start a sweep to see each platform.</td></tr></tbody></table></div>
         </div>
         <div class="card">
           <h2>Activity</h2>
@@ -246,7 +298,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
             <button class="btn ghost" id="rWipe" style="color:var(--bad)">Clear</button>
           </div>
         </div>
-        <div class="scroll"><table id="rTable"><tbody></tbody></table></div>
+        <div class="reswrap"><div class="scroll"><table id="rTable"><tbody></tbody></table></div></div>
         <div class="dim2 mono" style="font-size:11.5px;margin-top:10px" id="rNote"></div>
       </div>
     </section>
@@ -306,6 +358,7 @@ const S = {
 const MAXROWS = 20000, SHOWROWS = 400;
 const fmt = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
 const clock = (s) => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+const plat = (n) => `${n} platform${n === 1 ? '' : 's'}`;
 const kb = (b) => b < 1024 ? b+' B' : b < 1048576 ? (b/1024).toFixed(1)+' KB' : (b/1048576).toFixed(1)+' MB';
 
 function toast(msg, kind='') {
@@ -366,7 +419,7 @@ function renderBuckets() {
       html += `<div class="bucket ${on ? 'on' : ''} ${red ? 'redun' : ''}" data-label="${b.label}">
         ${red ? `<span class="x">in ${red}</span>` : ''}
         <div class="k">${b.label}</div>
-        <div class="n">${fmt(b.size)}</div>
+        <div class="n" title="${b.size.toLocaleString()} names">${fmt(b.size)}</div>
         <div class="d">${red ? 'already covered' : b.detail}</div></div>`;
     }
     html += '</div>';
@@ -420,30 +473,83 @@ function renderPlats() {
   }
 }
 /* ============================ run ============================ */
+let clockTimer = null;
 function setRunning(on) {
   S.running = on;
+  if (on && !clockTimer) clockTimer = setInterval(() => { if (S.live) { S.live.elapsed = (performance.now() - S.live.startedAt) / 1000; paintLive(); } }, 1000);
+  if (!on && clockTimer) { clearInterval(clockTimer); clockTimer = null; }
   $('start').disabled = on; $('start').textContent = on ? 'Running…' : 'Start sweep';
   $('stop').disabled = !on;
   $('sticky').classList.toggle('on', on);
   ['conc','pickShort','pickNil'].forEach(id => $(id).disabled = on);
 }
-function tiles(p) {
-  $('tChecked').textContent = fmt(p.checked);
-  $('tProg').textContent = Math.round((p.progress || 0) * 100) + '%';
-  $('tRate').textContent = Math.round(p.per_second || 0);
-  $('tAvail').textContent = fmt(p.available_count || 0);
-  $('tLimit').textContent = fmt(p.rate_limits || 0);
-  $('tMiss').textContent = fmt(p.proxy_misses || 0);
-  $('tTime').textContent = clock(p.elapsed_s || 0);
-  $('tAns').textContent = Math.round((p.answer_rate || 0) * 100) + '%';
-  $('pbar').style.width = Math.min(100, (p.progress || 0) * 100) + '%';
-  $('sbChecked').textContent = fmt(p.checked);
-  $('sbRate').textContent = Math.round(p.per_second || 0);
-  $('sbAvail').textContent = fmt(p.available_count || 0);
-  $('sbLimit').textContent = fmt(p.rate_limits || 0);
-  $('sbPool').textContent = fmt(p.pool_alive ?? S.proxies?.count ?? 0);
-  if (p.current_target) $('sbTarget').textContent = '→ ' + p.current_target;
-  renderPlatTable(p.by_platform);
+/* The dashboard is counted in the browser, from the result lines themselves, so
+   a number moves the moment a check lands rather than on some server tick. The
+   server's progress line is still used for the rate and the clock, which the
+   browser cannot know. */
+const POOL_MISS = new Set(['proxies exhausted this run', 'no proxies saved']);
+const FINAL = new Set(['available', 'taken', 'invalid']);
+const zeroRow = () => ({ checked: 0, available: 0, taken: 0, invalid: 0, blocked: 0, error: 0 });
+
+function liveReset(total, plats) {
+  S.live = {
+    checked: 0, avail: 0, limits: 0, misses: 0, answered: 0, total, plats,
+    byStatus: {}, byPlat: {}, stamps: [], rate: 0, elapsed: 0, startedAt: performance.now(),
+  };
+}
+function liveAdd(ev) {
+  const L = S.live;
+  L.checked++;
+  if (ev.status === 'available') L.avail++;
+  if (ev.status === 'blocked') L.limits++;
+  if (POOL_MISS.has(ev.detail)) L.misses++;
+  if (FINAL.has(ev.status)) L.answered++;
+  L.byStatus[ev.status] = (L.byStatus[ev.status] || 0) + 1;
+  const row = L.byPlat[ev.platform] || (L.byPlat[ev.platform] = zeroRow());
+  row.checked++;
+  if (ev.status in row) row[ev.status]++;
+  const now = performance.now();
+  L.stamps.push(now);
+  // Results inside the last second *are* checks per second. Dividing by a span
+  // needed a floor to avoid nonsense on a burst, and that floor read a fast run
+  // as zero: 73 checks in 0.15s reported 0/s.
+  while (L.stamps.length && now - L.stamps[0] > 1000) L.stamps.shift();
+  L.rate = L.stamps.length;
+  L.elapsed = (now - L.startedAt) / 1000;
+}
+function paintLive() {
+  const L = S.live; if (!L) return;
+  const pct = L.total ? Math.min(100, (L.checked / L.total) * 100) : 0;
+  $('tChecked').textContent = fmt(L.checked);
+  $('tProg').textContent = pct < 1 && L.checked ? '<1%' : Math.round(pct) + '%';
+  $('tRate').textContent = Math.round(L.rate);
+  $('tAvail').textContent = fmt(L.avail);
+  $('tLimit').textContent = fmt(L.limits);
+  $('tMiss').textContent = fmt(L.misses);
+  $('tTime').textContent = clock(L.elapsed);
+  $('tAns').textContent = Math.round((L.answered / Math.max(1, L.checked)) * 100) + '%';
+  $('pbar').style.width = pct + '%';
+  $('sbChecked').textContent = `${fmt(L.checked)}/${fmt(L.total || 0)}`;
+  $('sbRate').textContent = Math.round(L.rate);
+  $('sbAvail').textContent = fmt(L.avail);
+  $('sbLimit').textContent = fmt(L.limits);
+  $('sbPool').textContent = fmt(S.proxies?.count ?? 0);
+  renderPlatTable(L.byPlat);
+}
+/* A server line refines the model rather than replacing it: its counters are
+   authoritative but arrive after the browser already counted those results, and
+   a counter that ticks backwards looks broken. */
+function serverTick(p) {
+  const L = S.live; if (!L) return;
+  const bump = (k, v) => { if (typeof v === 'number') L[k] = Math.max(L[k], v); };
+  bump('checked', p.checked); bump('avail', p.available_count);
+  bump('limits', p.rate_limits); bump('misses', p.proxy_misses);
+  if (p.total_checks) L.total = p.total_checks;
+  if (typeof p.elapsed_s === 'number') L.elapsed = p.elapsed_s;
+  if (p.per_second) L.rate = p.per_second;
+  if (p.current_target) $('sbTarget').textContent = '\u2192 ' + p.current_target;
+  if (p.by_platform && p.checked === L.checked) L.byPlat = p.by_platform;
+  paintLive();
 }
 function renderPlatTable(by) {
   if (!by) return;
@@ -451,7 +557,7 @@ function renderPlatTable(by) {
   $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th><th>blocked</th><th>errors</th></tr></thead><tbody>'
     + keys.map(k => {
         const r = by[k];
-        return `<tr><td>${k}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
+        return `<tr><td>${esc(k)}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
           <td class="dim">${fmt(r.taken)}</td><td style="color:#a99bff">${fmt(r.blocked)}</td>
           <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td></tr>`;
       }).join('') + '</tbody>';
@@ -465,10 +571,12 @@ async function start() {
   const platforms = S.plats.filter(p => p.on).map(p => p.name);
   const concurrency = Number($('conc').value);
   S.results = []; S.held = 0; S.avail = []; S.counts = {};
-  renderResults(); renderFilters();
-  tiles({ checked: 0, progress: 0, elapsed_s: 0, available_count: 0 });
+  liveReset(total * platforms.length, platforms.length);
+  S.waitingOn = false;
+  paintLive(); renderResults(); renderFilters();
   setRunning(true);
-  logline(`start — ${fmt(total)} names × ${platforms.length} platforms, ${concurrency} concurrent`, 'ok');
+  $('target').textContent = `${fmt(total)} names \u00d7 ${plat(platforms.length)} = ${fmt(total * platforms.length)} checks`;
+  logline(`start — ${fmt(total)} names \u00d7 ${plat(platforms.length)}, ${concurrency} concurrent`, 'ok');
   S.ac = new AbortController();
   let res;
   try {
@@ -483,7 +591,7 @@ async function start() {
     setRunning(false); toast(msg, 'bad'); return logline('refused: ' + msg, 'bad');
   }
   const reader = res.body.getReader(), dec = new TextDecoder();
-  let buf = '', lastPaint = 0;
+  let buf = '', lastPaint = 0, lastTile = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -498,12 +606,27 @@ async function start() {
           S.counts[ev.status] = (S.counts[ev.status] || 0) + 1;
           if (ev.status === 'available') S.avail.push(ev);
           if (S.held < MAXROWS || ev.status === 'available') { S.results.push(ev); S.held++; }
+          if (S.waitingOn) { S.waitingOn = false; logline('a proxy came back \u2014 resuming', 'ok'); }
+          liveAdd(ev);
           const now = performance.now();
-          if (now - lastPaint > 240) { lastPaint = now; renderResults(); renderFilters(); }
+          // Tiles are ~20 text writes, cheap enough to keep current; the table
+          // is up to 400 rows, so it repaints on its own slower clock.
+          if (now - lastTile > 90) { lastTile = now; paintLive(); }
+          if (now - lastPaint > 320) { lastPaint = now; renderResults(); renderFilters(); }
+        } else if (ev.type === 'waiting') {
+          // The run has nothing to dispatch: every proxy is resting. Say so once
+          // per episode and keep the counters painted, because silence here is
+          // what made a waiting run look like a broken one.
+          serverTick(ev);
+          if (!S.waitingOn) {
+            S.waitingOn = true;
+            logline(ev.detail, 'warn');
+          }
+          $('sbTarget').textContent = '\u23f3 ' + ev.detail;
         } else if (ev.type === 'progress') {
-          tiles(ev); renderFilters();
+          serverTick(ev);
         } else if (ev.type === 'start') {
-          $('target').textContent = `${fmt(ev.names)} names · ${ev.platforms.length} platforms`;
+          $('target').textContent = `${fmt(ev.names)} names \u00d7 ${plat(ev.platforms.length)} = ${fmt(ev.names * ev.platforms.length)} checks`;
           if (ev.pool_note) logline(ev.pool_note, 'warn');
         } else if (ev.type === 'note') {
           if (ev.pool_note) logline(ev.pool_note, 'warn');
@@ -519,7 +642,14 @@ async function start() {
   setRunning(false);
 }
 function finish(d) {
-  tiles(d);
+  serverTick(d);
+  const L = S.live;
+  if (L && typeof d.checked === 'number') { L.checked = Math.max(L.checked, d.checked); }
+  if (L && d.by_platform) L.byPlat = d.by_platform;
+  if (L && d.elapsed_s) L.elapsed = d.elapsed_s;
+  if (L && typeof d.total_checks === 'number' && d.total_checks) L.total = d.total_checks;
+  if (L && d.answer_rate !== undefined) L.answerRate = d.answer_rate;
+  paintLive();
   if (d.per_second) { S.rate = d.per_second; localStorage.setItem('bahs.rate', String(d.per_second)); }
   const paused = Object.keys(d.platforms_paused || {});
   logline(`done — ${fmt(d.checked)} checked, ${fmt(d.available_count)} available, ${fmt(d.rate_limits)} rate-limited`

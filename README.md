@@ -92,6 +92,8 @@ Measured against a local origin through real HTTP proxies:
 | 800 ms | 1 endpoint | 64 | 77 |
 
 The client's own ceiling is around 2,000 dispatches/s, so it is never the wall.
+Measured end to end through the dashboard, 1,000 Roblox checks on eight proxy
+endpoints ran at 323/s and finished in three seconds.
 What moves the number is **more concurrent exit IPs**. With one rotating
 endpoint, per-proxy connections are the whole ceiling: measured 3.9/s at 1
 connection, 13.0/s at 6, 53.1/s at 32. Per-proxy connections are sized from your
@@ -114,6 +116,10 @@ A `429` is the platform talking, not your proxies, and it is handled as such:
 - The **rest of the run continues** on the platforms that are still answering.
   A discord 429 no longer costs you the tiktok sweep.
 - If every platform ends up paused, the run stops and says which and why.
+- When *every* proxy is resting, the run parks rather than going quiet: it emits
+  a `waiting` line every half second saying how many are resting and how long it
+  will wait, which the dashboard shows in the activity log and the status bar. A
+  run that says nothing for twenty seconds looks broken; it was just waiting.
 
 A run only reports "proxies exhausted" when the list genuinely is — every proxy
 retired on transport errors.
@@ -156,7 +162,8 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /settings` `POST /settings` `POST /settings/test-webhook` | alerts |
 
 `stream: true` returns NDJSON: `start`, then a `result` line per verdict, a
-`progress` line as it goes, and a `done` summary.
+`progress` line as it goes, a `waiting` line whenever the pool has nothing free,
+and a `done` summary.
 
 ## Environment
 
@@ -183,6 +190,8 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
 | `SNIPE_PROXY_FAIL_LIMIT` | `6` | transport failures before a proxy is retired |
+| `POOL_WAIT_MAX` | `10` | seconds to wait for a resting proxy before re-checking |
+| `POOL_EMPTY_STREAK` | `3` | waits before a run gives up on a resting pool |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |
