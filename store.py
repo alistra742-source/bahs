@@ -73,6 +73,10 @@ class ProxyStore:
     def __init__(self, path: str) -> None:
         self.path = path
         self.records: dict[str, ProxyRecord] = {}
+        # Set by every mutation, cleared by save(). The scheduler saves on a
+        # wall clock, so without this a quiet interval would still rewrite the
+        # whole store; with it a save with nothing new to say is free.
+        self.dirty = False
         # Cumulative, survives restarts. total_seen counts distinct proxies ever
         # tracked; total_checks counts every validation run, dead or alive.
         self.total_seen = 0
@@ -98,6 +102,7 @@ class ProxyStore:
             self.records[result.proxy] = record
             self.total_seen += 1
         self.total_checks += 1
+        self.dirty = True
 
         record.last_checked = now
         if result.ok:
@@ -127,13 +132,16 @@ class ProxyStore:
 
     def remove(self, proxy: str) -> bool:
         """Delete one proxy by its canonical key. Returns True if it existed."""
-        return self.records.pop(proxy, None) is not None
+        existed = self.records.pop(proxy, None) is not None
+        self.dirty = self.dirty or existed
+        return existed
 
     def purge(self, scope: str = "dead") -> int:
         """Drop proxies: ``dead`` (never validated or failing) or ``all``."""
         if scope == "all":
             count = len(self.records)
             self.records.clear()
+            self.dirty = self.dirty or count > 0
             return count
         dead = [
             key
@@ -142,6 +150,7 @@ class ProxyStore:
         ]
         for key in dead:
             del self.records[key]
+        self.dirty = self.dirty or bool(dead)
         return len(dead)
 
     def prune(self, now: float | None = None) -> int:
@@ -160,6 +169,7 @@ class ProxyStore:
         for key in drop:
             del self.records[key]
         self.remember_dead(drop, now)
+        self.dirty = self.dirty or bool(drop)
         return len(drop)
 
     def remember_dead(self, keys: Iterable[str], now: float | None = None) -> None:
@@ -169,6 +179,7 @@ class ProxyStore:
         now = now if now is not None else time.time()
         for key in keys:
             self.dead[key] = now
+        self.dirty = self.dirty or bool(keys)
         if len(self.dead) > MAX_DEAD_REMEMBERED:
             # Oldest failures are the most likely to have recovered; forget them
             # first so the list cannot grow without bound.
@@ -222,7 +233,15 @@ class ProxyStore:
         }
 
     # --- persistence ------------------------------------------------------
-    def save(self) -> None:
+    def save(self, force: bool = False) -> None:
+        """Write the store to disk, unless there is nothing new to write.
+
+        The whole store is serialised on every call, so the caller leans on
+        ``dirty`` and a wall clock rather than calling this per check.
+        """
+        if not (force or self.dirty):
+            return
+        self.dirty = False
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)

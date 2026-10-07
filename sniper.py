@@ -47,7 +47,13 @@ from dataclasses import dataclass
 
 import httpx
 
-from config import SNIPE_CONNECT_TIMEOUT, SNIPE_PROXY_COOLDOWN, SNIPE_READ_TIMEOUT
+from config import (
+    SNIPE_CONNECT_TIMEOUT,
+    SNIPE_PROXY_COOLDOWN,
+    SNIPE_PROXY_FAIL_LIMIT,
+    SNIPE_READ_TIMEOUT,
+    SSL_CONTEXT,
+)
 
 log = logging.getLogger("proxy-scraper.sniper")
 
@@ -125,6 +131,7 @@ class ProxyPool:
         per_proxy: int = 4,
         timeout: httpx.Timeout | None = None,
         platform_weight: int = 1,
+        fail_limit: int = SNIPE_PROXY_FAIL_LIMIT,
     ) -> None:
         self._all = list(dict.fromkeys(proxies))
         known = set(self._all)
@@ -145,6 +152,12 @@ class ProxyPool:
         self._timeout = timeout or _timeout()
         self._clients: dict[str, httpx.AsyncClient] = {}
         self._resting: dict[str, float] = {}
+        self._fails: dict[str, int] = {}
+        # A proxy retired mid-run is never handed out again: one that has failed
+        # `fail_limit` times is dead for this batch's purposes, and continuing
+        # to rotate it in is where a wall of ConnectErrors comes from.
+        self._retired: set[str] = set()
+        self._fail_limit = max(1, fail_limit)
         self._cursor = 0
 
     def __len__(self) -> int:
@@ -155,18 +168,39 @@ class ProxyPool:
         return self._platform_counts.get(platform, 0)
 
     def next(self, platform: str | None = None) -> str | None:
-        """The next proxy to use, preferring one already proven for ``platform``."""
+        """The next proxy to use, preferring one already proven for ``platform``.
+
+        A cursor walks the rotation and skips resting/retired entries in place.
+        The previous form rebuilt a filtered copy of the whole pool on every
+        call -- O(n) per check, tens of millions of operations over a wide
+        scan. Walking from the cursor is O(resting) in the common case and only
+        reaches O(n) when nearly everything is resting, which is itself the
+        signal that the pool is dead.
+        """
         now = time.time()
         for group in (self._by_platform.get(platform or "", ()), self._all):
-            ready = [p for p in group if self._resting.get(p, 0.0) <= now]
-            if ready:
-                picked = ready[self._cursor % len(ready)]
-                self._cursor += 1
-                return picked
+            n = len(group)
+            if not n:
+                continue
+            start = self._cursor % n
+            for offset in range(n):
+                idx = start + offset
+                if idx >= n:
+                    idx -= n
+                proxy = group[idx]
+                if proxy in self._retired:
+                    continue
+                if self._resting.get(proxy, 0.0) > now:
+                    continue
+                self._cursor = idx + 1
+                return proxy
         if not self._all:
             return None
-        # Every proxy is resting: use whichever comes back first.
-        return min(self._all, key=lambda p: self._resting.get(p, 0.0))
+        usable = [p for p in self._all if p not in self._retired]
+        if not usable:
+            return None
+        # Every live proxy is resting: use whichever comes back first.
+        return min(usable, key=lambda p: self._resting.get(p, 0.0))
 
     def client(self, proxy: str) -> httpx.AsyncClient:
         """The kept-alive client for one proxy, created on first use.
@@ -184,16 +218,42 @@ class ProxyPool:
                     max_connections=self._per_proxy,
                     max_keepalive_connections=self._per_proxy,
                 ),
+                # Shared context: a pool is one client per proxy, and a
+                # per-client SSLContext would cost ~1.25 MB x pool size.
+                verify=SSL_CONTEXT,
             )
             self._clients[proxy] = client
         return client
 
     def report(self, proxy: str, ok: bool) -> None:
-        """Remember whether a proxy just behaved, so retries avoid a bad one."""
+        """Remember whether a proxy just behaved, so retries avoid a bad one.
+
+        A proxy that keeps failing is retired for the rest of the run; a single
+        failure only rests it. The distinction matters on a free list, where
+        plenty of hosts answer one probe and then die.
+        """
         if ok:
             self._resting.pop(proxy, None)
+            self._fails.pop(proxy, None)
+            return
+        fails = self._fails.get(proxy, 0) + 1
+        self._fails[proxy] = fails
+        if fails >= self._fail_limit:
+            self._retired.add(proxy)
+            client = self._clients.pop(proxy, None)
+            if client is not None:
+                # Free the sockets immediately; a retired proxy's warm pool is
+                # dead weight against the process fd budget.
+                try:
+                    asyncio.get_running_loop().create_task(client.aclose())
+                except RuntimeError:  # pragma: no cover - no loop, nothing to close onto
+                    pass
         elif self._cooldown > 0:
             self._resting[proxy] = time.time() + self._cooldown
+
+    def alive(self) -> int:
+        """Proxies still eligible to be handed out."""
+        return sum(1 for p in self._all if p not in self._retired)
 
     def resting(self) -> int:
         now = time.time()
@@ -429,7 +489,8 @@ async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResu
     """One name on one platform, through the next proxy the pool hands out."""
     proxy = pool.next(platform)
     if proxy is None:
-        return SnipeResult(username, platform, "error", "no validated proxies")
+        detail = "pool exhausted this run" if len(pool) else "no validated proxies"
+        return SnipeResult(username, platform, "error", detail)
     started = time.perf_counter()
     try:
         result = await CHECKERS[platform](pool.client(proxy), username)
@@ -450,6 +511,7 @@ async def iter_snipes(
     concurrency: int = 32,
     retries: int = 2,
     window_factor: int = 4,
+    stop: asyncio.Event | None = None,
 ) -> AsyncIterator[SnipeResult]:
     """Yield results as they land, retrying a blocked name on another proxy.
 
@@ -464,6 +526,13 @@ async def iter_snipes(
     first result to the last. Waiting for a whole chunk to drain instead leaves
     the tail of every chunk idle, which is exactly the throughput a scan cannot
     spare.
+
+    ``stop`` is the run's cancel token. When it is set the dispatch loop stops
+    handing out new work, every in-flight check is cancelled, and the generator
+    returns -- so /snipe/stop actually stops the run instead of merely orphaning
+    the HTTP response. Cancellation is awaited in the ``finally`` rather than
+    fired and forgotten, so by the time this generator closes no check is still
+    holding a proxy or a socket.
     """
     queue: list[tuple[str, str]] = []
     for username in usernames:
@@ -478,10 +547,12 @@ async def iter_snipes(
     sem = asyncio.Semaphore(max(1, concurrency))
     window = max(1, concurrency * window_factor)
 
-    async def one(platform: str, username: str) -> SnipeResult:
+    async def one(platform: str, username: str) -> SnipeResult | None:
         async with sem:
             attempt = 0
             while True:
+                if stop is not None and stop.is_set():
+                    return None
                 result = await check_once(platform, username, pool)
                 if result.status in ("blocked", "error") and attempt < retries:
                     attempt += 1
@@ -492,19 +563,49 @@ async def iter_snipes(
     # cannot spawn a task each, while one semaphore keeps in-flight requests at
     # the ceiling.
     pending: dict[asyncio.Task, None] = {}
+    # A waiter on the run's stop event, so a stop interrupts the dispatch wait
+    # immediately. Waiting on `pending` alone means the stop is only noticed
+    # after the next check happens to finish -- and a check stuck on a
+    # slow-but-connected proxy does not finish until its read timeout, so a
+    # "stop" could take the full timeout to take effect.
+    stop_task: asyncio.Task | None = None
+    if stop is not None:
+        stop_task = asyncio.create_task(stop.wait())
     offset = 0
     try:
         while offset < len(queue) or pending:
+            if stop is not None and stop.is_set():
+                break
             while offset < len(queue) and len(pending) < window:
+                if stop is not None and stop.is_set():
+                    break
                 platform, username = queue[offset]
                 offset += 1
                 pending[asyncio.create_task(one(platform, username))] = None
             if not pending:
                 break
-            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            waiters: set[asyncio.Task] = set(pending)
+            if stop_task is not None and not stop_task.done():
+                waiters.add(stop_task)
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
+                if task is stop_task:
+                    continue
                 del pending[task]
-                yield task.result()
+                result = task.result()
+                if result is not None:
+                    yield result
     finally:
+        if stop_task is not None and not stop_task.done():
+            stop_task.cancel()
         for task in pending:
             task.cancel()
+        if pending:
+            # Wait for the cancellations to land before returning: the caller
+            # telling the user "stopped" should mean no request is still out.
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except asyncio.CancelledError:
+                # We are being torn down by the caller; cancel() above already
+                # reached every task, so there is nothing left to await.
+                pass

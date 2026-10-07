@@ -16,11 +16,13 @@ from dataclasses import dataclass, field
 import httpx
 
 from config import (
+    CHECK_MAX_CONNECTIONS,
     CONNECT_TIMEOUT,
     JUDGE_PER_ENDPOINT,
     JUDGE_TIMEOUT,
     JUDGE_URLS,
     READ_TIMEOUT,
+    SSL_CONTEXT,
 )
 from platforms import PlatformResult, probe_all
 
@@ -139,7 +141,9 @@ async def get_direct_ip() -> str | None:
     """The validator's own public IP, for transparency comparison."""
     urls = JUDGE_URLS
     timeout = httpx.Timeout(JUDGE_TIMEOUT, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, verify=SSL_CONTEXT
+    ) as client:
         for url in urls:
             try:
                 resp = await client.get(url)
@@ -177,6 +181,15 @@ async def check_proxy(proxy: str, direct_ip: str | None) -> CheckResult:
             proxy=proxy_url,
             timeout=timeout,
             follow_redirects=True,
+            # One proxy may not fan out into an unbounded number of sockets: a
+            # wide cycle runs hundreds of these clients at once and the process
+            # fd budget, not the network, is what runs out first.
+            limits=httpx.Limits(
+                max_connections=CHECK_MAX_CONNECTIONS,
+                max_keepalive_connections=CHECK_MAX_CONNECTIONS,
+            ),
+            # Shared context: a per-client SSLContext is ~1.25 MB of CA bundle.
+            verify=SSL_CONTEXT,
         ) as client:
             # Judge and platform probes are independent, so both start at once:
             # an alive proxy pays one round trip instead of two. The judge is
@@ -237,7 +250,7 @@ async def check_proxy(proxy: str, direct_ip: str | None) -> CheckResult:
 
 
 async def iter_checks(
-    proxies: list[str], direct_ip: str | None, concurrency: int, window_factor: int = 4
+    proxies: list[str], direct_ip: str | None, concurrency: int, window_factor: int = 3
 ) -> AsyncIterator[CheckResult]:
     """Yield each verdict the moment it lands, in completion order.
 
@@ -247,6 +260,12 @@ async def iter_checks(
     bounded to ``concurrency * window_factor`` so a huge input cannot spawn a
     task per proxy, and one wide semaphore keeps the in-flight count at the
     configured ceiling across window boundaries.
+
+    ``window_factor`` is the socket budget multiplier: every outstanding task
+    owns one AsyncClient with ``CHECK_MAX_CONNECTIONS`` sockets of room, so the
+    window is kept close to the concurrency it feeds rather than a multiple of
+    it. The window only needs to be wider than ``concurrency`` by the margin
+    that keeps the semaphore fed while finished results are being yielded.
     """
     total = len(proxies)
     if total == 0:

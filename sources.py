@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from config import SOURCE_TIMEOUT
+from config import SOURCE_TIMEOUT, SSL_CONTEXT
 
 log = logging.getLogger("proxy-scraper.sources")
 
@@ -47,6 +47,25 @@ SOURCES: tuple[Source, ...] = (
     Source("proxylist-download-socks5", "https://www.proxy-list.download/api/v1/get?type=socks5", "socks5"),
     Source("prxchk-http", "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt", "http"),
     Source("prxchk-socks5", "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt", "socks5"),
+    Source("hideip-http", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt", "http"),
+    Source("hideip-socks5", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt", "socks5"),
+    Source("hideip-socks4", "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt", "socks4"),
+    Source("vakhov-http", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt", "http"),
+    Source("vakhov-socks5", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt", "socks5"),
+    Source("vakhov-socks4", "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt", "socks4"),
+    Source("ercin-http", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt", "http"),
+    Source("ercin-socks5", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt", "socks5"),
+    Source("ercin-socks4", "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt", "socks4"),
+    Source("aliilapro-http", "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt", "http"),
+    Source("aliilapro-socks5", "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt", "socks5"),
+    Source("murongpig-http", "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt", "http"),
+    Source("murongpig-socks5", "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt", "socks5"),
+    Source("zevtyardt-http", "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt", "http"),
+    Source("proxyscrape4-http", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text", "http"),
+    Source("proxyscrape4-socks5", "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=socks5&proxy_format=ipport&format=text", "socks5"),
+    Source("openproxylist-http", "https://openproxylist.xyz/http.txt", "http"),
+    Source("openproxylist-socks5", "https://openproxylist.xyz/socks5.txt", "socks5"),
+    Source("hookzof-socks4", "https://raw.githubusercontent.com/hookzof/socks5_list/master/socks4.txt", "socks4"),
 )
 
 # host:port, optionally prefixed with a scheme the source labels per-line.
@@ -105,7 +124,9 @@ async def fetch_all(sources: tuple[Source, ...] = SOURCES) -> set[str]:
     """Fetch every source concurrently and return the de-duplicated union."""
     timeout = httpx.Timeout(SOURCE_TIMEOUT, connect=10.0)
     headers = {"User-Agent": "Mozilla/5.0 (proxy-scraper)"}
-    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout, headers=headers, follow_redirects=True, verify=SSL_CONTEXT
+    ) as client:
         results = await asyncio.gather(*(_fetch_one(client, s) for s in sources))
     merged: set[str] = set()
     for chunk in results:

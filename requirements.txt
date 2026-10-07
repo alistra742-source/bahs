@@ -1,5 +1,7 @@
-fastapi
-uvicorn[standard]
+# Pinned: an unpinned FastAPI/Starlette pair is how a deploy picks up a
+# breaking ASGI change with no code change on our side.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
 # httpx[socks] pulls in socksio, which is what makes socks4:// and socks5://
 # proxy URLs work at all -- without it httpx refuses the scheme.
-httpx[socks]
+httpx[socks]==0.28.1

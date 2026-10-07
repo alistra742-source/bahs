@@ -19,7 +19,7 @@ from config import (
     PROGRESS_EVERY,
     REFRESH_INTERVAL,
     REFRESH_ON_START,
-    STORE_SAVE_EVERY,
+    STORE_SAVE_INTERVAL,
 )
 from sources import fetch_all
 from store import ProxyStore
@@ -66,10 +66,16 @@ class RefreshManager:
                 # Store each verdict as it lands: a cycle over 20k candidates runs for many
                 # minutes, and the dashboard must fill while it runs rather than after it ends.
                 checked = 0
+                last_save = time.monotonic()
                 async for result in iter_checks(candidates, self.direct_ip, MAX_CONCURRENCY):
                     self.store.upsert(result)
                     checked += 1
-                    if checked % STORE_SAVE_EVERY == 0:
+                    # Persist on a wall clock, not a check count: the save is a
+                    # full-store dump, so its cost must not scale with how fast
+                    # the validator happens to be running.
+                    now = time.monotonic()
+                    if now - last_save >= STORE_SAVE_INTERVAL:
+                        last_save = now
                         self.store.save()
                     if checked % PROGRESS_EVERY == 0:
                         stats = self.store.stats()
@@ -82,7 +88,7 @@ class RefreshManager:
                         )
 
                 dropped = self.store.prune()
-                self.store.save()
+                self.store.save(force=True)
 
                 alive = self.store.stats()["alive"]
                 self.last_alive = alive
@@ -110,7 +116,7 @@ class RefreshManager:
             finally:
                 # A cancelled cycle (Stop pressed mid-run) keeps what it already validated.
                 try:
-                    self.store.save()
+                    self.store.save(force=True)
                 except OSError:
                     log.warning("could not persist the store at the end of the cycle", exc_info=True)
                 self.running = False

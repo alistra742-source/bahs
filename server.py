@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,7 @@ import sniper
 from config import (
     AUTO_START,
     LOG_LEVEL,
+    MAX_CONCURRENT_RUNS,
     MIN_ALIVE,
     PORT,
     REFRESH_INTERVAL,
@@ -58,6 +60,37 @@ for _noisy in ("httpx", "httpcore"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("proxy-scraper.server")
 
+
+def _raise_fd_limit() -> int | None:
+    """Lift RLIMIT_NOFILE so a wide validation cycle cannot hit EMFILE.
+
+    Every in-flight check owns a proxy client with up to ``CHECK_MAX_CONNECTIONS``
+    sockets, so the 1024 default is a handful of concurrent checks away from
+    "Too many open files" -- which the checker can only report as ConnectError,
+    i.e. a "dead proxy" that is really a dead file descriptor. The container's
+    hard limit is the ceiling; if it is already high enough this is a no-op.
+    """
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - non-POSIX
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard == resource.RLIM_INFINITY:
+            target = 65536
+        else:
+            target = min(hard, 65536)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            return target
+        return soft
+    except (ValueError, OSError):
+        log.debug("could not raise RLIMIT_NOFILE", exc_info=True)
+        return None
+
+
+_RAISED_FD_LIMIT = _raise_fd_limit()
+
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 store = ProxyStore(STORE_PATH)
@@ -70,10 +103,11 @@ async def lifespan(app: FastAPI):
     if AUTO_START:
         manager.start()
     log.info(
-        "proxy-scraper up on :%d, refresh every %ds, auto_start=%s",
+        "proxy-scraper up on :%d, refresh every %ds, auto_start=%s, nofile=%s",
         PORT,
         REFRESH_INTERVAL,
         AUTO_START,
+        _RAISED_FD_LIMIT if _RAISED_FD_LIMIT is not None else "unchanged",
     )
     try:
         yield
@@ -125,6 +159,10 @@ def info() -> dict:
             "POST /refresh": "queue a single scrape+validate cycle",
             "POST /snipe": "check usernames on Discord / guns.lol / Instagram through validated proxies (JSON, or NDJSON with stream=true)",
             "GET /snipe": "the same for one ?username=",
+            "POST /snipe/stop": "stop every in-flight /snipe batch",
+            "POST /scan/stop": "stop every in-flight /scan",
+            "GET /runs": "in-flight and just-finished snipe/scan runs",
+            "POST /runs/stop": "stop all runs, or the one named by ?run_id=",
             "GET /generate": "candidate usernames: letters | alnum | numbers | words, by length",
             "POST /generate": "the same for several patterns at once",
             "POST /scan": "generate and check in bulk at a target rate, NDJSON with stream=true",
@@ -230,6 +268,116 @@ def purge_proxies(scope: str = Query("dead", pattern="^(dead|all)$")) -> dict:
     removed = store.purge(scope)
     store.save()
     return {"scope": scope, "removed": removed, "store": store.stats()}
+
+
+# --- run control ----------------------------------------------------------
+class RunHandle:
+    """One in-flight snipe or scan, cancellable from another HTTP request.
+
+    A streaming endpoint holds one of these. Setting ``stop`` makes the generator
+    stop dispatching, cancel its in-flight checks and finish, so ``/runs/stop``
+    is a real halt rather than the client merely closing its socket. Every
+    mutation happens on the event loop with no awaits between read and write, so
+    no lock is needed.
+    """
+
+    __slots__ = ("id", "kind", "stop", "started", "finished", "checked")
+
+    def __init__(self, kind: str) -> None:
+        self.id = uuid.uuid4().hex[:12]
+        self.kind = kind
+        self.stop = asyncio.Event()
+        self.started = time.time()
+        self.finished: float | None = None
+        self.checked = 0
+
+    @property
+    def active(self) -> bool:
+        return self.finished is None
+
+    def finish(self) -> None:
+        if self.finished is None:
+            self.finished = time.time()
+
+    def status(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "started": self.started,
+            "finished": self.finished,
+            "checked": self.checked,
+            "stopping": self.stop.is_set(),
+            "active": self.active,
+            "elapsed_s": round((self.finished or time.time()) - self.started, 2),
+        }
+
+
+_runs: dict[str, RunHandle] = {}
+
+
+def _reap_runs() -> None:
+    for run_id in [rid for rid, handle in _runs.items() if not handle.active]:
+        _runs.pop(run_id, None)
+
+
+def _open_run(kind: str) -> RunHandle:
+    """Register a run, refusing once ``MAX_CONCURRENT_RUNS`` are in flight."""
+    _reap_runs()
+    if len(_runs) >= MAX_CONCURRENT_RUNS:
+        raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
+    handle = RunHandle(kind)
+    _runs[handle.id] = handle
+    return handle
+
+
+def _stop_runs(kind: str | None = None, run_id: str | None = None) -> list[str]:
+    """Signal stop to the runs matching ``kind``/``run_id``; return their ids."""
+    stopped: list[str] = []
+    for rid, handle in _runs.items():
+        if not handle.active:
+            continue
+        if run_id and rid != run_id:
+            continue
+        if kind and handle.kind != kind:
+            continue
+        handle.stop.set()
+        stopped.append(rid)
+    return stopped
+
+
+def _runs_status() -> list[dict]:
+    _reap_runs()
+    return [handle.status() for handle in _runs.values()]
+
+
+@app.get("/runs")
+def runs_status() -> dict:
+    """Every tracked snipe/scan, active or just finished."""
+    # _runs_status() reaps finished runs, so it must run before the count is
+    # read or the two disagree.
+    runs = _runs_status()
+    return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS}
+
+
+@app.post("/runs/stop")
+def stop_all_runs(run_id: str | None = Query(None)) -> dict:
+    """Stop every run, or the one named by ``?run_id=``."""
+    stopped = _stop_runs(run_id=run_id)
+    return {"stopped": stopped, "runs": _runs_status()}
+
+
+@app.post("/snipe/stop")
+def stop_snipe() -> dict:
+    """Stop every in-flight /snipe batch."""
+    stopped = _stop_runs(kind="snipe")
+    return {"stopped": stopped, "runs": _runs_status()}
+
+
+@app.post("/scan/stop")
+def stop_scan() -> dict:
+    """Stop every in-flight /scan."""
+    stopped = _stop_runs(kind="scan")
+    return {"stopped": stopped, "runs": _runs_status()}
 
 
 # --- username sniping -----------------------------------------------------
@@ -377,32 +525,51 @@ async def _snipe_ndjson(
     concurrency: int,
     retries: int,
     note: str = "",
+    run: RunHandle | None = None,
 ) -> AsyncIterator[str]:
     """One JSON verdict per line, then a summary line.
 
     A large batch runs for tens of seconds; streaming means the first answer is
     visible in the first second and no proxy or gateway has to hold the whole
-    response open.
+    response open. ``run.stop`` is checked on every result, so a stop request
+    lands within one check's latency instead of at the end of the batch.
     """
     started = time.perf_counter()
     checked = 0
     available = 0
     counts: dict[str, int] = {}
+    run_id = run.id if run else ""
     if note:
-        yield json.dumps({"type": "note", "pool_note": note, "pool_size": len(pool)}) + "\n"
-    async for result in sniper.iter_snipes(
-        names, platforms, pool, concurrency=concurrency, retries=retries
-    ):
-        checked += 1
-        counts[result.status] = counts.get(result.status, 0) + 1
-        available += 1 if result.status == "available" else 0
-        yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+        yield json.dumps(
+            {"type": "note", "run_id": run_id, "pool_note": note, "pool_size": len(pool)}
+        ) + "\n"
+    try:
+        async for result in sniper.iter_snipes(
+            names,
+            platforms,
+            pool,
+            concurrency=concurrency,
+            retries=retries,
+            stop=run.stop if run else None,
+        ):
+            checked += 1
+            if run:
+                run.checked = checked
+            counts[result.status] = counts.get(result.status, 0) + 1
+            available += 1 if result.status == "available" else 0
+            yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+    finally:
+        if run:
+            run.finish()
     yield json.dumps(
         {
             "type": "done",
+            "run_id": run_id,
+            "stopped": bool(run and run.stop.is_set()),
             "names": len(names),
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_alive": pool.alive(),
             "pool_note": note,
             "by_status": counts,
             "resting": pool.resting(),
@@ -421,25 +588,37 @@ async def snipe_batch(req: SnipeRequest):
     result per line, so a big batch lands incrementally.
     """
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
+    run = _open_run("snipe")
     if req.stream:
         return StreamingResponse(
-            _snipe_ndjson(names, platforms, pool, concurrency, retries, note),
+            _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run),
             media_type="application/x-ndjson",
             # Nothing between here and the browser may buffer the stream.
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
-    results = [
-        result
-        async for result in sniper.iter_snipes(
-            names, platforms, pool, concurrency=concurrency, retries=retries
-        )
-    ]
+    try:
+        results = [
+            result
+            async for result in sniper.iter_snipes(
+                names,
+                platforms,
+                pool,
+                concurrency=concurrency,
+                retries=retries,
+                stop=run.stop,
+            )
+        ]
+    finally:
+        run.finish()
     rows = [_snipe_row(r) for r in results]
     available = [r for r in rows if r["status"] == "available"]
     return {
+        "run_id": run.id,
+        "stopped": run.stop.is_set(),
         "names": len(names),
         "platforms": platforms,
         "pool_size": len(pool),
+        "pool_alive": pool.alive(),
         "pool_note": note,
         "by_status": _status_counts(rows),
         "checked": len(rows),
@@ -457,12 +636,21 @@ async def snipe_one(
     """Same thing for one name, from the query string."""
     req = SnipeRequest(username=username, platforms=platform)
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
-    rows = [
-        _snipe_row(r)
-        async for r in sniper.iter_snipes(
-            names, platforms, pool, concurrency=concurrency, retries=retries
-        )
-    ]
+    run = _open_run("snipe")
+    try:
+        rows = [
+            _snipe_row(r)
+            async for r in sniper.iter_snipes(
+                names,
+                platforms,
+                pool,
+                concurrency=concurrency,
+                retries=retries,
+                stop=run.stop,
+            )
+        ]
+    finally:
+        run.finish()
     available = [r for r in rows if r["status"] == "available"]
     return {
         "names": len(names),
@@ -583,16 +771,24 @@ async def _scan_stream(
     retries: int,
     truncated: bool,
     note: str = "",
+    run: RunHandle | None = None,
 ) -> AsyncIterator[str]:
-    """NDJSON: one verdict per line, a rate line every ~100 checks, then a summary."""
+    """NDJSON: one verdict per line, a rate line every ~100 checks, then a summary.
+
+    ``run.stop`` is what makes the dashboard's Stop button real: the dispatch
+    loop in ``iter_snipes`` sees the same event, so a stop cancels the checks
+    already in flight instead of only ending the response.
+    """
     meter = sniper.RateMeter()
     checked = 0
     available = 0
     last_report = 0.0
     counts: dict[str, int] = {}
+    run_id = run.id if run else ""
     yield json.dumps(
         {
             "type": "start",
+            "run_id": run_id,
             "names": len(names),
             "truncated": truncated,
             "platforms": platforms,
@@ -604,36 +800,50 @@ async def _scan_stream(
         }
     ) + "\n"
 
-    async for result in sniper.iter_snipes(
-        names, platforms, pool, concurrency=concurrency, retries=retries
-    ):
-        meter.tick()
-        checked += 1
-        counts[result.status] = counts.get(result.status, 0) + 1
-        if result.status == "available":
-            available += 1
-        yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
-        now = time.perf_counter()
-        if checked % 100 == 0 and (now - last_report) >= 0.5:
-            last_report = now
-            yield json.dumps(
-                {
-                    "type": "progress",
-                    "checked": checked,
-                    "per_second": round(meter.recent, 1),
-                    "average_per_second": round(meter.average, 1),
-                    "available_count": available,
-                    "elapsed_s": round(meter.elapsed, 2),
-                }
-            ) + "\n"
+    try:
+        async for result in sniper.iter_snipes(
+            names,
+            platforms,
+            pool,
+            concurrency=concurrency,
+            retries=retries,
+            stop=run.stop if run else None,
+        ):
+            meter.tick()
+            checked += 1
+            if run:
+                run.checked = checked
+            counts[result.status] = counts.get(result.status, 0) + 1
+            if result.status == "available":
+                available += 1
+            yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+            now = time.perf_counter()
+            if checked % 100 == 0 and (now - last_report) >= 0.5:
+                last_report = now
+                yield json.dumps(
+                    {
+                        "type": "progress",
+                        "checked": checked,
+                        "per_second": round(meter.recent, 1),
+                        "average_per_second": round(meter.average, 1),
+                        "available_count": available,
+                        "elapsed_s": round(meter.elapsed, 2),
+                    }
+                ) + "\n"
+    finally:
+        if run:
+            run.finish()
 
     rate = meter.average
     yield json.dumps(
         {
             "type": "done",
+            "run_id": run_id,
+            "stopped": bool(run and run.stop.is_set()),
             "names": len(names),
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_alive": pool.alive(),
             "pool_note": note,
             "by_status": counts,
             "checked": checked,
@@ -659,21 +869,33 @@ async def scan(req: ScanRequest):
     platforms = sniper.normalize_platforms(req.platforms)
     concurrency = max(1, req.concurrency or SCAN_CONCURRENCY)
     retries = SCAN_RETRIES if req.retries is None else max(0, req.retries)
+    run = _open_run("scan")
 
     if not req.stream:
-        results = [
-            result
-            async for result in sniper.iter_snipes(
-                names, platforms, pool, concurrency=concurrency, retries=retries
-            )
-        ]
+        try:
+            results = [
+                result
+                async for result in sniper.iter_snipes(
+                    names,
+                    platforms,
+                    pool,
+                    concurrency=concurrency,
+                    retries=retries,
+                    stop=run.stop,
+                )
+            ]
+        finally:
+            run.finish()
         rows = [_snipe_row(r) for r in results]
         available = [r for r in rows if r["status"] == "available"]
         return {
+            "run_id": run.id,
+            "stopped": run.stop.is_set(),
             "names": len(names),
             "truncated": truncated,
             "platforms": platforms,
             "pool_size": len(pool),
+            "pool_alive": pool.alive(),
             "pool_note": note,
             "by_status": _status_counts(rows),
             "checked": len(rows),
@@ -683,7 +905,7 @@ async def scan(req: ScanRequest):
         }
 
     return StreamingResponse(
-        _scan_stream(names, platforms, pool, concurrency, retries, truncated, note),
+        _scan_stream(names, platforms, pool, concurrency, retries, truncated, note, run),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )

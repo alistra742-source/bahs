@@ -192,6 +192,7 @@ a{color:var(--blue)}
       <input id="snipe-conc" type="number" min="1" max="2000" value="256" style="width:78px">
       <button class="primary" id="btn-snipe">Check names</button>
       <button class="go" id="btn-scan">Scan at max rate</button>
+      <button class="stop" id="btn-run-stop" disabled>Stop run</button>
       <span class="hint">runs through the validated proxies</span>
     </div>
     <div class="row" style="margin-top:10px">
@@ -510,11 +511,14 @@ async function openClaim(platform, username) {
 }
 
 // One NDJSON reader for both /snipe and /scan: every line goes to onLine.
-async function streamResults(url, body, onLine) {
+// `signal` is the run's AbortController: aborting it drops the response reader
+// instantly, and the server's own stop endpoint cancels the checks behind it.
+async function streamResults(url, body, onLine, signal) {
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: signal,
   });
   if (!res.ok) throw new Error(await errorText(res));
   if (!res.body) {
@@ -560,12 +564,21 @@ function scanProgress(done, total) {
   $("scan-bar").style.width = total ? Math.min(100, (done / total) * 100) + "%" : "0%";
 }
 
-function beginRun() {
+// The live run's abort controller and the server-side endpoint that cancels it.
+// Both are needed: the abort frees the browser reader, the POST makes the
+// server stop dispatching and cancel its in-flight checks.
+let runAbort = null;
+let runStopPath = "";
+
+function beginRun(stopPath) {
   lastSnipes = [];
   $("snipe-rows").innerHTML = "";
   $("snipe-empty").style.display = "none";
   $("btn-snipe").disabled = true;
   $("btn-scan").disabled = true;
+  $("btn-run-stop").disabled = false;
+  runAbort = new AbortController();
+  runStopPath = stopPath;
   scanRate("0.0/s");
   scanProgress(0, 0);
 }
@@ -573,6 +586,32 @@ function beginRun() {
 function endRun() {
   $("btn-snipe").disabled = false;
   $("btn-scan").disabled = false;
+  $("btn-run-stop").disabled = true;
+  runAbort = null;
+  runStopPath = "";
+}
+
+function isAbort(e) {
+  return e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
+}
+
+// Tell the server to stop, then drop the reader. The server response to
+// /snipe/stop names the runs it signalled, so a stop that hit nothing is
+// visible rather than silent.
+async function stopRun() {
+  $("btn-run-stop").disabled = true;
+  snipeMsg("stopping…");
+  const path = runStopPath;
+  if (path) {
+    try {
+      const out = await api(path, { method: "POST" });
+      const n = (out.stopped || []).length;
+      snipeMsg(n ? "stop sent to " + n + " run" + (n === 1 ? "" : "s") : "no run was still active");
+    } catch (e) {
+      snipeMsg("stop request failed: " + e.message, true);
+    }
+  }
+  if (runAbort) runAbort.abort();
 }
 
 // --- pattern builder ------------------------------------------------------
@@ -663,7 +702,7 @@ async function runSnipe() {
     if (!(await generateNames())) return;
     names = namesInBox();
   }
-  beginRun();
+  beginRun("/snipe/stop");
   let checked = 0, available = 0, summary = "";
   const started = Date.now();
   const tick = () => {
@@ -687,10 +726,11 @@ async function runSnipe() {
         if (msg.pool_note) summary += " - " + msg.pool_note;
       }
       tick();
-    });
+    }, runAbort ? runAbort.signal : undefined);
     if (summary) snipeMsg(summary); else tick();
   } catch (e) {
-    snipeMsg(e.message, true);
+    if (isAbort(e)) snipeMsg("stopped", false);
+    else snipeMsg(e.message, true);
   } finally {
     endRun();
   }
@@ -708,7 +748,7 @@ async function runScan() {
     snipeMsg("pick at least one platform", true);
     return;
   }
-  beginRun();
+  beginRun("/scan/stop");
   let checked = 0, available = 0, summary = "";
   const started = Date.now();
   try {
@@ -758,11 +798,13 @@ async function runScan() {
           summary += " - " + errs + " of " + msg.checked +
             " errored: the validated pool is thin or dead, a refresh was queued";
         }
+        if (msg.stopped) summary += " - stopped early";
       }
-    });
+    }, runAbort ? runAbort.signal : undefined);
     if (summary) snipeMsg(summary);
   } catch (e) {
-    snipeMsg(e.message, true);
+    if (isAbort(e)) snipeMsg("stopped", false);
+    else snipeMsg(e.message, true);
   } finally {
     endRun();
   }
@@ -770,6 +812,7 @@ async function runScan() {
 
 $("btn-snipe").onclick = runSnipe;
 $("btn-scan").onclick = runScan;
+$("btn-run-stop").onclick = stopRun;
 $("btn-gen-add").onclick = addGenPattern;
 $("btn-gen-run").onclick = generateNames;
 $("btn-gen-random").onclick = randomRun;
