@@ -12,7 +12,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager
 
 import httpx
@@ -20,14 +20,19 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from alerts import AlertSettings, Alerter
+
+import alerts
 import generator
 import proxies as proxy_list_module
 import sniper
 from config import (
     LOG_LEVEL,
     MAX_CONCURRENT_RUNS,
+    MAX_ENUMERATION,
     MIN_POOL_WARN,
     PORT,
+    SCAN_BUFFER_MAX,
     SCAN_CONCURRENCY,
     SCAN_CONNECT_TIMEOUT,
     SCAN_MAX_NAMES,
@@ -38,6 +43,7 @@ from config import (
     SNIPE_CONCURRENCY,
     SNIPE_MAX_NAMES,
     SNIPE_PER_PROXY,
+    SNIPE_PER_PROXY_MAX,
     SNIPE_POOL,
     SNIPE_POOL_TTL,
     SNIPE_PROXY_COOLDOWN,
@@ -90,10 +96,15 @@ STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 proxy_list = proxy_list_module.ProxyList(STORE_PATH)
 
+# Discord alerts. The environment is the base and the UI can override it, so
+# this is loaded at boot and saved only when someone changes something by hand.
+alert_settings = AlertSettings()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     proxy_list.load()
+    alert_settings.load()
     log.info(
         "bahs up on :%d, %d stored proxies, nofile=%s",
         PORT,
@@ -107,7 +118,7 @@ async def lifespan(app: FastAPI):
         proxy_list.save()
 
 
-app = FastAPI(title="bahs", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="bahs", version="3.0.0", lifespan=lifespan)
 
 
 # --- site + info ----------------------------------------------------------
@@ -118,9 +129,19 @@ def site() -> FileResponse:
 
 @app.get("/info")
 def info() -> dict:
+    words = generator.words_by_length()
     return {
         "service": "bahs",
         "platforms": list(sniper.PLATFORMS),
+        "alerts_enabled": bool(alert_settings.get().get("enabled")),
+        # What the UI needs to show a running total for "every name of this
+        # length" before anyone starts a run.
+        "generation": {
+            "charset": {name: len(chars) for name, chars in generator.CHARSETS.items()},
+            "words_by_length": words,
+            "max_enumeration": MAX_ENUMERATION,
+            "note": "limit omitted or 0 means every name of that length",
+        },
         "endpoints": {
             "GET /": "dashboard",
             "GET /health": "counts: stored proxies, live runs",
@@ -139,6 +160,9 @@ def info() -> dict:
             "GET /generate": "candidate usernames: letters | alnum | numbers | words, by length",
             "POST /generate": "the same for several patterns at once",
             "GET /claim": "the registration route for a name on a platform",
+            "GET /settings": "alert settings (webhook url, template, ping)",
+            "POST /settings": "change the alert settings",
+            "POST /settings/test-webhook": "post one test message to the webhook",
         },
     }
 
@@ -375,29 +399,52 @@ _pool_state: dict[str, dict[str, object]] = {
 _pool_lock = asyncio.Lock()
 
 
-def _build_pool(scan: bool) -> sniper.ProxyPool:
+def _build_pool(scan: bool, concurrency: int) -> sniper.ProxyPool:
+    """Pool the stored proxies with a connection budget that can carry it.
+
+    The per-proxy connection count is derived from ``concurrency / len(list)``
+    rather than fixed, because a fixed one is a hard throughput ceiling for a
+    short list: with one rotating endpoint, asking for 256 concurrent checks
+    still got however many connections the fixed number allowed. A long list
+    still works out to the floor, so this only ever helps.
+    """
     stored = proxy_list.all()[:SNIPE_POOL]
+    floor = SCAN_PER_PROXY if scan else SNIPE_PER_PROXY
+    per_proxy = sniper.per_proxy_connections(
+        len(stored), concurrency, floor, SNIPE_PER_PROXY_MAX
+    )
     if not scan:
-        return sniper.ProxyPool(stored, cooldown=SNIPE_PROXY_COOLDOWN, per_proxy=SNIPE_PER_PROXY)
+        return sniper.ProxyPool(stored, cooldown=SNIPE_PROXY_COOLDOWN, per_proxy=per_proxy)
     timeout = httpx.Timeout(
         connect=SCAN_CONNECT_TIMEOUT,
         read=SCAN_READ_TIMEOUT,
         write=SCAN_READ_TIMEOUT,
         pool=SCAN_READ_TIMEOUT,
     )
-    return sniper.ProxyPool(stored, per_proxy=SCAN_PER_PROXY, timeout=timeout)
+    return sniper.ProxyPool(stored, per_proxy=per_proxy, timeout=timeout)
 
 
-async def _pool(mode: str) -> sniper.ProxyPool:
+async def _pool(mode: str, concurrency: int) -> sniper.ProxyPool:
     scan = mode == "scan"
+    floor = SCAN_PER_PROXY if scan else SNIPE_PER_PROXY
     async with _pool_lock:
         state = _pool_state[mode]
         pool = state["pool"]
         age = time.time() - float(state["built"])  # type: ignore[arg-type]
         fresh_list = state["version"] == proxy_list.version
-        if isinstance(pool, sniper.ProxyPool) and len(pool) and fresh_list and age < SNIPE_POOL_TTL:
+        # Reuse only when this pool's connection budget is already the one this
+        # concurrency needs. Rebuilding on every request would throw away the
+        # warm tunnels that make a batch fast.
+        if (
+            isinstance(pool, sniper.ProxyPool)
+            and len(pool)
+            and fresh_list
+            and age < SNIPE_POOL_TTL
+            and pool.per_proxy
+            == sniper.per_proxy_connections(len(pool), concurrency, floor, SNIPE_PER_PROXY_MAX)
+        ):
             return pool
-        new_pool = _build_pool(scan)
+        new_pool = _build_pool(scan, concurrency)
         if isinstance(pool, sniper.ProxyPool) and pool is not new_pool:
             # Retire the old connections in the background; nobody waits on it.
             asyncio.create_task(pool.aclose())
@@ -415,20 +462,31 @@ async def _close_pools() -> None:
         state["pool"] = None
 
 
-async def _prepare_pool(mode: str) -> tuple[sniper.ProxyPool, str]:
+async def _prepare_pool(mode: str, concurrency: int) -> tuple[sniper.ProxyPool, str]:
     """The pool for a run, plus a note when the list is too thin to be useful.
 
     With an empty list every check comes back an error and the caller just sees
     a table of nothing, so that is a 503 with the reason rather than a run that
     quietly fails. A short list still runs, but says so up front.
     """
-    pool = await _pool(mode)
+    pool = await _pool(mode, concurrency)
     if len(pool) == 0:
         raise HTTPException(503, "no proxies saved yet -- paste or upload a list first")
     if len(pool) < MIN_POOL_WARN:
         return pool, (
             f"only {len(pool)} proxies in the list -- a run this narrow will be slow "
             "and will repeat the same few hosts"
+        )
+    # Measured on one proxy endpoint: 32 concurrent checks ran at 147/s while the
+    # same work at 256 concurrent ran at 65/s. Widening past what a short list can
+    # carry makes a run slower, not faster, so say so instead of letting the
+    # concurrency box look like a speed dial.
+    capacity = len(pool) * pool.per_proxy
+    if concurrency > capacity:
+        return pool, (
+            f"{len(pool)} proxies at {pool.per_proxy} connections each can carry about "
+            f"{capacity} checks at once, and {concurrency} were asked for -- the extra "
+            "ones queue. More proxies helps here; more concurrency does not."
         )
     return pool, ""
 
@@ -446,13 +504,20 @@ class SnipeRequest(BaseModel):
     stream: bool = False
 
 
-def _status_counts(rows: list[dict]) -> dict[str, int]:
-    """How the verdicts broke down, so a wall of errors is a number, not a guess."""
-    counts: dict[str, int] = {}
-    for row in rows:
-        key = str(row.get("status") or "unknown")
-        counts[key] = counts.get(key, 0) + 1
-    return counts
+def _verdict_report(answered: int, checked: int) -> dict:
+    """How many checks actually answered the question about the name.
+
+    ``checked`` counts results; ``answered`` counts the ones that came back with
+    a verdict (available/taken/invalid). Everything else is blocked or errored,
+    which says something about the proxy and the platform and nothing at all
+    about the name -- so a run that reports 20,000 checks and 40 answers is not
+    a run that checked 20,000 names.
+    """
+    return {
+        "answered": answered,
+        "no_verdict": checked - answered,
+        "answer_rate": round(answered / checked, 4) if checked else 0.0,
+    }
 
 
 def _names_of(req: SnipeRequest) -> list[str]:
@@ -466,6 +531,90 @@ def _names_of(req: SnipeRequest) -> list[str]:
     if len(names) > SNIPE_MAX_NAMES:
         raise HTTPException(400, f"at most {SNIPE_MAX_NAMES} names per request")
     return names
+
+
+class _Tally:
+    """Live counters for one run -- the numbers the dashboard shows.
+
+    ``available / occupied / errors / rate limits / proxy misses`` is the set
+    every tool in this space puts on a dashboard, and the per-platform split is
+    what makes a run legible: a global "40 errors" hides that they are all one
+    host, which is the difference between a dead proxy list and a platform
+    throttling its share of the run.
+    """
+
+    _ZERO = {"checked": 0, "available": 0, "taken": 0, "invalid": 0, "blocked": 0, "error": 0}
+
+    def __init__(
+        self, names: int, platforms: list[str], alerter: Alerter | None = None
+    ) -> None:
+        self.names = names
+        self.platforms = platforms
+        self.alerter = alerter
+        self.meter = sniper.RateMeter()
+        self.checked = 0
+        self.available = 0
+        self.answered = 0
+        self.rate_limits = 0
+        self.proxy_misses = 0
+        self.by_status: dict[str, int] = {}
+        self.by_platform: dict[str, dict[str, int]] = {p: dict(self._ZERO) for p in platforms}
+        self.current = ""
+
+    def add(self, result: sniper.SnipeResult) -> None:
+        self.meter.tick()
+        self.checked += 1
+        self.current = result.username
+        status = result.status
+        self.by_status[status] = self.by_status.get(status, 0) + 1
+        row = self.by_platform.setdefault(result.platform, dict(self._ZERO))
+        row["checked"] += 1
+        if status in row:
+            row[status] += 1
+        if status == "available":
+            self.available += 1
+            # Queued, not sent: the alerter digests and posts on its own clock.
+            if self.alerter is not None:
+                self.alerter.offer(result.username, result.platform, result.detail)
+        if result.answered:
+            self.answered += 1
+        if status == "blocked":
+            self.rate_limits += 1
+        if result.detail in sniper.POOL_MISS_DETAILS:
+            self.proxy_misses += 1
+
+    @property
+    def elapsed(self) -> float:
+        return self.meter.elapsed
+
+    def progress(self) -> dict:
+        """The per-tick line: everything the dashboard moves while a run is live."""
+        return {
+            "checked": self.checked,
+            "names": self.names,
+            "progress": round(self.checked / self.names, 4) if self.names else 0.0,
+            "per_second": round(self.meter.recent, 1),
+            "average_per_second": round(self.meter.average, 1),
+            "available_count": self.available,
+            "rate_limits": self.rate_limits,
+            "proxy_misses": self.proxy_misses,
+            "current_target": self.current,
+            "elapsed_s": round(self.elapsed, 2),
+            "by_platform": self.by_platform,
+            **_verdict_report(self.answered, self.checked),
+        }
+
+    def summary(self) -> dict:
+        return {
+            "by_status": self.by_status,
+            "by_platform": self.by_platform,
+            "checked": self.checked,
+            "available_count": self.available,
+            "rate_limits": self.rate_limits,
+            "proxy_misses": self.proxy_misses,
+            "elapsed_s": round(self.elapsed, 2),
+            **_verdict_report(self.answered, self.checked),
+        }
 
 
 def _snipe_row(result: sniper.SnipeResult) -> dict:
@@ -485,6 +634,16 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         "pool_alive": pool.alive(),
         "pool_resting": pool.resting(),
         "pool_retired": pool.retired(),
+        "pool_blocked": pool.blocked(),
+        "per_proxy_connections": pool.per_proxy,
+        # Set only when the run stopped early because of the pool rather than
+        # because it ran out of names -- "the platform throttled every proxy" is
+        # a completely different message from "your list is dead".
+        "stop_reason": pool.stop_reason,
+        # Platforms sat out because they refused the whole list, so a throttle is
+        # visible per platform instead of hidden in the blocked count.
+        "platforms_paused": pool.paused(),
+        "skipped": pool.skipped,
     }
 
 
@@ -493,11 +652,45 @@ async def _snipe_ready(
 ) -> tuple[list[str], list[str], sniper.ProxyPool, int, int, str]:
     """Validate the request and fetch the pool before anything streams."""
     names = _names_of(req)
-    pool, note = await _prepare_pool("snipe")
     platforms = sniper.normalize_platforms(req.platforms)
     concurrency = max(1, req.concurrency or SNIPE_CONCURRENCY)
     retries = SNIPE_RETRIES if req.retries is None else max(0, req.retries)
+    pool, note = await _prepare_pool("snipe", concurrency)
     return names, platforms, pool, concurrency, retries, note
+
+
+def _alert_report(alerter: Alerter | None) -> dict:
+    if alerter is None or not alerter.enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "sent": alerter.sent,
+        "failed": alerter.failed,
+        "dropped": alerter.dropped,
+    }
+
+
+async def _flush_alerts(alerter: Alerter | None, force: bool = False) -> None:
+    """Push queued alerts. A webhook that is down must never touch the run."""
+    if alerter is None or not alerter.enabled:
+        return
+    if not force and alerter.pending < int(alerter.settings.get("batch") or 10):
+        return
+    try:
+        await alerter.flush(force=force)
+    except Exception as exc:  # pragma: no cover - a webhook is not a dependency
+        log.warning("alert flush failed: %s", type(exc).__name__)
+
+
+async def _finish_alerts(alerter: Alerter | None) -> None:
+    try:
+        await _flush_alerts(alerter, force=True)
+    finally:
+        if alerter is not None:
+            try:
+                await alerter.aclose()
+            except Exception:  # pragma: no cover
+                pass
 
 
 async def _snipe_ndjson(
@@ -508,18 +701,17 @@ async def _snipe_ndjson(
     retries: int,
     note: str = "",
     run: RunHandle | None = None,
+    alerter: Alerter | None = None,
 ) -> AsyncIterator[str]:
-    """One JSON verdict per line, then a summary line.
+    """One JSON verdict per line, progress as it goes, then a summary.
 
     A large batch runs for tens of seconds; streaming means the first answer is
     visible in the first second and no proxy or gateway has to hold the whole
     response open.
     """
-    started = time.perf_counter()
-    checked = 0
-    available = 0
-    counts: dict[str, int] = {}
+    tally = _Tally(len(names), platforms, alerter)
     run_id = run.id if run else ""
+    last_report = 0.0
     if note:
         yield json.dumps(
             {"type": "note", "run_id": run_id, "pool_note": note, "pool_size": len(pool)}
@@ -533,15 +725,19 @@ async def _snipe_ndjson(
             retries=retries,
             stop=run.stop if run else None,
         ):
-            checked += 1
+            tally.add(result)
             if run:
-                run.checked = checked
-            counts[result.status] = counts.get(result.status, 0) + 1
-            available += 1 if result.status == "available" else 0
+                run.checked = tally.checked
             yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+            now = time.perf_counter()
+            if tally.checked % 50 == 0 and (now - last_report) >= 0.25:
+                last_report = now
+                yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
+                await _flush_alerts(alerter)
     finally:
         if run:
             run.finish()
+        await _finish_alerts(alerter)
     yield json.dumps(
         {
             "type": "done",
@@ -550,14 +746,13 @@ async def _snipe_ndjson(
             "names": len(names),
             "platforms": platforms,
             "pool_note": note,
-            "by_status": counts,
-            "checked": checked,
-            "available_count": available,
-            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            "duration_ms": round(tally.elapsed * 1000, 1),
+            "per_second": round(tally.meter.average, 1),
+            "alerts": _alert_report(alerter),
             **_pool_report(pool),
+            **tally.summary(),
         }
     ) + "\n"
-
 
 @app.post("/snipe")
 async def snipe_batch(req: SnipeRequest):
@@ -568,9 +763,10 @@ async def snipe_batch(req: SnipeRequest):
     """
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
     run = _open_run("snipe")
+    alerter = Alerter(alert_settings.get())
     if req.stream:
         return StreamingResponse(
-            _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run),
+            _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run, alerter),
             media_type="application/x-ndjson",
             # Nothing between here and the browser may buffer the stream.
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
@@ -589,6 +785,14 @@ async def snipe_batch(req: SnipeRequest):
         ]
     finally:
         run.finish()
+    # The same tally the streaming path uses, so a buffered run reports the same
+    # counters -- the per-platform split and the proxy-miss count used to exist
+    # only on the streaming path, which made the two ways of asking the same
+    # question answer differently.
+    tally = _Tally(len(names), platforms, alerter)
+    for result in results:
+        tally.add(result)
+    await _finish_alerts(alerter)
     rows = [_snipe_row(r) for r in results]
     available = [r for r in rows if r["status"] == "available"]
     return {
@@ -597,12 +801,11 @@ async def snipe_batch(req: SnipeRequest):
         "names": len(names),
         "platforms": platforms,
         "pool_note": note,
-        "by_status": _status_counts(rows),
-        "checked": len(rows),
-        "available_count": len(available),
         "available": available,
         "results": rows,
+        "alerts": _alert_report(alerter),
         **_pool_report(pool),
+        **tally.summary(),
     }
 
 
@@ -615,9 +818,11 @@ async def snipe_one(
     req = SnipeRequest(username=username, platforms=platform)
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
     run = _open_run("snipe")
+    alerter = Alerter(alert_settings.get())
+    results: list[sniper.SnipeResult] = []
     try:
-        rows = [
-            _snipe_row(r)
+        results = [
+            r
             async for r in sniper.iter_snipes(
                 names,
                 platforms,
@@ -629,17 +834,21 @@ async def snipe_one(
         ]
     finally:
         run.finish()
+    tally = _Tally(len(names), platforms, alerter)
+    for result in results:
+        tally.add(result)
+    await _finish_alerts(alerter)
+    rows = [_snipe_row(r) for r in results]
     available = [r for r in rows if r["status"] == "available"]
     return {
         "names": len(names),
         "platforms": platforms,
         "pool_note": note,
-        "by_status": _status_counts(rows),
-        "checked": len(rows),
-        "available_count": len(available),
         "available": available,
         "results": rows,
+        "alerts": _alert_report(alerter),
         **_pool_report(pool),
+        **tally.summary(),
     }
 
 
@@ -657,7 +866,8 @@ class GenerateRequest(BaseModel):
     patterns: list[PatternSpec] = Field(default_factory=list)
     pattern: str | None = None
     length: int | None = None
-    limit: int = 500
+    # None or 0 means every name of that length, not a sample of 500.
+    limit: int | None = None
     seed: int | None = None
     mode: str = "random"
     words: list[str] | None = None
@@ -674,15 +884,30 @@ def _generate(req: GenerateRequest) -> dict:
     try:
         names = generator.generate_many(specs, limit=req.limit, seed=req.seed, words=req.words)
     except ValueError as exc:
+        # A space too big to enumerate is refused with its real size rather than
+        # silently sampled, so "every name of this length" is never a lie.
         raise HTTPException(400, str(exc))
-    return {"count": len(names), "patterns": specs, "seed": req.seed, "usernames": names}
+    total = sum(
+        generator.space_size(str(spec["pattern"]), int(spec["length"]), req.words)
+        for spec in specs
+        if spec.get("pattern") and spec.get("length")
+    )
+    return {
+        "count": len(names),
+        "total": total,
+        "truncated": total > len(names),
+        "patterns": specs,
+        "seed": req.seed,
+        "usernames": names,
+    }
 
 
 @app.get("/generate")
 def generate_one(
     pattern: str = Query(..., pattern="^(letters|alnum|numbers|words)$"),
     length: int = Query(..., ge=1, le=32),
-    limit: int = Query(500, ge=1, le=100000),
+    # 0 or omitted enumerates the whole space, subject to MAX_ENUMERATION.
+    limit: int | None = Query(None, ge=0, le=100000),
     seed: int | None = Query(None),
     mode: str = Query("random", pattern="^(random|sequential)$"),
 ) -> dict:
@@ -698,6 +923,35 @@ def generate_many(req: GenerateRequest) -> dict:
     return _generate(req)
 
 
+# --- bucket menu ----------------------------------------------------------
+class BucketSpec(BaseModel):
+    """One entry in the dashboard's picker: `l` letters, `n` digits, `c` both,
+    `og` dictionary words, with the length."""
+
+    kind: str
+    length: int
+
+
+@app.get("/menu")
+def bucket_menu() -> dict:
+    """Every bucket the picker offers, with its real size.
+
+    The sizes are computed, not guessed: `3l` is 17,576 names, and a couple of
+    the buckets are large enough that the number is the most useful thing on the
+    screen. Nothing is sampled, so this is exactly what a run over that bucket
+    will check.
+    """
+    return {
+        "buckets": generator.menu(),
+        "kinds": {kind: generator.KIND_LABEL[kind] for kind in generator.KINDS},
+        "max_enumeration": MAX_ENUMERATION,
+    }
+
+
+def _bucket_words(buckets: list[BucketSpec]) -> list[str] | None:
+    return None
+
+
 # --- bulk scan ------------------------------------------------------------
 class ScanRequest(BaseModel):
     """Generate (and/or supply) names, then check them at throughput."""
@@ -705,7 +959,11 @@ class ScanRequest(BaseModel):
     platforms: list[str] | None = None
     usernames: list[str] = Field(default_factory=list)
     patterns: list[PatternSpec] = Field(default_factory=list)
-    limit: int = 2000
+    # The picker's selection. Each one is a kind and a length, and the union is
+    # what gets checked -- once per name, with the redundant buckets dropped.
+    buckets: list[BucketSpec] = Field(default_factory=list)
+    # None or 0 means every name the patterns describe, not a sample.
+    limit: int | None = None
     seed: int | None = None
     words: list[str] | None = None
     concurrency: int | None = None
@@ -713,13 +971,38 @@ class ScanRequest(BaseModel):
     stream: bool = False
 
 
-def _scan_names(req: ScanRequest) -> tuple[list[str], bool]:
-    names: list[str] = []
+def _scan_plan(req: ScanRequest) -> tuple[Iterable[str], int, bool]:
+    """The names to run over, lazily, plus how many that is.
+
+    An iterator rather than a list, deliberately: the picker can select
+    60,466,176 names, and the run consumes them once from front to back, so
+    building the list would make memory the only thing in the process that scales
+    with the size of the selection.
+    """
+    explicit: list[str] = []
     for raw in req.usernames:
         name = (raw or "").strip().lstrip("@")
-        if name and name not in names:
-            names.append(name)
-    if req.patterns:
+        if name and name not in explicit:
+            explicit.append(name)
+    if len(explicit) > SCAN_MAX_NAMES:
+        return explicit[:SCAN_MAX_NAMES], SCAN_MAX_NAMES, True
+
+    generated: Iterable[str] = ()
+    total = 0
+    if req.buckets:
+        specs = [bucket.model_dump() for bucket in req.buckets]
+        # Overlapping buckets are dropped before the count, so the number on the
+        # dashboard is what will actually be checked rather than a total that
+        # double-counts `og` inside `l`.
+        total = generator.buckets_total(specs, req.words)
+        if total > MAX_ENUMERATION:
+            raise HTTPException(
+                400,
+                f"that selection is {total:,} names, over the {MAX_ENUMERATION:,} one run "
+                "will enumerate. Drop a bucket or a length.",
+            )
+        generated = generator.iter_buckets(specs, req.words)
+    elif req.patterns:
         try:
             drawn = generator.generate_many(
                 [spec.model_dump() for spec in req.patterns],
@@ -729,18 +1012,28 @@ def _scan_names(req: ScanRequest) -> tuple[list[str], bool]:
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc))
-        for name in drawn:
-            if name not in names:
-                names.append(name)
-    if not names:
-        raise HTTPException(400, "give usernames, or at least one pattern to generate")
-    if len(names) > SCAN_MAX_NAMES:
-        return names[:SCAN_MAX_NAMES], True
-    return names, False
+        generated = drawn
+        total = len(drawn)
+
+    if not explicit and total == 0:
+        raise HTTPException(400, "pick at least one bucket, or give usernames")
+
+    def stream() -> Iterator[str]:
+        # Only the hand-supplied names are held in a set, so a selection of tens
+        # of millions still costs one name at a time.
+        seen = set(explicit)
+        yield from explicit
+        for name in generated:
+            if name in seen:
+                continue
+            yield name
+
+    return stream(), len(explicit) + total, False
 
 
 async def _scan_stream(
-    names: list[str],
+    names: Iterable[str],
+    names_total: int,
     platforms: list[str],
     pool: sniper.ProxyPool,
     concurrency: int,
@@ -748,24 +1041,22 @@ async def _scan_stream(
     truncated: bool,
     note: str = "",
     run: RunHandle | None = None,
+    alerter: Alerter | None = None,
 ) -> AsyncIterator[str]:
-    """NDJSON: one verdict per line, a rate line every ~100 checks, then a summary.
+    """NDJSON: one verdict per line, progress as it goes, then a summary.
 
     ``run.stop`` is what makes the dashboard's Stop button real: the dispatch
     loop in ``iter_snipes`` sees the same event, so a stop cancels the checks
     already in flight instead of only ending the response.
     """
-    meter = sniper.RateMeter()
-    checked = 0
-    available = 0
-    last_report = 0.0
-    counts: dict[str, int] = {}
+    tally = _Tally(names_total, platforms, alerter)
     run_id = run.id if run else ""
+    last_report = 0.0
     yield json.dumps(
         {
             "type": "start",
             "run_id": run_id,
-            "names": len(names),
+            "names": names_total,
             "truncated": truncated,
             "platforms": platforms,
             "pool_note": note,
@@ -783,49 +1074,37 @@ async def _scan_stream(
             retries=retries,
             stop=run.stop if run else None,
         ):
-            meter.tick()
-            checked += 1
+            tally.add(result)
             if run:
-                run.checked = checked
-            counts[result.status] = counts.get(result.status, 0) + 1
-            if result.status == "available":
-                available += 1
+                run.checked = tally.checked
             yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
             now = time.perf_counter()
-            if checked % 100 == 0 and (now - last_report) >= 0.5:
+            if tally.checked % 100 == 0 and (now - last_report) >= 0.5:
                 last_report = now
-                yield json.dumps(
-                    {
-                        "type": "progress",
-                        "checked": checked,
-                        "per_second": round(meter.recent, 1),
-                        "average_per_second": round(meter.average, 1),
-                        "available_count": available,
-                        "elapsed_s": round(meter.elapsed, 2),
-                    }
-                ) + "\n"
+                yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
+                await _flush_alerts(alerter)
     finally:
         if run:
             run.finish()
+        await _finish_alerts(alerter)
 
-    rate = meter.average
+    rate = tally.meter.average
     yield json.dumps(
         {
             "type": "done",
             "run_id": run_id,
             "stopped": bool(run and run.stop.is_set()),
-            "names": len(names),
+            "names": names_total,
             "platforms": platforms,
             "pool_note": note,
-            "by_status": counts,
-            "checked": checked,
-            "available_count": available,
             "per_second": round(rate, 1),
-            "recent_per_second": round(meter.recent, 1),
+            "recent_per_second": round(tally.meter.recent, 1),
             "target_rate": SCAN_TARGET_RATE,
             "target_met": rate >= SCAN_TARGET_RATE,
-            "duration_ms": round(meter.elapsed * 1000, 1),
+            "duration_ms": round(tally.elapsed * 1000, 1),
+            "alerts": _alert_report(alerter),
             **_pool_report(pool),
+            **tally.summary(),
         }
     ) + "\n"
 
@@ -837,12 +1116,21 @@ async def scan(req: ScanRequest):
     NDJSON by default so a long run can be watched live; ``"stream": false``
     buffers the same data into one JSON document.
     """
-    names, truncated = _scan_names(req)
-    pool, note = await _prepare_pool("scan")
+    names, names_total, truncated = _scan_plan(req)
     platforms = sniper.normalize_platforms(req.platforms)
     concurrency = max(1, req.concurrency or SCAN_CONCURRENCY)
     retries = SCAN_RETRIES if req.retries is None else max(0, req.retries)
+    if not req.stream and names_total > SCAN_BUFFER_MAX:
+        # The buffered path keeps every verdict in memory. A selection of
+        # millions would be an OOM, so it is refused before the pool is built.
+        raise HTTPException(
+            400,
+            f"that is {names_total:,} names; ask for stream=true, or keep a buffered "
+            f"batch under {SCAN_BUFFER_MAX:,}.",
+        )
+    pool, note = await _prepare_pool("scan", concurrency)
     run = _open_run("scan")
+    alerter = Alerter(alert_settings.get())
 
     if not req.stream:
         try:
@@ -859,28 +1147,91 @@ async def scan(req: ScanRequest):
             ]
         finally:
             run.finish()
+        tally = _Tally(names_total, platforms, alerter)
+        for result in results:
+            tally.add(result)
+        await _finish_alerts(alerter)
         rows = [_snipe_row(r) for r in results]
         available = [r for r in rows if r["status"] == "available"]
         return {
             "run_id": run.id,
             "stopped": run.stop.is_set(),
-            "names": len(names),
+            "names": names_total,
             "truncated": truncated,
             "platforms": platforms,
             "pool_note": note,
-            "by_status": _status_counts(rows),
-            "checked": len(rows),
-            "available_count": len(available),
             "available": available,
             "results": rows,
+            "alerts": _alert_report(alerter),
             **_pool_report(pool),
+            **tally.summary(),
         }
 
     return StreamingResponse(
-        _scan_stream(names, platforms, pool, concurrency, retries, truncated, note, run),
+        _scan_stream(
+            names,
+            names_total,
+            platforms,
+            pool,
+            concurrency,
+            retries,
+            truncated,
+            note,
+            run,
+            alerter,
+        ),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+# --- alert settings -------------------------------------------------------
+def _public_alert_settings() -> dict:
+    """Settings as the UI sees them. The webhook url is a capability, so it is
+    never logged and never echoed anywhere but here."""
+    effective = alert_settings.get()
+    webhook = str(effective.get("webhook") or "")
+    return {
+        "enabled": bool(effective.get("enabled")),
+        "webhook": webhook,
+        "webhook_set": bool(webhook),
+        "template": effective.get("template") or "",
+        "username": effective.get("username") or "",
+        "avatar": effective.get("avatar") or "",
+        "ping": effective.get("ping") or "",
+        "batch": effective.get("batch"),
+        "min_interval": effective.get("min_interval"),
+        "max_messages": effective.get("max_messages"),
+    }
+
+
+class AlertPatch(BaseModel):
+    webhook: str | None = None
+    template: str | None = None
+    username: str | None = None
+    avatar: str | None = None
+    ping: str | None = None
+    enabled: bool | None = None
+
+
+@app.get("/settings")
+def get_settings() -> dict:
+    return {"alerts": _public_alert_settings()}
+
+
+@app.post("/settings")
+def save_settings(patch: AlertPatch) -> dict:
+    """Change the alert settings. Anything left out keeps its current value."""
+    changes = {k: v for k, v in patch.model_dump().items() if v is not None}
+    alert_settings.update(changes)
+    log.info("alert settings updated: %s", sorted(changes))
+    return {"alerts": _public_alert_settings()}
+
+
+@app.post("/settings/test-webhook")
+async def test_webhook() -> dict:
+    """Post one message so the webhook can be seen to land, not assumed to."""
+    return await alerts.post_test(alert_settings.get())
 
 
 # --- claiming -------------------------------------------------------------
@@ -889,6 +1240,36 @@ async def scan(req: ScanRequest):
 # account factory: automating signups is what gets an IP range banned and is not
 # something this service will do.
 CLAIM_TARGETS: dict[str, dict[str, str]] = {
+    "roblox": {
+        "register_url": "https://www.roblox.com/signup",
+        "existing_account": "Settings > Account Info > Edit username (1000 Robux)",
+        "note": "Roblox assigns the username at signup and allows one paid change later.",
+    },
+    "minecraft": {
+        "register_url": "https://www.minecraft.net/en-us/msa",
+        "existing_account": "minecraft.net > Profile > Change username",
+        "note": "A Java Edition name is set on the account, not on a profile.",
+    },
+    "telegram": {
+        "register_url": "https://web.telegram.org/",
+        "existing_account": "Settings > Username",
+        "note": "Telegram handles are set inside the app once you have an account.",
+    },
+    "x": {
+        "register_url": "https://x.com/i/flow/signup",
+        "existing_account": "Settings > Your account > Account information > Username",
+        "note": "X assigns the handle at signup and allows changes from settings.",
+    },
+    "github": {
+        "register_url": "https://github.com/signup",
+        "existing_account": "Settings > Account > Change username",
+        "note": "GitHub redirects the old name to the new one after a change.",
+    },
+    "youtube": {
+        "register_url": "https://www.youtube.com/handle",
+        "existing_account": "youtube.com/handle",
+        "note": "A YouTube handle is claimed once the channel has one, at /handle.",
+    },
     "discord": {
         "register_url": "https://discord.com/register",
         "existing_account": "User Settings > My Account > Username",
@@ -914,11 +1295,18 @@ CLAIM_TARGETS: dict[str, dict[str, str]] = {
 
 @app.get("/claim")
 def claim(
-    platform: str = Query(..., pattern="^(discord|guns\\.lol|instagram|tiktok)$"),
+    platform: str = Query(..., min_length=1),
     username: str = Query(..., min_length=1, max_length=32),
 ) -> dict:
-    """Where to register a name the run just reported as free."""
-    target = CLAIM_TARGETS[platform]
+    """Where to register a name the run just reported as free.
+
+    The platform is looked up rather than pattern-matched against a hardcoded
+    list, so adding a platform to the grid cannot leave /claim answering 422 for
+    a platform the run itself reports on.
+    """
+    target = CLAIM_TARGETS.get(platform.strip().lower())
+    if target is None:
+        raise HTTPException(400, f"unknown platform; try one of {sorted(CLAIM_TARGETS)}")
     return {
         "platform": platform,
         "username": username.strip().lstrip("@"),

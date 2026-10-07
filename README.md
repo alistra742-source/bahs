@@ -1,161 +1,202 @@
 # bahs
 
-Username availability across **Discord · guns.lol · Instagram · TikTok**, run through a
-proxy list you control.
+Username availability across ten platforms, over your own proxy list.
 
-Paste or upload your proxies, paste or generate usernames, press run. The dashboard
-streams every verdict as it lands, with a live check rate, an available-only filter and
-a Stop button that actually cancels the requests in flight.
+Paste or upload a proxy list, pick the name spaces you want swept, and it checks
+**every** name in them — nothing is sampled. Results stream to the dashboard as
+they land, free names can go straight to a Discord webhook, and a platform that
+rate-limits the whole pool sits out while the rest of the run continues.
 
-There is no scraper and no proxy validator in here. The list you save **is** the pool: a
-host that does not work shows up as an error on the name it was used for and is retired
-for the rest of the run.
-
----
+Nothing is scraped. Nothing is validated ahead of time. The list you paste is
+exactly what a run rotates over.
 
 ## Run it
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 
-Open <http://localhost:8080>. On Railway the `Dockerfile` and `railway.json` are already
-wired up; set `STORE_PATH` to a mounted volume to keep the list across deploys.
+Open `http://localhost:8080`. On Railway, `PORT` is injected; point `STORE_PATH`
+at a volume so the proxy list and settings survive a deploy.
 
-## Proxy list
+## Platforms
 
-Paste one per line, or drop a `.txt` on the box in the dashboard. All of these read
-correctly:
-
-```
-1.2.3.4:8080                       -> http://1.2.3.4:8080
-https://1.2.3.4:8080               -> https://1.2.3.4:8080
-socks5://1.2.3.4:1080              -> socks5://1.2.3.4:1080
-user:pass@1.2.3.4:8080             -> http://user:pass@1.2.3.4:8080
-socks5://user:pass@1.2.3.4:1080    -> socks5://user:pass@1.2.3.4:1080
-1.2.3.4:8080:user:pass             -> http://user:pass@1.2.3.4:8080
-[2001:db8::1]:8080                 -> http://[2001:db8::1]:8080
-proxy.example.com:3128             -> http://proxy.example.com:3128
-```
-
-A bare `host:port` is read as `http`. Duplicates are dropped, unreadable lines are counted
-and shown. `socks4://` and `socks5://` work because `httpx[socks]` is pinned in
-`requirements.txt`.
-
-The list lives in `data/proxies.json` (`STORE_PATH`), written atomically — a crash
-mid-write cannot leave a half-written list for a run to read.
-
-## The four checks
-
-Each one is the platform's own availability answer, read off the live site rather than
-guessed at. Nothing here logs in, and nothing creates an account.
-
-| platform | request | available means |
+| platform | how the check works | latency from a datacenter IP |
 |---|---|---|
-| **discord** | `POST /api/v9/unique-username/username-attempt-unauthed` — the signup form's own endpoint | `{"taken": false}` |
-| **guns.lol** | `GET /{name}`, read until the verdict lands | the default page (no `profile-page-json-ld` marker) |
-| **instagram** | `GET /api/v1/users/web_profile_info/?username=` with the web app's `x-ig-app-id` | `404` |
-| **tiktok** | `GET /oembed?url=…/@name` | `400 {"message":"Something went wrong","code":400}` |
+| **roblox** | its own signup validator — a ~50 byte JSON body whose `code` *is* the verdict | ~130 ms |
+| **minecraft** | `minecraftservices` profile lookup; 200 carries the account, 404 means free | ~290 ms |
+| **github** | `api.github.com/users/{name}` — 200 taken, 404 free | ~130 ms |
+| **telegram** | `t.me/{name}`; a live handle renders `tgme_page_title`, a free one the generic page | ~450 ms |
+| **discord** | `unique-username/username-attempt-unauthed` | ~140 ms |
+| **instagram** | `web_profile_info` with the web app id | refused from most datacenter IPs |
+| **tiktok** | oEmbed: 200 + `author_name` taken, 400 free | ~300 ms |
+| **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
+| **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
+| **guns.lol** | profile page, first 16 KB | ~860 ms |
 
-Statuses you will see: `available`, `taken`, `invalid` (the name itself is not allowed —
-e.g. Discord's reserved words), `blocked` (the platform rate-limited or challenged the
-request) and `error` (transport, or a response that could not be read).
+**GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
+IP — not a check rate, a limit you hit in a minute and then sit out. Set
+`GITHUB_TOKEN` and the ceiling becomes 5,000.
 
-A `blocked` or `error` says nothing about the name, only about the proxy it went through,
-so those are retried on a different host. A definitive answer is never retried, and a
-response that cannot be interpreted is reported as an error rather than assumed to be
-available.
+**Instagram is the weak one.** It refuses datacenter IPs with a blanket 429
+before your proxy list is involved, so it depends on the list being
+residential-ish. It reports that honestly as `blocked` rather than guessing.
+
+## Name spaces
+
+Pick any combination of these. `l` letters a–z, `n` digits, `c` letters+digits,
+`og` dictionary words — and the length.
+
+| | 3 | 4 | 5 |
+|---|---|---|---|
+| **l** | 17,576 | 456,976 | 11,881,376 |
+| **n** | 1,000 | 10,000 | 100,000 |
+| **c** | 46,656 | 1,679,616 | 60,466,176 |
+| **og** | 431 | 1,418 | 2,157 |
+
+Overlapping selections are dropped before the count: `og` words are letters, so
+`3og` inside `3l` adds nothing, and `l`/`n` are both inside `c`. Selecting `3l`
+and `3og` checks 17,576 names, not 18,007 — "every combination" never means the
+same name twice.
+
+Lower-case only, deliberately: a handle is case-insensitive for uniqueness
+everywhere here, and TikTok's oEmbed will not resolve a mixed-case one at all.
+
+### The ceiling, and why it moved
+
+`MAX_ENUMERATION` used to be 1,000,000, and it was a *memory* limit — the names
+were built as a list, and "all of length 4 alphanumeric" is ~200 MB of Python
+strings while 14,776,336 is ~843 MB.
+
+Enumeration is lazy now. `itertools` walks the space while the run consumes it,
+so **memory no longer scales with the size of the space** — walking 400,000
+names of a 60-million space holds RSS flat (measured: 29 MB → 29 MB).
+
+So the ceiling is a sanity bound rather than a resource one, and it defaults to
+100,000,000: every bucket above is allowed, including `5c`. What a big selection
+costs is **wall clock**, which is why the dashboard shows an estimate from your
+last measured rate instead of letting you start a three-day run blind. Nothing
+is ever silently sampled — a space over the cap is refused with its real size.
+
+## Speed, measured
+
+Throughput tracks **connections ÷ platform latency**, not client parallelism.
+Measured against a local origin through real HTTP proxies:
+
+| origin latency | pool | connections | checks/s |
+|---|---|---|---|
+| 150 ms | 1 endpoint | 64 | 75 |
+| 150 ms | 8 endpoints | 64 | **364** |
+| 800 ms | 8 endpoints | 256 | 254 |
+| 800 ms | 1 endpoint | 64 | 77 |
+
+The client's own ceiling is around 2,000 dispatches/s, so it is never the wall.
+What moves the number is **more concurrent exit IPs**. With one rotating
+endpoint, per-proxy connections are the whole ceiling: measured 3.9/s at 1
+connection, 13.0/s at 6, 53.1/s at 32. Per-proxy connections are sized from your
+pool and the concurrency you ask for, so a small list still gets the connections
+it can use.
+
+**A headless browser would make this slower, not faster** — a page load adds
+hundreds of milliseconds and hundreds of MB per worker to do what one HTTP
+request already does.
+
+## Rate limits
+
+A `429` is the platform talking, not your proxies, and it is handled as such:
+
+- The proxy is **rested** briefly and counted in its own `blocked` column. It is
+  never retired for it.
+- When a platform has refused **every** proxy in the list, that platform is
+  **paused** — with the `retry_after` the platform gave, capped at
+  `SNIPE_PLATFORM_PAUSE_MAX`. Jobs for it are skipped instead of hammered.
+- The **rest of the run continues** on the platforms that are still answering.
+  A discord 429 no longer costs you the tiktok sweep.
+- If every platform ends up paused, the run stops and says which and why.
+
+A run only reports "proxies exhausted" when the list genuinely is — every proxy
+retired on transport errors.
+
+## Alerts
+
+Set a Discord webhook on the **Alerts** tab (or `ALERT_WEBHOOK`) and free names
+are posted as they are found, digested into batches of ten embeds. Default
+template: `{platform} username available: `{username}``. Placeholders are
+`{username}`, `{platform}`, `{detail}`.
+
+The webhook is posted to **directly, never through your proxy list** — a webhook
+URL authenticates the post *and* names the channel, so routing it through a
+pasted proxy would hand whoever runs that proxy the ability to post there.
+
+A webhook URL is a capability. Keep it out of screenshots, and use **Send test**
+to confirm it lands rather than assuming.
+
+## Claiming
+
+`GET /claim?platform=&username=` returns the platform's own registration route.
+It does **not** create an account, and no part of this does: automating signups
+is what gets an IP range banned, and a name is only yours once *you* have
+registered it. Confirm the name is still free, then claim it yourself.
 
 ## API
 
-```
-GET    /info                     what this is, and every route
-GET    /health                   stored-proxy stats and live runs
-GET    /proxies                  the stored list (?limit / ?offset / ?format=txt)
-POST   /proxies                  {"text": "...", "mode": "append"|"replace"}
-POST   /proxies/upload           same, with the list as the raw request body
-DELETE /proxies?proxy=...        remove one
-POST   /proxies/clear            empty the list
+| | |
+|---|---|
+| `GET /` | the dashboard |
+| `GET /info`, `GET /health` | platforms, generation, counters |
+| `GET /menu` | every bucket with its real size |
+| `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
+| `POST /scan` | `{buckets:[{kind,length}], platforms, concurrency, stream}` |
+| `POST /snipe` | the same for explicit `usernames` |
+| `GET /snipe?username=` | one name |
+| `GET /generate` | `letters\|alnum\|numbers\|words` by length |
+| `POST /scan/stop` `POST /snipe/stop` `POST /runs/stop` `GET /runs` | the stop path |
+| `GET /claim` | where to register a name |
+| `GET /settings` `POST /settings` `POST /settings/test-webhook` | alerts |
 
-POST   /snipe                    {"usernames": [...], "platforms": [...], "stream": true}
-GET    /snipe?username=...       one name from the query string
-POST   /snipe/stop               cancel every in-flight /snipe
-POST   /scan                     {"patterns": [...], "platforms": [...], "stream": true}
-POST   /scan/stop                cancel every in-flight /scan
-GET    /runs  ·  POST /runs/stop runs in flight, and how to stop them
+`stream: true` returns NDJSON: `start`, then a `result` line per verdict, a
+`progress` line as it goes, and a `done` summary.
 
-GET    /generate?pattern=letters&length=4&limit=500
-POST   /generate                 several patterns at once
-GET    /claim?platform=&username= where a free name would be registered
-```
+## Environment
 
-`/snipe` and `/scan` answer **NDJSON** when `stream: true` — one verdict per line, then a
-`done` line — so the first answer is visible in the first second and a proxy or gateway
-never has to hold a whole batch open. `stream: false` buffers the same data into one JSON
-document.
-
-Stop is a real halt, not just a closed socket: `POST /snipe/stop` flips an event the
-dispatch loop is racing against its in-flight tasks, those tasks are cancelled and awaited,
-and only then does the run report `stopped: true`.
-
-```bash
-# upload a list, then check a handful of names
-curl -X POST --data-binary @proxies.txt 'localhost:8080/proxies/upload?mode=replace'
-curl -s 'localhost:8080/snipe?username=nike&platform=tiktok' | jq
-```
-
-## Configuration
-
-Everything tunable is an environment variable read in `config.py`.
-
-| variable | default | what it does |
+| variable | default | |
 |---|---|---|
-| `PORT` / `HOST` | `8080` / `0.0.0.0` | where the service binds |
-| `STORE_PATH` | `data/proxies.json` | where the saved list lives (mount a volume here) |
-| `MAX_PROXIES` | `100000` | ceiling on the stored list |
-| `SNIPE_POOL` | `5000` | how many stored proxies one run rotates over |
-| `SNIPE_CONCURRENCY` / `SCAN_CONCURRENCY` | `64` / `256` | checks in flight at once |
-| `SNIPE_PER_PROXY` / `SCAN_PER_PROXY` | `4` / `6` | simultaneous requests allowed through one proxy |
-| `SNIPE_MAX_CLIENTS` | `512` | warm clients kept open before the least recently used is closed |
-| `SNIPE_RETRIES` / `SCAN_RETRIES` | `2` / `0` | retries on another proxy for blocked/errored names |
-| `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3.0` / `8.0` | per-check timeouts |
-| `SNIPE_PROXY_COOLDOWN` | `60` | how long a proxy that just failed is rested |
-| `SNIPE_PROXY_FAIL_LIMIT` | `6` | failures in one run before a proxy is retired |
-| `MAX_CONCURRENT_RUNS` | `8` | runs the server will track at once (429 past it) |
-| `SCAN_TARGET_RATE` | `100` | the rate the dashboard reports against |
-| `OG_WORDS_FILE` / `OG_WORDS` | — | extra words for the `words` pattern |
+| `PORT` | `8080` | |
+| `STORE_PATH` | `data/proxies.json` | point at a volume |
+| `SETTINGS_PATH` | `data/settings.json` | alert settings |
+| `GITHUB_TOKEN` | — | raises GitHub from 60/hr to 5,000 |
+| `ALERT_WEBHOOK` | — | Discord webhook |
+| `ALERT_TEMPLATE` | `{platform} username available: `{username}`` | |
+| `ALERT_PING` | — | `@here`, `<@&roleid>` — first message only |
+| `ALERT_BATCH` | `10` | embeds per message |
+| `ALERT_MIN_INTERVAL` | `1.2` | seconds between posts |
+| `ALERT_MAX_MESSAGES` | `20` | posts per run |
+| `MAX_ENUMERATION` | `100000000` | names per run |
+| `MAX_PROXIES` | `100000` | |
+| `SCAN_CONCURRENCY` | `256` | checks in flight |
+| `SCAN_BUFFER_MAX` | `50000` | largest buffered (non-stream) run |
+| `SCAN_TARGET_RATE` | `100` | reported against on the dashboard |
+| `SNIPE_PER_PROXY` | `4` | floor for connections per proxy |
+| `SNIPE_PER_PROXY_MAX` | `64` | ceiling for one proxy |
+| `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
+| `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
+| `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
+| `SNIPE_PROXY_FAIL_LIMIT` | `6` | transport failures before a proxy is retired |
+| `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
+| `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
+| `MAX_CONCURRENT_RUNS` | `8` | 429 past it |
+| `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
+| `LOG_LEVEL` | `info` | |
 
-## Performance notes
+## Layout
 
-Three things decide how fast a run moves, and none of them is the HTTP client:
-
-1. **The proxies.** A pasted public list is mostly dead within minutes, and a dead host
-   costs its connect timeout. `ConnectError`/`ProxyError` columns are what an exhausted
-   list looks like, not a bug.
-2. **`READ_TIMEOUT`.** A host that accepts TCP and then never answers costs the *read*
-   timeout, not the connect timeout. Lower it and runs get faster; raise it and more
-   slow-but-alive hosts survive.
-3. **Warm clients.** One `httpx.AsyncClient` per proxy keeps the CONNECT tunnel and the
-   TLS handshake alive across names, which is the single biggest cost in a batch. They
-   share one `ssl.SSLContext`: a fresh context per client costs ~1.25 MB (the CA bundle
-   is re-parsed), which at a few hundred clients is enough to OOM the process. Bounded to
-   `SNIPE_MAX_CLIENTS` so a six-figure list cannot become a six-figure number of sockets.
-
-## Honest limits
-
-- **Instagram blocks datacenter IPs outright** — from a cloud host every request comes
-  back `429` before the proxy list is involved. Its check is the one most dependent on the
-  quality of the proxies you supply, and it is the one that could not be verified from a
-  datacenter host.
-- **TikTok's profile page is useless for this from a datacenter IP**: it answers `200`
-  with a generic shell that is byte-for-byte similar whether or not the account exists,
-  which would read as "available" for everything. That is why the check is oEmbed, and
-  why anything other than its `200`/`400` shapes is reported as `blocked`/`error`.
-- **There is no account creation here.** `/claim` copies the name and hands you the
-  platform's own registration page. Automating signups is what gets an IP range banned,
-  and it is not something this service does.
-- **Rate limits are still real.** Rotating proxies spreads requests across IPs; it does
-  not make the platforms stop counting. The `blocked` column is the platform saying so.
-- Results live in the browser session only. Nothing about a run is persisted.
+```
+server.py      HTTP surface, the run loop's reporting, alerts wiring
+sniper.py      the proxy pool, the scheduler, and the per-platform checkers
+generator.py   buckets and lazy enumeration
+proxies.py     parsing and storing the proxy list
+alerts.py      the Discord webhook
+static/        the dashboard (one file, no build step)
+wordlists/     og.txt
+```

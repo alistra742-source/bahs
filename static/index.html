@@ -2,952 +2,741 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>bahs — username availability</title>
 <style>
 :root{
-  color-scheme:dark;
-  --bg:#080a0f; --panel:#0f131b; --panel2:#0b0f16; --line:#1d2534; --line2:#28313f;
-  --txt:#e8ebf2; --dim:#8b96ab; --dim2:#606b80;
-  --blue:#4c8dff; --green:#2fd07a; --red:#ff5c5c; --amber:#f0b429; --purple:#a880ff;
-  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --bg:#0a0b10; --panel:#12141c; --panel2:#171a24; --line:#232735; --line2:#2e3346;
+  --text:#e8ecf5; --dim:#8b93a8; --dim2:#5d6579;
+  --acc:#6c5ce7; --acc2:#00e0b8; --ok:#2ee6a8; --warn:#ffb020; --bad:#ff5f6d; --info:#4aa8ff;
+  --mono:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{
-  margin:0;background:var(--bg);color:var(--txt);
-  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
-  -webkit-text-size-adjust:100%;
-}
-body::before{
-  content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:
-    radial-gradient(760px 420px at 8% -8%,rgba(76,141,255,.16),transparent 62%),
-    radial-gradient(620px 380px at 98% -4%,rgba(47,208,122,.10),transparent 60%),
-    radial-gradient(900px 600px at 50% 110%,rgba(168,128,255,.07),transparent 65%);
-}
-.app{position:relative;z-index:1;max-width:1320px;margin:0 auto;padding:26px 18px 120px}
-
-/* --- header --- */
-header.top{display:flex;flex-wrap:wrap;gap:18px;align-items:center;justify-content:space-between;margin-bottom:20px}
-.brand{display:flex;align-items:center;gap:13px;min-width:0}
-.logo{
-  width:42px;height:42px;border-radius:13px;flex:none;display:grid;place-items:center;
-  background:linear-gradient(135deg,#4c8dff,#2fd07a);color:#06090e;
-  font:800 18px var(--mono);box-shadow:0 6px 24px -8px rgba(76,141,255,.8)
-}
-h1{margin:0;font-size:21px;font-weight:680;letter-spacing:-.03em}
-h1 span{color:var(--dim);font-weight:400}
-.sub{color:var(--dim);font-size:12.5px;font-family:var(--mono);margin-top:1px}
-.chips{display:flex;flex-wrap:wrap;gap:8px}
-.chip{
-  display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);
-  border-radius:999px;padding:7px 13px;font:12px var(--mono);white-space:nowrap
-}
-.chip .led{width:7px;height:7px;border-radius:50%;background:var(--dim2);flex:none;transition:background .2s}
-.chip.on .led{background:var(--green);box-shadow:0 0 9px rgba(47,208,122,.75)}
-.chip.warn .led{background:var(--amber);box-shadow:0 0 9px rgba(240,180,41,.7)}
-.chip.bad .led{background:var(--red);box-shadow:0 0 9px rgba(255,92,92,.7)}
-.chip .k{color:var(--dim2);text-transform:uppercase;letter-spacing:.09em;font-size:10.5px;font-weight:700}
-.chip .v{color:#cfd7e6;font-weight:600}
-
-/* --- layout --- */
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
-@media(max-width:900px){.grid2{grid-template-columns:1fr}}
-.card{
-  background:linear-gradient(180deg,rgba(255,255,255,.018),transparent 40%),var(--panel);
-  border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:16px
-}
-.ch{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:12px}
-.ch h2{margin:0;font-size:14.5px;font-weight:660;letter-spacing:-.01em;display:flex;align-items:center;gap:8px}
-.ch h2 .n{
-  width:20px;height:20px;border-radius:7px;display:grid;place-items:center;font:700 10.5px var(--mono);
-  background:#16202f;color:var(--blue);border:1px solid #22304a
-}
-.hint{color:var(--dim);font:11.5px var(--mono)}
-.hint.dim2{color:var(--dim2)}
-.row{display:flex;flex-wrap:wrap;gap:9px;align-items:center}
-.row.tight{gap:7px}
-.spacer{flex:1 1 auto}
-
-/* --- controls --- */
-button{
-  border:1px solid transparent;border-radius:10px;padding:9px 15px;font:640 13px inherit;cursor:pointer;
-  color:#fff;background:#1a2230;transition:transform .13s,filter .13s,opacity .13s;white-space:nowrap
-}
-button:disabled{opacity:.4;cursor:not-allowed}
-button:not(:disabled):hover{transform:translateY(-1px);filter:brightness(1.12)}
-button:not(:disabled):active{transform:translateY(0)}
-.primary{background:linear-gradient(135deg,#3f7dff,#2757d6)}
-.go{background:linear-gradient(135deg,#22b96a,#17904f)}
-.stopbtn{background:#34161a;border-color:#5b2630;color:#ffb3b3}
-.ghost{background:#141a24;border-color:var(--line2);color:#c6d0e0}
-.mini{background:#141a24;border:1px solid var(--line2);color:#c6d0e0;padding:5px 10px;font-size:11.5px;border-radius:8px}
-.danger{background:#241318;border:1px solid #4d2229;color:#ffa1a1}
-input,select,textarea{
-  background:var(--panel2);border:1px solid var(--line);border-radius:10px;color:var(--txt);
-  padding:9px 11px;font:13px var(--mono);outline:none;transition:border-color .15s
-}
-input:focus,select:focus,textarea:focus{border-color:#31517f}
-textarea{width:100%;resize:vertical;line-height:1.5}
-input[type=number]{width:82px}
-label.f{display:inline-flex;align-items:center;gap:6px;font:11.5px var(--mono);color:var(--dim)}
-
-/* --- platform toggles --- */
-.pfs{display:flex;flex-wrap:wrap;gap:8px}
-.pf{
-  display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--panel2);
-  border-radius:11px;padding:9px 13px;cursor:pointer;font:600 12.5px var(--mono);color:var(--dim);
-  transition:border-color .15s,color .15s,background .15s;user-select:none
-}
-.pf input{display:none}
-.pf .dot{width:8px;height:8px;border-radius:50%;background:var(--dim2);transition:all .15s}
-.pf.on{color:#eaf0fa;border-color:#31517f;background:#111a29}
-.pf.on .dot{background:var(--green);box-shadow:0 0 8px rgba(47,208,122,.8)}
-
-/* --- dropzone --- */
-.drop{
-  border:1.5px dashed var(--line2);border-radius:12px;padding:16px;text-align:center;color:var(--dim);
-  font:12px var(--mono);cursor:pointer;transition:border-color .15s,background .15s,color .15s;background:var(--panel2)
-}
-.drop:hover,.drop.over{border-color:#31517f;background:#101827;color:#cfd7e6}
-
-/* --- stats --- */
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:9px;margin-top:12px}
-.stat{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:10px 12px}
-.stat .k{color:var(--dim2);font:10.5px var(--mono);text-transform:uppercase;letter-spacing:.08em;font-weight:700}
-.stat .v{font:660 19px var(--mono);margin-top:3px;letter-spacing:-.02em}
-.stat .v.green{color:var(--green)}
-.stat .v.blue{color:var(--blue)}
-.stat .v.amber{color:var(--amber)}
-
-/* --- progress --- */
-.bar{height:6px;border-radius:99px;background:#182130;overflow:hidden;margin-top:10px}
-.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4c8dff,#2fd07a);transition:width .25s ease}
-
-/* --- tables --- */
-.tw{overflow:auto;margin-top:12px;border:1px solid var(--line);border-radius:12px;max-height:420px}
-.tw.tall{max-height:560px}
-table{width:100%;border-collapse:collapse;font:12px var(--mono)}
-th{
-  position:sticky;top:0;z-index:1;background:#0d121a;text-align:left;color:var(--dim2);font-weight:700;
-  padding:9px 10px;border-bottom:1px solid var(--line);font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;white-space:nowrap
-}
-td{padding:7px 10px;border-bottom:1px solid #141a24;white-space:nowrap;color:#d3dae7}
-tbody tr:last-child td{border-bottom:none}
-tbody tr:hover td{background:#0d131d}
-td.wrap{white-space:normal;word-break:break-all;color:var(--dim);min-width:150px}
-td.num{text-align:right;color:var(--dim)}
-.pill{
-  display:inline-block;border-radius:99px;padding:2px 9px;font:700 10.5px var(--mono);
-  border:1px solid var(--line);letter-spacing:.02em
-}
-.pill.available{color:#8ff0b4;border-color:#1d5133;background:#0c2116}
-.pill.taken{color:#ffb3b3;border-color:#5b2630;background:#221014}
-.pill.invalid{color:#f5cd7a;border-color:#54401a;background:#241d0e}
-.pill.blocked{color:#c0b0ff;border-color:#3d3566;background:#171430}
-.pill.error{color:var(--dim);border-color:var(--line2);background:#12171f}
-.filter{display:inline-flex;gap:6px;flex-wrap:wrap}
-.filter button{
-  background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:5px 11px;
-  font:600 11.5px var(--mono);border-radius:99px
-}
-.filter button.on{background:#111a29;border-color:#31517f;color:#e6ecf7}
-.empty{color:var(--dim2);font:12.5px var(--mono);padding:26px 12px;text-align:center}
-.fnote{color:var(--dim2);font:11px var(--mono);margin-top:8px}
-.msg{font:12px var(--mono);color:var(--dim)}
-.msg.ok{color:var(--green)}
-.msg.bad{color:var(--red)}
-.spin{width:11px;height:11px;border:2px solid var(--blue);border-top-color:transparent;border-radius:50%;display:inline-block;animation:sp .7s linear infinite;vertical-align:-1px}
-@keyframes sp{to{transform:rotate(360deg)}}
+   radial-gradient(900px 500px at 12% -8%,rgba(108,92,231,.16),transparent 60%),
+   radial-gradient(700px 420px at 100% 0%,rgba(0,224,184,.10),transparent 60%)}
+.shell{position:relative;z-index:1;display:grid;grid-template-columns:220px 1fr;min-height:100%}
+/* ---------- sidebar ---------- */
+.side{border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:6px;background:rgba(10,11,16,.6)}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 18px}
+.brand .dot{width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 0 14px rgba(108,92,231,.8)}
+.brand b{font-size:15px;letter-spacing:.5px}
+.brand span{font-size:10px;color:var(--dim2);font-family:var(--mono)}
+.nav{display:flex;flex-direction:column;gap:3px}
+.nav button{all:unset;cursor:pointer;display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;color:var(--dim);font-weight:500;transition:.12s}
+.nav button:hover{background:var(--panel);color:var(--text)}
+.nav button.on{background:linear-gradient(90deg,rgba(108,92,231,.22),rgba(108,92,231,.05));color:#fff;box-shadow:inset 0 0 0 1px var(--line2)}
+.nav .ico{width:18px;text-align:center;opacity:.9}
+.nav .tag{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--dim2)}
+.side .foot{margin-top:auto;font-size:11px;color:var(--dim2);font-family:var(--mono);padding:10px 8px;line-height:1.7}
+.side .foot b{color:var(--dim)}
+/* ---------- main ---------- */
+main{padding:26px 30px 90px;max-width:1500px}
+.view{display:none}.view.on{display:block;animation:fade .18s ease}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+h1{font-size:21px;margin:0 0 3px;letter-spacing:-.2px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:22px}
+.card{background:linear-gradient(180deg,var(--panel),rgba(18,20,28,.6));border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);margin:0 0 14px;font-weight:600}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:1100px){.grid2{grid-template-columns:1fr}.shell{grid-template-columns:64px 1fr}.brand b,.brand span,.nav .tag{display:none}.nav button{justify-content:center}}
+/* ---------- controls ---------- */
+button.btn{all:unset;cursor:pointer;padding:9px 15px;border-radius:9px;font-weight:600;font-size:13px;text-align:center;transition:.12s;border:1px solid var(--line2);color:var(--text)}
+button.btn:hover{border-color:var(--acc);background:rgba(108,92,231,.12)}
+button.btn.primary{background:linear-gradient(135deg,var(--acc),#8b7cf6);border-color:transparent;color:#fff}
+button.btn.primary:hover{filter:brightness(1.13)}
+button.btn.danger{border-color:rgba(255,95,109,.4);color:#ffb4ba}
+button.btn.danger:hover{background:rgba(255,95,109,.14);border-color:var(--bad)}
+button.btn.ghost{border-color:transparent;color:var(--dim);padding:6px 9px}
+button.btn.ghost:hover{color:var(--text);background:var(--panel2)}
+button.btn:disabled{opacity:.42;cursor:not-allowed;filter:none}
+input[type=text],input[type=number],textarea,select{width:100%;background:#0d0f16;border:1px solid var(--line2);color:var(--text);border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:12.5px;outline:none;transition:.12s}
+input:focus,textarea:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(108,92,231,.14)}
+textarea{min-height:110px;resize:vertical;line-height:1.5}
+label.fld{display:block;font-size:11px;color:var(--dim);margin:0 0 6px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px}
+input[type=range]{width:100%;accent-color:var(--acc)}
+.sw{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;font-size:12.5px;color:var(--dim)}
+.sw input{display:none}
+.sw i{width:34px;height:19px;border-radius:20px;background:var(--line2);position:relative;transition:.16s;flex:none}
+.sw i::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#7c8299;transition:.16s}
+.sw input:checked + i{background:rgba(46,230,168,.35)}
+.sw input:checked + i::after{left:17px;background:var(--ok)}
+.chips{display:flex;gap:7px;flex-wrap:wrap}
+.chip{cursor:pointer;user-select:none;padding:6px 11px;border-radius:8px;border:1px solid var(--line2);font-family:var(--mono);font-size:12px;color:var(--dim);transition:.12s}
+.chip:hover{border-color:var(--acc);color:var(--text)}
+.chip.on{background:rgba(108,92,231,.2);border-color:var(--acc);color:#fff}
+/* ---------- buckets ---------- */
+.bucketrow{display:grid;grid-template-columns:52px repeat(4,1fr);gap:9px;align-items:center;margin-bottom:9px}
+.bhead{font-size:10.5px;color:var(--dim2);font-family:var(--mono);text-transform:uppercase;letter-spacing:.6px}
+.bucketrow .len{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--dim)}
+.bucket{cursor:pointer;border:1px solid var(--line2);border-radius:10px;padding:8px 10px;background:#0d0f16;transition:.12s;position:relative;overflow:hidden}
+.bucket:hover{border-color:var(--acc)}
+.bucket.on{border-color:var(--acc);background:linear-gradient(135deg,rgba(108,92,231,.25),rgba(0,224,184,.09))}
+.bucket .k{font-family:var(--mono);font-size:12.5px;font-weight:700;color:var(--text)}
+.bucket .n{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:2px}
+.bucket .d{font-size:10px;color:var(--dim2);margin-top:3px}
+.bucket.redun{opacity:.4}
+.bucket .x{position:absolute;top:5px;right:7px;font-size:9px;color:var(--warn);font-family:var(--mono)}
+/* ---------- stats ---------- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:11px}
+.tile{background:#0d0f16;border:1px solid var(--line);border-radius:11px;padding:12px 13px}
+.tile .l{font-size:10px;color:var(--dim2);text-transform:uppercase;letter-spacing:.7px;font-family:var(--mono)}
+.tile .v{font-family:var(--mono);font-size:23px;font-weight:700;margin-top:5px;letter-spacing:-.5px}
+.tile.ok .v{color:var(--ok)}.tile.bad .v{color:var(--bad)}.tile.warn .v{color:var(--warn)}
+.tile.info .v{color:var(--info)}.tile.acc .v{color:var(--acc2)}
+.bar{height:7px;border-radius:6px;background:#0d0f16;border:1px solid var(--line);overflow:hidden;margin:14px 0 8px}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .25s}
 .mono{font-family:var(--mono)}
-a{color:var(--blue)}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#1e2836;border-radius:99px;border:2px solid var(--panel)}
-::-webkit-scrollbar-thumb:hover{background:#2b3849}
-
-/* --- run bar --- */
-.runbar{
-  position:fixed;left:0;right:0;bottom:0;z-index:20;border-top:1px solid var(--line);
-  background:rgba(9,12,18,.9);backdrop-filter:blur(12px);padding:10px 18px
-}
-.runbar .in{max-width:1320px;margin:0 auto;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
-.runbar .metric{display:flex;align-items:baseline;gap:6px;font:12px var(--mono)}
-.runbar .metric b{font-size:15px;font-weight:700}
-.runbar .metric span{color:var(--dim2);text-transform:uppercase;font-size:10.5px;letter-spacing:.08em;font-weight:700}
-.logline{color:var(--dim);font:11.5px var(--mono);flex:1 1 240px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dim{color:var(--dim)}.dim2{color:var(--dim2)}
+/* ---------- tables ---------- */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim2);padding:0 10px 8px;font-weight:600;font-family:var(--mono)}
+td{padding:7px 10px;border-top:1px solid var(--line);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+tbody tr:hover{background:rgba(108,92,231,.07)}
+.pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
+.s-available{background:rgba(46,230,168,.16);color:var(--ok)}
+.s-taken{background:rgba(139,147,168,.13);color:var(--dim)}
+.s-invalid{background:rgba(255,176,32,.14);color:var(--warn)}
+.s-blocked{background:rgba(108,92,231,.2);color:#a99bff}
+.s-error{background:rgba(255,95,109,.15);color:var(--bad)}
+.scroll{max-height:390px;overflow:auto}
+.scroll::-webkit-scrollbar{width:9px;height:9px}
+.scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:9px}
+.note{border-left:2px solid var(--acc);background:rgba(108,92,231,.08);padding:9px 12px;border-radius:0 8px 8px 0;font-size:12.5px;color:var(--dim);margin:10px 0}
+.note.warn{border-color:var(--warn);background:rgba(255,176,32,.08)}
+.note.bad{border-color:var(--bad);background:rgba(255,95,109,.08)}
+.empty{text-align:center;color:var(--dim2);padding:34px;font-size:13px}
+.kv{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+.kv:last-child{border:0}
+.kv span:first-child{color:var(--dim)}
+/* ---------- log ---------- */
+.log{font-family:var(--mono);font-size:11.5px;max-height:190px;overflow:auto;background:#0a0c12;border:1px solid var(--line);border-radius:10px;padding:11px}
+.log div{padding:2px 0;color:var(--dim)}
+.log .ok{color:var(--ok)}.log .bad{color:var(--bad)}.log .warn{color:var(--warn)}
+.sticky{position:fixed;left:220px;right:0;bottom:0;z-index:5;background:rgba(10,11,16,.9);backdrop-filter:blur(9px);border-top:1px solid var(--line);padding:11px 30px;display:none;gap:22px;align-items:center;font-family:var(--mono);font-size:12px}
+.sticky.on{display:flex}
+.sticky b{color:var(--acc2)}
+.toast{position:fixed;right:20px;bottom:20px;z-index:20;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+.toast div{background:var(--panel2);border:1px solid var(--line2);border-left:3px solid var(--acc);padding:10px 14px;border-radius:9px;font-size:12.5px;animation:fade .18s}
+.toast div.bad{border-left-color:var(--bad)}
+.toast div.ok{border-left-color:var(--ok)}
 </style>
 </head>
 <body>
-<div class="app">
-
-  <header class="top">
-    <div class="brand">
-      <div class="logo">bh</div>
-      <div>
-        <h1>bahs <span>· username availability</span></h1>
-        <div class="sub">discord · guns.lol · instagram · tiktok — through your own proxy list</div>
-      </div>
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="dot"></span><b>bahs</b><span>v3</span></div>
+    <nav class="nav" id="nav">
+      <button data-view="dash" class="on"><span class="ico">◎</span>Dashboard</button>
+      <button data-view="proxies"><span class="ico">⇄</span>Proxies<span class="tag" id="navProxies">0</span></button>
+      <button data-view="results"><span class="ico">≡</span>Results<span class="tag" id="navResults">0</span></button>
+      <button data-view="settings"><span class="ico">⚙</span>Alerts</button>
+    </nav>
+    <div class="foot">
+      <div><b id="footPlat">…</b> platforms</div>
+      <div><b id="footProx">0</b> proxies</div>
+      <div id="footRuns">idle</div>
     </div>
-    <div class="chips">
-      <div class="chip" id="chip-proxies"><span class="led"></span><span class="k">proxies</span><span class="v" id="c-proxies">—</span></div>
-      <div class="chip" id="chip-run"><span class="led"></span><span class="k">run</span><span class="v" id="c-run">idle</span></div>
-      <div class="chip" id="chip-fd"><span class="led"></span><span class="k">status</span><span class="v" id="c-status">…</span></div>
-    </div>
-  </header>
+  </aside>
+  <main>
+    <!-- ================= DASHBOARD ================= -->
+    <section class="view on" id="v-dash">
+      <h1>Dashboard</h1>
+      <div class="sub">Pick the name spaces to sweep, then run. Every name in a space is checked — nothing is sampled.</div>
 
-  <!-- 1 · proxies -->
-  <section class="card">
-    <div class="ch">
-      <h2><span class="n">1</span> Proxy list</h2>
-      <div class="row tight">
-        <span class="msg" id="pr-msg"></span>
-        <button class="mini" id="btn-pr-download">Download .txt</button>
-        <button class="mini danger" id="btn-pr-clear">Clear list</button>
-      </div>
-    </div>
+      <div class="grid2">
+        <div class="card">
+          <h2>Name space</h2>
+          <div id="buckets"></div>
+          <div class="row" style="margin-top:14px;justify-content:space-between">
+            <div class="mono" style="font-size:13px">Selected: <b id="selCount" style="color:var(--acc2)">0</b> names</div>
+            <div class="row" style="gap:6px">
+              <button class="btn ghost" id="pickShort">3·4</button>
+              <button class="btn ghost" id="pickNil">clear</button>
+            </div>
+          </div>
+          <div id="redundant"></div>
+        </div>
 
-    <div class="grid2" style="gap:14px">
-      <div>
-        <div class="drop" id="drop">
-          <input type="file" id="file" accept=".txt,.csv,text/plain,text/csv" hidden>
-          <div id="drop-text">Drop a <b>.txt</b> here, or click to choose a file</div>
-        </div>
-        <textarea id="pr-text" rows="6" spellcheck="false"
-          placeholder="…or paste here, one per line:
-1.2.3.4:8080
-socks5://user:pass@5.6.7.8:1080
-host.example.com:3128:user:pass"></textarea>
-        <div class="row" style="margin-top:10px">
-          <button class="go" id="btn-pr-append">Add to list</button>
-          <button class="primary" id="btn-pr-replace">Replace list</button>
-          <span class="hint" id="pr-count">loading…</span>
-        </div>
-        <div class="fnote">
-          Formats: <code>host:port</code> · <code>scheme://host:port</code> · <code>user:pass@host:port</code> ·
-          <code>host:port:user:pass</code> · <code>[ipv6]:port</code>. Bare entries are read as <b>http</b>.
-          Duplicates are dropped, unreadable lines are reported and skipped.
-        </div>
-      </div>
-      <div>
-        <div class="stats" id="pr-stats"></div>
-        <div class="fnote" style="margin-top:12px">
-          Nothing is validated up front and nothing is scraped: this list <i>is</i> the pool.
-          A host that is dead shows up as an error on the name it was used for and gets
-          retired for the rest of the run.
-        </div>
-        <div class="tw" style="max-height:300px;margin-top:12px">
-          <table>
-            <thead><tr><th>proxy</th><th>scheme</th><th></th></tr></thead>
-            <tbody id="pr-rows"></tbody>
-          </table>
-        </div>
-        <div class="row" style="margin-top:9px">
-          <span class="hint" id="pr-shown"></span>
-          <span class="spacer"></span>
-          <button class="mini" id="btn-pr-more">Load more</button>
+        <div class="card">
+          <h2>Run</h2>
+          <label class="fld">Platforms</label>
+          <div class="chips" id="plats" style="margin-bottom:16px"></div>
+          <label class="fld">Concurrency — <span id="concVal" class="mono">256</span></label>
+          <input type="range" id="conc" min="8" max="1024" step="8" value="256">
+          <div class="dim2" style="font-size:11.5px;margin:4px 0 16px">Checks in flight. Throughput tracks connections ÷ latency, so this only helps as far as your proxies can carry it.</div>
+          <div class="row" style="gap:9px">
+            <button class="btn primary" id="start" style="flex:1">Start sweep</button>
+            <button class="btn danger" id="stop" disabled>Stop</button>
+          </div>
+          <div id="est" class="note" style="margin-top:14px"></div>
         </div>
       </div>
-    </div>
-  </section>
 
-  <!-- 2 · names -->
-  <section class="card">
-    <div class="ch">
-      <h2><span class="n">2</span> Usernames</h2>
-      <span class="hint" id="nm-count">0 names</span>
-    </div>
-    <div class="row tight" style="margin-bottom:10px">
-      <label class="f">pattern
-        <select id="gen-pattern">
-          <option value="words">OG words</option>
-          <option value="letters">letters</option>
-          <option value="alnum">alphanumeric</option>
-          <option value="numbers">numbers</option>
-        </select>
-      </label>
-      <label class="f">length <input id="gen-length" type="number" min="1" max="32" value="4"></label>
-      <label class="f">count <input id="gen-count" type="number" min="1" max="20000" value="500"></label>
-      <button class="mini" id="btn-gen-add">Add pattern</button>
-      <button class="ghost" id="btn-gen-run">Generate</button>
-      <button class="mini" id="btn-gen-clear">Clear patterns</button>
-      <span class="spacer"></span>
-      <button class="go" id="btn-gen-random">🎲 Random 4L · 4N · OG</button>
-    </div>
-    <div class="row tight" id="gen-chips" style="margin-bottom:10px"></div>
-    <textarea id="nm-text" rows="7" spellcheck="false"
-      placeholder="One name per line (or comma separated). Leave empty and press “Random 4L · 4N · OG” to draw names instead."></textarea>
-    <div class="row" style="margin-top:9px">
-      <span class="hint" id="nm-hint">names are de-duplicated and checked on every platform you pick below</span>
-    </div>
-  </section>
-
-  <!-- 3 · run -->
-  <section class="card">
-    <div class="ch">
-      <h2><span class="n">3</span> Run</h2>
-      <span class="msg" id="run-msg"></span>
-    </div>
-    <div class="row" style="margin-bottom:12px">
-      <div class="pfs" id="pfs"></div>
-    </div>
-    <div class="row">
-      <label class="f">concurrency <input id="run-conc" type="number" min="1" max="4000" value="256"></label>
-      <label class="f">retries <input id="run-retries" type="number" min="0" max="5" value="2"></label>
-      <label class="f">watch rate <input id="run-target" type="number" min="1" max="100000" value="100"></label>
-      <span class="spacer"></span>
-      <button class="go" id="btn-run">Check names</button>
-      <button class="primary" id="btn-scan">Scan generated</button>
-      <button class="stopbtn" id="btn-stop" disabled>Stop run</button>
-    </div>
-    <div class="bar"><i id="run-bar"></i></div>
-
-    <div class="ch" style="margin-top:16px">
-      <h2 style="font-size:13.5px">Results</h2>
-      <div class="row tight">
-        <div class="filter" id="filter">
-          <button data-f="all" class="on">all</button>
-          <button data-f="available">available</button>
-          <button data-f="taken">taken</button>
-          <button data-f="invalid">invalid</button>
-          <button data-f="blocked">blocked</button>
-          <button data-f="error">error</button>
+      <div class="card">
+        <h2>Live</h2>
+        <div class="bar"><i id="pbar"></i></div>
+        <div class="tiles">
+          <div class="tile"><div class="l">Checked</div><div class="v" id="tChecked">0</div></div>
+          <div class="tile info"><div class="l">Progress</div><div class="v" id="tProg">0%</div></div>
+          <div class="tile acc"><div class="l">Checks/s</div><div class="v" id="tRate">0</div></div>
+          <div class="tile ok"><div class="l">Available</div><div class="v" id="tAvail">0</div></div>
+          <div class="tile warn"><div class="l">Rate limits</div><div class="v" id="tLimit">0</div></div>
+          <div class="tile bad"><div class="l">Proxy misses</div><div class="v" id="tMiss">0</div></div>
+          <div class="tile"><div class="l">Elapsed</div><div class="v" id="tTime">0:00</div></div>
+          <div class="tile"><div class="l">Answered</div><div class="v" id="tAns">0%</div></div>
         </div>
-        <button class="mini" id="btn-copy-avail">Copy available</button>
-        <button class="mini" id="btn-export">Export .csv</button>
-        <button class="mini" id="btn-rows-clear">Clear</button>
+        <div class="mono dim" style="margin-top:12px;font-size:12px">Target: <span id="target">—</span></div>
       </div>
-    </div>
-    <div class="tw tall">
-      <table>
-        <thead><tr><th>username</th><th>platform</th><th>status</th><th>detail</th><th>proxy</th><th>ms</th><th></th></tr></thead>
-        <tbody id="rs-rows"></tbody>
-      </table>
-    </div>
-    <div class="empty" id="rs-empty">nothing checked yet</div>
-    <div class="fnote" id="rs-note"></div>
-  </section>
 
-  <div class="fnote" style="margin-top:6px">
-    API: <span class="mono">POST /proxies</span> · <span class="mono">POST /proxies/upload</span> ·
-    <span class="mono">POST /snipe</span> · <span class="mono">POST /scan</span> ·
-    <span class="mono">POST /snipe/stop</span> · <span class="mono">GET /info</span>
-  </div>
+      <div class="grid2">
+        <div class="card">
+          <h2>Per platform</h2>
+          <div class="scroll"><table id="platTable"><tbody></tbody></table></div>
+        </div>
+        <div class="card">
+          <h2>Activity</h2>
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= PROXIES ================= -->
+    <section class="view" id="v-proxies">
+      <h1>Proxies</h1>
+      <div class="sub">Your list is the pool. Nothing is scraped, nothing is validated ahead of time — what you paste is what a run rotates over.</div>
+      <div class="card">
+        <h2>Add</h2>
+        <textarea id="pPaste" placeholder="host:port&#10;user:pass@host:port&#10;socks5://host:port&#10;# comments and blank lines are ignored"></textarea>
+        <div class="row" style="margin-top:11px">
+          <button class="btn primary" id="pAppend">Add to list</button>
+          <button class="btn" id="pReplace">Replace list</button>
+          <button class="btn" id="pUpload">Upload .txt</button>
+          <input type="file" id="pFile" accept=".txt,text/plain" style="display:none">
+          <span class="dim2 mono" id="pInfo" style="font-size:11.5px"></span>
+        </div>
+        <div id="pReport"></div>
+      </div>
+      <div class="card">
+        <h2>Stored <span class="dim2 mono" id="pCount"></span></h2>
+        <div class="row" style="margin-bottom:11px">
+          <button class="btn ghost" id="pDownload">Download .txt</button>
+          <button class="btn ghost" id="pCopyAll">Copy all</button>
+          <button class="btn ghost" id="pClear" style="color:var(--bad)">Clear list</button>
+        </div>
+        <div class="scroll"><table id="pTable"><tbody></tbody></table></div>
+      </div>
+    </section>
+
+    <!-- ================= RESULTS ================= -->
+    <section class="view" id="v-results">
+      <h1>Results</h1>
+      <div class="sub">Held in this tab only — nothing is stored server-side.</div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:12px">
+          <div class="chips" id="filters"></div>
+          <div class="row" style="gap:7px">
+            <button class="btn ghost" id="rCopy">Copy available</button>
+            <button class="btn ghost" id="rCsv">CSV</button>
+            <button class="btn ghost" id="rWipe" style="color:var(--bad)">Clear</button>
+          </div>
+        </div>
+        <div class="scroll"><table id="rTable"><tbody></tbody></table></div>
+        <div class="dim2 mono" style="font-size:11.5px;margin-top:10px" id="rNote"></div>
+      </div>
+    </section>
+
+    <!-- ================= SETTINGS ================= -->
+    <section class="view" id="v-settings">
+      <h1>Alerts</h1>
+      <div class="sub">Post the names that come back free to a Discord webhook, digested into batches.</div>
+      <div class="card">
+        <h2>Discord webhook</h2>
+        <label class="fld">Webhook URL</label>
+        <input type="text" id="sHook" placeholder="https://discord.com/api/webhooks/…">
+        <div class="row" style="margin:13px 0">
+          <label class="sw"><input type="checkbox" id="sOn"><i></i>Enabled</label>
+          <span class="dim2" style="font-size:11.5px">A URL with enabled off stores the webhook but stays quiet.</span>
+        </div>
+        <div class="grid2">
+          <div><label class="fld">Message template</label><input type="text" id="sTpl"></div>
+          <div><label class="fld">Ping (first message only)</label><input type="text" id="sPing" placeholder="@here or &lt;@&amp;roleid&gt;"></div>
+          <div><label class="fld">Webhook name</label><input type="text" id="sUser"></div>
+          <div><label class="fld">Avatar URL</label><input type="text" id="sAvatar"></div>
+        </div>
+        <div class="row" style="margin-top:16px">
+          <button class="btn primary" id="sSave">Save</button>
+          <button class="btn" id="sTest">Send test</button>
+          <span class="dim2 mono" style="font-size:11.5px">Placeholders: {username} {platform} {detail}</span>
+        </div>
+        <div id="sNote"></div>
+      </div>
+      <div class="card">
+        <h2>How a run behaves</h2>
+        <div class="kv"><span>Enumeration</span><span id="kMax">—</span></div>
+        <div class="kv"><span>Platform pause on blanket 429</span><span>that platform sits out, the rest continue</span></div>
+        <div class="kv"><span>Account creation</span><span>never — you claim it yourself</span></div>
+      </div>
+    </section>
+  </main>
 </div>
 
-<div class="runbar">
-  <div class="in">
-    <div class="metric"><b id="m-rate">0.0</b><span>checks/s</span></div>
-    <div class="metric"><b id="m-done">0</b><span>checked</span></div>
-    <div class="metric"><b id="m-avail" class="mono" style="color:var(--green)">0</b><span>available</span></div>
-    <div class="metric"><b id="m-elapsed">0s</b><span>elapsed</span></div>
-    <div class="metric"><b id="m-pool">0</b><span>pool alive</span></div>
-    <div class="logline" id="m-log">ready</div>
-  </div>
+<div class="sticky" id="sticky">
+  <span>checked <b id="sbChecked">0</b></span>
+  <span><b id="sbRate">0</b>/s</span>
+  <span>available <b id="sbAvail">0</b></span>
+  <span>blocked <b id="sbLimit">0</b></span>
+  <span>pool <b id="sbPool">0</b></span>
+  <span id="sbTarget" class="dim2"></span>
 </div>
-
+<div class="toast" id="toast"></div>
 <script>
+/* ============================ state ============================ */
 const $ = (id) => document.getElementById(id);
-const PLATFORM_DEFAULT = ["discord", "guns.lol", "instagram", "tiktok"];
-const RENDER_CAP = 1200;          // rows kept in the DOM at once
-let PLATFORMS = PLATFORM_DEFAULT.slice();
+const S = {
+  info: null, menu: [], kinds: {}, buckets: [], plats: [], sel: new Set(),
+  results: [], filter: 'all', held: 0, running: false, ac: null,
+  rate: Number(localStorage.getItem('bahs.rate') || 0), last: null, avail: [],
+};
+const MAXROWS = 20000, SHOWROWS = 400;
+const fmt = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
+const clock = (s) => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+const kb = (b) => b < 1024 ? b+' B' : b < 1048576 ? (b/1024).toFixed(1)+' KB' : (b/1048576).toFixed(1)+' MB';
 
-function esc(s) {
-  return String(s === null || s === undefined ? "" : s)
-    .replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+function toast(msg, kind='') {
+  const el = document.createElement('div');
+  el.className = kind; el.textContent = msg;
+  $('toast').appendChild(el);
+  setTimeout(() => el.remove(), 4200);
 }
-const fmtMs = (v) => (v === null || v === undefined ? "—" : Math.round(v) + "");
-
+function logline(text, kind='') {
+  const box = $('log');
+  const el = document.createElement('div');
+  el.className = kind;
+  el.textContent = new Date().toLocaleTimeString() + '  ' + text;
+  box.appendChild(el);
+  while (box.children.length > 220) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
 async function api(path, opts) {
-  const res = await fetch(path, opts || {});
+  const res = await fetch(path, opts);
   if (!res.ok) {
-    let detail = "HTTP " + res.status;
-    try { const j = await res.json(); if (j && j.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch (e) {}
+    let detail = res.status + ' ' + res.statusText;
+    try { const j = await res.json(); if (j.detail) detail = j.detail; } catch (e) {}
     throw new Error(detail);
   }
-  const ct = res.headers.get("content-type") || "";
-  return ct.includes("json") ? res.json() : res.text();
+  return res.headers.get('content-type')?.includes('json') ? res.json() : res.text();
 }
-function postJSON(path, body) {
-  return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+/* ============================ buckets ============================ */
+/* The same rule the server applies before it counts: a name space inside another
+   selected space is not extra coverage, it is the same names twice. */
+function isRedundant(b) {
+  const has = (k, l) => S.sel.has(k + l);
+  const l = b.length;
+  if (b.kind === 'og') return has('c', l) || has('l', l) ? (has('c',l) ? 'c'+l : 'l'+l) : null;
+  if (b.kind === 'l' || b.kind === 'n') return has('c', l) ? 'c'+l : null;
+  return null;
 }
-function msg(el, text, kind) {
-  el.textContent = text || "";
-  el.className = "msg" + (kind ? " " + kind : "");
+function selectedTotal() {
+  let total = 0;
+  for (const b of S.menu) {
+    if (!S.sel.has(b.label)) continue;
+    if (isRedundant(b)) continue;
+    total += b.size;
+  }
+  return total;
 }
-async function copyText(text) {
-  if (!text) throw new Error("nothing to copy");
-  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
-  const ta = document.createElement("textarea");
-  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
-  document.body.appendChild(ta); ta.select();
-  try { document.execCommand("copy"); } finally { document.body.removeChild(ta); }
-}
-function download(name, text, type) {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([text], { type: type || "text/plain" }));
-  a.download = name; a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-}
-
-/* ── 1 · proxies ─────────────────────────────────────────────────────── */
-let prOffset = 0, prLimit = 60, prTotal = 0;
-
-async function loadProxies(reset) {
-  if (reset) { prOffset = 0; $("pr-rows").innerHTML = ""; }
-  try {
-    const data = await api("/proxies?limit=" + prLimit + "&offset=" + prOffset);
-    prTotal = data.count;
-    renderProxyStats(data.stats);
-    const rows = $("pr-rows");
-    for (const p of data.proxies) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `<td class="mono wrap">${esc(p)}</td><td class="num">${esc(p.split("://")[0])}</td>`;
-      const act = document.createElement("td");
-      act.style.textAlign = "right";
-      const copy = document.createElement("button");
-      copy.className = "mini"; copy.textContent = "copy";
-      copy.onclick = () => copyText(p);
-      const del = document.createElement("button");
-      del.className = "mini danger"; del.textContent = "remove";
-      del.style.marginLeft = "6px";
-      del.onclick = async () => {
-        try { await api("/proxies?proxy=" + encodeURIComponent(p), { method: "DELETE" }); loadProxies(true); }
-        catch (e) { msg($("pr-msg"), e.message, "bad"); }
-      };
-      act.append(copy, del);
-      tr.appendChild(act);
-      rows.appendChild(tr);
+function renderBuckets() {
+  const lengths = [...new Set(S.menu.map(b => b.length))].sort((a, b) => a - b);
+  const order = ['l', 'n', 'c', 'og'];
+  let html = '<div class="bucketrow"><div class="bhead"></div>' +
+    order.map(k => `<div class="bhead">${S.kinds[k] || k}</div>`).join('') + '</div>';
+  for (const len of lengths) {
+    html += `<div class="bucketrow"><div class="len">${len}</div>`;
+    for (const kind of order) {
+      const b = S.menu.find(x => x.kind === kind && x.length === len);
+      if (!b) { html += '<div></div>'; continue; }
+      const on = S.sel.has(b.label);
+      const red = on ? isRedundant(b) : null;
+      html += `<div class="bucket ${on ? 'on' : ''} ${red ? 'redun' : ''}" data-label="${b.label}">
+        ${red ? `<span class="x">in ${red}</span>` : ''}
+        <div class="k">${b.label}</div>
+        <div class="n">${fmt(b.size)}</div>
+        <div class="d">${red ? 'already covered' : b.detail}</div></div>`;
     }
-    prOffset += data.proxies.length;
-    $("pr-shown").textContent = prTotal
-      ? "showing " + Math.min(prOffset, prTotal) + " of " + prTotal
-      : "";
-    $("btn-pr-more").disabled = prOffset >= prTotal;
-    $("pr-count").textContent = prTotal + (prTotal === 1 ? " proxy stored" : " proxies stored");
-    $("c-proxies").textContent = prTotal;
-    $("chip-proxies").className = "chip " + (prTotal ? "on" : "warn");
-    if (!prTotal) {
-      $("pr-rows").innerHTML = '<tr><td colspan="3" class="empty">no proxies yet — paste a list or drop a .txt above</td></tr>';
-    }
-  } catch (e) {
-    msg($("pr-msg"), e.message, "bad");
+    html += '</div>';
   }
-}
-
-function renderProxyStats(st) {
-  const by = st.by_scheme || {};
-  const order = ["http", "https", "socks4", "socks5"];
-  const cls = { http: "blue", https: "blue", socks4: "green", socks5: "green" };
-  $("pr-stats").innerHTML =
-    order.map((k) => `<div class="stat"><div class="k">${k}</div><div class="v ${cls[k]}">${by[k] || 0}</div></div>`).join("") +
-    `<div class="stat"><div class="k">total</div><div class="v">${st.count || 0}</div></div>` +
-    `<div class="stat"><div class="k">with auth</div><div class="v">${st.with_auth || 0}</div></div>`;
-}
-
-async function savePaste(mode) {
-  const text = $("pr-text").value;
-  if (!text.trim()) { msg($("pr-msg"), "paste some proxies first", "bad"); return; }
-  msg($("pr-msg"), '<span class="spin"></span> saving…');
-  $("pr-msg").innerHTML = '<span class="spin"></span> saving…';
-  try {
-    const out = await postJSON("/proxies", { text: text, mode: mode });
-    const bits = [out.added + " " + (mode === "replace" ? "stored" : "added")];
-    if (out.duplicates) bits.push(out.duplicates + " duplicate");
-    if (out.rejected && out.rejected.length) bits.push(out.rejected.length + "+ rejected");
-    msg($("pr-msg"), bits.join(" · ") + " — " + out.stored.count + " total", "ok");
-    $("pr-text").value = "";
-    loadProxies(true);
-  } catch (e) {
-    msg($("pr-msg"), e.message, "bad");
-  }
-}
-
-function bindFileInput() {
-  const drop = $("drop"), input = $("file");
-  drop.onclick = () => input.click();
-  input.onchange = () => { if (input.files && input.files[0]) readFile(input.files[0]); input.value = ""; };
-  ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); }));
-  ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
-  drop.addEventListener("drop", (e) => {
-    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-    if (f) readFile(f);
-  });
-}
-
-function readFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    const text = String(reader.result || "");
-    const box = $("pr-text");
-    box.value = box.value.trim() ? box.value.replace(/\s*$/, "\n") + text : text;
-    const lines = text.split(/\r?\n/).filter((l) => l.trim()).length;
-    $("drop-text").innerHTML = `<b>${esc(file.name)}</b> — ${lines} line${lines === 1 ? "" : "s"} loaded into the box below`;
-    msg($("pr-msg"), "read " + file.name + " — press Add to list", "ok");
-  };
-  reader.onerror = () => msg($("pr-msg"), "could not read that file", "bad");
-  reader.readAsText(file);
-}
-
-/* ── 2 · names ───────────────────────────────────────────────────────── */
-let genPatterns = [];
-
-function renderPatterns() {
-  const box = $("gen-chips");
-  box.innerHTML = "";
-  if (!genPatterns.length) {
-    box.innerHTML = '<span class="hint dim2">no patterns — add one, or press “Random 4L · 4N · OG”</span>';
-    return;
-  }
-  genPatterns.forEach((p, i) => {
-    const chip = document.createElement("span");
-    chip.className = "chip on";
-    chip.innerHTML = `<span class="k">${esc(p.pattern)}</span><span class="v">${p.length} chars × ${p.count}</span>`;
-    const x = document.createElement("button");
-    x.className = "mini"; x.textContent = "×"; x.style.marginLeft = "4px";
-    x.onclick = () => { genPatterns.splice(i, 1); renderPatterns(); };
-    chip.appendChild(x);
-    box.appendChild(chip);
-  });
-}
-
-function readPatterns() {
-  const pattern = $("gen-pattern").value;
-  const length = Math.max(1, Math.min(32, Number($("gen-length").value) || 4));
-  const count = Math.max(1, Math.min(20000, Number($("gen-count").value) || 500));
-  return { pattern, length, limit: count };
-}
-
-// The one-click set: 4 letters, 4 numbers and 4-letter OG words. The
-// 4-character alphanumeric space is 14.7M names, so a run samples it instead of
-// enumerating it — which is why "random" is the default mode.
-function randomPatterns() {
-  const count = Math.max(1, Math.min(20000, Number($("gen-count").value) || 500));
-  return ["letters", "numbers", "words"].map((pattern) => ({ pattern, length: 4, limit: count }));
-}
-
-async function generateInto(box) {
-  if (!genPatterns.length) genPatterns = randomPatterns();
-  renderPatterns();
-  const data = await postJSON("/generate", { patterns: genPatterns, limit: 0 });
-  box.value = data.usernames.join("\n");
-  box.dispatchEvent(new Event("input"));
-  return data.count;
-}
-
-async function generateNames() {
-  try {
-    const n = await generateInto($("nm-text"));
-    msg($("run-msg"), "generated " + n + " random names", "ok");
-  } catch (e) { msg($("run-msg"), e.message, "bad"); }
-}
-
-function namesInBox() {
-  const seen = new Set();
-  return $("nm-text").value
-    .split(/[\n,]/)
-    .map((s) => s.trim().replace(/^@/, ""))
-    .filter((s) => { if (!s || seen.has(s)) return false; seen.add(s); return true; });
-}
-
-function refreshNameCount() {
-  $("nm-count").textContent = namesInBox().length + " names";
-}
-
-/* ── 3 · platforms ───────────────────────────────────────────────────── */
-function buildPlatforms(list) {
-  PLATFORMS = list && list.length ? list : PLATFORM_DEFAULT;
-  let saved = [];
-  try { saved = JSON.parse(localStorage.getItem("bahs.platforms") || "[]"); } catch (e) {}
-  const on = new Set(saved.filter((p) => PLATFORMS.includes(p)));
-  if (!on.size) PLATFORMS.forEach((p) => on.add(p));
-  const box = $("pfs");
-  box.innerHTML = "";
-  for (const p of PLATFORMS) {
-    const label = document.createElement("label");
-    label.className = "pf" + (on.has(p) ? " on" : "");
-    label.innerHTML = `<span class="dot"></span>${esc(p)}<input type="checkbox" value="${esc(p)}"${on.has(p) ? " checked" : ""}>`;
-    label.querySelector("input").onchange = (e) => {
-      e.target.checked ? on.add(p) : on.delete(p);
-      label.classList.toggle("on", e.target.checked);
-      try { localStorage.setItem("bahs.platforms", JSON.stringify([...on])); } catch (err) {}
+  $('buckets').innerHTML = html;
+  for (const el of $('buckets').querySelectorAll('.bucket')) {
+    el.onclick = () => {
+      const label = el.dataset.label;
+      S.sel.has(label) ? S.sel.delete(label) : S.sel.add(label);
+      renderBuckets(); updateEstimate();
     };
-    box.appendChild(label);
+  }
+  const total = selectedTotal();
+  $('selCount').textContent = fmt(total);
+  const red = S.menu.filter(b => S.sel.has(b.label) && isRedundant(b));
+  $('redundant').innerHTML = red.length
+    ? `<div class="note warn">${red.length} selected space${red.length>1?'s are':' is'} already inside another selection, so ${red.length>1?'they are':'it is'} dropped — the run checks each name once, not twice.</div>`
+    : '';
+  return total;
+}
+/* The run costs names x platforms, not names. Quoting the name count alone is
+   how a "17,576 name" sweep turns into 175,760 checks on ten platforms. */
+function updateEstimate() {
+  const names = selectedTotal();
+  const plats = S.plats.filter(p => p.on).length || 1;
+  const checks = names * plats;
+  const rate = S.rate || 60;
+  const src = S.rate ? `last measured ${Math.round(S.rate)}/s` : `an assumed 60/s`;
+  if (!names) { $('est').innerHTML = 'Nothing selected yet.'; return; }
+  const secs = checks / rate;
+  const span = secs < 90 ? secs.toFixed(1) + 's'
+    : secs < 5400 ? (secs / 60).toFixed(1) + ' min'
+    : secs < 172800 ? (secs / 3600).toFixed(1) + ' hours'
+    : (secs / 86400).toFixed(1) + ' days';
+  const over = names > (S.info?.generation?.max_enumeration || 1e8);
+  $('est').innerHTML = `<b>${names.toLocaleString()}</b> names × <b>${plats}</b> platform${plats > 1 ? 's' : ''} = `
+    + `≈ <b>${checks.toLocaleString()}</b> checks, at ${src} ≈ <b>${span}</b>. `
+    + `Throughput tracks your connections ÷ platform latency, so that is the honest number rather than a promise.`
+    + (over ? `<br><span style="color:var(--bad)">Over the ${fmt(S.info.generation.max_enumeration)} ceiling — the server will refuse it.</span>` : '');
+}
+/* ============================ platforms ============================ */
+function renderPlats() {
+  $('plats').innerHTML = S.plats.map(p =>
+    `<span class="chip ${p.on ? 'on' : ''}" data-p="${p.name}">${p.name}</span>`).join('');
+  for (const el of $('plats').querySelectorAll('.chip')) {
+    el.onclick = () => {
+      const p = S.plats.find(x => x.name === el.dataset.p);
+      if (S.plats.filter(x => x.on).length === 1 && p.on) { toast('Keep at least one platform', 'bad'); return; }
+      p.on = !p.on; renderPlats(); updateEstimate();
+    };
   }
 }
-
-function selectedPlatforms() {
-  const picked = [...document.querySelectorAll(".pf.on input")].map((i) => i.value);
-  return picked.length ? picked : PLATFORMS.slice();
+/* ============================ run ============================ */
+function setRunning(on) {
+  S.running = on;
+  $('start').disabled = on; $('start').textContent = on ? 'Running…' : 'Start sweep';
+  $('stop').disabled = !on;
+  $('sticky').classList.toggle('on', on);
+  ['conc','pickShort','pickNil'].forEach(id => $(id).disabled = on);
 }
-
-/* ── results ─────────────────────────────────────────────────────────── */
-let results = [];
-let filter = "all";
-let scanTotal = 0;
-
-function statusRow(r, i) {
-  const tr = document.createElement("tr");
-  tr.style.cursor = r.status === "available" ? "pointer" : "default";
-  tr.innerHTML =
-    `<td class="mono">${esc(r.username)}</td>` +
-    `<td class="num">${esc(r.platform)}</td>` +
-    `<td><span class="pill ${esc(r.status)}">${esc(r.status)}</span></td>` +
-    `<td class="wrap">${esc(r.detail || "")}</td>` +
-    `<td class="wrap">${esc(r.proxy || "—")}</td>` +
-    `<td class="num">${fmtMs(r.latency_ms)}</td>`;
-  const act = document.createElement("td");
-  act.style.textAlign = "right";
-  if (r.status === "available") {
-    const claim = document.createElement("button");
-    claim.className = "mini go"; claim.textContent = "claim";
-    claim.title = "copy the name and open " + r.platform + " registration";
-    claim.onclick = (ev) => { ev.stopPropagation(); openClaim(r.platform, r.username); };
-    act.appendChild(claim);
-  }
-  tr.appendChild(act);
-  return tr;
+function tiles(p) {
+  $('tChecked').textContent = fmt(p.checked);
+  $('tProg').textContent = Math.round((p.progress || 0) * 100) + '%';
+  $('tRate').textContent = Math.round(p.per_second || 0);
+  $('tAvail').textContent = fmt(p.available_count || 0);
+  $('tLimit').textContent = fmt(p.rate_limits || 0);
+  $('tMiss').textContent = fmt(p.proxy_misses || 0);
+  $('tTime').textContent = clock(p.elapsed_s || 0);
+  $('tAns').textContent = Math.round((p.answer_rate || 0) * 100) + '%';
+  $('pbar').style.width = Math.min(100, (p.progress || 0) * 100) + '%';
+  $('sbChecked').textContent = fmt(p.checked);
+  $('sbRate').textContent = Math.round(p.per_second || 0);
+  $('sbAvail').textContent = fmt(p.available_count || 0);
+  $('sbLimit').textContent = fmt(p.rate_limits || 0);
+  $('sbPool').textContent = fmt(p.pool_alive ?? S.proxies?.count ?? 0);
+  if (p.current_target) $('sbTarget').textContent = '→ ' + p.current_target;
+  renderPlatTable(p.by_platform);
 }
-
-function matchesFilter(r) { return filter === "all" || r.status === filter; }
-
-function renderResults() {
-  const tbody = $("rs-rows");
-  tbody.innerHTML = "";
-  const shown = results.filter(matchesFilter).slice(-RENDER_CAP).reverse();
-  for (const r of shown) tbody.appendChild(statusRow(r));
-  $("rs-empty").style.display = shown.length ? "none" : "block";
-  $("rs-empty").textContent = results.length
-    ? "no results match the “" + filter + "” filter"
-    : "nothing checked yet";
-  updateMetricNote();
+function renderPlatTable(by) {
+  if (!by) return;
+  const keys = Object.keys(by);
+  $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th><th>blocked</th><th>errors</th></tr></thead><tbody>'
+    + keys.map(k => {
+        const r = by[k];
+        return `<tr><td>${k}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
+          <td class="dim">${fmt(r.taken)}</td><td style="color:#a99bff">${fmt(r.blocked)}</td>
+          <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td></tr>`;
+      }).join('') + '</tbody>';
 }
-
-// Cheap enough to run on every result: one textContent write, not a 1200-row
-// rebuild.
-function updateMetricNote() {
-  const avail = results.filter((r) => r.status === "available").length;
-  $("rs-note").textContent = results.length
-    ? results.length + " checks this session · " + avail + " available · " +
-      results.filter(matchesFilter).length + " match “" + filter + "”"
-    : "";
-}
-
-function pushResult(r) {
-  results.push(r);
-  const tbody = $("rs-rows");
-  if (matchesFilter(r)) {
-    tbody.insertBefore(statusRow(r), tbody.firstChild);
-    while (tbody.childElementCount > RENDER_CAP) tbody.removeChild(tbody.lastElementChild);
-    $("rs-empty").style.display = "none";
-  }
-  updateMetricNote();
-}
-
-async function openClaim(platform, username) {
+async function start() {
+  const total = selectedTotal();
+  if (!total) return toast('Pick at least one name space', 'bad');
+  if (!S.proxies || !S.proxies.count) return toast('No proxies stored — add some on the Proxies tab', 'bad');
+  const buckets = S.menu.filter(b => S.sel.has(b.label) && !isRedundant(b))
+                        .map(b => ({ kind: b.kind, length: b.length }));
+  const platforms = S.plats.filter(p => p.on).map(p => p.name);
+  const concurrency = Number($('conc').value);
+  S.results = []; S.held = 0; S.avail = []; S.counts = {};
+  renderResults(); renderFilters();
+  tiles({ checked: 0, progress: 0, elapsed_s: 0, available_count: 0 });
+  setRunning(true);
+  logline(`start — ${fmt(total)} names × ${platforms.length} platforms, ${concurrency} concurrent`, 'ok');
+  S.ac = new AbortController();
+  let res;
   try {
-    const info = await api("/claim?platform=" + encodeURIComponent(platform) + "&username=" + encodeURIComponent(username));
-    await copyText(username);
-    msg($("run-msg"), "copied “" + username + "” — opening " + platform + " registration", "ok");
-    window.open(info.url, "_blank", "noopener");
-  } catch (e) { msg($("run-msg"), e.message, "bad"); }
-}
-
-/* ── the run ─────────────────────────────────────────────────────────── */
-let runAbort = null, runStopPath = "", runTimer = null, runStarted = 0, runCount = 0, runAvail = 0, runTarget = 100;
-
-function clearResults() {
-  results = [];
-  runCount = 0; runAvail = 0;
-  $("rs-rows").innerHTML = "";
-  $("rs-empty").style.display = "block";
-  $("rs-note").textContent = "";
-}
-
-function bar(done, total) {
-  $("run-bar").style.width = total ? Math.min(100, (done / total) * 100) + "%" : "0%";
-}
-
-function setLog(text) { $("m-log").textContent = text; }
-
-function updateMetrics(rate) {
-  const secs = runStarted ? (Date.now() - runStarted) / 1000 : 0;
-  $("m-done").textContent = runCount;
-  $("m-avail").textContent = runAvail;
-  $("m-elapsed").textContent = secs < 10 ? secs.toFixed(1) + "s" : Math.round(secs) + "s";
-  if (rate !== undefined && rate !== null) $("m-rate").textContent = Number(rate).toFixed(1);
-}
-
-function beginRun(stopPath, kind) {
-  clearResults();
-  runAbort = new AbortController();
-  runStopPath = stopPath;
-  runStarted = Date.now();
-  runTarget = Math.max(1, Number($("run-target").value) || 100);
-  $("btn-run").disabled = true;
-  $("btn-scan").disabled = true;
-  $("btn-stop").disabled = false;
-  $("c-run").textContent = kind + " running";
-  $("chip-run").className = "chip warn";
-  $("m-pool").textContent = "—";
-  bar(0, 0);
-  updateMetrics(0);
-  if (runTimer) clearInterval(runTimer);
-  runTimer = setInterval(() => updateMetrics(), 250);
-}
-
-function endRun() {
-  $("btn-run").disabled = false;
-  $("btn-scan").disabled = false;
-  $("btn-stop").disabled = true;
-  $("c-run").textContent = "idle";
-  $("chip-run").className = "chip " + (runCount ? "on" : "");
-  runAbort = null; runStopPath = "";
-  if (runTimer) { clearInterval(runTimer); runTimer = null; }
-  updateMetrics();
-  renderResults();
-}
-
-const isAbort = (e) => e && (e.name === "AbortError" || /abort/i.test(e.message || ""));
-
-// One NDJSON reader for both /snipe and /scan: every line goes to onLine.
-// `signal` is the run's AbortController — aborting it drops the response reader
-// instantly, and the stop endpoint cancels the checks behind it.
-async function streamResults(url, body, onLine, signal) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: signal,
-  });
+    res = await fetch('/scan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: S.ac.signal,
+      body: JSON.stringify({ buckets, platforms, concurrency, stream: true }),
+    });
+  } catch (e) { setRunning(false); return logline('could not reach the server: ' + e.message, 'bad'); }
   if (!res.ok) {
-    let detail = "HTTP " + res.status;
-    try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
-    throw new Error(detail);
+    let msg = res.status + ' ' + res.statusText;
+    try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (e) {}
+    setRunning(false); toast(msg, 'bad'); return logline('refused: ' + msg, 'bad');
   }
-  if (!res.body) {
-    const data = await res.json();
-    (data.results || []).forEach((row) => onLine(Object.assign({ type: "result" }, row)));
-    onLine(Object.assign({ type: "done" }, data));
-    return;
-  }
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      let m; try { m = JSON.parse(line); } catch (e) { continue; }
-      onLine(m);
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '', lastPaint = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev; try { ev = JSON.parse(line); } catch (e) { continue; }
+        if (ev.type === 'result') {
+          S.counts[ev.status] = (S.counts[ev.status] || 0) + 1;
+          if (ev.status === 'available') S.avail.push(ev);
+          if (S.held < MAXROWS || ev.status === 'available') { S.results.push(ev); S.held++; }
+          const now = performance.now();
+          if (now - lastPaint > 240) { lastPaint = now; renderResults(); renderFilters(); }
+        } else if (ev.type === 'progress') {
+          tiles(ev); renderFilters();
+        } else if (ev.type === 'start') {
+          $('target').textContent = `${fmt(ev.names)} names · ${ev.platforms.length} platforms`;
+          if (ev.pool_note) logline(ev.pool_note, 'warn');
+        } else if (ev.type === 'note') {
+          if (ev.pool_note) logline(ev.pool_note, 'warn');
+        } else if (ev.type === 'done') {
+          finish(ev);
+        }
+      }
     }
+  } catch (e) {
+    if (e.name !== 'AbortError') logline('stream error: ' + e.message, 'bad');
   }
+  renderResults(); renderFilters();
+  setRunning(false);
 }
-
-// Tell the server to stop, then drop the reader. The response names the runs it
-// signalled, so a stop that hit nothing is visible rather than silent.
+function finish(d) {
+  tiles(d);
+  if (d.per_second) { S.rate = d.per_second; localStorage.setItem('bahs.rate', String(d.per_second)); }
+  const paused = Object.keys(d.platforms_paused || {});
+  logline(`done — ${fmt(d.checked)} checked, ${fmt(d.available_count)} available, ${fmt(d.rate_limits)} rate-limited`
+    + (d.skipped ? `, ${fmt(d.skipped)} skipped` : '') + ` in ${clock(d.elapsed_s)} (${Math.round(d.per_second || 0)}/s)`,
+    d.available_count ? 'ok' : '');
+  for (const p of paused) logline(`${p} sat out: ${d.platforms_paused[p].reason}`, 'warn');
+  if (d.stop_reason) logline(d.stop_reason, 'bad');
+  if (d.alerts?.enabled) logline(`alerts — ${d.alerts.sent} sent, ${d.alerts.failed} failed`);
+  updateEstimate();
+}
 async function stopRun() {
-  $("btn-stop").disabled = true;
-  msg($("run-msg"), "stopping…");
-  const path = runStopPath;
-  if (path) {
-    try {
-      const out = await api(path, { method: "POST" });
-      const n = (out.stopped || []).length;
-      setLog(n ? "stop signalled to " + n + " run" + (n === 1 ? "" : "s") : "no run was still active");
-    } catch (e) { msg($("run-msg"), "stop failed: " + e.message, "bad"); }
+  try { await api('/scan/stop', { method: 'POST' }); } catch (e) {}
+  if (S.ac) S.ac.abort();
+  setRunning(false);
+  logline('stop requested', 'warn');
+}
+/* ============================ results ============================ */
+const FILTERS = ['all','available','taken','invalid','blocked','error'];
+function renderFilters() {
+  const c = S.counts || {};
+  const total = Object.values(c).reduce((a, b) => a + b, 0);
+  $('filters').innerHTML = FILTERS.map(f =>
+    `<span class="chip ${S.filter === f ? 'on' : ''}" data-f="${f}">${f}${f === 'all' ? ' ' + fmt(total) : ' ' + fmt(c[f] || 0)}</span>`
+  ).join('');
+  for (const el of $('filters').querySelectorAll('.chip')) {
+    el.onclick = () => { S.filter = el.dataset.f; renderFilters(); renderResults(); };
   }
-  if (runAbort) runAbort.abort();
+  $('navResults').textContent = fmt(total);
 }
-
-function summarize(d, label) {
-  const st = d.by_status || {};
-  const bits = [d.available_count + " available of " + d.checked + " checks"];
-  const parts = Object.keys(st).sort().map((k) => st[k] + " " + k);
-  if (parts.length) bits.push(parts.join(", "));
-  if (d.pool_size !== undefined) bits.push("pool " + d.pool_alive + "/" + d.pool_size + " alive");
-  if (d.pool_note) bits.push(d.pool_note);
-  if (d.pool_retired) bits.push(d.pool_retired + " retired");
-  if (d.stopped) bits.push("stopped early");
-  return label + ": " + bits.join(" · ");
-}
-
-function handleResult(m) {
-  runCount++;
-  if (m.status === "available") runAvail++;
-  pushResult(m);
-  if (runCount % 5 === 0) { updateMetrics(); bar(runCount, scanTotal); }
-}
-
-async function runSnipe() {
-  let names = namesInBox();
-  const platforms = selectedPlatforms();
-  if (!names.length) {
-    try { await generateInto($("nm-text")); names = namesInBox(); }
-    catch (e) { msg($("run-msg"), e.message, "bad"); return; }
+function renderResults() {
+  const rows = (S.filter === 'all' ? S.results : S.results.filter(r => r.status === S.filter));
+  const view = rows.slice(-SHOWROWS).reverse();
+  if (!view.length) {
+    $('rTable').innerHTML = '<tbody><tr><td class="empty">Nothing yet — start a sweep.</td></tr></tbody>';
+  } else {
+    $('rTable').innerHTML = '<thead><tr><th>name</th><th>platform</th><th>status</th><th>detail</th><th>latency</th><th></th></tr></thead><tbody>'
+      + view.map(r => `<tr>
+          <td style="color:${r.status === 'available' ? 'var(--ok)' : 'inherit'}">${esc(r.username)}</td>
+          <td class="dim">${esc(r.platform)}</td>
+          <td><span class="pill s-${r.status}">${r.status}</span></td>
+          <td class="dim2">${esc(r.detail || '')}</td>
+          <td class="dim2">${r.latency_ms ? Math.round(r.latency_ms) + 'ms' : '—'}</td>
+          <td>${r.status === 'available' ? `<button class="btn ghost" data-claim="${esc(r.platform)}|${esc(r.username)}">claim ↗</button>` : ''}</td>
+        </tr>`).join('') + '</tbody>';
   }
-  if (!platforms.length) { msg($("run-msg"), "pick at least one platform", "bad"); return; }
-  beginRun("/snipe/stop", "check");
-  scanTotal = names.length * platforms.length;
-  $("run-msg").innerHTML = '<span class="spin"></span> checking ' + names.length + " names on " + platforms.length + " platforms";
-  setLog("checking " + names.length + " names on " + platforms.join(", "));
-  let done = null;
-  try {
-    await streamResults("/snipe", {
-      usernames: names,
-      platforms: platforms,
-      concurrency: Number($("run-conc").value) || 64,
-      retries: Number($("run-retries").value),
-      stream: true,
-    }, (m) => {
-      if (m.type === "result") handleResult(m);
-      else if (m.type === "note") { msg($("run-msg"), m.pool_note, "bad"); setLog(m.pool_note); }
-      else if (m.type === "done") { done = m; }
-    }, runAbort ? runAbort.signal : undefined);
-    if (done) {
-      msg($("run-msg"), summarize(done, "done"), done.available_count ? "ok" : "");
-      setLog(summarize(done, "done"));
-    }
-  } catch (e) {
-    if (isAbort(e)) { msg($("run-msg"), "stopped after " + runCount + " checks"); setLog("stopped"); }
-    else { msg($("run-msg"), e.message, "bad"); setLog("error: " + e.message); }
-  } finally { endRun(); }
+  for (const el of $('rTable').querySelectorAll('[data-claim]')) {
+    el.onclick = async () => {
+      const [platform, username] = el.dataset.claim.split('|');
+      try {
+        const info = await api(`/claim?platform=${encodeURIComponent(platform)}&username=${encodeURIComponent(username)}`);
+        window.open(info.url, '_blank', 'noopener');
+        logline(`claim ${platform}/${username} — opening ${info.url}`, 'ok');
+      } catch (e) { toast('claim failed: ' + e.message, 'bad'); }
+    };
+  }
+  $('rNote').textContent = S.held > MAXROWS
+    ? `Holding the first ${fmt(MAXROWS)} rows plus every available name (${fmt(S.avail.length)}); the counters above are the real totals.`
+    : `Showing the latest ${Math.min(SHOWROWS, rows.length)} of ${fmt(rows.length)} rows held in this tab.`;
 }
-
-async function runScan() {
-  const platforms = selectedPlatforms();
-  if (!genPatterns.length) genPatterns = randomPatterns();
-  renderPatterns();
-  const patterns = genPatterns.map((p) => ({ pattern: p.pattern, length: p.length, limit: p.count }));
-  beginRun("/scan/stop", "scan");
-  $("run-msg").innerHTML = '<span class="spin"></span> scanning ' + patterns.length + " patterns…";
-  let done = null, expect = 0;
-  try {
-    await streamResults("/scan", {
-      usernames: namesInBox(),
-      patterns: patterns,
-      platforms: platforms,
-      concurrency: Number($("run-conc").value) || 256,
-      retries: Number($("run-retries").value),
-      stream: true,
-    }, (m) => {
-      if (m.type === "start") {
-        expect = m.names * (m.platforms.length || 1);
-        scanTotal = expect;
-        setLog("scanning " + m.names + " names × " + m.platforms.length + " platforms = " + expect + " checks · pool " + m.pool_size);
-        if (m.pool_note) { msg($("run-msg"), m.pool_note, "bad"); }
-      } else if (m.type === "result") {
-        handleResult(m);
-      } else if (m.type === "progress") {
-        updateMetrics(m.per_second);
-        const behind = m.per_second < runTarget;
-        $("m-rate").style.color = behind ? "var(--amber)" : "var(--green)";
-        setLog(m.checked + " checks · " + m.per_second.toFixed(1) + "/s · " + m.available_count + " available");
-      } else if (m.type === "done") { done = m; }
-    }, runAbort ? runAbort.signal : undefined);
-    if (done) {
-      $("m-rate").style.color = done.target_met ? "var(--green)" : "var(--amber)";
-      msg($("run-msg"), summarize(done, "scan finished") + " · " + done.per_second + "/s", done.available_count ? "ok" : "");
-      setLog(summarize(done, "scan finished"));
-      bar(done.checked, done.checked);
-    }
-  } catch (e) {
-    if (isAbort(e)) { msg($("run-msg"), "stopped after " + runCount + " checks"); setLog("stopped"); }
-    else { msg($("run-msg"), e.message, "bad"); setLog("error: " + e.message); }
-  } finally { endRun(); }
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+/* ============================ proxies ============================ */
+async function loadProxies() {
+  const data = await api('/proxies');
+  S.proxies = data;
+  const st = data.stats || {};
+  $('pCount').textContent = `— ${fmt(data.count)} · ${Object.entries(st.by_scheme || {}).map(([k, v]) => k + '\u00d7' + v).join(' ') || 'no schemes yet'}`;
+  $('navProxies').textContent = fmt(data.count);
+  $('footProx').textContent = fmt(data.count);
+  const list = data.proxies || [];
+  $('pTable').innerHTML = list.length
+    ? '<tbody>' + list.slice(0, 500).map(p =>
+        `<tr><td>${esc(p)}</td><td style="width:60px"><button class="btn ghost" data-drop="${esc(p)}">drop</button></td></tr>`).join('')
+      + '</tbody>'
+    : '<tbody><tr><td class="empty">No proxies stored. Paste a list above.</td></tr></tbody>';
+  for (const el of $('pTable').querySelectorAll('[data-drop]')) {
+    el.onclick = async () => {
+      await api('/proxies?proxy=' + encodeURIComponent(el.dataset.drop), { method: 'DELETE' });
+      loadProxies();
+    };
+  }
+  $('pInfo').textContent = st.updated ? 'updated ' + new Date(st.updated * 1000).toLocaleString() : '';
 }
-
-/* ── wiring ──────────────────────────────────────────────────────────── */
-$("btn-pr-append").onclick = () => savePaste("append");
-$("btn-pr-replace").onclick = () => {
-  if (confirm("Replace the whole stored list with what is in the box?")) savePaste("replace");
-};
-$("btn-pr-clear").onclick = async () => {
-  if (!confirm("Remove every stored proxy?")) return;
-  try { const out = await api("/proxies/clear", { method: "POST" }); msg($("pr-msg"), "cleared " + out.removed, "ok"); loadProxies(true); }
-  catch (e) { msg($("pr-msg"), e.message, "bad"); }
-};
-$("btn-pr-download").onclick = async () => {
-  if (!prTotal) { msg($("pr-msg"), "nothing stored to download", "bad"); return; }
-  try { download("proxies.txt", await api("/proxies?format=txt"), "text/plain"); }
-  catch (e) { msg($("pr-msg"), e.message, "bad"); }
-};
-$("btn-pr-more").onclick = () => loadProxies(false);
-
-$("btn-gen-add").onclick = () => { genPatterns.push(readPatterns()); renderPatterns(); };
-$("btn-gen-clear").onclick = () => { genPatterns = []; renderPatterns(); };
-$("btn-gen-run").onclick = generateNames;
-$("btn-gen-random").onclick = async () => {
-  genPatterns = randomPatterns();
-  $("nm-text").value = "";
-  renderPatterns();
+/* The server answers with `stored` as a stats object and `rejected` as a sample
+   list plus `rejected_count` for the total -- so read the fields that exist
+   rather than stringifying an object into the message. */
+function report(r) {
+  const bits = [];
+  if (r.added !== undefined) bits.push(`${fmt(r.added)} ${r.mode === 'replace' ? 'stored' : 'added'}`);
+  if (r.stored && typeof r.stored === 'object') bits.push(`${fmt(r.stored.count)} in the list now`);
+  if (r.duplicates) bits.push(`${fmt(r.duplicates)} already there`);
+  if (r.rejected_count) bits.push(`${fmt(r.rejected_count)} rejected`);
+  if (r.rejected?.length) bits.push('e.g. ' + r.rejected.slice(0, 3).join(', '));
+  $('pReport').innerHTML = bits.length ? `<div class="note">${esc(bits.join(' · '))}</div>` : '';
+}
+async function saveProxies(mode) {
+  const text = $('pPaste').value;
+  if (!text.trim()) return toast('Nothing pasted', 'bad');
   try {
-    const n = await generateInto($("nm-text"));
-    msg($("run-msg"), "drew " + n + " random names — press Check names or Scan generated", "ok");
-  } catch (e) { msg($("run-msg"), e.message, "bad"); }
-};
-
-$("btn-run").onclick = runSnipe;
-$("btn-scan").onclick = runScan;
-$("btn-stop").onclick = stopRun;
-$("btn-rows-clear").onclick = () => { clearResults(); renderResults(); };
-$("btn-copy-avail").onclick = async () => {
-  const rows = results.filter((r) => r.status === "available");
-  if (!rows.length) { msg($("run-msg"), "no available names yet", "bad"); return; }
+    const r = await api('/proxies', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, mode }) });
+    report(r); $('pPaste').value = ''; await loadProxies();
+    const total = (r.stored && r.stored.count) || 0;
+    toast(`${mode === 'replace' ? 'Replaced' : 'Added'} — ${fmt(total)} in the list`, 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+}
+/* ============================ settings ============================ */
+async function loadSettings() {
+  const s = (await api('/settings')).alerts;
+  $('sHook').value = s.webhook || ''; $('sOn').checked = !!s.enabled;
+  $('sTpl').value = s.template || ''; $('sPing').value = s.ping || '';
+  $('sUser').value = s.username || ''; $('sAvatar').value = s.avatar || '';
+  return s;
+}
+async function saveSettings() {
   try {
-    await copyText(rows.map((r) => r.platform + " " + r.username).join("\n"));
-    msg($("run-msg"), "copied " + rows.length + " available", "ok");
-  } catch (e) { msg($("run-msg"), e.message, "bad"); }
-};
-$("btn-export").onclick = () => {
-  if (!results.length) { msg($("run-msg"), "nothing to export", "bad"); return; }
-  const head = "username,platform,status,detail,proxy,latency_ms";
-  const body = results.map((r) =>
-    [r.username, r.platform, r.status, (r.detail || "").replace(/"/g, '""'), r.proxy || "", r.latency_ms ?? ""]
-      .map((v) => `"${v}"`).join(",")).join("\n");
-  download("bahs-results.csv", head + "\n" + body, "text/csv");
-};
-document.querySelectorAll("#filter button").forEach((b) => {
+    const body = { webhook: $('sHook').value.trim(), enabled: $('sOn').checked, template: $('sTpl').value,
+      ping: $('sPing').value, username: $('sUser').value, avatar: $('sAvatar').value.trim() };
+    const s = (await api('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) })).alerts;
+    $('sNote').innerHTML = `<div class="note">Saved. Alerts are <b>${s.enabled ? 'on' : 'off'}</b>${s.webhook_set ? '' : ' — no webhook URL set yet'}.</div>`;
+    toast('Settings saved', 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+}
+async function testHook() {
+  $('sNote').innerHTML = '<div class="note">Sending…</div>';
+  try {
+    const r = await api('/settings/test-webhook', { method: 'POST' });
+    $('sNote').innerHTML = r.ok
+      ? '<div class="note">Test delivered — check the channel.</div>'
+      : `<div class="note bad">Not delivered: ${esc(r.error || (r.failed + ' failed'))}</div>`;
+  } catch (e) { $('sNote').innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+}
+/* ============================ wiring ============================ */
+for (const b of $('nav').querySelectorAll('button')) {
   b.onclick = () => {
-    filter = b.dataset.f;
-    document.querySelectorAll("#filter button").forEach((x) => x.classList.toggle("on", x === b));
-    renderResults();
+    for (const o of $('nav').querySelectorAll('button')) o.classList.toggle('on', o === b);
+    for (const v of document.querySelectorAll('.view')) v.classList.toggle('on', v.id === 'v-' + b.dataset.view);
   };
-});
-$("nm-text").addEventListener("input", refreshNameCount);
-
-async function pollHealth() {
-  try {
-    const h = await api("/health");
-    const p = h.proxies || {};
-    $("c-proxies").textContent = p.count || 0;
-    $("chip-proxies").className = "chip " + (p.count ? "on" : "warn");
-    const active = (h.runs && h.runs.active) || 0;
-    if (active && !runAbort) { $("c-run").textContent = active + " running"; $("chip-run").className = "chip warn"; }
-    else if (!runAbort) { $("c-run").textContent = "idle"; $("chip-run").className = "chip " + (runCount ? "on" : ""); }
-    $("c-status").textContent = "ok";
-    $("chip-fd").className = "chip on";
-  } catch (e) {
-    $("c-status").textContent = "unreachable";
-    $("chip-fd").className = "chip bad";
-  }
 }
+$('start').onclick = start;
+$('stop').onclick = stopRun;
+$('conc').oninput = (e) => $('concVal').textContent = e.target.value;
+$('pickNil').onclick = () => { S.sel.clear(); renderBuckets(); updateEstimate(); };
+$('pickShort').onclick = () => {
+  S.sel.clear();
+  for (const b of S.menu) if ((b.length === 3 || b.length === 4) && ['l','n','og'].includes(b.kind)) S.sel.add(b.label);
+  renderBuckets(); updateEstimate();
+};
+$('pAppend').onclick = () => saveProxies('append');
+$('pReplace').onclick = () => saveProxies('replace');
+$('pUpload').onclick = () => $('pFile').click();
+$('pFile').onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const text = await f.text();
+  try {
+    const r = await api('/proxies/upload', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: text });
+    report(r); await loadProxies(); toast('Uploaded ' + f.name, 'ok');
+  } catch (err) { toast(err.message, 'bad'); }
+  e.target.value = '';
+};
+$('pDownload').onclick = async () => {
+  const txt = await api('/proxies?format=txt');
+  const url = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+  const a = document.createElement('a'); a.href = url; a.download = 'proxies.txt'; a.click();
+  URL.revokeObjectURL(url);
+};
+$('pCopyAll').onclick = async () => {
+  const txt = await api('/proxies?format=txt');
+  await navigator.clipboard.writeText(txt); toast('Copied ' + txt.split('\n').filter(Boolean).length + ' lines', 'ok');
+};
+$('pClear').onclick = async () => {
+  if (!confirm('Empty the stored proxy list?')) return;
+  await api('/proxies/clear', { method: 'POST' }); await loadProxies(); toast('List cleared', 'ok');
+};
+$('rCopy').onclick = async () => {
+  if (!S.avail.length) return toast('Nothing available yet', 'bad');
+  await navigator.clipboard.writeText(S.avail.map(r => r.username).join('\n'));
+  toast(`Copied ${S.avail.length} available names`, 'ok');
+};
+$('rCsv').onclick = () => {
+  const rows = [['username','platform','status','detail','proxy','latency_ms']]
+    .concat(S.results.map(r => [r.username, r.platform, r.status, r.detail || '', r.proxy || '', r.latency_ms ?? '']));
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  const a = document.createElement('a'); a.href = url; a.download = 'bahs-results.csv'; a.click();
+  URL.revokeObjectURL(url);
+};
+$('rWipe').onclick = () => { S.results = []; S.avail = []; S.held = 0; S.counts = {}; renderResults(); renderFilters(); };
+$('sSave').onclick = saveSettings;
+$('sTest').onclick = testHook;
 
+/* ============================ init ============================ */
 (async function init() {
-  try { const info = await api("/info"); buildPlatforms(info.platforms); }
-  catch (e) { buildPlatforms(null); }
-  renderPatterns();
-  bindFileInput();
-  refreshNameCount();
-  await loadProxies(true);
-  await pollHealth();
-  setInterval(pollHealth, 5000);
+  try {
+    S.info = await api('/info');
+    const menu = await api('/menu');
+    S.menu = menu.buckets; S.kinds = menu.kinds;
+    $('kMax').textContent = fmt(menu.max_enumeration) + ' names per run';
+    S.plats = S.info.platforms.map((name, i) => ({ name, on: true }));
+    $('footPlat').textContent = S.plats.length;
+    $('conc').value = 256; $('concVal').textContent = '256';
+    for (const b of S.menu) if (['3l','3n','3og'].includes(b.label)) S.sel.add(b.label);
+    renderBuckets(); renderPlats(); updateEstimate(); renderFilters(); renderResults();
+    await loadProxies(); await loadSettings();
+    logline('ready — ' + S.plats.length + ' platforms, ' + fmt(S.proxies.count) + ' proxies', 'ok');
+    if (!S.proxies.count) logline('add proxies on the Proxies tab before starting a sweep', 'warn');
+    setInterval(async () => {
+      try {
+        const h = await api('/health');
+        $('footRuns').textContent = h.runs.active ? h.runs.active + ' run(s) live' : 'idle';
+        $('footProx').textContent = fmt(h.proxies.count);
+      } catch (e) {}
+    }, 5000);
+  } catch (e) {
+    logline('init failed: ' + e.message, 'bad');
+    $('est').innerHTML = '<span style="color:var(--bad)">Could not load the API: ' + esc(e.message) + '</span>';
+  }
 })();
 </script>
 </body>
