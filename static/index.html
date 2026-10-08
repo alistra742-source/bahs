@@ -21,9 +21,9 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
   background:
    radial-gradient(900px 500px at 12% -8%,rgba(108,92,231,.16),transparent 60%),
    radial-gradient(700px 420px at 100% 0%,rgba(0,224,184,.10),transparent 60%)}
-.shell{position:relative;z-index:1;display:grid;grid-template-columns:220px 1fr;min-height:100%}
+.shell{position:relative;z-index:1;display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100%}
 /* ---------- sidebar ---------- */
-.side{border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:6px;background:rgba(10,11,16,.6)}
+.side{min-width:0;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:6px;background:rgba(10,11,16,.6)}
 .brand{display:flex;align-items:center;gap:9px;padding:4px 8px 18px}
 .brand .dot{width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 0 14px rgba(108,92,231,.8)}
 .brand b{font-size:15px;letter-spacing:.5px}
@@ -37,62 +37,21 @@ body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
 .side .foot{margin-top:auto;font-size:11px;color:var(--dim2);font-family:var(--mono);padding:10px 8px;line-height:1.7}
 .side .foot b{color:var(--dim)}
 /* ---------- main ---------- */
-main{padding:26px 30px 90px;max-width:1500px}
+main{min-width:0;padding:26px 30px 90px;max-width:1500px}
 .view{display:none}.view.on{display:block;animation:fade .18s ease}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
 h1{font-size:21px;margin:0 0 3px;letter-spacing:-.2px}
 .sub{color:var(--dim);font-size:13px;margin-bottom:22px}
-.card{background:linear-gradient(180deg,var(--panel),rgba(18,20,28,.6));border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+.card{min-width:0;background:linear-gradient(180deg,var(--panel),rgba(18,20,28,.6));border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
 .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);margin:0 0 14px;font-weight:600}
 .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-/* Two layouts: a sidebar on a desktop, a sticky top bar on a phone. The old
-   rule collapsed the column to 64px and hid the brand but kept the nav labels,
-   so on a phone the labels spilled over the content. */
-@media(max-width:900px){
-  .shell{grid-template-columns:1fr}
-  .grid2{grid-template-columns:1fr}
-  .side{position:sticky;top:0;height:auto;flex-direction:row;align-items:center;gap:6px;
-        padding:8px 10px;border-right:0;border-bottom:1px solid var(--line);
-        background:rgba(10,11,16,.95);backdrop-filter:blur(10px);z-index:6;overflow-x:auto}
-  .side::-webkit-scrollbar{display:none}
-  .brand{padding:0 4px 0 0;flex:none}
-  .brand b,.brand span{display:none}
-  .nav{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;flex:1}
-  .nav button{padding:9px 2px;font-size:12px;white-space:nowrap;justify-content:center;gap:0}
-  .nav .ico{display:none}
-  .nav .tag{display:none}
-  .side .foot{display:none}
-  main{padding:15px 12px 104px}
-  h1{font-size:18px}
-  .sub{font-size:12.5px;margin-bottom:15px}
-  .card{padding:13px;border-radius:12px;margin-bottom:12px}
-  .tiles{grid-template-columns:repeat(auto-fit,minmax(94px,1fr));gap:7px}
-  .tile{padding:9px 10px}
-  .tile .v{font-size:18px}
-  .bucketrow{grid-template-columns:24px repeat(4,1fr);gap:4px;margin-bottom:6px}
-  .bucket{padding:6px 5px;border-radius:8px}
-  .bucket .k{font-size:11px}
-  .bucket .n{font-size:8.4px;letter-spacing:-.3px}
-  .bucket .d{display:none}
-  .bucket .x{display:none}
-  .bhead{font-size:8.5px;letter-spacing:0}
-  .bucketrow .len{font-size:13px}
-  .sticky{left:0;padding:8px 12px;gap:11px;flex-wrap:wrap;font-size:11px}
-  .toast{right:10px;left:10px;bottom:78px;align-items:stretch}
-  table{font-size:11.5px}
-  td,th{padding:6px 7px}
-  .scroll{max-height:none}
-  .log{max-height:230px}
-  button.btn{padding:8px 12px;font-size:12.5px}
-  .row{gap:8px}
-}
-@media(min-width:901px){
-  .sticky{left:220px}
-}
-/* A wide table scrolls sideways rather than squashing its columns into nothing. */
-.scroll{overflow:auto;-webkit-overflow-scrolling:touch}
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+/* A wide table scrolls sideways *inside* this box. min-width:0 matters: without
+   it the table's intrinsic width travels up through .card and main, and the
+   whole page -- not the table -- becomes wider than the phone. */
+.scroll{min-width:0;overflow:auto;-webkit-overflow-scrolling:touch}
 table{min-width:520px}
+th{white-space:nowrap}
 #platTable{min-width:0}
 .reswrap{position:relative}
 .reswrap::after{content:"";position:absolute;top:0;right:0;bottom:0;width:26px;pointer-events:none;
@@ -178,6 +137,55 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
 .toast div{background:var(--panel2);border:1px solid var(--line2);border-left:3px solid var(--acc);padding:10px 14px;border-radius:9px;font-size:12.5px;animation:fade .18s}
 .toast div.bad{border-left-color:var(--bad)}
 .toast div.ok{border-left-color:var(--ok)}
+/* Phone rules live at the END of the sheet on purpose. Several of these
+   override properties the base rules set further down (the bucket grid, the
+   table font, button padding); placed above them they lost on source order
+   and the phone quietly rendered the desktop metrics. */
+/* Two layouts: a sidebar on a desktop, a sticky top bar on a phone. The old
+   rule collapsed the column to 64px and hid the brand but kept the nav labels,
+   so on a phone the labels spilled over the content. */
+@media(max-width:900px){
+  .shell{grid-template-columns:minmax(0,1fr)}
+  .grid2{grid-template-columns:minmax(0,1fr)}
+  .side{position:sticky;top:0;height:auto;flex-direction:row;align-items:center;gap:6px;
+        padding:8px 10px;border-right:0;border-bottom:1px solid var(--line);
+        background:rgba(10,11,16,.95);backdrop-filter:blur(10px);z-index:6;overflow-x:auto}
+  .side::-webkit-scrollbar{display:none}
+  .brand{padding:0 4px 0 0;flex:none}
+  .brand b,.brand span{display:none}
+  .nav{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;flex:1}
+  .nav button{padding:9px 2px;font-size:12px;white-space:nowrap;justify-content:center;gap:0}
+  .nav .ico{display:none}
+  .nav .tag{display:none}
+  .side .foot{display:none}
+  main{padding:15px 12px 104px}
+  h1{font-size:18px}
+  .sub{font-size:12.5px;margin-bottom:15px}
+  .card{padding:13px;border-radius:12px;margin-bottom:12px}
+  .tiles{grid-template-columns:repeat(auto-fit,minmax(94px,1fr));gap:7px}
+  .tile{padding:9px 10px}
+  .tile .v{font-size:18px}
+  .bucketrow{grid-template-columns:24px repeat(4,1fr);gap:4px;margin-bottom:6px}
+  .bucket{padding:6px 5px;border-radius:8px}
+  .bucket .k{font-size:11px}
+  .bucket .n{font-size:8.4px;letter-spacing:-.3px}
+  .bucket .d{display:none}
+  .bucket .x{display:none}
+  .bhead{font-size:8.5px;letter-spacing:0}
+  .bucketrow .len{font-size:13px}
+  .sticky{left:0;padding:8px 12px;gap:11px;flex-wrap:wrap;font-size:11px}
+  .toast{right:10px;left:10px;bottom:78px;align-items:stretch}
+  table{font-size:11.5px}
+  td,th{padding:6px 7px}
+  .scroll{max-height:none}
+  .log{max-height:230px}
+  button.btn{padding:8px 12px;font-size:12.5px}
+  .row{gap:8px}
+}
+@media(min-width:901px){
+  .sticky{left:220px}
+}
+
 </style>
 </head>
 <body>

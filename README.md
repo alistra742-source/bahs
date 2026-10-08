@@ -92,6 +92,14 @@ Measured against a local origin through real HTTP proxies:
 | 800 ms | 1 endpoint | 64 | 77 |
 
 The client's own ceiling is around 2,000 dispatches/s, so it is never the wall.
+
+That ceiling is only the ceiling if the scheduler gets out of its own way. The
+dispatch loop asks the pool for `usable()` **once per check**, and `usable()` used
+to walk every proxy in the list. Measured on the loop alone, 60,000 checks through
+a 400-proxy pool: **35,924/s** counting each call, **86,328/s** once the count is
+O(1) — a 2.4x change in dispatch cost that scaled with how good your list is.
+The wall-clock gain in a real run is smaller, because with real exit IPs the
+network dominates; it is the client-side floor that moved.
 Measured end to end through the dashboard, 1,000 Roblox checks on eight proxy
 endpoints ran at 323/s and finished in three seconds.
 What moves the number is **more concurrent exit IPs**. With one rotating
@@ -110,7 +118,7 @@ A `429` is the platform talking, not your proxies, and it is handled as such:
 
 - The proxy is **rested** briefly and counted in its own `blocked` column. It is
   never retired for it.
-- When a platform has refused **every** proxy in the list, that platform is
+- When a platform has refused **every proxy still alive** in the pool, it is
   **paused** — with the `retry_after` the platform gave, capped at
   `SNIPE_PLATFORM_PAUSE_MAX`. Jobs for it are skipped instead of hammered.
 - The **rest of the run continues** on the platforms that are still answering.
@@ -223,6 +231,28 @@ down, and a `done` summary.
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |
 | `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
 | `LOG_LEVEL` | `info` | |
+
+## The dashboard on a phone
+
+The phone view is verified in a real browser, not assumed: Chromium at a 390 px
+viewport and at 1440 px, with the document width compared to the viewport and
+every element checked for crossing it.
+
+Two things that were wrong and are now measured rather than guessed:
+
+- **The page was 550 px wide in a 390 px viewport.** `table{min-width:520px}`
+  is what makes a wide table scroll sideways, but the table's intrinsic width
+  travelled up through `.card`, `.grid2` and `main` — every one of them a grid
+  item with the default `min-width:auto` — and the whole page grew instead of
+  the table. The wrappers now carry `min-width:0`, so the tables scroll **inside**
+  their own box and the document is exactly the viewport width (390 = 390).
+- **The entire `@media(max-width:900px)` block sat above the rules it overrides.**
+  Same specificity, decided by source order, and the desktop rules came later —
+  so the bucket grid, the table font and the button padding quietly stayed at
+  desktop metrics on a phone. That is why the sizes in the name-space grid kept
+  getting clipped (`1,679,6` instead of `1,679,616`) no matter how many times the
+  numbers were shrunk. The phone block now lives at the end of the sheet, with a
+  comment saying why it has to.
 
 ## Layout
 
