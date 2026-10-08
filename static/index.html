@@ -156,6 +156,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
 .s-invalid{background:rgba(255,176,32,.14);color:var(--warn)}
 .s-blocked{background:rgba(108,92,231,.2);color:#a99bff}
 .s-error{background:rgba(255,95,109,.15);color:var(--bad)}
+.s-unanswered{background:rgba(255,255,255,.07);color:var(--dim2)}
 .scroll{max-height:390px;overflow:auto}
 .scroll::-webkit-scrollbar{width:9px;height:9px}
 .scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:9px}
@@ -489,7 +490,7 @@ function setRunning(on) {
    browser cannot know. */
 const POOL_MISS = new Set(['proxies exhausted this run', 'no proxies saved']);
 const FINAL = new Set(['available', 'taken', 'invalid']);
-const zeroRow = () => ({ checked: 0, available: 0, taken: 0, invalid: 0, blocked: 0, error: 0 });
+const zeroRow = () => ({ checked: 0, available: 0, taken: 0, invalid: 0, blocked: 0, error: 0, unanswered: 0 });
 
 function liveReset(total, plats) {
   S.live = {
@@ -554,12 +555,21 @@ function serverTick(p) {
 function renderPlatTable(by) {
   if (!by) return;
   const keys = Object.keys(by);
-  $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th><th>blocked</th><th>errors</th></tr></thead><tbody>'
+  /* Two failure columns, because they mean opposite things: `errors` is the
+     transport failing -- evidence about the proxy list -- while `no answer` is
+     the platform handing back something unreadable, which is not the list's
+     fault. One merged column is how a run on a flaky host read as "proxies
+     exhausted". */
+  $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th>'
+    + '<th title="the platform refused this exit IP">blocked</th>'
+    + '<th title="the proxy could not carry the request -- this is the list">errors</th>'
+    + '<th title="the platform answered something unreadable -- not the list">no answer</th></tr></thead><tbody>'
     + keys.map(k => {
         const r = by[k];
         return `<tr><td>${esc(k)}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
           <td class="dim">${fmt(r.taken)}</td><td style="color:#a99bff">${fmt(r.blocked)}</td>
-          <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td></tr>`;
+          <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td>
+          <td class="dim2">${fmt(r.unanswered || 0)}</td></tr>`;
       }).join('') + '</tbody>';
 }
 async function start() {
@@ -657,6 +667,15 @@ function finish(d) {
     d.available_count ? 'ok' : '');
   for (const p of paused) logline(`${p} sat out: ${d.platforms_paused[p].reason}`, 'warn');
   if (d.stop_reason) logline(d.stop_reason, 'bad');
+  /* The two failure kinds get told apart here, because this is the line
+     everybody reads and "911 errors" is useless without knowing whose. */
+  const unans = (L && L.byStatus.unanswered) || 0;
+  if (unans) logline(`${fmt(unans)} checks got no readable answer from the platform — not the proxies' doing`, 'warn');
+  const att = d.proxy_attempts || 0, fl = d.proxy_failures || 0;
+  if (att >= 20 && fl / att >= 0.1) {
+    logline(`the proxies failed ${Math.round(fl / att * 100)}% of ${fmt(att)} requests at the transport level — that is the list, not the names`, 'bad');
+  }
+  if (d.pool_retired) logline(`${fmt(d.pool_retired)} of ${fmt(d.pool_size)} proxies were written off for this run`, 'warn');
   if (d.alerts?.enabled) logline(`alerts — ${d.alerts.sent} sent, ${d.alerts.failed} failed`);
   updateEstimate();
 }
@@ -667,7 +686,7 @@ async function stopRun() {
   logline('stop requested', 'warn');
 }
 /* ============================ results ============================ */
-const FILTERS = ['all','available','taken','invalid','blocked','error'];
+const FILTERS = ['all','available','taken','invalid','blocked','error','unanswered'];
 function renderFilters() {
   const c = S.counts || {};
   const total = Object.values(c).reduce((a, b) => a + b, 0);

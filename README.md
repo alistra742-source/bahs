@@ -116,13 +116,39 @@ A `429` is the platform talking, not your proxies, and it is handled as such:
 - The **rest of the run continues** on the platforms that are still answering.
   A discord 429 no longer costs you the tiktok sweep.
 - If every platform ends up paused, the run stops and says which and why.
-- When *every* proxy is resting, the run parks rather than going quiet: it emits
-  a `waiting` line every half second saying how many are resting and how long it
-  will wait, which the dashboard shows in the activity log and the status bar. A
-  run that says nothing for twenty seconds looks broken; it was just waiting.
 
 A run only reports "proxies exhausted" when the list genuinely is — every proxy
-retired on transport errors.
+retired.
+
+## A flaky proxy no longer ends the run
+
+The pool used to treat a *cooldown* as "unusable": one transport error put a
+proxy to sleep for `SNIPE_PROXY_COOLDOWN` seconds, the scheduler stopped
+dispatching, and with a single proxy the run then slept ten seconds at a time
+before abandoning the sweep. Measured with one host answering 70% of requests:
+302 of 3,000 names checked in 36 s, 30 s of it asleep, then "the list is dead".
+A proxy in a cooldown is not a pool that cannot be used, so a cache of live
+proxies is now what "usable" means; only retirement takes one out.
+
+**Retirement is a rate, not a streak.** A streak of failures was wiped by any
+answer, so a host that answered one request in three kept its record clean
+forever and the run limped through the name list one error at a time. A proxy is
+now written off when it has failed every attempt up to `SNIPE_PROXY_FAIL_LIMIT`
+(it is simply gone), or `SNIPE_PROXY_FAIL_RATE` of at least sixteen attempts.
+A host failing a third of its requests is kept — it is still producing answers,
+and ending a sweep is worse than reporting its error rate. When every proxy in
+the list is retired the run stops and says so.
+
+The `done` summary carries `proxy_attempts` and `proxy_failures`, and the
+dashboard turns them into one line: a high transport-failure share is the list,
+not the names.
+
+**Errors and unanswered checks are different things.** A transport failure is
+the tunnel's fault. A challenge page, a status we do not read, or a 200 missing
+the field we look at is the *platform's* answer, reported separately as
+`unanswered` — it never rests, strikes or retires a proxy. Charging those to the
+list is what made a run against a challenged site report "your list is dead"
+about a list that was working.
 
 ## Alerts
 
@@ -161,9 +187,10 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /claim` | where to register a name |
 | `GET /settings` `POST /settings` `POST /settings/test-webhook` | alerts |
 
-`stream: true` returns NDJSON: `start`, then a `result` line per verdict, a
-`progress` line as it goes, a `waiting` line whenever the pool has nothing free,
-and a `done` summary.
+`stream: true` returns NDJSON: `start`, then a `result` line per verdict
+(`available`, `taken`, `invalid`, `blocked`, `error`, `unanswered`), a
+`progress` line as it goes, a `waiting` line when every live proxy is cooling
+down, and a `done` summary.
 
 ## Environment
 
@@ -189,9 +216,8 @@ and a `done` summary.
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
-| `SNIPE_PROXY_FAIL_LIMIT` | `6` | transport failures before a proxy is retired |
-| `POOL_WAIT_MAX` | `10` | seconds to wait for a resting proxy before re-checking |
-| `POOL_EMPTY_STREAK` | `3` | waits before a run gives up on a resting pool |
+| `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired |
+| `SNIPE_PROXY_FAIL_RATE` | `0.75` | share of failures that writes a proxy off |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |

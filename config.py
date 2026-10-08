@@ -146,24 +146,20 @@ SNIPE_BLOCK_COOLDOWN: float = _float("SNIPE_BLOCK_COOLDOWN", 5.0)
 # because a block that repeats across proxies means the platform is throttling,
 # not that the list is full of dead hosts.
 SNIPE_PROXY_BLOCK_LIMIT: int = _int("SNIPE_PROXY_BLOCK_LIMIT", 40)
-# A proxy that fails this many times in one run is taken out of the rotation
-# for the rest of the run: hosts that answered once and then died are where a
-# wall of ConnectErrors comes from.
+# The least attempts a proxy is judged on, and how many of them have to fail
+# before it is taken out of the rotation for the rest of the run.
 SNIPE_PROXY_FAIL_LIMIT: int = _int("SNIPE_PROXY_FAIL_LIMIT", 6)
+# The share of a proxy's attempts that may fail before it is written off, once
+# it has carried at least sixteen of them. A *rate* rather than a streak,
+# because a streak is wiped by any answer: a host that answers one request in
+# three never built one, so it stayed on the list forever while every third name
+# came back an error. At 0.75 a list has to be very nearly dead before a run
+# stops using it -- stopping a sweep is worse than reporting an error rate, and
+# a host still answering two requests in five is still producing answers.
+SNIPE_PROXY_FAIL_RATE: float = _float("SNIPE_PROXY_FAIL_RATE", 0.75)
 # Seconds the warm pool is reused across requests before it is rebuilt, so
 # consecutive batches skip their handshakes.
 SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)
-# When nothing in the pool can be handed out -- every proxy resting because the
-# platform just refused it -- a run waits this long for the soonest one to come
-# back before giving up and saying why. Only *resting* proxies are waited for;
-# a list that is retired in full ends the run immediately.
-POOL_WAIT_MAX: float = _float("POOL_WAIT_MAX", 10.0)
-# Consecutive empty waits before the run stops. A transient throttle recovers on
-# the first or second wait; a global rate limit does not recover at all, and
-# without this the run would sit there trading waits with the platform forever
-# while its remaining names never get dispatched.
-POOL_EMPTY_STREAK: int = _int("POOL_EMPTY_STREAK", 3)
-
 # --- Bulk scan -------------------------------------------------------------
 # A scan is the same loop at throughput: many names per platform.
 SCAN_CONCURRENCY: int = _int("SCAN_CONCURRENCY", 256)

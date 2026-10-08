@@ -543,7 +543,14 @@ class _Tally:
     throttling its share of the run.
     """
 
-    _ZERO = {"checked": 0, "available": 0, "taken": 0, "invalid": 0, "blocked": 0, "error": 0}
+    # "unanswered" is its own column on purpose: an error is the transport
+    # failing and is evidence about the proxy list, while an answer nobody could
+    # read is evidence about the platform. Folding them together is how a run
+    # that was limping on a bad host looked like the proxies were exhausted.
+    _ZERO = {
+        "checked": 0, "available": 0, "taken": 0, "invalid": 0,
+        "blocked": 0, "error": 0, "unanswered": 0,
+    }
 
     def __init__(
         self, names: int, platforms: list[str], alerter: Alerter | None = None
@@ -647,6 +654,12 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         "pool_retired": pool.retired(),
         "pool_blocked": pool.blocked(),
         "per_proxy_connections": pool.per_proxy,
+        # Requests the proxies carried and how many failed at the transport
+        # level. This is what tells "your list is bad" apart from "the names are
+        # taken" -- the errors column alone cannot, which is how a run that was
+        # limping on one flaky host looked like the names were the problem.
+        "proxy_attempts": pool.attempts(),
+        "proxy_failures": pool.failures(),
         # Set only when the run stopped early because of the pool rather than
         # because it ran out of names -- "the platform throttled every proxy" is
         # a completely different message from "your list is dead".
