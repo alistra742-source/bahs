@@ -20,6 +20,12 @@ uvicorn server:app --host 0.0.0.0 --port 8080
 Open `http://localhost:8080`. On Railway, `PORT` is injected; point `STORE_PATH`
 at a volume so the proxy list and settings survive a deploy.
 
+The dashboard's Live card prints the commit it is running (`build 9597c9d`), from
+`RAILWAY_GIT_COMMIT_SHA` or the checkout's `HEAD`, and `/health` and `/info`
+carry the same string. That is how "I changed it, why do I still see the old
+bug?" gets answered: a stale deploy or a cached page shows an old commit, and
+the page itself is served `no-cache`, so it has to revalidate.
+
 ## Platforms
 
 | platform | how the check works | latency from a datacenter IP |
@@ -125,8 +131,13 @@ A `429` is the platform talking, not your proxies, and it is handled as such:
   A discord 429 no longer costs you the tiktok sweep.
 - If every platform ends up paused, the run stops and says which and why.
 
-A run only reports "proxies exhausted" when the list genuinely is — every proxy
-retired.
+**A name the pool could not carry is not a result.** When every proxy is
+retired, the checks that never went out are not filed as `error` rows — a run
+does not get to report a failure for a name it never asked about. They are
+counted as `unattempted` (`proxy_misses` covers the narrower case of a name the
+pool refused when it was handed one) and the run stops with the reason. Filing
+them as errors is what filled the results table with hundreds of "proxies
+exhausted" lines and made a dead list look like a broken scanner.
 
 ## A flaky proxy no longer ends the run
 
@@ -146,6 +157,15 @@ now written off when it has failed every attempt up to `SNIPE_PROXY_FAIL_LIMIT`
 A host failing a third of its requests is kept — it is still producing answers,
 and ending a sweep is worse than reporting its error rate. When every proxy in
 the list is retired the run stops and says so.
+
+**And it is judged on a settled sample.** A failure that is fast and an answer
+that is slow means the *first* outcomes to come back are the failures. At
+concurrency 64 on a host dropping a third of its tunnels, the first six
+completions were all drops and the pool was written off 0.05 s into a sweep it
+could have carried: 8 checks, 0 answers, "the list is dead". A proxy is now only
+judged once nothing it was handed is still in flight, so "every attempt failed"
+means every attempt rather than every fast one. A host that is simply gone fails
+instantly, settles instantly, and is still retired at the same speed.
 
 The `done` summary carries `proxy_attempts` and `proxy_failures`, and the
 dashboard turns them into one line: a high transport-failure share is the list,
@@ -184,7 +204,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 | | |
 |---|---|
 | `GET /` | the dashboard |
-| `GET /info`, `GET /health` | platforms, generation, counters |
+| `GET /info`, `GET /health` | platforms, generation, counters, and the commit this process is running (`build`) |
 | `GET /menu` | every bucket with its real size |
 | `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
 | `POST /scan` | `{buckets:[{kind,length}], platforms, concurrency, stream}` |
@@ -224,7 +244,7 @@ down, and a `done` summary.
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
-| `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired |
+| `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired, on a settled sample |
 | `SNIPE_PROXY_FAIL_RATE` | `0.75` | share of failures that writes a proxy off |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |

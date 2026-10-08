@@ -94,6 +94,51 @@ _RAISED_FD_LIMIT = _raise_fd_limit()
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
+
+def _build_id() -> str:
+    """The commit this process is running, so a live site can be told apart from
+    a stale deploy or a cached page.
+
+    Without this there is no way to answer "I changed it, why do I still see the
+    old bug?" from the outside: the UI ships with no version anywhere. Railway
+    and Docker both hand the commit to the container; a local run falls back to
+    the checkout's HEAD, and anything else says so honestly.
+    """
+    for name in ("RAILWAY_GIT_COMMIT_SHA", "SOURCE_COMMIT", "GIT_COMMIT", "BUILD_ID"):
+        value = os.environ.get(name)
+        if value:
+            return value.strip()[:7]
+    root = os.path.dirname(os.path.abspath(__file__))
+    try:
+        meta = os.path.join(root, ".git")
+        # A worktree keeps .git as a one-line pointer ("gitdir: /path"), not a
+        # directory, so follow it before reading HEAD.
+        if os.path.isfile(meta):
+            with open(meta, encoding="utf-8") as fh:
+                pointer = fh.read().strip()
+            if not pointer.startswith("gitdir:"):
+                return "dev"
+            meta = pointer.split(":", 1)[1].strip()
+        # Branch refs live in the *common* git dir, which a worktree names in
+        # its commondir file; only HEAD and the per-worktree state are local.
+        common = meta
+        pointer = os.path.join(meta, "commondir")
+        if os.path.isfile(pointer):
+            with open(pointer, encoding="utf-8") as fh:
+                common = os.path.join(meta, fh.read().strip())
+        with open(os.path.join(meta, "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref:"):
+            ref = os.path.join(common, head.split(" ", 1)[1].strip())
+            with open(ref, encoding="utf-8") as fh:
+                head = fh.read().strip()
+    except OSError:
+        return "dev"
+    return head[:7] if head else "dev"
+
+
+BUILD = _build_id()
+
 proxy_list = proxy_list_module.ProxyList(STORE_PATH)
 
 # Discord alerts. The environment is the base and the UI can override it, so
@@ -124,7 +169,12 @@ app = FastAPI(title="bahs", version="3.0.0", lifespan=lifespan)
 # --- site + info ----------------------------------------------------------
 @app.get("/", include_in_schema=False)
 def site() -> FileResponse:
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    # no-cache (not no-store): the browser may keep the page but must revalidate
+    # it, so a single-file dashboard cannot go on serving an old build.
+    return FileResponse(
+        os.path.join(STATIC_DIR, "index.html"),
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/info")
@@ -132,6 +182,7 @@ def info() -> dict:
     words = generator.words_by_length()
     return {
         "service": "bahs",
+        "build": BUILD,
         "platforms": list(sniper.PLATFORMS),
         "alerts_enabled": bool(alert_settings.get().get("enabled")),
         # What the UI needs to show a running total for "every name of this
@@ -172,6 +223,7 @@ def health() -> dict:
     runs = _runs_status()
     return {
         "status": "ok",
+        "build": BUILD,
         "proxies": proxy_list.stats(),
         "runs": {"active": sum(1 for r in runs if r["active"]), "tracked": len(runs)},
         "platforms": list(sniper.PLATFORMS),
@@ -553,10 +605,19 @@ class _Tally:
     }
 
     def __init__(
-        self, names: int, platforms: list[str], alerter: Alerter | None = None
+        self,
+        names: int,
+        platforms: list[str],
+        alerter: Alerter | None = None,
+        pool: "sniper.ProxyPool | None" = None,
     ) -> None:
         self.names = names
         self.platforms = platforms
+        # The pool is where misses are counted now. A name the pool could not
+        # carry is never emitted as a result -- a run must not file an error
+        # against a name it never asked about -- so there is nothing in the
+        # stream to count and the pool is the only honest source.
+        self.pool = pool
         # A run costs names x platforms, not names. Reporting progress against
         # the name count alone showed 0% on a run that was a third of the way
         # through, because every name is checked once per platform.
@@ -567,7 +628,6 @@ class _Tally:
         self.available = 0
         self.answered = 0
         self.rate_limits = 0
-        self.proxy_misses = 0
         self.by_status: dict[str, int] = {}
         self.by_platform: dict[str, dict[str, int]] = {p: dict(self._ZERO) for p in platforms}
         self.current = ""
@@ -591,12 +651,30 @@ class _Tally:
             self.answered += 1
         if status == "blocked":
             self.rate_limits += 1
-        if result.detail in sniper.POOL_MISS_DETAILS:
-            self.proxy_misses += 1
 
     @property
     def elapsed(self) -> float:
         return self.meter.elapsed
+
+    @property
+    def unattempted(self) -> int:
+        """Checks the run never got to, because the pool died before them.
+
+        Not the same as a proxy miss: a miss is a name the pool refused when it
+        was handed one, this is the rest of the list being abandoned when the
+        run stopped early. Both are checks that never happened, and a summary
+        that reports only the ones it attempted makes a sweep that died at name
+        6 of 500 look like it simply finished. Names dropped because a platform
+        was sitting out are counted separately, by `skipped`.
+        """
+        skipped = self.pool.skipped if self.pool is not None else 0
+        return max(0, self.total_checks - self.checked - skipped)
+
+    @property
+    def proxy_misses(self) -> int:
+        """Names the pool could not carry. Zero without a pool attached, which
+        is what a unit test tallying a hand-built list of results gets."""
+        return self.pool.missed() if self.pool is not None else 0
 
     def progress(self) -> dict:
         """The per-tick line: everything the dashboard moves while a run is live."""
@@ -611,6 +689,7 @@ class _Tally:
             "available_count": self.available,
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
+            "unattempted": self.unattempted,
             "current_target": self.current,
             "elapsed_s": round(self.elapsed, 2),
             "by_platform": self.by_platform,
@@ -630,6 +709,7 @@ class _Tally:
             "available_count": self.available,
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
+            "unattempted": self.unattempted,
             "elapsed_s": round(self.elapsed, 2),
             **_verdict_report(self.answered, self.checked),
         }
@@ -733,7 +813,7 @@ async def _snipe_ndjson(
     visible in the first second and no proxy or gateway has to hold the whole
     response open.
     """
-    tally = _Tally(len(names), platforms, alerter)
+    tally = _Tally(len(names), platforms, alerter, pool)
     run_id = run.id if run else ""
     last_report = 0.0
     if note:
@@ -819,7 +899,7 @@ async def snipe_batch(req: SnipeRequest):
     # counters -- the per-platform split and the proxy-miss count used to exist
     # only on the streaming path, which made the two ways of asking the same
     # question answer differently.
-    tally = _Tally(len(names), platforms, alerter)
+    tally = _Tally(len(names), platforms, alerter, pool)
     for result in results:
         tally.add(result)
     await _finish_alerts(alerter)
@@ -865,7 +945,7 @@ async def snipe_one(
         ]
     finally:
         run.finish()
-    tally = _Tally(len(names), platforms, alerter)
+    tally = _Tally(len(names), platforms, alerter, pool)
     for result in results:
         tally.add(result)
     await _finish_alerts(alerter)
@@ -1080,7 +1160,7 @@ async def _scan_stream(
     loop in ``iter_snipes`` sees the same event, so a stop cancels the checks
     already in flight instead of only ending the response.
     """
-    tally = _Tally(names_total, platforms, alerter)
+    tally = _Tally(names_total, platforms, alerter, pool)
     run_id = run.id if run else ""
     last_report = 0.0
     yield json.dumps(
@@ -1182,7 +1262,7 @@ async def scan(req: ScanRequest):
             ]
         finally:
             run.finish()
-        tally = _Tally(names_total, platforms, alerter)
+        tally = _Tally(names_total, platforms, alerter, pool)
         for result in results:
             tally.add(result)
         await _finish_alerts(alerter)

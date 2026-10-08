@@ -299,6 +299,14 @@ class ProxyPool:
         # is 95% healthy.
         self._attempts: dict[str, int] = {}
         self._failed: dict[str, int] = {}
+        # Attempts handed to a proxy that have not reported yet. A proxy is only
+        # judged on a *settled* sample: at high concurrency the first completions
+        # are whichever requests failed fastest, so a host dropping a third of
+        # its tunnels looked like a host failing everything -- 64 checks went out
+        # at once, the six fastest answers were all failures, and the pool was
+        # written off about 0.05s into a sweep it could have carried. With this,
+        # "every attempt failed" means every attempt, not every fast one.
+        self._inflight: dict[str, int] = {}
         self._blocks: dict[str, int] = {}
         # A proxy retired mid-run is never handed out again.
         self._retired: set[str] = set()
@@ -323,6 +331,12 @@ class ProxyPool:
         # Jobs dropped because their platform was sitting out. Counted so the
         # summary can say how much of the run a throttle actually cost.
         self.skipped = 0
+        # Names the run never got to because the pool had nothing left to hand
+        # out. Not errors and not results -- a run does not get to file a
+        # verdict, or even a failure, for a name it never asked about -- but the
+        # summary has to own them, or a sweep that died at name 6 of 500 looks
+        # like it simply finished. See `one()` in the dispatch loop.
+        self.misses = 0
         # Why a run ended before its last name, when it did, and the longest
         # retry_after any platform handed us.
         self.stop_reason = ""
@@ -359,12 +373,22 @@ class ProxyPool:
             if self._resting.get(proxy, 0.0) > now:
                 continue
             self._cursor = idx + 1
-            return proxy
+            return self._hand_out(proxy)
         usable = [p for p in self._all if p not in self._retired]
         if not usable:
             return None
         # Every live proxy is resting: use whichever comes back first.
-        return min(usable, key=lambda p: self._resting.get(p, 0.0))
+        return self._hand_out(min(usable, key=lambda p: self._resting.get(p, 0.0)))
+
+    def _hand_out(self, proxy: str) -> str:
+        """Mark a proxy as carrying a request that has not reported yet."""
+        self._inflight[proxy] = self._inflight.get(proxy, 0) + 1
+        return proxy
+
+    def abandon(self, proxy: str) -> None:
+        """A request that will never report -- the run was stopped mid-flight."""
+        if self._inflight.get(proxy):
+            self._inflight[proxy] -= 1
 
     def client(self, proxy: str) -> httpx.AsyncClient:
         """The kept-alive client for one proxy, created on first use.
@@ -434,6 +458,12 @@ class ProxyPool:
         * ``failed``  -- a transport error is the proxy's own problem and counts
           toward retirement quickly.
         """
+        # The request is over, whatever it decided. Released before the early
+        # returns below, or a proxy judged on work still in flight would never
+        # come back to zero and could never be retired at all.
+        if self._inflight.get(proxy):
+            self._inflight[proxy] -= 1
+
         if retry_after and (self.retry_after is None or retry_after > self.retry_after):
             self.retry_after = retry_after
 
@@ -487,8 +517,15 @@ class ProxyPool:
         # mostly working, and a host answering one request in three is kept --
         # it is still producing answers, and ending a sweep is worse than
         # reporting its error rate.
-        if (attempts >= self._fail_limit and failed == attempts) or (
-            attempts >= self._fail_sample and failed >= attempts * SNIPE_PROXY_FAIL_RATE
+        # Only a settled sample gets a vote: while requests are still out, the
+        # outcomes in hand are the fast ones, which are the failures. A truly
+        # dead host settles instantly and is retired exactly as quickly as
+        # before; a host that is merely slow to answer is not written off for
+        # losing a race it never ran.
+        settled = self._inflight.get(proxy, 0) == 0
+        if settled and (
+            (attempts >= self._fail_limit and failed == attempts)
+            or (attempts >= self._fail_sample and failed >= attempts * SNIPE_PROXY_FAIL_RATE)
         ):
             self._retire(proxy)
         elif self._cooldown > 0:
@@ -522,6 +559,10 @@ class ProxyPool:
     def resting(self) -> int:
         now = time.time()
         return sum(1 for until in self._resting.values() if until > now)
+
+    def missed(self) -> int:
+        """How many names the pool could not carry at all. Never a result row."""
+        return self.misses
 
     def retired(self) -> int:
         return len(self._retired)
@@ -1189,6 +1230,11 @@ async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResu
     started = time.perf_counter()
     try:
         result = await CHECKERS[platform](pool.client(proxy), username)
+    except asyncio.CancelledError:
+        # Stopped mid-flight. Hand the mark back, or this proxy carries a
+        # phantom in-flight request for the rest of the run and is never judged.
+        pool.abandon(proxy)
+        raise
     except Exception as exc:  # pragma: no cover - guard against library surprises
         result = SnipeResult(username, platform, "error", f"unexpected:{type(exc).__name__}")
     result.latency_ms = (time.perf_counter() - started) * 1000.0
@@ -1265,12 +1311,28 @@ async def iter_snipes(
     async def one(platform: str, username: str) -> SnipeResult | None:
         async with sem:
             attempt = 0
+            # The last real attempt at this name, kept so a pool that dies
+            # between two retries does not erase a failure that really happened.
+            tried: SnipeResult | None = None
             while True:
                 if stop is not None and stop.is_set():
                     return None
                 result = await check_once(platform, username, pool)
+                if result.detail in POOL_MISS_DETAILS:
+                    # Nothing in the pool could carry this name. `next()` hands
+                    # back None only once every proxy is retired, so this is the
+                    # run's ending rather than a judgement on the name -- and
+                    # filing it as an error row is what used to fill Results with
+                    # hundreds of "proxies exhausted" lines and made a dead list
+                    # look like a broken scanner. Counted as a miss and dropped:
+                    # only a name that was genuinely asked about, and failed, is
+                    # reported, and then as the failure it was.
+                    if tried is None:
+                        pool.misses += 1
+                    return tried
                 if result.status not in ("blocked", "error", STATUS_UNANSWERED):
                     return result
+                tried = result
                 # How many retries are worth spending depends on who could take
                 # them. With a second proxy in play a reprieve is real, so the
                 # name gets the full budget on a different exit IP. With one
@@ -1297,9 +1359,6 @@ async def iter_snipes(
     cooling_note = -1e9
     answered = 0
     skipped = 0
-    # Results that could not be checked at all because the pool had nothing to
-    # hand out. A pool miss means the pool is the problem, not the name.
-    misses = 0
     stop_task: asyncio.Task | None = None
     if stop is not None:
         stop_task = asyncio.create_task(stop.wait())
@@ -1315,15 +1374,13 @@ async def iter_snipes(
                 result = harvest(task)
                 if result is not None:
                     answered += 1 if result.answered else 0
-                    if result.detail in POOL_MISS_DETAILS:
-                        misses += 1
                     yield result
 
             # Every proxy gone means nothing else can be dispatched, so the run
             # stops and says so rather than working through the rest of the name
             # list against a pool that is not there. Checked only once a pool
             # miss has been seen, because alive() walks the whole list.
-            if misses and pool.alive() == 0:
+            if pool.misses and pool.alive() == 0:
                 pool.stop_reason = pool.exhausted_reason()
                 break
 
@@ -1406,10 +1463,8 @@ async def iter_snipes(
                 result = harvest(task)
                 if result is not None:
                     answered += 1 if result.answered else 0
-                    if result.detail in POOL_MISS_DETAILS:
-                        misses += 1
                     yield result
-            if misses and pool.alive() == 0:
+            if pool.misses and pool.alive() == 0:
                 pool.stop_reason = pool.exhausted_reason()
                 break
             pool.pause_blocked(platforms)

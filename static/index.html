@@ -252,7 +252,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
           <div class="tile"><div class="l">Elapsed</div><div class="v" id="tTime">0:00</div></div>
           <div class="tile"><div class="l">Answered</div><div class="v" id="tAns">0%</div></div>
         </div>
-        <div class="mono dim" style="margin-top:12px;font-size:12px">Target: <span id="target">—</span></div>
+        <div class="mono dim" style="margin-top:12px;font-size:12px">Target: <span id="target">—</span> <span class="dim2" id="buildTag"></span></div>
       </div>
 
       <div class="grid2">
@@ -670,11 +670,20 @@ function finish(d) {
   paintLive();
   if (d.per_second) { S.rate = d.per_second; localStorage.setItem('bahs.rate', String(d.per_second)); }
   const paused = Object.keys(d.platforms_paused || {});
-  logline(`done — ${fmt(d.checked)} checked, ${fmt(d.available_count)} available, ${fmt(d.rate_limits)} rate-limited`
+  /* "done" was a lie whenever the pool died at name 6 of 500: the line said the
+     run finished, and the only hint otherwise was in a field nobody reads. */
+  const ended = d.stopped ? 'stopped' : (d.stop_reason ? 'stopped early' : 'done');
+  logline(`${ended} — ${fmt(d.checked)} checked, ${fmt(d.available_count)} available, ${fmt(d.rate_limits)} rate-limited`
+    + (d.proxy_misses ? `, ${fmt(d.proxy_misses)} never checked` : '')
     + (d.skipped ? `, ${fmt(d.skipped)} skipped` : '') + ` in ${clock(d.elapsed_s)} (${Math.round(d.per_second || 0)}/s)`,
     d.available_count ? 'ok' : '');
   for (const p of paused) logline(`${p} sat out: ${d.platforms_paused[p].reason}`, 'warn');
   if (d.stop_reason) logline(d.stop_reason, 'bad');
+  /* A name nobody asked about is not an error, but it is not a checked name
+     either, and the results table is now free of fake rows so it cannot be
+     spotted there. Said out loud here, once. */
+  const missed = (d.unattempted || 0) + (d.proxy_misses || 0);
+  if (missed) logline(`${fmt(missed)} checks were never made — nothing left in the pool could carry them, so they are not counted as errors`, 'bad');
   /* The two failure kinds get told apart here, because this is the line
      everybody reads and "911 errors" is useless without knowing whose. */
   const unans = (L && L.byStatus.unanswered) || 0;
@@ -877,6 +886,9 @@ $('sTest').onclick = testHook;
     $('kMax').textContent = fmt(menu.max_enumeration) + ' names per run';
     S.plats = S.info.platforms.map((name, i) => ({ name, on: true }));
     $('footPlat').textContent = S.plats.length;
+    // Which build is actually serving this page. "I still see the old
+    // bug" is unanswerable from the outside without it.
+    if (S.info.build) $('buildTag').textContent = '· build ' + S.info.build;
     $('conc').value = 256; $('concVal').textContent = '256';
     for (const b of S.menu) if (['3l','3n','3og'].includes(b.label)) S.sel.add(b.label);
     renderBuckets(); renderPlats(); updateEstimate(); renderFilters(); renderResults();
