@@ -139,7 +139,29 @@ A `429` is the platform talking, not your proxies, and it is handled as such:
   `SNIPE_PLATFORM_PAUSE_MAX`. Jobs for it are skipped instead of hammered.
 - The **rest of the run continues** on the platforms that are still answering.
   A discord 429 no longer costs you the tiktok sweep.
-- If every platform ends up paused, the run stops and says which and why.
+- If every platform ends up paused, the run **waits** for the shortest pause to
+  lift and carries on, up to `SNIPE_PLATFORM_WAIT`. It used to end there, which
+  is what threw away every name that had not been asked about yet ("17,303
+  checks were never made"). It only stops if the wait is exhausted.
+
+**A rotating endpoint is one proxy, and one refusal is not a verdict.** A
+single-line list of one rotating global endpoint is one proxy URL — so the
+old "every proxy was refused" test tripped on the very first 403, sat the whole
+platform out, and (when it was the only platform) ended the run after a single
+answer. Two things fix that:
+
+- A platform's refusal of one proxy is now remembered for `SNIPE_BLOCK_MEMORY`
+  seconds, not forever. A rotating endpoint answers from a different exit IP on
+  the next request, so a 403 from a minute ago says nothing about the request
+  going out now; the mark ages out and the proxy is tried again.
+- A pause needs real evidence: at least `SNIPE_PLATFORM_BLOCK_MIN` refusals, and
+  at least one per live proxy. One unlucky 403 against a one-line list no longer
+  pauses anything.
+
+**guns.lol and Instagram still need residential-ish exits.** Both sit behind a
+challenge that refuses datacenter ranges outright — the 403 is the exit IP, not
+your tooling. A global *datacenter* rotating proxy will get 403s from them no
+matter what; the run now keeps going and reports it instead of dying on it.
 
 **A name the pool could not carry is not a result.** When every proxy is
 retired, the checks that never went out are not filed as `error` rows — a run
@@ -270,6 +292,9 @@ down, and a `done` summary.
 | `SNIPE_PER_PROXY` | `4` | floor for connections per proxy |
 | `SNIPE_PER_PROXY_MAX` | `64` | ceiling for one proxy |
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
+| `SNIPE_BLOCK_MEMORY` | `75` | how long one platform's refusal of one proxy is remembered |
+| `SNIPE_PLATFORM_BLOCK_MIN` | `3` | refusals before a platform may be sat out |
+| `SNIPE_PLATFORM_WAIT` | `300` | seconds a run waits when every platform is paused |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
 | `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired, on a settled sample |

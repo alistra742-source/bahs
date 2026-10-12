@@ -64,11 +64,14 @@ from config import (
     SHUFFLE_NAMES,
     SHUFFLE_WINDOW,
     SNIPE_BLOCK_COOLDOWN,
+    SNIPE_BLOCK_MEMORY,
     SNIPE_MAX_CLIENTS,
     GITHUB_TOKEN,
     SNIPE_PER_PROXY,
+    SNIPE_PLATFORM_BLOCK_MIN,
     SNIPE_PLATFORM_PAUSE,
     SNIPE_PLATFORM_PAUSE_MAX,
+    SNIPE_PLATFORM_WAIT,
     SNIPE_PROXY_BLOCK_LIMIT,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
@@ -357,6 +360,7 @@ class ProxyPool:
         timeout: httpx.Timeout | None = None,
         fail_limit: int = SNIPE_PROXY_FAIL_LIMIT,
         block_limit: int = SNIPE_PROXY_BLOCK_LIMIT,
+        block_memory: float = SNIPE_BLOCK_MEMORY,
         max_clients: int = SNIPE_MAX_CLIENTS,
     ) -> None:
         self._all = list(dict.fromkeys(proxies))
@@ -393,12 +397,20 @@ class ProxyPool:
         # answers 40% of requests on one unlucky opening.
         self._fail_sample = max(2 * self._fail_limit, 16)
         self._block_limit = max(1, block_limit)
+        self._block_memory = max(0.0, block_memory)
+        self._block_min = max(1, SNIPE_PLATFORM_BLOCK_MIN)
+        # Total refusals each platform has recorded this run. Distinct from the
+        # per-proxy marks: this is the evidence that a platform is actually
+        # throttling the whole list, and a pause needs it before it may fire.
+        self._platform_blocks: dict[str, int] = {}
         self._cursor = 0
-        # platform -> the proxies it has refused, so "the platform blocked
-        # everything" can be asked about a specific platform. A proxy blocked by
-        # discord is still a perfectly good proxy for tiktok, and treating those
-        # as the same thing stops a healthy run.
-        self._blocked_by: dict[str, set[str]] = {}
+        # platform -> {proxy: monotonic time of its last refusal}. A proxy
+        # blocked by discord is still a perfectly good proxy for tiktok, and
+        # treating those as the same thing stops a healthy run. The timestamp is
+        # what makes this correct for a *rotating* endpoint: the exit IP changes
+        # between requests, so a refusal is only meaningful for a window, not
+        # forever -- see `_refused_now`.
+        self._blocked_by: dict[str, dict[str, float]] = {}
         # platform -> monotonic deadline, for a platform that refused the whole
         # list. Sitting one out is what keeps a discord 429 from costing the rest
         # of a multi-platform run.
@@ -443,6 +455,7 @@ class ProxyPool:
         self._inflight.clear()
         self._blocks.clear()
         self._blocked_by.clear()
+        self._platform_blocks.clear()
         self._retired.clear()
         self._paused.clear()
         self.paused_reason.clear()
@@ -601,12 +614,14 @@ class ProxyPool:
             # tiktok answers on both, and the run never notices discord is dead.
             refused = self._blocked_by.get(platform or "")
             if refused is not None:
-                refused.discard(proxy)
+                refused.pop(proxy, None)
             return
 
         if outcome == OUTCOME_BLOCKED:
-            refused = self._blocked_by.setdefault(platform or "", set())
-            refused.add(proxy)
+            key = platform or ""
+            refused = self._blocked_by.setdefault(key, {})
+            refused[proxy] = time.monotonic()
+            self._platform_blocks[key] = self._platform_blocks.get(key, 0) + 1
             blocks = self._blocks.get(proxy, 0) + 1
             self._blocks[proxy] = blocks
             if blocks >= self._block_limit:
@@ -680,34 +695,50 @@ class ProxyPool:
     def retired(self) -> int:
         return len(self._retired)
 
+    def _refused_now(self, platform: str) -> set[str]:
+        """Proxies this platform has refused *within the memory window*.
+
+        The window is what makes this right for a rotating endpoint: the exit IP
+        behind a single proxy URL changes between requests, so a 403 ten minutes
+        ago says nothing about the request going out now. Older marks age out,
+        and the proxy gets tried again rather than being treated as permanently
+        refused.
+        """
+        marks = self._blocked_by.get(platform)
+        if not marks:
+            return set()
+        if self._block_memory <= 0:
+            return set(marks)
+        cutoff = time.monotonic() - self._block_memory
+        return {proxy for proxy, when in marks.items() if when >= cutoff}
+
     def blocked(self) -> int:
-        """Proxies some platform has refused at least once."""
-        return len(self._blocks)
+        """Proxies some platform is refusing right now."""
+        seen: set[str] = set()
+        for platform in self._blocked_by:
+            seen |= self._refused_now(platform)
+        return len(seen)
 
     def blocked_by(self) -> dict[str, int]:
-        """How many proxies each platform has refused."""
-        return {name: len(refused) for name, refused in self._blocked_by.items() if refused}
+        """How many proxies each platform is refusing right now."""
+        counts = {name: len(self._refused_now(name)) for name in self._blocked_by}
+        return {name: n for name, n in counts.items() if n}
 
     def all_blocked(self, platforms: Iterable[str]) -> bool:
         """Has every proxy *still alive* been refused by every platform in play?
 
-        This is the crisp signal for a blanket rate limit, and it fires after one
-        request per proxy per platform instead of after some number of wasted
-        seconds. Waiting for a rest to expire cannot detect it: with one proxy,
-        each 5-second rest expires, the next check is refused again, and the run
-        grinds one blocked name at a time forever.
-
-        It has to be per platform. Asking "has anything refused these proxies"
-        makes a discord 429 look like a dead list, and a three-platform run then
-        stops before tiktok -- which was answering fine -- is ever asked.
+        Read against the fresh-refusal window, so a rotating endpoint's stale
+        403s do not count. It has to be per platform: asking "has anything
+        refused these proxies" makes a discord 429 look like a dead list, and a
+        three-platform run then stops before tiktok -- which was answering fine
+        -- is ever asked.
         """
         if not self._all:
             return False
         # Only proxies still in the run count. A proxy that died at the
         # transport level never appears in any platform's refused set, so
         # counting every proxy ever listed meant a blanket rate limit on the
-        # survivors was never noticed: the run kept spending the remaining
-        # proxies on 429s until they were each retired for the same reason.
+        # survivors was never noticed.
         live = [p for p in self._all if p not in self._retired]
         if not live:
             return False
@@ -715,9 +746,15 @@ class ProxyPool:
         if not wanted:
             return False
         return all(
-            all(proxy in self._blocked_by.get(one, ()) for proxy in live)
+            all(proxy in self._refused_now(one) for proxy in live)
             for one in wanted
         )
+
+    def shortest_pause(self) -> float:
+        """Seconds until the soonest-expiring platform pause lifts (0 if none)."""
+        now = time.monotonic()
+        left = [until - now for until in self._paused.values() if until > now]
+        return max(0.0, min(left)) if left else 0.0
 
     def pause_seconds(self) -> float:
         """How long to sit a platform out after it refused the whole list."""
@@ -742,6 +779,9 @@ class ProxyPool:
         self._paused.pop(platform, None)
         self.paused_reason.pop(platform, None)
         self._blocked_by.pop(platform, None)
+        # Evidence resets with the pause, so a fresh set of attempts decides the
+        # next pause instead of the strikes left over from before.
+        self._platform_blocks.pop(platform, None)
         return False
 
     def pause_blocked(self, platforms: Iterable[str]) -> list[str]:
@@ -754,13 +794,21 @@ class ProxyPool:
         for platform in platforms:
             if self.is_paused(platform):
                 continue
-            refused = self._blocked_by.get(platform)
+            refused = self._refused_now(platform)
             # This is asked twice per dispatch iteration. Comparing counts is
             # O(1) where ``all_blocked`` is O(list) -- with a large list and a
             # handful of platforms that walk was the loop's own ceiling. Only
             # when a platform has refused at least as many distinct proxies as
             # are still alive is there any chance the whole pool is blocked.
-            if not refused or len(refused) < self.alive():
+            if len(refused) < self.alive():
+                continue
+            # Real evidence, not one unlucky answer. A single rotating endpoint
+            # is one proxy, so the count test above passes after a single 403 --
+            # which is exactly how one refusal used to end a run. A pause now
+            # needs at least `_block_min` refusals, and at least one per live
+            # proxy, before it fires.
+            evidence = max(self.alive(), self._block_min)
+            if self._platform_blocks.get(platform, 0) < evidence:
                 continue
             if self.all_blocked([platform]):
                 refused = len(self._blocked_by.get(platform, ()))
@@ -838,7 +886,7 @@ class ProxyPool:
         if total == 0:
             return "no proxies are saved, so there was nothing to check through"
         if self.retired() >= total:
-            if self.blocked():
+            if self._blocks:
                 return (
                     f"every one of the {total} proxies was rate-limited {self._block_limit} "
                     "times and retired for this run -- the list is being throttled, not "
@@ -1496,6 +1544,8 @@ async def iter_snipes(
     # Timestamp of the last "everything is cooling down" note, so a proxy that
     # alternates fail/answer cannot turn it into a line per check.
     cooling_note = -1e9
+    # When the current all-platforms-paused sit-out began, so the wait is bounded.
+    pause_since = 0.0
     answered = 0
     skipped = 0
     stop_task: asyncio.Task | None = None
@@ -1528,8 +1578,29 @@ async def iter_snipes(
             # that are still answering instead of stopping on the worst one.
             pool.pause_blocked(platforms)
             if platforms and all(pool.is_paused(p) for p in platforms):
-                pool.stop_reason = pool.blocked_reason()
-                break
+                # Every platform is sitting out at once -- a datacenter list
+                # refused by every target is the usual cause, and ending the run
+                # here is what reported "17,303 checks were never made": every
+                # name not yet asked about was thrown away. Sit out for the
+                # shortest pause and resume instead, bounded so a pool that can
+                # never answer still ends honestly.
+                remaining = pool.shortest_pause()
+                now_m = time.monotonic()
+                if pause_since == 0.0:
+                    pause_since = now_m
+                if now_m - pause_since >= SNIPE_PLATFORM_WAIT:
+                    pool.stop_reason = pool.blocked_reason()
+                    break
+                if now_m - cooling_note > 5.0:
+                    cooling_note = now_m
+                    yield SnipeResult(
+                        "", "", WAITING_STATUS,
+                        f"every platform is sitting out a throttle -- waiting "
+                        f"{remaining:.0f}s for the shortest to lift",
+                    )
+                await asyncio.sleep(min(1.0, max(0.05, remaining)))
+                continue
+            pause_since = 0.0
 
             # Every live proxy is cooling down after an error. Work still flows
             # -- the pool hands out whichever comes back first -- but say so
@@ -1606,10 +1677,34 @@ async def iter_snipes(
             if pool.misses and pool.alive() == 0:
                 pool.stop_reason = pool.exhausted_reason()
                 break
+            # Any platform that has now refused the whole pool is sat out with
+            # the reason the platform gave. The run continues on the platforms
+            # that are still answering instead of stopping on the worst one.
             pool.pause_blocked(platforms)
             if platforms and all(pool.is_paused(p) for p in platforms):
-                pool.stop_reason = pool.blocked_reason()
-                break
+                # Every platform is sitting out at once -- a datacenter list
+                # refused by every target is the usual cause, and ending the run
+                # here is what reported "17,303 checks were never made": every
+                # name not yet asked about was thrown away. Sit out for the
+                # shortest pause and resume instead, bounded so a pool that can
+                # never answer still ends honestly.
+                remaining = pool.shortest_pause()
+                now_m = time.monotonic()
+                if pause_since == 0.0:
+                    pause_since = now_m
+                if now_m - pause_since >= SNIPE_PLATFORM_WAIT:
+                    pool.stop_reason = pool.blocked_reason()
+                    break
+                if now_m - cooling_note > 5.0:
+                    cooling_note = now_m
+                    yield SnipeResult(
+                        "", "", WAITING_STATUS,
+                        f"every platform is sitting out a throttle -- waiting "
+                        f"{remaining:.0f}s for the shortest to lift",
+                    )
+                await asyncio.sleep(min(1.0, max(0.05, remaining)))
+                continue
+            pause_since = 0.0
     finally:
         if stop_task is not None and not stop_task.done():
             stop_task.cancel()

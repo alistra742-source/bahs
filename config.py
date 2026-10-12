@@ -218,6 +218,23 @@ SHUFFLE_WINDOW: int = _int("SHUFFLE_WINDOW", 50000)
 # the ceiling.
 SNIPE_PLATFORM_PAUSE: float = _float("SNIPE_PLATFORM_PAUSE", 90.0)
 SNIPE_PLATFORM_PAUSE_MAX: float = _float("SNIPE_PLATFORM_PAUSE_MAX", 900.0)
+# How long a platform's refusal of *one* proxy is remembered. A rotating
+# endpoint answers from a different exit IP on the next request, so a refusal is
+# transient by nature -- remembering it forever means every later request is
+# treated as coming from a host the platform already refused. Set this above the
+# rotation interval.
+SNIPE_BLOCK_MEMORY: float = _float("SNIPE_BLOCK_MEMORY", 75.0)
+# How many refusals a platform must have recorded before it can be sat out.
+# This is the fix for the report that one 403 from a single rotating endpoint
+# paused the whole platform and ended the run: a pause now needs real evidence
+# (at least this many, and at least as many as there are live proxies), not the
+# first refusal of a list that happens to be one line long.
+SNIPE_PLATFORM_BLOCK_MIN: int = _int("SNIPE_PLATFORM_BLOCK_MIN", 3)
+# When every platform is sitting out at once, the run waits for the shortest
+# pause to lift and carries on instead of ending. The old behaviour dropped
+# every name that had not been asked about yet. This bounds that wait, after
+# which the run stops and says why rather than waiting forever.
+SNIPE_PLATFORM_WAIT: float = _float("SNIPE_PLATFORM_WAIT", 300.0)
 
 # --- Runs ------------------------------------------------------------------
 # Cap on the simultaneous snipe/scan runs the server will track. The dashboard
