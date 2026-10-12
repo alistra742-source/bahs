@@ -100,10 +100,24 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 # default page without it.
 GUNS_PROFILE_MARKER = b"profile-page-json-ld"
 GUNS_IDENTIFIER_RE = re.compile(r'"identifier"\s*:\s*"([^"]{1,64})"')
+# A *registered* handle ships its account payload in the page even when its
+# public profile is gone, which is what a banned or hidden account looks like.
+# That matters because such a page renders the site's *default* title -- the
+# exact title a free name renders -- so a title-only test calls a banned profile
+# free. Worst case: the dashboard says a name is available, and registering it
+# fails. `account_created` is in every registered account's payload and in no
+# free page's.
+GUNS_ACCOUNT_MARKER = b"account_created"
+# The page offers to *claim this name* only when it is free, so the offer itself
+# is the positive signal. `/register?claim=<name>` is exactly what the free page
+# links to, and a taken or banned page never carries it.
+GUNS_CLAIM = b"/register?claim="
 
-# How much of a profile page to look at. Both guns.lol signals land well inside
-# this while the page itself runs 21-40 KB.
-MAX_HEAD_BYTES = 16 * 1024
+# How much of a profile page to look at. The signals live at the head of the
+# page, but the account payload of a banned profile sits past 16 KB, and the
+# whole body is already in memory by the time this is read -- the slice saves
+# only the search, not the transfer -- so the window is comfortably wide.
+MAX_HEAD_BYTES = 64 * 1024
 
 # The union of every platform's charset and length, used only as a cheap "is
 # this even a name" gate before the per-platform rule below. It is deliberately
@@ -173,6 +187,19 @@ STATUS_UNANSWERED = "unanswered"
 # to dispatch, so a run that is waiting on a resting pool says so instead of
 # going quiet. Callers must drop these -- they are not rows.
 WAITING_STATUS = "waiting"
+
+# Not a verdict either: a keep-alive the scheduler emits when a run has been
+# silent for a while with work still in flight. A long-lived NDJSON response is
+# held open through whatever sits between the process and the browser -- a
+# platform edge, a carrier NAT, a reverse proxy -- and those drop a connection
+# that sends nothing for long enough. A slow platform (a 6s read timeout on
+# every in-flight check) could leave the socket quiet for seconds at a time, and
+# on a phone that reads as `stream error: Load failed` with the run still going.
+# One line every few seconds costs nothing and keeps the pipe warm.
+HEARTBEAT_STATUS = "heartbeat"
+
+# How long the scheduler may sit silent before it emits a heartbeat.
+HEARTBEAT_AFTER = 5.0
 
 # How a result reflects on the proxy that carried it.
 OUTCOME_OK = "ok"            # the check produced a verdict
@@ -1014,20 +1041,34 @@ def _discord_reason(resp: httpx.Response) -> str:
 
 # --- guns.lol -------------------------------------------------------------
 def _guns_verdict(username: str, body: bytes) -> SnipeResult | None:
-    """Read a verdict off the part of the page we look at, or None for "unknown"."""
+    """Read a verdict off the page, or None for "unknown".
+
+    Order matters, and it is *taken first*. The site renders the same default
+    title for a free name and for a banned one, so the title alone cannot tell
+    them apart -- the old test compared the title to the default and called the
+    page free, which is how a banned profile came back "available" and then
+    failed to register. Every positive signal is checked before the claim offer.
+    """
     if GUNS_PROFILE_MARKER in body:
         found = GUNS_IDENTIFIER_RE.search(body.decode("utf-8", errors="ignore"))
         return SnipeResult(
             username, "guns.lol", "taken", f"@{found.group(1)}" if found else "live profile"
         )
+    # A registered account whose public profile is gone (banned, hidden) still
+    # carries its own payload. Its page renders the default title, so this is
+    # the only thing that separates it from a genuinely free name.
+    if GUNS_ACCOUNT_MARKER in body:
+        return SnipeResult(username, "guns.lol", "taken", "registered account (no public profile)")
+    # Free: the page is offering to claim *this* name. That offer is the signal,
+    # not the title it shares with a banned profile's page.
+    if GUNS_CLAIM + username.encode() in body:
+        return SnipeResult(username, "guns.lol", "available", "claimable")
     if b"</title>" not in body:
         return None
     match = TITLE_RE.search(body.decode("utf-8", errors="ignore"))
     if not match:
         return None
     title = match.group(1).strip()
-    if title == GUNS_DEFAULT_TITLE:
-        return SnipeResult(username, "guns.lol", "available", "default page")
     if GUNS_TITLE_RE.match(title):
         return SnipeResult(username, "guns.lol", "taken", title)
     # A title we do not recognise: no verdict from this page.
@@ -1059,10 +1100,17 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
         # run spending every name on a page that never carries a verdict.
         return _blocked(username, "guns.lol", resp, note=f"status {resp.status_code}")
     if resp.status_code == 404:
-        return SnipeResult(username, "guns.lol", "available", "404")
+        # A free name is a 200 page that offers to claim it. The site answers
+        # 404 for its own reserved routes (``/api`` returns ``{"error":"Not
+        # found"}``) and for anything the app does not serve, so a 404 is not a
+        # free name -- it is a name that cannot be claimed here.
+        return SnipeResult(username, "guns.lol", "invalid", "reserved or unserved route")
     if resp.status_code != 200:
         return SnipeResult(username, "guns.lol", "error", f"status {resp.status_code}")
 
+    # The account payload of a banned profile sits past the old 16 KB window;
+    # the body is already downloaded, so the wider slice costs a search, not a
+    # transfer.
     body = resp.content[:MAX_HEAD_BYTES]
     verdict = _guns_verdict(username, body)
     if verdict is not None:
@@ -1571,8 +1619,25 @@ async def iter_snipes(
                 return result
 
     def harvest(task: asyncio.Task) -> SnipeResult | None:
+        """Read one finished task, and never let it take the run down with it.
+
+        `one()` is written not to raise, but a task that *did* raise would
+        otherwise propagate out of the generator and abort the response -- the
+        browser sees a dropped stream (`Load failed`) mid-run instead of the
+        rest of the names. A real check that fails is reported as the failure it
+        was; an unexpected one is dropped, and the run carries on.
+        """
         del pending[task]
-        return task.result()
+        try:
+            return task.result()
+        except asyncio.CancelledError:
+            return None
+        except Exception:  # pragma: no cover - guard against library surprises
+            # The check never produced a verdict, so it is dropped rather than
+            # filed against a platform it never reached. The run continues, and
+            # the summary counts it among the checks that were never made.
+            log.debug("a check task raised; dropping it", exc_info=True)
+            return None
 
     ordered = shuffled(usernames) if SHUFFLE_NAMES else usernames
     jobs = job_stream(ordered, platforms)
@@ -1704,7 +1769,15 @@ async def iter_snipes(
             waiters: set[asyncio.Task] = set(pending)
             if stop_task is not None and not stop_task.done():
                 waiters.add(stop_task)
-            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            # The timeout does not cancel anything -- `asyncio.wait` leaves the
+            # pending tasks running -- it only wakes this loop so a heartbeat can
+            # go out while the checks are slow.
+            done, _ = await asyncio.wait(
+                waiters, timeout=HEARTBEAT_AFTER, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                yield SnipeResult("", "", HEARTBEAT_STATUS, "")
+                continue
             for task in done:
                 if task is stop_task:
                     continue

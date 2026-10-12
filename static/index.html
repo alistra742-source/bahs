@@ -231,6 +231,11 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
           <label class="fld">Concurrency — <span id="concVal" class="mono">256</span></label>
           <input type="range" id="conc" min="8" max="1024" step="8" value="256">
           <div class="dim2" style="font-size:11.5px;margin:4px 0 16px">Checks in flight. Throughput tracks connections ÷ latency, so this only helps as far as your proxies can carry it.</div>
+          <label class="fld" style="display:flex;align-items:center;gap:8px;cursor:pointer">
+            <input type="checkbox" id="hunt" style="width:auto;margin:0">
+            <span>Stop at the first free name <span class="dim2">(hunt)</span></span>
+          </label>
+          <div class="dim2" style="font-size:11.5px;margin:4px 0 16px">A 3-letter space is 46,656 names; once one comes back free there is nothing left to learn, so the sweep ends there instead of spending the pool on the rest.</div>
           <div class="row" style="gap:9px">
             <button class="btn primary" id="start" style="flex:1">Start sweep</button>
             <button class="btn danger" id="stop" disabled>Stop</button>
@@ -600,7 +605,8 @@ async function start() {
   try {
     res = await fetch('/scan', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: S.ac.signal,
-      body: JSON.stringify({ buckets, platforms, concurrency, stream: true }),
+      body: JSON.stringify({ buckets, platforms, concurrency, stream: true,
+        stop_on_available: !!($('hunt') && $('hunt').checked) }),
     });
   } catch (e) { setRunning(false); return logline('could not reach the server: ' + e.message, 'bad'); }
   if (!res.ok) {
@@ -643,6 +649,11 @@ async function start() {
           $('sbTarget').textContent = '\u23f3 ' + ev.detail;
         } else if (ev.type === 'progress') {
           serverTick(ev);
+        } else if (ev.type === 'heartbeat') {
+          /* Not a row: the server's keep-alive for a slow stretch. Repaint the
+             live counters so a slow run still looks alive instead of frozen. */
+          serverTick(ev);
+          if (S.waitingOn) { S.waitingOn = false; logline('a proxy came back \u2014 resuming', 'ok'); }
         } else if (ev.type === 'start') {
           $('target').textContent = `${fmt(ev.names)} names \u00d7 ${plat(ev.platforms.length)} = ${fmt(ev.names * ev.platforms.length)} checks`;
           if (ev.pool_note) logline(ev.pool_note, 'warn');
@@ -654,7 +665,13 @@ async function start() {
       }
     }
   } catch (e) {
-    if (e.name !== 'AbortError') logline('stream error: ' + e.message, 'bad');
+    /* `Load failed` / `Failed to fetch` is the connection dropping, not the run
+       necessarily ending: on a phone the socket can be cut while the server is
+       still working. Say which it was and let the results stand. */
+    if (e.name !== 'AbortError') {
+      logline('connection lost mid-run (' + e.message + ') \u2014 ' + fmt(S.live?.checked || 0)
+        + ' checks were seen; the rest may still be running on the server', 'bad');
+    }
   }
   renderResults(); renderFilters();
   setRunning(false);

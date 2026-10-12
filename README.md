@@ -39,11 +39,20 @@ the page itself is served `no-cache`, so it has to revalidate.
 | **tiktok** | oEmbed: 200 + `author_name` taken, 400 free | ~300 ms |
 | **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
 | **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
-| **guns.lol** | profile page, first 16 KB | ~860 ms |
+| **guns.lol** | profile page, first 64 KB | ~860 ms |
 
 **GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
 IP — not a check rate, a limit you hit in a minute and then sit out. Set
 `GITHUB_TOKEN` and the ceiling becomes 5,000.
+
+**guns.lol is read by its signals, not its title.** The site renders the *same*
+default title for a free name and for a banned one, so a title-only test called
+a banned profile free — the dashboard said "available", and registering it
+failed. The check now looks for a live profile's Schema.org block, then for the
+account payload every *registered* handle carries (a banned one has no public
+profile but still has this), and only calls a name free when the page is
+offering to claim *that* name. A 404 is the site's own reserved route (`/api`),
+not a free name.
 
 **Instagram is the weak one.** It refuses datacenter IPs with a blanket 429
 before your proxy list is involved, so it depends on the list being
@@ -266,7 +275,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /info`, `GET /health` | platforms, generation, counters, and the commit this process is running (`build`) |
 | `GET /menu` | every bucket with its real size |
 | `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
-| `POST /scan` | `{buckets:[{kind,length}], platforms, concurrency, stream}` |
+| `POST /scan` | `{buckets:[{kind,length}], platforms, concurrency, stream, stop_on_available}` |
 | `POST /snipe` | the same for explicit `usernames` |
 | `GET /snipe?username=` | one name |
 | `GET /generate` | `letters\|alnum\|numbers\|words` by length |
@@ -277,7 +286,16 @@ registered it. Confirm the name is still free, then claim it yourself.
 `stream: true` returns NDJSON: `start`, then a `result` line per verdict
 (`available`, `taken`, `invalid`, `blocked`, `error`, `unanswered`), a
 `progress` line as it goes, a `waiting` line when every live proxy is cooling
-down, and a `done` summary.
+down, a `heartbeat` line when a slow stretch would otherwise leave the socket
+silent for seconds on end (so a phone does not read it as a dropped
+connection), and a `done` summary. A run that dies mid-response still ends with
+a `done` line carrying the reason, instead of the browser reporting only
+`stream error: Load failed`.
+
+`stop_on_available: true` ends a run the moment any name comes back free — the
+"hunt" checkbox on the dashboard. A 3-letter space is 46,656 names, and once one
+is claimed the answer is in hand, so there is no reason to keep spending the
+pool on the rest.
 
 ## Environment
 

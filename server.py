@@ -841,6 +841,10 @@ async def _snipe_ndjson(
                 # is what keeps the dashboard from looking frozen.
                 yield json.dumps({"type": "waiting", "detail": result.detail, **tally.progress()}) + "\n"
                 continue
+            if result.status == sniper.HEARTBEAT_STATUS:
+                # Not a row: a keep-alive for a slow stretch.
+                yield json.dumps({"type": "heartbeat", **tally.progress()}) + "\n"
+                continue
             tally.add(result)
             if run:
                 run.checked = tally.checked
@@ -898,7 +902,7 @@ async def snipe_batch(req: SnipeRequest):
                 retries=retries,
                 stop=run.stop,
             )
-            if result.status != sniper.WAITING_STATUS
+            if result.status not in (sniper.WAITING_STATUS, sniper.HEARTBEAT_STATUS)
         ]
     finally:
         run.finish()
@@ -1087,6 +1091,11 @@ class ScanRequest(BaseModel):
     concurrency: int | None = None
     retries: int | None = None
     stream: bool = False
+    # A "hunt": stop the moment any name comes back free. A 3-letter sweep is
+    # 46,656 names, and once one is claimed the answer is in hand -- grinding
+    # through the other 46,000 spends the whole pool for nothing. Off by
+    # default because a sweep is usually collecting *every* free name.
+    stop_on_available: bool = False
 
 
 def _scan_plan(req: ScanRequest) -> tuple[Iterable[str], int, bool]:
@@ -1160,16 +1169,22 @@ async def _scan_stream(
     note: str = "",
     run: RunHandle | None = None,
     alerter: Alerter | None = None,
+    stop_on_available: bool = False,
 ) -> AsyncIterator[str]:
     """NDJSON: one verdict per line, progress as it goes, then a summary.
 
     ``run.stop`` is what makes the dashboard's Stop button real: the dispatch
     loop in ``iter_snipes`` sees the same event, so a stop cancels the checks
     already in flight instead of only ending the response.
+
+    With ``stop_on_available`` the run ends the moment a name comes back free,
+    which is what a hunt for a scarce name wants: the answer is in hand, and the
+    rest of the list is not worth the pool it would spend.
     """
     tally = _Tally(names_total, platforms, alerter, pool)
     run_id = run.id if run else ""
     last_report = 0.0
+    hunted = False
     yield json.dumps(
         {
             "type": "start",
@@ -1195,15 +1210,45 @@ async def _scan_stream(
             if result.status == sniper.WAITING_STATUS:
                 yield json.dumps({"type": "waiting", "detail": result.detail, **tally.progress()}) + "\n"
                 continue
+            if result.status == sniper.HEARTBEAT_STATUS:
+                # Not a row: a keep-alive so a slow stretch is not read as a
+                # dropped connection. Carries live counters so the dashboard
+                # stays painted while the checks are slow.
+                yield json.dumps({"type": "heartbeat", **tally.progress()}) + "\n"
+                continue
             tally.add(result)
             if run:
                 run.checked = tally.checked
             yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+            if stop_on_available and result.status == "available":
+                hunted = True
+                break
             now = time.perf_counter()
             if tally.checked % 10 == 0 and (now - last_report) >= 0.12:
                 last_report = now
                 yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
                 await _flush_alerts(alerter)
+    except Exception as exc:  # pragma: no cover - a stream must terminate cleanly
+        # A run that dies mid-response used to just drop the socket, which the
+        # browser reports as `stream error: Load failed` with no explanation.
+        # Emit a real `done` so the dashboard can say what happened.
+        log.exception("scan run failed mid-stream")
+        yield json.dumps({
+            "type": "done",
+            "run_id": run_id,
+            "stopped": False,
+            "names": names_total,
+            "platforms": platforms,
+            "pool_note": note,
+            "per_second": round(tally.meter.average, 1),
+            "duration_ms": round(tally.elapsed * 1000, 1),
+            "alerts": _alert_report(alerter),
+            **_pool_report(pool),
+            # After _pool_report, which carries an empty stop_reason of its own.
+            "stop_reason": f"the run ended on an internal error: {type(exc).__name__}",
+            **tally.summary(),
+        }) + "\n"
+        return
     finally:
         if run:
             run.finish()
@@ -1214,7 +1259,7 @@ async def _scan_stream(
         {
             "type": "done",
             "run_id": run_id,
-            "stopped": bool(run and run.stop.is_set()),
+            "stopped": bool(run and run.stop.is_set()) or hunted,
             "names": names_total,
             "platforms": platforms,
             "pool_note": note,
@@ -1225,6 +1270,8 @@ async def _scan_stream(
             "duration_ms": round(tally.elapsed * 1000, 1),
             "alerts": _alert_report(alerter),
             **_pool_report(pool),
+            # After _pool_report, whose stop_reason is empty on a clean hunt.
+            "stop_reason": "stopped at the first free name" if hunted else pool.stop_reason,
             **tally.summary(),
         }
     ) + "\n"
@@ -1255,18 +1302,20 @@ async def scan(req: ScanRequest):
 
     if not req.stream:
         try:
-            results = [
-                result
-                async for result in sniper.iter_snipes(
-                    names,
-                    platforms,
-                    pool,
-                    concurrency=concurrency,
-                    retries=retries,
-                    stop=run.stop,
-                )
-                if result.status != sniper.WAITING_STATUS
-            ]
+            results = []
+            async for result in sniper.iter_snipes(
+                names,
+                platforms,
+                pool,
+                concurrency=concurrency,
+                retries=retries,
+                stop=run.stop,
+            ):
+                if result.status in (sniper.WAITING_STATUS, sniper.HEARTBEAT_STATUS):
+                    continue
+                results.append(result)
+                if req.stop_on_available and result.status == "available":
+                    break
         finally:
             run.finish()
         tally = _Tally(names_total, platforms, alerter, pool)
@@ -1301,6 +1350,7 @@ async def scan(req: ScanRequest):
             note,
             run,
             alerter,
+            stop_on_available=req.stop_on_available,
         ),
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
