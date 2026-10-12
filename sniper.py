@@ -74,6 +74,7 @@ from config import (
     SNIPE_PLATFORM_PAUSE_MAX,
     SNIPE_PLATFORM_WAIT,
     SNIPE_PROXY_BLOCK_LIMIT,
+    SNIPE_PROXY_BLOCK_RATE,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
     SNIPE_PROXY_FAIL_RATE,
@@ -401,12 +402,16 @@ class ProxyPool:
         self._block_memory = max(0.0, block_memory)
         self._block_min = max(1, SNIPE_PLATFORM_BLOCK_MIN)
         self._block_rate = min(1.0, max(0.0, SNIPE_PLATFORM_BLOCK_RATE))
+        self._proxy_block_rate = min(1.0, max(0.0, SNIPE_PROXY_BLOCK_RATE))
         # Total refusals each platform has recorded this run, and total answers
         # it gave. The ratio is the evidence a pause turns on: a handful of
         # refusals inside a flood of answers is a transient 401, not a blanket
         # throttle, and pausing on the raw count is what stopped a healthy run.
         self._platform_blocks: dict[str, int] = {}
         self._platform_seen: dict[str, int] = {}
+        # Total answers each proxy gave (any outcome). The denominator for the
+        # refusal *rate* that decides block-retirement.
+        self._seen: dict[str, int] = {}
         self._cursor = 0
         # platform -> {proxy: monotonic time of its last refusal}. A proxy
         # blocked by discord is still a perfectly good proxy for tiktok, and
@@ -461,6 +466,7 @@ class ProxyPool:
         self._blocked_by.clear()
         self._platform_blocks.clear()
         self._platform_seen.clear()
+        self._seen.clear()
         self._retired.clear()
         self._paused.clear()
         self.paused_reason.clear()
@@ -593,6 +599,7 @@ class ProxyPool:
         # answer still counts as the platform having answered something.
         if platform:
             self._platform_seen[platform] = self._platform_seen.get(platform, 0) + 1
+        self._seen[proxy] = self._seen.get(proxy, 0) + 1
 
         if outcome == OUTCOME_UNKNOWN:
             # The request arrived and the answer was unusable. Not the tunnel's
@@ -635,7 +642,20 @@ class ProxyPool:
             self._platform_blocks[key] = self._platform_blocks.get(key, 0) + 1
             blocks = self._blocks.get(proxy, 0) + 1
             self._blocks[proxy] = blocks
-            if blocks >= self._block_limit:
+            seen = self._seen.get(proxy, 0)
+            # Retired only when refusals *dominate* what this proxy answered, and
+            # never when it is the last live proxy -- retiring the only entry
+            # does not replace it with anything, it ends the run. A single
+            # rotating endpoint sits at a low refusal rate and is refused in
+            # bursts; the raw count of 40 retired it and killed a working sweep.
+            # A genuinely blanket-blocked host reads ~100% and is still retired.
+            if (
+                blocks >= self._block_limit
+                and seen > 0
+                and blocks / seen >= self._proxy_block_rate
+                and self.alive() > 1
+                and self._inflight.get(proxy, 0) == 0
+            ):
                 self._retire(proxy)
             elif self._block_cooldown > 0:
                 self._resting[proxy] = time.time() + self._block_cooldown

@@ -153,6 +153,12 @@ SNIPE_BLOCK_COOLDOWN: float = _float("SNIPE_BLOCK_COOLDOWN", 5.0)
 # because a block that repeats across proxies means the platform is throttling,
 # not that the list is full of dead hosts.
 SNIPE_PROXY_BLOCK_LIMIT: int = _int("SNIPE_PROXY_BLOCK_LIMIT", 40)
+# The share of a proxy's own answers that must be refusals before that count
+# retires it. Measured live through one rotating endpoint on guns.lol: 105
+# refusals out of 594 answers (17.7%) -- a working proxy -- retired by the raw
+# count of 40 alone, which ended the sweep. Refusals now have to dominate what
+# the proxy answered for the count to mean anything.
+SNIPE_PROXY_BLOCK_RATE: float = _float("SNIPE_PROXY_BLOCK_RATE", 0.8)
 # The least attempts a proxy is judged on, and how many of them have to fail
 # before it is taken out of the rotation for the rest of the run.
 SNIPE_PROXY_FAIL_LIMIT: int = _int("SNIPE_PROXY_FAIL_LIMIT", 6)

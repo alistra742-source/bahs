@@ -163,6 +163,11 @@ answer. Two things fix that:
 - A refused name is retried once by default (`SCAN_RETRIES=1`). Through a
   rotating endpoint the retry lands on a different exit IP and most transient
   401/403s resolve into a real verdict.
+- A proxy is retired for refusals only when refusals dominate its own answers
+  (`SNIPE_PROXY_BLOCK_RATE`) **and** it is not the last live proxy. One rotating
+  endpoint measured at 105 refusals in 594 answers (17.7%) was retired by the
+  raw count of 40 and ended the sweep; its own panel showed the traffic. A host
+  that is genuinely blanket-blocked reads ~100% and is still retired.
 
 **guns.lol and Instagram still need residential-ish exits.** Both sit behind a
 challenge that refuses datacenter ranges outright — the 403 is the exit IP, not
@@ -304,7 +309,8 @@ down, and a `done` summary.
 | `SCAN_RETRIES` | `1` | retries a refused name once, on a fresh exit IP |
 | `SNIPE_PLATFORM_WAIT` | `300` | seconds a run waits when every platform is paused |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
-| `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |
+| `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired (see rate) |
+| `SNIPE_PROXY_BLOCK_RATE` | `0.8` | share of a proxy's answers that must be refusals to retire it |
 | `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired, on a settled sample |
 | `SNIPE_PROXY_FAIL_RATE` | `0.75` | share of failures that writes a proxy off |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
