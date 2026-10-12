@@ -89,6 +89,21 @@ READ_TIMEOUT: float = _float("READ_TIMEOUT", 8.0)
 # other platform here needs nothing.
 GITHUB_TOKEN: str = _str("GITHUB_TOKEN", "")
 
+# --- TikTok ----------------------------------------------------------------
+# oEmbed answers 400 both for a name nobody holds and for a live handle it
+# refuses to embed -- measured on a random 4-character sample, 7 of the 9 names
+# it called missing were real accounts whose profile is not public. With this on
+# (the default, and the only setting that is correct) a 400 is confirmed against
+# the profile page, which costs one extra request and ~50 KB on the quarter of
+# checks that come back 400. Turning it off reports every unembeddable handle as
+# free: faster, and wrong most of the time. Left on unless a run needs the bytes
+# more than the answer.
+TIKTOK_CONFIRM_FREE: bool = _bool("TIKTOK_CONFIRM_FREE", True)
+# Read timeout for that confirmation. The page is 166-202 KB and the check is a
+# whole page rather than a 45-byte embed, so it needs more room than a normal
+# check; it is a ceiling, not a wait.
+TIKTOK_PAGE_TIMEOUT: float = _float("TIKTOK_PAGE_TIMEOUT", 15.0)
+
 # --- Alerts ----------------------------------------------------------------
 # A Discord webhook told which names came back free. Empty disables alerting.
 # The default template matches the one every tool in this space ships with.
@@ -132,8 +147,13 @@ SNIPE_MAX_NAMES: int = _int("SNIPE_MAX_NAMES", 20000)
 # concurrency of 256 still only works out to the floor.
 SNIPE_PER_PROXY: int = _int("SNIPE_PER_PROXY", 4)
 # Ceiling on one proxy's pool, so a one-line list cannot open a thousand sockets
-# to the same host.
-SNIPE_PER_PROXY_MAX: int = _int("SNIPE_PER_PROXY_MAX", 64)
+# to the same host. Raised from 64 after measuring the real thing: through one
+# rotating endpoint on guns.lol, 200 names at 32 concurrent ran at 12.8/s, at 64
+# at 15.3/s, and at 128 at 19.6/s -- a short list was being capped below the
+# throughput the proxy would actually carry. Past that it flattens and then
+# degrades (192: 11.9/s, 256: 11.0/s), which is where this ceiling sits. A long
+# list still divides down to the floor, so this only ever affects a short one.
+SNIPE_PER_PROXY_MAX: int = _int("SNIPE_PER_PROXY_MAX", 128)
 # Warm clients kept open at once. One client per proxy is what makes a batch
 # fast (the CONNECT tunnel and the TLS handshake are paid once per proxy), but
 # keeping one for every proxy in a 100k-line list would cost ~1 GB of buffers

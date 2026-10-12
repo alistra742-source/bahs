@@ -36,10 +36,10 @@ the page itself is served `no-cache`, so it has to revalidate.
 | **telegram** | `t.me/{name}`; a live handle renders `tgme_page_title`, a free one the generic page | ~450 ms |
 | **discord** | `unique-username/username-attempt-unauthed` | ~140 ms |
 | **instagram** | `web_profile_info` with the web app id | refused from most datacenter IPs |
-| **tiktok** | oEmbed: 200 + `author_name` taken, 400 free | ~300 ms |
+| **tiktok** | oEmbed (lower-cased handle) for a public live handle, the profile page for the names oEmbed refuses to embed | ~300 ms, ~1 s when the page confirms |
 | **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
 | **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
-| **guns.lol** | profile page, first 64 KB | ~860 ms |
+| **guns.lol** | profile page, first 64 KB: Schema.org block or account payload taken, ban heading `banned`, claim offer free | ~860 ms |
 
 **GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
 IP — not a check rate, a limit you hit in a minute and then sit out. Set
@@ -58,6 +58,31 @@ not a free name.
 before your proxy list is involved, so it depends on the list being
 residential-ish. It reports that honestly as `blocked` rather than guessing.
 
+### Two checks used to answer "available" about names that were taken
+
+Both are fixed, and both were measured live rather than guessed.
+
+**TikTok's 400 is not "no such user".** oEmbed returns it for a name nobody
+holds *and* for a live handle it will not embed, and for any spelling that is
+not the account's own lower-case one. On a random 4-character sample, **7 of the
+9 names oEmbed called missing were real accounts** — `statusCode` 10222,
+`ErrBizUserSecret`, with the account's `uniqueId`, id and follower count still
+in the page. The check now asks oEmbed about the lower-cased handle (a 200 is a
+verdict and costs 45 bytes), and a 400 is *confirmed* against the profile page:
+`webapp.user-detail` carrying `userInfo` means taken, TikTok's own `10221` means
+free, and anything else — a shell, an interstitial — is `unanswered` and never
+"available". The page has to be asked for with a **mobile Safari user agent**: a
+desktop UA is served a 1,462-byte "enable JavaScript" shell to a datacenter IP
+for a live handle and a free name alike (measured), while the iPhone UA gets the
+real 166-202 KB page. `TIKTOK_CONFIRM_FREE=false` skips the confirmation —
+faster, and wrong most of the time.
+
+**guns.lol renders a banned account's page like a free one.** Same default
+title, no Schema.org block — the ban heading sits at ~9.3 KB and was never read.
+A banned handle cannot be registered either, so it now has its own verdict,
+`banned`, which counts as an answer, never fires an alert, and is a column of
+its own on the dashboard.
+
 ## Name spaces
 
 Pick any combination of these. `l` letters a–z, `n` digits, `c` letters+digits,
@@ -75,8 +100,11 @@ Overlapping selections are dropped before the count: `og` words are letters, so
 and `3og` checks 17,576 names, not 18,007 — "every combination" never means the
 same name twice.
 
-Lower-case only, deliberately: a handle is case-insensitive for uniqueness
-everywhere here, and TikTok's oEmbed will not resolve a mixed-case one at all.
+Lower-case only, deliberately: a handle is case-insensitive for uniqueness on
+every target here, so generating both cases would ask the same question twice.
+Names you paste in are not rewritten — every checker resolves case the way its
+platform does (measured across all ten, only TikTok needed the request itself to
+be lower-cased, which `check_tiktok` does).
 
 ### The ceiling, and why it moved
 
@@ -284,7 +312,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /settings` `POST /settings` `POST /settings/test-webhook` | alerts |
 
 `stream: true` returns NDJSON: `start`, then a `result` line per verdict
-(`available`, `taken`, `invalid`, `blocked`, `error`, `unanswered`), a
+(`available`, `taken`, `banned`, `invalid`, `blocked`, `error`, `unanswered`), a
 `progress` line as it goes, a `waiting` line when every live proxy is cooling
 down, a `heartbeat` line when a slow stretch would otherwise leave the socket
 silent for seconds on end (so a phone does not read it as a dropped
@@ -319,7 +347,9 @@ pool on the rest.
 | `SCAN_BUFFER_MAX` | `50000` | largest buffered (non-stream) run |
 | `SCAN_TARGET_RATE` | `100` | reported against on the dashboard |
 | `SNIPE_PER_PROXY` | `4` | floor for connections per proxy |
-| `SNIPE_PER_PROXY_MAX` | `64` | ceiling for one proxy |
+| `SNIPE_PER_PROXY_MAX` | `128` | ceiling for one proxy (measured sweet spot for a single endpoint) |
+| `TIKTOK_CONFIRM_FREE` | `true` | confirm an oEmbed 400 against the profile page |
+| `TIKTOK_PAGE_TIMEOUT` | `15` | read ceiling for that confirmation |
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
 | `SNIPE_BLOCK_MEMORY` | `75` | how long one platform's refusal of one proxy is remembered |
 | `SNIPE_PLATFORM_BLOCK_MIN` | `3` | refusals before a platform may be sat out |

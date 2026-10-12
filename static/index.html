@@ -112,6 +112,7 @@ tbody tr:hover{background:rgba(108,92,231,.07)}
 .pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
 .s-available{background:rgba(46,230,168,.16);color:var(--ok)}
 .s-taken{background:rgba(139,147,168,.13);color:var(--dim)}
+.s-banned{background:rgba(255,95,109,.1);color:#ff8a94}
 .s-invalid{background:rgba(255,176,32,.14);color:var(--warn)}
 .s-blocked{background:rgba(108,92,231,.2);color:#a99bff}
 .s-error{background:rgba(255,95,109,.15);color:var(--bad)}
@@ -574,13 +575,15 @@ function renderPlatTable(by) {
      fault. One merged column is how a run on a flaky host read as "proxies
      exhausted". */
   $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th>'
+    + '<th title="the name is held by a banned account -- nobody can claim it">banned</th>'
     + '<th title="the platform refused this exit IP">blocked</th>'
     + '<th title="the proxy could not carry the request -- this is the list">errors</th>'
     + '<th title="the platform answered something unreadable -- not the list">no answer</th></tr></thead><tbody>'
     + keys.map(k => {
         const r = by[k];
         return `<tr><td>${esc(k)}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
-          <td class="dim">${fmt(r.taken)}</td><td style="color:#a99bff">${fmt(r.blocked)}</td>
+          <td class="dim">${fmt(r.taken)}</td><td style="color:#ff8a94">${fmt(r.banned || 0)}</td>
+          <td style="color:#a99bff">${fmt(r.blocked)}</td>
           <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td>
           <td class="dim2">${fmt(r.unanswered || 0)}</td></tr>`;
       }).join('') + '</tbody>';
@@ -720,7 +723,7 @@ async function stopRun() {
   logline('stop requested', 'warn');
 }
 /* ============================ results ============================ */
-const FILTERS = ['all','available','taken','invalid','blocked','error','unanswered'];
+const FILTERS = ['all','available','taken','banned','invalid','blocked','error','unanswered'];
 function renderFilters() {
   const c = S.counts || {};
   const total = Object.values(c).reduce((a, b) => a + b, 0);

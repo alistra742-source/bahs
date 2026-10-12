@@ -607,7 +607,7 @@ class _Tally:
     # read is evidence about the platform. Folding them together is how a run
     # that was limping on a bad host looked like the proxies were exhausted.
     _ZERO = {
-        "checked": 0, "available": 0, "taken": 0, "invalid": 0,
+        "checked": 0, "available": 0, "taken": 0, "invalid": 0, "banned": 0,
         "blocked": 0, "error": 0, "unanswered": 0,
     }
 

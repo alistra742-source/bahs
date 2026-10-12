@@ -33,17 +33,34 @@ rather than assumed:
   the status is useless. A live profile embeds a Schema.org block
   (``profile-page-json-ld``) at 8-9 KB; a free name renders the site's default
   page without it. Measured: taken 34 KB with the marker, free 21 KB without.
+  A *banned* account renders that same default page with no block at all, so it
+  was reported free like any untouched name -- the ban page carries its own
+  heading at ~9.3 KB and is read as its own verdict. The site also answers a
+  datacenter exit with a "Please wait a moment" clearance page (401, ~4 KB,
+  sometimes 200 under load), which is a refusal and never a verdict.
 * **Instagram** -- ``GET /api/v1/users/web_profile_info/?username=`` with the
   web app's own ``x-ig-app-id``. 200 with a user object = taken, 404 =
   available, and 429/401/302 = blocked, which is reported as such rather than
   guessed at. A datacenter IP is refused outright, which is exactly what the
   proxy list is for.
-* **TikTok** -- ``GET /oembed?url=.../@name``. The full profile page is useless
-  for this: from a datacenter IP TikTok answers 200 with a generic shell whose
-  body is the same whether or not the account exists. oEmbed does distinguish
-  (measured): a live handle returns 200 with an ``author_name``, a free one
-  returns 400 with ``{"message":"Something went wrong","code":400}`` -- 45
-  bytes, so it is also by far the cheapest of the four.
+* **TikTok** -- two sources, because neither is right on its own. oEmbed
+  (``GET /oembed?url=.../@name``, 45 bytes, asked about the lower-cased handle)
+  answers 200 with an ``author_name`` for a public handle, and *only* then is a
+  verdict free. Its 400 is not "no such user": measured on a random
+  4-character sample, 7 of the 9 names oEmbed called missing were live accounts
+  whose profile is not public (``statusCode`` 10222, ``ErrBizUserSecret``, with
+  the account's own ``uniqueId``, id and follower count still in the page) --
+  and a mixed-case spelling of a taken handle also comes back 400, because
+  oEmbed only resolves the canonical spelling. So a 400 is *confirmed* against
+  the profile page, which is authoritative in both directions and resolves any
+  case: ``webapp.user-detail`` carrying ``userInfo`` means the handle is held,
+  and TikTok's own ``10221`` means there is no such user. The page has to be
+  asked for with a **mobile Safari** user agent: measured through one datacenter
+  endpoint, a desktop UA gets a 1,462-byte "enable JavaScript" shell with no
+  verdict in it for a live account and a free name alike, while an iPhone UA
+  gets the real 166-202 KB page. A response with neither marker is reported as
+  unanswered -- never as available, which is the false positive this whole
+  arrangement exists to kill.
 """
 
 import asyncio
@@ -55,6 +72,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -79,6 +97,8 @@ from config import (
     SNIPE_PROXY_FAIL_LIMIT,
     SNIPE_PROXY_FAIL_RATE,
     SSL_CONTEXT,
+    TIKTOK_CONFIRM_FREE,
+    TIKTOK_PAGE_TIMEOUT,
 )
 
 log = logging.getLogger("bahs.sniper")
@@ -92,8 +112,29 @@ DISCORD_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) discord/1.0"
 
 DISCORD_ATTEMPT = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"
 TIKTOK_OEMBED = "https://www.tiktok.com/oembed"
+TIKTOK_PROFILE = "https://www.tiktok.com/@{handle}"
+# TikTok gates the server-rendered profile on the client it thinks is asking: a
+# datacenter request with a desktop user agent is answered with a 1.5 KB "enable
+# JavaScript" shell whichever handle it names, and the same request with a mobile
+# Safari agent is answered with the real page. Measured through one datacenter
+# endpoint: desktop 1,462 bytes for a live handle and a free name alike, iPhone
+# 166-202 KB with the verdict intact.
+TIKTOK_IPHONE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+)
+# The profile page's own scope. `webapp.user-detail` opens the block that holds
+# the account; 10221 is TikTok's "no such user" inside it. The window is wide
+# enough to reach the status code that follows the (empty) user block on a free
+# page, and narrow enough that a `uniqueId` in a later script cannot be misread
+# as this account's handle.
+TIKTOK_USER_DETAIL = '"webapp.user-detail"'
+TIKTOK_NO_USER = '"statusCode":10221'
+TIKTOK_UNIQUE_ID_RE = re.compile(r'"uniqueId":"([^"]{1,40})"')
+TIKTOK_SCOPE_CHARS = 8000
 GUNS_DEFAULT_TITLE = "guns.lol: Everything you want, right here."
 GUNS_TITLE_RE = re.compile(r"^\s*@[^|]{1,64}\|\s*guns\.lol\s*$", re.I)
+TIKTOK_HANDLE_RE = re.compile(r"/@([A-Za-z0-9._]{1,40})")
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 # A live profile embeds its own Schema.org block; a free name renders the site's
@@ -112,6 +153,26 @@ GUNS_ACCOUNT_MARKER = b"account_created"
 # is the positive signal. `/register?claim=<name>` is exactly what the free page
 # links to, and a taken or banned page never carries it.
 GUNS_CLAIM = b"/register?claim="
+
+# A banned account's page carries neither the Schema.org block nor a claim
+# offer -- it is byte-for-byte the "available" shape apart from its own heading,
+# which sits at ~9.3 KB into a ~25 KB page. Read as its own verdict: the handle
+# is held, nobody can register it, and the dashboard should say so rather than
+# offering a name whose signup cannot succeed.
+GUNS_BANNED_MARKERS = (b"This user has been banned", b"has been banned from")
+# guns.lol's own clearance page and Cloudflare's interstitial. Neither carries a
+# verdict about the name: they mean the *exit IP* was asked to wait, so they are a
+# refusal -- which rests that proxy briefly and gets the name retried on another
+# attempt -- and never an answer. Matched on the interstitial's own text only:
+# Cloudflare appends a ``challenge-platform`` script reference to *every* page it
+# serves, and matching on that turned a normal profile into a refusal and the
+# whole platform into a wall.
+GUNS_CHALLENGE_MARKERS = (
+    b"Please wait a moment",
+    b"Just a moment",
+    b"Attention Required",
+    b"challenge-error-text",
+)
 
 # How much of a profile page to look at. The signals live at the head of the
 # page, but the account payload of a banned profile sits past 16 KB, and the
@@ -172,8 +233,15 @@ PLATFORMS = (
     "guns.lol",
 )
 
-# The statuses that are an answer: a verdict about the name.
-FINAL_STATUSES = ("available", "taken", "invalid")
+# A name held by an account the platform has banned. Its own verdict rather than
+# `taken`, because the two want different things from the user: a taken name is
+# someone's live handle, a banned one is a slot nobody can claim.
+STATUS_BANNED = "banned"
+
+# The statuses that are an answer: a verdict about the name. `banned` is one of
+# them -- a name held by a banned account is occupied, and saying "available"
+# about it sends the user to a signup that cannot succeed.
+FINAL_STATUSES = ("available", "taken", "invalid", STATUS_BANNED)
 
 # A request that came back and said nothing usable: a challenge page, a status
 # we do not read, a 200 whose body is missing the field we look at. Deliberately
@@ -257,18 +325,47 @@ def per_proxy_connections(pool_size: int, concurrency: int, floor: int, ceiling:
     return max(1, min(ceiling, max(floor, share)))
 
 
-def retry_after_seconds(body: object) -> float | None:
-    """Pull ``retry_after`` out of a rate-limit body, when the platform sends it."""
-    if not isinstance(body, dict):
+def retry_after_seconds(body: object, resp: "httpx.Response | None" = None) -> float | None:
+    """How long a platform asked us to wait, from the body or the headers.
+
+    Discord puts it in the JSON body (``retry_after``, seconds). GitHub and
+    Cloudflare put it in a ``Retry-After`` header -- seconds or an HTTP-date --
+    and GitHub additionally sends ``x-ratelimit-reset`` as an epoch second.
+    Reading only the body meant a platform that said "back off 30s" in a header
+    was sat out for the default instead of for as long as it asked.
+    """
+    if isinstance(body, dict):
+        for key in ("retry_after", "retry_after_ms", "retryAfter"):
+            value = body.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                seconds = float(value)
+                if key == "retry_after_ms":
+                    seconds /= 1000.0
+                if 0 < seconds < 86400:
+                    return seconds
+    if resp is None:
         return None
-    for key in ("retry_after", "retry_after_ms", "retryAfter"):
-        value = body.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            seconds = float(value)
-            if key == "retry_after_ms":
-                seconds /= 1000.0
-            if 0 < seconds < 86400:
-                return seconds
+    raw = (resp.headers.get("retry-after") or "").strip()
+    if raw:
+        seconds: float | None
+        try:
+            seconds = float(raw)
+        except ValueError:
+            try:
+                stamp = parsedate_to_datetime(raw)
+            except (TypeError, ValueError):
+                stamp = None
+            seconds = (stamp.timestamp() - time.time()) if stamp is not None else None
+        if seconds is not None and 0 < seconds < 86400:
+            return seconds
+    reset = (resp.headers.get("x-ratelimit-reset") or "").strip()
+    if reset:
+        try:
+            delta = float(reset) - time.time()
+        except ValueError:
+            delta = 0.0
+        if 0 < delta < 86400:
+            return delta
     return None
 
 
@@ -1014,7 +1111,7 @@ async def check_discord(client: httpx.AsyncClient, username: str) -> SnipeResult
             return SnipeResult(username, "discord", "error", "unreadable body")
         return SnipeResult(username, "discord", "taken" if taken else "available")
     if resp.status_code == 429:
-        wait = retry_after_seconds(_json_or_none(resp))
+        wait = retry_after_seconds(_json_or_none(resp), resp)
         detail = "rate limited" + (f", retry_after {wait:.0f}s" if wait else "")
         return SnipeResult(username, "discord", "blocked", detail, retry_after=wait)
     if resp.status_code == 400:
@@ -1047,8 +1144,12 @@ def _guns_verdict(username: str, body: bytes) -> SnipeResult | None:
     title for a free name and for a banned one, so the title alone cannot tell
     them apart -- the old test compared the title to the default and called the
     page free, which is how a banned profile came back "available" and then
-    failed to register. Every positive signal is checked before the claim offer.
+    failed to register. So every signal that says the handle is held is checked
+    before the claim offer: the ban heading first, because a banned name is the
+    one case where the page looks untouched *and* cannot be registered.
     """
+    if any(marker in body for marker in GUNS_BANNED_MARKERS):
+        return SnipeResult(username, "guns.lol", STATUS_BANNED, "account is banned")
     if GUNS_PROFILE_MARKER in body:
         found = GUNS_IDENTIFIER_RE.search(body.decode("utf-8", errors="ignore"))
         return SnipeResult(
@@ -1075,6 +1176,11 @@ def _guns_verdict(username: str, body: bytes) -> SnipeResult | None:
     return None
 
 
+def _guns_challenge(body: bytes) -> bool:
+    """Is this the site's clearance interstitial rather than a profile page?"""
+    return any(marker in body for marker in GUNS_CHALLENGE_MARKERS)
+
+
 async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
     """One request, read in full, then inspected.
 
@@ -1098,7 +1204,8 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
         # datacenter IP with. Reported as a block rather than an error so the
         # platform is paused once it has refused the whole list, instead of the
         # run spending every name on a page that never carries a verdict.
-        return _blocked(username, "guns.lol", resp, note=f"status {resp.status_code}")
+        note = "clearance check" if _guns_challenge(resp.content) else f"status {resp.status_code}"
+        return _blocked(username, "guns.lol", resp, note=note)
     if resp.status_code == 404:
         # A free name is a 200 page that offers to claim it. The site answers
         # 404 for its own reserved routes (``/api`` returns ``{"error":"Not
@@ -1107,6 +1214,11 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
         return SnipeResult(username, "guns.lol", "invalid", "reserved or unserved route")
     if resp.status_code != 200:
         return SnipeResult(username, "guns.lol", "error", f"status {resp.status_code}")
+
+    # The clearance page served under load, with a 200 on it. It is not a profile
+    # and it is certainly not a free name, so it is refused rather than read.
+    if _guns_challenge(resp.content):
+        return _blocked(username, "guns.lol", resp, note="clearance check")
 
     # The account payload of a banned profile sits past the old 16 KB window;
     # the body is already downloaded, so the wider slice costs a search, not a
@@ -1141,7 +1253,7 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> SnipeResu
     if resp.status_code == 404:
         return SnipeResult(username, "instagram", "available", "404")
     if resp.status_code == 429:
-        wait = retry_after_seconds(_json_or_none(resp))
+        wait = retry_after_seconds(_json_or_none(resp), resp)
         detail = "rate limited" + (f", retry_after {wait:.0f}s" if wait else "")
         return SnipeResult(username, "instagram", "blocked", detail, retry_after=wait)
     if resp.status_code in (401, 302):
@@ -1159,19 +1271,94 @@ async def check_instagram(client: httpx.AsyncClient, username: str) -> SnipeResu
 
 
 # --- TikTok ---------------------------------------------------------------
-async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
-    """oEmbed answers 200 for a live handle and 400 for a free one.
+def _tiktok_page_verdict(username: str, body: bytes) -> SnipeResult | None:
+    """Read the profile page's own verdict, or None when it carries none.
 
-    Anything else -- a 403, a 429, an HTML body, an empty one -- is reported as
-    blocked or an error rather than as an answer, because the whole point of the
-    proxy list is that a datacenter IP gets a shell page whose body does not
-    distinguish the two cases.
+    TikTok's profile page ships its state as JSON inside
+    ``webapp.user-detail``: a live account puts a ``userInfo`` block there, and a
+    handle with no account at all gets ``"statusCode":10221``. The block is a
+    plain string search rather than a parser, because the page is 166-202 KB of
+    markup around it and only this one scope decides anything.
     """
+    text = body.decode("utf-8", errors="ignore")
+    start = text.find(TIKTOK_USER_DETAIL)
+    if start < 0:
+        return None
+    scope = text[start : start + TIKTOK_SCOPE_CHARS]
+    found = TIKTOK_UNIQUE_ID_RE.search(scope)
+    if found:
+        # The account exists. Its status code may be 10222 `ErrBizUserSecret`
+        # -- a profile that is not public, which is exactly the case oEmbed
+        # reports as missing -- but a handle is never released, so it is taken.
+        handle = found.group(1)
+        return SnipeResult(
+            username, "tiktok", "taken", f"@{handle}" if handle != username else "profile exists"
+        )
+    if TIKTOK_NO_USER in scope:
+        return SnipeResult(username, "tiktok", "available", "no such user")
+    return None
+
+
+async def _tiktok_profile(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    """Ask the profile page, which is the only source that sees a hidden account.
+
+    Requested with a mobile Safari user agent on purpose: the desktop page is a
+    1.5 KB "enable JavaScript" shell to a datacenter IP, for a live handle and a
+    free name alike, so reading it would answer nothing. Anything the page does
+    not decide -- the shell, an interstitial, a status we do not read -- comes
+    back as an error, which the pool retries and never files as "available".
+    """
+    headers = {"User-Agent": TIKTOK_IPHONE_UA, "Accept": "text/html"}
+    timeout = httpx.Timeout(
+        connect=CONNECT_TIMEOUT, read=max(READ_TIMEOUT, TIKTOK_PAGE_TIMEOUT),
+        write=READ_TIMEOUT, pool=READ_TIMEOUT,
+    )
+    try:
+        resp = await client.get(
+            TIKTOK_PROFILE.format(handle=username), headers=headers, timeout=timeout
+        )
+    except Exception as exc:
+        return transport_error(username, "tiktok", exc)
+
+    if resp.status_code in (403, 429, 503):
+        # 503 here is TikTok's own edge page (`overload-protect triggered`, from
+        # its load balancer) rather than a gateway in front of the proxy -- a
+        # refusal by the platform, which rests the exit and counts towards the
+        # platform pause, instead of an error that blames nobody and retries into
+        # the same throttle.
+        wait = retry_after_seconds(_json_or_none(resp), resp)
+        detail = f"status {resp.status_code}" + (f", retry_after {wait:.0f}s" if wait else "")
+        return SnipeResult(username, "tiktok", "blocked", detail, retry_after=wait)
+    if resp.status_code != 200:
+        return SnipeResult(username, "tiktok", "error", f"status {resp.status_code}")
+    verdict = _tiktok_page_verdict(username, resp.content)
+    if verdict is not None:
+        return verdict
+    return SnipeResult(username, "tiktok", "error", "no profile data in page")
+
+
+async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    """oEmbed for the answer it can give, the profile page for the one it cannot.
+
+    Case first: a TikTok handle is case-insensitive for uniqueness but oEmbed
+    only resolves the canonical all-lowercase spelling, so ``@Nike`` answers 400
+    with the same body a free name gets. The embed is asked about the
+    lower-cased handle, and a 200 is a verdict -- that is the common case and it
+    costs 45 bytes.
+
+    A 400 is not one. It covers a name nobody holds *and* a live handle whose
+    profile oEmbed will not embed, and the second is not rare: on a random
+    4-character sample, 7 of the 9 names oEmbed called missing were real
+    accounts. So it is confirmed against the profile page (`TIKTOK_CONFIRM_FREE`,
+    on by default). Everything else -- a 403, a 429, an HTML body, an empty one
+    -- is a block or an error and never an answer.
+    """
+    handle = username.lower()
     headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*"}
     try:
         resp = await client.get(
             TIKTOK_OEMBED,
-            params={"url": f"https://www.tiktok.com/@{username}"},
+            params={"url": f"https://www.tiktok.com/@{handle}"},
             headers=headers,
         )
     except Exception as exc:
@@ -1183,17 +1370,27 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
         if not isinstance(body, dict):
             return SnipeResult(username, "tiktok", "error", "unreadable body")
         author = str(body.get("author_name") or "")
-        if author:
-            return SnipeResult(username, "tiktok", "taken", author)
-        return SnipeResult(username, "tiktok", "error", "no author_name in oembed body")
+        if not author:
+            return SnipeResult(username, "tiktok", "error", "no author_name in oembed body")
+        # The embed names the canonical handle even when the request did not,
+        # so a name typed in a different case comes back with the handle that
+        # actually holds it rather than a bare "taken".
+        found = TIKTOK_HANDLE_RE.search(str(body.get("author_url") or ""))
+        canonical = found.group(1) if found else handle
+        return SnipeResult(
+            username, "tiktok", "taken", f"@{canonical}" if canonical != username else author
+        )
     if resp.status_code == 400:
-        # oEmbed's "no such user" answer. Only trust it as *free* when it is the
-        # shape oEmbed actually returns for a missing handle.
-        if isinstance(body, dict) and not body.get("author_name"):
+        if not isinstance(body, dict) or body.get("author_name") or body.get("html"):
+            # A 400 carrying more than the "no user" body is a different failure
+            # wearing the same status, and guessing "free" from it is exactly the
+            # false positive this check used to produce.
+            return SnipeResult(username, "tiktok", "error", "unexpected 400 body")
+        if not TIKTOK_CONFIRM_FREE:
             return SnipeResult(username, "tiktok", "available", "oembed 400")
-        return SnipeResult(username, "tiktok", "error", "unexpected 400 body")
-    if resp.status_code in (403, 429):
-        wait = retry_after_seconds(body)
+        return await _tiktok_profile(client, handle)
+    if resp.status_code in (403, 429, 503):
+        wait = retry_after_seconds(body, resp)
         detail = f"status {resp.status_code}" + (f", retry_after {wait:.0f}s" if wait else "")
         return SnipeResult(username, "tiktok", "blocked", detail, retry_after=wait)
     return SnipeResult(username, "tiktok", "error", f"status {resp.status_code}")
@@ -1222,7 +1419,7 @@ def _blocked(
     username: str, platform: str, resp: httpx.Response, note: str = "rate limited"
 ) -> SnipeResult:
     """A platform refusal, which is not the proxy's fault and is not a verdict."""
-    wait = retry_after_seconds(_json_or_none(resp))
+    wait = retry_after_seconds(_json_or_none(resp), resp)
     detail = note + (f", retry_after {wait:.0f}s" if wait else "")
     return SnipeResult(username, platform, "blocked", detail, retry_after=wait)
 
