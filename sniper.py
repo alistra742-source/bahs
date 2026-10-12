@@ -58,9 +58,14 @@ rather than assumed:
   asked for with a **mobile Safari** user agent: measured through one datacenter
   endpoint, a desktop UA gets a 1,462-byte "enable JavaScript" shell with no
   verdict in it for a live account and a free name alike, while an iPhone UA
-  gets the real 166-202 KB page. A response with neither marker is reported as
-  unanswered -- never as available, which is the false positive this whole
-  arrangement exists to kill.
+  gets the real 166-202 KB page. That page leads the check for a second
+  reason: TikTok throttles the embed endpoint per exit IP far harder than the
+  page -- measured through one rotating endpoint at 16 concurrent, 56 of 80
+  embed calls came back 429/503 while 80 of 80 page reads were answered -- so
+  the page is both the authoritative source and the one that keeps working, and
+  one request per name instead of a wasted round trip on every name. A response
+  with neither marker is reported as unanswered -- never as available, which is
+  the false positive this whole arrangement exists to kill.
 """
 
 import asyncio
@@ -97,7 +102,7 @@ from config import (
     SNIPE_PROXY_FAIL_LIMIT,
     SNIPE_PROXY_FAIL_RATE,
     SSL_CONTEXT,
-    TIKTOK_CONFIRM_FREE,
+    TIKTOK_PAGE_FIRST,
     TIKTOK_PAGE_TIMEOUT,
 )
 
@@ -1337,23 +1342,20 @@ async def _tiktok_profile(client: httpx.AsyncClient, username: str) -> SnipeResu
     return SnipeResult(username, "tiktok", "error", "no profile data in page")
 
 
-async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
-    """oEmbed for the answer it can give, the profile page for the one it cannot.
+async def _tiktok_oembed(
+    client: httpx.AsyncClient, username: str, handle: str
+) -> SnipeResult | None:
+    """The 45-byte embed. ``None`` means "no such user", which is not a verdict.
 
-    Case first: a TikTok handle is case-insensitive for uniqueness but oEmbed
-    only resolves the canonical all-lowercase spelling, so ``@Nike`` answers 400
-    with the same body a free name gets. The embed is asked about the
-    lower-cased handle, and a 200 is a verdict -- that is the common case and it
-    costs 45 bytes.
-
-    A 400 is not one. It covers a name nobody holds *and* a live handle whose
-    profile oEmbed will not embed, and the second is not rare: on a random
-    4-character sample, 7 of the 9 names oEmbed called missing were real
-    accounts. So it is confirmed against the profile page (`TIKTOK_CONFIRM_FREE`,
-    on by default). Everything else -- a 403, a 429, an HTML body, an empty one
-    -- is a block or an error and never an answer.
+    A 200 is a whole answer -- the handle is live -- and it is asked about the
+    lower-cased handle, because the embed only resolves the canonical spelling.
+    The 400 is returned as ``None`` rather than as `available`: it covers a name
+    nobody holds *and* a live handle the embed will not resolve, and on a random
+    4-character sample 7 of the 9 names it called missing were real accounts. It
+    is the cheapest source here and the one TikTok throttles hardest -- measured
+    through one rotating endpoint at 16 concurrent: 56 of 80 calls came back
+    429/503 while the profile page answered 80 of 80 in the same window.
     """
-    handle = username.lower()
     headers = {"User-Agent": BROWSER_UA, "Accept": "application/json, text/plain, */*"}
     try:
         resp = await client.get(
@@ -1386,14 +1388,50 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
             # wearing the same status, and guessing "free" from it is exactly the
             # false positive this check used to produce.
             return SnipeResult(username, "tiktok", "error", "unexpected 400 body")
-        if not TIKTOK_CONFIRM_FREE:
-            return SnipeResult(username, "tiktok", "available", "oembed 400")
-        return await _tiktok_profile(client, handle)
+        return None
     if resp.status_code in (403, 429, 503):
         wait = retry_after_seconds(body, resp)
         detail = f"status {resp.status_code}" + (f", retry_after {wait:.0f}s" if wait else "")
         return SnipeResult(username, "tiktok", "blocked", detail, retry_after=wait)
     return SnipeResult(username, "tiktok", "error", f"status {resp.status_code}")
+
+
+async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    """The profile page leads; the embed is the cheap fallback, not the base.
+
+    The page is authoritative *and* the endpoint TikTok leaves alone: measured
+    through one rotating endpoint at 16 concurrent, 80 of 80 page reads came back
+    with a verdict while 56 of the same 80 oEmbed calls came back 429/503. It
+    also answers in one request, where the embed-first order paid a round trip on
+    every name -- 6.9 names/s against 3.6/s. Its price is bytes (~50 KB against
+    45), so `TIKTOK_PAGE_FIRST=false` restores the cheap order for a run that
+    cares more about the transfer than the answer rate.
+
+    Case is the other reason the page leads: a handle is case-insensitive for
+    uniqueness but the embed only resolves the canonical all-lowercase spelling,
+    so ``@Nike`` answers 400 with the same body a free name gets, while the page
+    resolves any case to the account that holds it.
+
+    A 400 from the embed is never "available" on its own. Everything else -- a
+    403, a 429, an HTML body, an empty one -- is a block or an error.
+    """
+    handle = username.lower()
+
+    if TIKTOK_PAGE_FIRST:
+        page = await _tiktok_profile(client, handle)
+        if page.status in FINAL_STATUSES or page.status == "blocked":
+            return page
+
+    result = await _tiktok_oembed(client, username, handle)
+    if result is not None:
+        return result
+    if TIKTOK_PAGE_FIRST:
+        # The page was asked first and had nothing to say -- it served the shell
+        # or an interstitial. A 400 from the embed is not evidence about the
+        # name, so this is unanswered rather than available, and the pool
+        # retries it.
+        return SnipeResult(username, "tiktok", "error", "oembed 400, page had no verdict")
+    return await _tiktok_profile(client, handle)
 
 
 # --- Status-only checks -----------------------------------------------------
@@ -1802,6 +1840,16 @@ async def iter_snipes(
                 if result.status not in ("blocked", "error", STATUS_UNANSWERED):
                     return result
                 tried = result
+                if result.status == "blocked" and result.retry_after:
+                    # The platform named the wait, and it is measured in minutes:
+                    # discord answered 429 with retry_after 1253, 679 and 187
+                    # through this pool. The bucket is per exit IP, so a retry
+                    # now asks the same closed bucket and only spends requests --
+                    # which is how a throttled name turned into two throttle rows
+                    # and twice the pressure that caused it. Reported blocked
+                    # once; the platform pause decides when it is worth asking
+                    # again.
+                    return result
                 # How many retries are worth spending depends on who could take
                 # them. With a second proxy in play a reprieve is real, so the
                 # name gets the full budget on a different exit IP. With one

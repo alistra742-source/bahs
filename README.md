@@ -74,8 +74,13 @@ free, and anything else — a shell, an interstitial — is `unanswered` and nev
 "available". The page has to be asked for with a **mobile Safari user agent**: a
 desktop UA is served a 1,462-byte "enable JavaScript" shell to a datacenter IP
 for a live handle and a free name alike (measured), while the iPhone UA gets the
-real 166-202 KB page. `TIKTOK_CONFIRM_FREE=false` skips the confirmation —
-faster, and wrong most of the time.
+real 166-202 KB page. That page is what the check leads with, for a second
+reason: **TikTok throttles the embed per exit IP far harder than the page.**
+Measured through one rotating endpoint at 16 concurrent, 56 of 80 embed calls
+came back 429/503 while 80 of 80 page reads were answered in the same window —
+and embed-first paid a wasted round trip on every name, 3.6 names/s against 6.9.
+`TIKTOK_PAGE_FIRST=false` restores the cheap order (45 bytes instead of ~50 KB
+per check, ~880 MB over a 17,576-name sweep) and takes the throttling with it.
 
 **guns.lol renders a banned account's page like a free one.** Same default
 title, no Schema.org block — the ban heading sits at ~9.3 KB and was never read.
@@ -348,8 +353,8 @@ pool on the rest.
 | `SCAN_TARGET_RATE` | `100` | reported against on the dashboard |
 | `SNIPE_PER_PROXY` | `4` | floor for connections per proxy |
 | `SNIPE_PER_PROXY_MAX` | `128` | ceiling for one proxy (measured sweet spot for a single endpoint) |
-| `TIKTOK_CONFIRM_FREE` | `true` | confirm an oEmbed 400 against the profile page |
-| `TIKTOK_PAGE_TIMEOUT` | `15` | read ceiling for that confirmation |
+| `TIKTOK_PAGE_FIRST` | `true` | read the profile page first — ~50 KB/check, and the endpoint TikTok does not throttle |
+| `TIKTOK_PAGE_TIMEOUT` | `15` | read ceiling for that page |
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
 | `SNIPE_BLOCK_MEMORY` | `75` | how long one platform's refusal of one proxy is remembered |
 | `SNIPE_PLATFORM_BLOCK_MIN` | `3` | refusals before a platform may be sat out |

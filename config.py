@@ -90,18 +90,18 @@ READ_TIMEOUT: float = _float("READ_TIMEOUT", 8.0)
 GITHUB_TOKEN: str = _str("GITHUB_TOKEN", "")
 
 # --- TikTok ----------------------------------------------------------------
-# oEmbed answers 400 both for a name nobody holds and for a live handle it
-# refuses to embed -- measured on a random 4-character sample, 7 of the 9 names
-# it called missing were real accounts whose profile is not public. With this on
-# (the default, and the only setting that is correct) a 400 is confirmed against
-# the profile page, which costs one extra request and ~50 KB on the quarter of
-# checks that come back 400. Turning it off reports every unembeddable handle as
-# free: faster, and wrong most of the time. Left on unless a run needs the bytes
-# more than the answer.
-TIKTOK_CONFIRM_FREE: bool = _bool("TIKTOK_CONFIRM_FREE", True)
-# Read timeout for that confirmation. The page is 166-202 KB and the check is a
-# whole page rather than a 45-byte embed, so it needs more room than a normal
-# check; it is a ceiling, not a wait.
+# Which source leads the check. The profile page does, by default, because it is
+# both the authoritative one and the one TikTok does not throttle: measured
+# through one rotating endpoint at 16 concurrent, 80 of 80 page reads came back
+# with a verdict while 56 of the same 80 oEmbed calls came back 429/503 -- and
+# the embed also cost a wasted round trip, so page-first ran at 6.9 names/s
+# against 3.6/s. The price is bytes: ~50 KB per check against 45 bytes, which is
+# ~880 MB for a 17,576-name sweep. Set false to lead with the 45-byte embed and
+# spend the page only on what it cannot answer -- cheaper, and many more rows
+# come back `blocked`.
+TIKTOK_PAGE_FIRST: bool = _bool("TIKTOK_PAGE_FIRST", True)
+# Read ceiling for the profile page. It is 166-202 KB, so it needs more room than
+# a normal check; it is a ceiling, not a wait.
 TIKTOK_PAGE_TIMEOUT: float = _float("TIKTOK_PAGE_TIMEOUT", 15.0)
 
 # --- Alerts ----------------------------------------------------------------
