@@ -47,7 +47,9 @@ rather than assumed:
 """
 
 import asyncio
+import itertools
 import logging
+import random
 import re
 import time
 from collections import OrderedDict, deque
@@ -59,6 +61,8 @@ import httpx
 from config import (
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
+    SHUFFLE_NAMES,
+    SHUFFLE_WINDOW,
     SNIPE_BLOCK_COOLDOWN,
     SNIPE_MAX_CLIENTS,
     GITHUB_TOKEN,
@@ -170,6 +174,7 @@ OUTCOME_OK = "ok"            # the check produced a verdict
 OUTCOME_BLOCKED = "blocked"  # the platform refused: not the proxy's fault
 OUTCOME_FAILED = "failed"    # transport, timeout: the proxy's fault
 OUTCOME_UNKNOWN = "unknown"  # an answer we could not read: nobody's fault
+OUTCOME_TIMEOUT = "timeout"  # carried through the tunnel, no answer in time: target
 
 # The details check_once reports when the pool had nothing to hand out. Kept as a
 # constant so a run can count them without matching on prose, and so the
@@ -185,6 +190,11 @@ def outcome_for(result: "SnipeResult") -> str:
     if result.status == "blocked":
         return OUTCOME_BLOCKED
     if result.status in ("error", STATUS_UNANSWERED):
+        # The tunnel carried the request but nothing came back in time. That is
+        # a slow target, not a dead proxy, and it gets its own outcome so the
+        # pool rests the host briefly instead of retiring it.
+        if result.fault == FAULT_TARGET:
+            return OUTCOME_TIMEOUT
         # Only a transport failure is the tunnel's own doing. Everything else
         # arrived and was unreadable, which says nothing about the proxy.
         return OUTCOME_FAILED if result.fault == FAULT_PROXY else OUTCOME_UNKNOWN
@@ -231,11 +241,77 @@ def retry_after_seconds(body: object) -> float | None:
 
 
 FAULT_PROXY = "proxy"    # the tunnel could not carry the request
+FAULT_TARGET = "target"  # the tunnel carried it; the far side never answered
+
+
+def proxy_fault(exc: BaseException) -> bool:
+    """Is this exception evidence the *proxy* is bad?
+
+    A proxy that cannot open its tunnel is dead and should be retired quickly.
+    A request that opened the tunnel, went out, and then timed out or came back
+    mangled is the *target* being slow -- and the proxy's own usage panel still
+    counts that request, which is why retiring the proxy for it produced the
+    classic false report: "the list is dead" about a list that was working and
+    visibly receiving traffic.
+
+    Only the connect phase and the proxy library's own errors are the proxy's.
+
+    * yes -- ``ProxyError`` (the tunnel refused), ``ConnectError`` (nothing
+      answered the CONNECT), ``ConnectTimeout`` (the CONNECT never landed),
+      ``UnsupportedProtocol``, and the SOCKS handshake errors those are raised
+      from.
+    * no  -- ``ReadTimeout`` / ``ReadError`` / ``WriteError`` /
+      ``RemoteProtocolError``: bytes went out and the answer was late or
+      malformed. The connect succeeded, so the exit IP is not what failed.
+    """
+    if isinstance(
+        exc,
+        (
+            httpx.ProxyError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.UnsupportedProtocol,
+        ),
+    ):
+        return True
+    # `httpx[socks]` tunnels through socksio, whose handshake failures are its
+    # own exception types rather than httpx ones (the original comment here
+    # caught them by name for exactly that reason).
+    module = (type(exc).__module__ or "").split(".")[0]
+    if module in ("socks", "socksio"):
+        return True
+    for cls in type(exc).__mro__:
+        if cls.__name__ in ("ProxyError", "GeneralProxyError"):
+            return True
+    return False
 
 
 def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeResult":
-    """The proxy could not carry the request, so the proxy is what is wrong."""
-    return SnipeResult(username, platform, "error", type(exc).__name__, fault=FAULT_PROXY)
+    """The request did not reach a verdict -- say who that implicates."""
+    fault = FAULT_PROXY if proxy_fault(exc) else FAULT_TARGET
+    return SnipeResult(username, platform, "error", type(exc).__name__, fault=fault)
+
+
+def shuffled(names: Iterable[str], window: int = SHUFFLE_WINDOW) -> Iterator[str]:
+    """The names in random order, in bounded blocks.
+
+    Every run draws its names in a different order, so two runs over the same
+    selection never spend the same proxies on the same prefixes. Enumeration can
+    be tens of millions of names and is deliberately lazy, so the shuffle is
+    buffered rather than global: order is randomised within a block and memory
+    stays flat. Any list that fits ``window`` -- every snipe batch, and any scan
+    selection up to it -- is shuffled in full.
+    """
+    window = max(1, int(window))
+    source = iter(names)
+    while True:
+        block = list(itertools.islice(source, window))
+        if not block:
+            return
+        random.Random().shuffle(block)
+        yield from block
+        if len(block) < window:
+            return
 
 
 @dataclass
@@ -348,6 +424,33 @@ class ProxyPool:
     @property
     def per_proxy(self) -> int:
         return self._per_proxy
+
+    def begin_run(self) -> None:
+        """Reset per-run bookkeeping, keeping the warm tunnels.
+
+        The pool object is cached across requests precisely so its CONNECT
+        tunnels and TLS sessions survive -- one client per proxy is where a
+        batch's speed comes from. But one run's verdicts must not carry into the
+        next: a proxy retired at the tail of a bad run was still retired at the
+        head of a fresh one, so a new list of names answered "the list is dead"
+        until the 300-second cache expired. Every count that describes *this*
+        run's behaviour resets here; the clients, the list and the connection
+        budget stay.
+        """
+        self._resting.clear()
+        self._attempts.clear()
+        self._failed.clear()
+        self._inflight.clear()
+        self._blocks.clear()
+        self._blocked_by.clear()
+        self._retired.clear()
+        self._paused.clear()
+        self.paused_reason.clear()
+        self._cursor = 0
+        self.skipped = 0
+        self.misses = 0
+        self.stop_reason = ""
+        self.retry_after = None
 
     def next(self) -> str | None:
         """The next proxy to use, walking the rotation from a cursor.
@@ -471,6 +574,16 @@ class ProxyPool:
             # The request arrived and the answer was unusable. Not the tunnel's
             # fault, and not a refusal either, so the proxy's record is left
             # exactly as it was: no cooldown, no strike, no attempt counted.
+            return
+
+        if outcome == OUTCOME_TIMEOUT:
+            # The tunnel carried this request and the answer never came. The
+            # proxy's panel shows the request -- it is not dead -- so this never
+            # counts as a strike or a retirement. It is rested briefly so load
+            # drifts off a host whose targets are answering slowly, and it is
+            # free to be handed out again the moment the cooldown lapses.
+            if self._cooldown > 0:
+                self._resting[proxy] = time.time() + self._cooldown
             return
 
         # A *request* the proxy was asked to carry. A platform refusal is not
@@ -641,6 +754,14 @@ class ProxyPool:
         for platform in platforms:
             if self.is_paused(platform):
                 continue
+            refused = self._blocked_by.get(platform)
+            # This is asked twice per dispatch iteration. Comparing counts is
+            # O(1) where ``all_blocked`` is O(list) -- with a large list and a
+            # handful of platforms that walk was the loop's own ceiling. Only
+            # when a platform has refused at least as many distinct proxies as
+            # are still alive is there any chance the whole pool is blocked.
+            if not refused or len(refused) < self.alive():
+                continue
             if self.all_blocked([platform]):
                 refused = len(self._blocked_by.get(platform, ()))
                 self.pause(
@@ -679,13 +800,17 @@ class ProxyPool:
         return self.alive()
 
     def cooling(self) -> int:
-        """Live proxies currently sitting out a short cooldown."""
+        """Live proxies currently sitting out a short cooldown.
+
+        Read off the resting map rather than the whole list: this is asked once
+        per dispatch iteration, and ``_resting`` only ever holds proxies that
+        recently errored, while ``_all`` holds the entire list. Scanning the
+        former is O(cooling); scanning the latter was O(list) *per iteration*,
+        which is tens of millions of operations across a wide run. Entries are
+        popped on recovery and on retirement, so nothing stale is counted.
+        """
         now = time.time()
-        return sum(
-            1
-            for p in self._all
-            if p not in self._retired and self._resting.get(p, 0.0) > now
-        )
+        return sum(1 for until in self._resting.values() if until > now)
 
     async def wait_usable(self, timeout: float, stop: asyncio.Event | None = None) -> bool:
         """Wait for a resting proxy to come back, up to ``timeout``.
@@ -1239,12 +1364,25 @@ async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResu
         result = SnipeResult(username, platform, "error", f"unexpected:{type(exc).__name__}")
     result.latency_ms = (time.perf_counter() - started) * 1000.0
     result.proxy = proxy
+    # A 407 is the proxy itself demanding credentials, not the target. The
+    # checkers see it as an ordinary response, so it is caught here and charged
+    # to the proxy -- otherwise an authenticated list with a wrong credential
+    # never answers and never retires, and the run limps one unusable host at a
+    # time. Only 407: a 5xx can come from either side and is left unanswered.
+    if (
+        result.status == "error"
+        and result.fault == ""
+        and result.detail.startswith("status 407")
+    ):
+        result.fault = FAULT_PROXY
     # How a result reflects on the proxy depends on what happened: a block is the
     # platform's doing, a transport error is the proxy's, and an answer nobody
     # can read is neither. Relabelling here keeps that judgement in one place --
     # every checker still just says "error" when a request does not answer.
     outcome = outcome_for(result)
-    if outcome == OUTCOME_UNKNOWN:
+    if outcome in (OUTCOME_UNKNOWN, OUTCOME_TIMEOUT):
+        # Neither produced a verdict about the name. Both are retried on another
+        # proxy; only the timeout additionally rests the host it came from.
         result.status = STATUS_UNANSWERED
     pool.report(proxy, outcome, platform, result.retry_after)
     return result
@@ -1350,7 +1488,8 @@ async def iter_snipes(
         del pending[task]
         return task.result()
 
-    jobs = job_stream(usernames, platforms)
+    ordered = shuffled(usernames) if SHUFFLE_NAMES else usernames
+    jobs = job_stream(ordered, platforms)
     jobs_done = False
     held: tuple[str, str, str] | None = None
     pending: dict[asyncio.Task, None] = {}

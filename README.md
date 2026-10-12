@@ -85,6 +85,16 @@ costs is **wall clock**, which is why the dashboard shows an estimate from your
 last measured rate instead of letting you start a three-day run blind. Nothing
 is ever silently sampled — a space over the cap is refused with its real size.
 
+## Name order
+
+Every run shuffles its name list. The enumeration is lazily buffered in blocks of
+`SHUFFLE_WINDOW` (default 50,000) and each block is shuffled with a fresh RNG, so
+two runs over the same selection ask two different questions first and never
+spend the same proxies on the same prefix twice. Any list that fits the window —
+every snipe batch, and any scan selection up to it — is a true full shuffle;
+memory stays flat for a selection of tens of millions. `SHUFFLE_NAMES=false`
+restores the alphabetical order.
+
 ## Speed, measured
 
 Throughput tracks **connections ÷ platform latency**, not client parallelism.
@@ -157,6 +167,22 @@ now written off when it has failed every attempt up to `SNIPE_PROXY_FAIL_LIMIT`
 A host failing a third of its requests is kept — it is still producing answers,
 and ending a sweep is worse than reporting its error rate. When every proxy in
 the list is retired the run stops and says so.
+
+**A working proxy is never retired for a slow target.** A request that opened
+its tunnel, went out, and then timed out is the *target* answering late — the
+proxy's own panel still shows that request, which is why retiring on it produced
+the classic false verdict: "the list is dead" about a list that was working and
+visibly receiving traffic. Only the connect phase counts against a proxy now
+(`ProxyError`, `ConnectError`, `ConnectTimeout`, a SOCKS handshake failure, or a
+`407` from the proxy itself); a read timeout or a malformed answer rests the host
+briefly and is retried on another, and is never a strike.
+
+**And a run starts clean.** The pool object is cached so its warm tunnels survive
+between batches, but one run's retirements used to survive with it — a proxy
+written off at the tail of a bad run still read as retired at the head of the
+next one, so fresh names answered "the list is dead" until the 300-second cache
+expired. Every run now resets the per-run bookkeeping (retirements, strikes,
+cooldowns, block tallies) while keeping the connections.
 
 **And it is judged on a settled sample.** A failure that is fast and an answer
 that is slow means the *first* outcomes to come back are the failures. At
@@ -235,6 +261,8 @@ down, and a `done` summary.
 | `ALERT_MIN_INTERVAL` | `1.2` | seconds between posts |
 | `ALERT_MAX_MESSAGES` | `20` | posts per run |
 | `MAX_ENUMERATION` | `100000000` | names per run |
+| `SHUFFLE_NAMES` | `true` | every run draws its names in a fresh random order |
+| `SHUFFLE_WINDOW` | `50000` | names buffered while shuffling (a list that fits is shuffled in full) |
 | `MAX_PROXIES` | `100000` | |
 | `SCAN_CONCURRENCY` | `256` | checks in flight |
 | `SCAN_BUFFER_MAX` | `50000` | largest buffered (non-stream) run |

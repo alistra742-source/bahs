@@ -48,6 +48,13 @@ def _str(name: str, default: str) -> str:
     return raw
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # --- Service ---------------------------------------------------------------
 # Railway injects PORT. Bind 0.0.0.0 or the platform cannot reach the process.
 HOST: str = _str("HOST", "0.0.0.0")
@@ -186,6 +193,21 @@ SCAN_READ_TIMEOUT: float = _float("SCAN_READ_TIMEOUT", 6.0)
 SCAN_PER_PROXY: int = _int("SCAN_PER_PROXY", 6)
 # The rate a scan aims for; reported against in /scan and on the dashboard.
 SCAN_TARGET_RATE: int = _int("SCAN_TARGET_RATE", 100)
+
+# --- Name order ------------------------------------------------------------
+# Every run draws its names in a fresh random order. A run that always walks
+# a-z first spends the same proxies on the same prefixes and shows the same
+# crowded corner of the namespace first; shuffling spreads the load and makes
+# two runs over the same selection ask two different questions first. On by
+# default -- there is no reason to want the alphabetical order back, and
+# "randomize the name list, always" is the standing order.
+SHUFFLE_NAMES: bool = _bool("SHUFFLE_NAMES", True)
+# How many names are held at once while shuffling. Enumeration is lazy and can
+# be tens of millions of names, so a full shuffle would put the whole space in
+# memory -- the buffer keeps order random within each block while memory stays
+# flat. Any list that fits the window (every snipe batch, and any scan up to
+# it) is shuffled in full.
+SHUFFLE_WINDOW: int = _int("SHUFFLE_WINDOW", 50000)
 
 # --- Platform throttling ---------------------------------------------------
 # A platform that has refused every proxy in the list is sat out for this long

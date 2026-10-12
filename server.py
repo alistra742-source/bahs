@@ -28,6 +28,7 @@ import proxies as proxy_list_module
 import sniper
 from config import (
     LOG_LEVEL,
+    SHUFFLE_NAMES,
     MAX_CONCURRENT_RUNS,
     MAX_ENUMERATION,
     MIN_POOL_WARN,
@@ -188,6 +189,7 @@ def info() -> dict:
         # What the UI needs to show a running total for "every name of this
         # length" before anyone starts a run.
         "generation": {
+            "name_order": "random" if SHUFFLE_NAMES else "sequential",
             "charset": {name: len(chars) for name, chars in generator.CHARSETS.items()},
             "words_by_length": words,
             "max_enumeration": MAX_ENUMERATION,
@@ -522,6 +524,11 @@ async def _prepare_pool(mode: str, concurrency: int) -> tuple[sniper.ProxyPool, 
     quietly fails. A short list still runs, but says so up front.
     """
     pool = await _pool(mode, concurrency)
+    # A fresh run gets fresh verdicts. The pool object is cached (and its warm
+    # tunnels with it), but the previous run's retirements and strikes must not
+    # decide this one -- otherwise a list that recovered still reads "the list
+    # is dead" until the cache expires.
+    pool.begin_run()
     if len(pool) == 0:
         raise HTTPException(503, "no proxies saved yet -- paste or upload a list first")
     if len(pool) < MIN_POOL_WARN:
