@@ -69,6 +69,7 @@ from config import (
     GITHUB_TOKEN,
     SNIPE_PER_PROXY,
     SNIPE_PLATFORM_BLOCK_MIN,
+    SNIPE_PLATFORM_BLOCK_RATE,
     SNIPE_PLATFORM_PAUSE,
     SNIPE_PLATFORM_PAUSE_MAX,
     SNIPE_PLATFORM_WAIT,
@@ -399,10 +400,13 @@ class ProxyPool:
         self._block_limit = max(1, block_limit)
         self._block_memory = max(0.0, block_memory)
         self._block_min = max(1, SNIPE_PLATFORM_BLOCK_MIN)
-        # Total refusals each platform has recorded this run. Distinct from the
-        # per-proxy marks: this is the evidence that a platform is actually
-        # throttling the whole list, and a pause needs it before it may fire.
+        self._block_rate = min(1.0, max(0.0, SNIPE_PLATFORM_BLOCK_RATE))
+        # Total refusals each platform has recorded this run, and total answers
+        # it gave. The ratio is the evidence a pause turns on: a handful of
+        # refusals inside a flood of answers is a transient 401, not a blanket
+        # throttle, and pausing on the raw count is what stopped a healthy run.
         self._platform_blocks: dict[str, int] = {}
+        self._platform_seen: dict[str, int] = {}
         self._cursor = 0
         # platform -> {proxy: monotonic time of its last refusal}. A proxy
         # blocked by discord is still a perfectly good proxy for tiktok, and
@@ -456,6 +460,7 @@ class ProxyPool:
         self._blocks.clear()
         self._blocked_by.clear()
         self._platform_blocks.clear()
+        self._platform_seen.clear()
         self._retired.clear()
         self._paused.clear()
         self.paused_reason.clear()
@@ -582,6 +587,12 @@ class ProxyPool:
 
         if retry_after and (self.retry_after is None or retry_after > self.retry_after):
             self.retry_after = retry_after
+
+        # Every request a platform answered is one data point about how often it
+        # refuses. Counted before the early returns below, so an unreadable
+        # answer still counts as the platform having answered something.
+        if platform:
+            self._platform_seen[platform] = self._platform_seen.get(platform, 0) + 1
 
         if outcome == OUTCOME_UNKNOWN:
             # The request arrived and the answer was unusable. Not the tunnel's
@@ -808,7 +819,14 @@ class ProxyPool:
             # needs at least `_block_min` refusals, and at least one per live
             # proxy, before it fires.
             evidence = max(self.alive(), self._block_min)
-            if self._platform_blocks.get(platform, 0) < evidence:
+            blocked = self._platform_blocks.get(platform, 0)
+            if blocked < evidence:
+                continue
+            # ...and refusals must dominate what this platform has answered. At
+            # a 4% refusal rate (measured live on guns.lol) a pause is noise;
+            # at 100% it is a real throttle and the pause is exactly right.
+            seen = self._platform_seen.get(platform, 0)
+            if seen and blocked / seen < self._block_rate:
                 continue
             if self.all_blocked([platform]):
                 refused = len(self._blocked_by.get(platform, ()))

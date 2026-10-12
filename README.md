@@ -154,9 +154,15 @@ answer. Two things fix that:
   seconds, not forever. A rotating endpoint answers from a different exit IP on
   the next request, so a 403 from a minute ago says nothing about the request
   going out now; the mark ages out and the proxy is tried again.
-- A pause needs real evidence: at least `SNIPE_PLATFORM_BLOCK_MIN` refusals, and
-  at least one per live proxy. One unlucky 403 against a one-line list no longer
-  pauses anything.
+- A pause needs real evidence: at least `SNIPE_PLATFORM_BLOCK_MIN` refusals, at
+  least one per live proxy, **and** refusals must be at least
+  `SNIPE_PLATFORM_BLOCK_RATE` (default 0.5) of everything that platform has
+  answered. Measured live on guns.lol: 46 refusals out of 1,036 answers is 4.4%
+  and is a healthy run — counting raw refusals alone paused the platform every
+  few hundred checks. A blanket throttle reads ~100% and still pauses at once.
+- A refused name is retried once by default (`SCAN_RETRIES=1`). Through a
+  rotating endpoint the retry lands on a different exit IP and most transient
+  401/403s resolve into a real verdict.
 
 **guns.lol and Instagram still need residential-ish exits.** Both sit behind a
 challenge that refuses datacenter ranges outright — the 403 is the exit IP, not
@@ -294,6 +300,8 @@ down, and a `done` summary.
 | `SNIPE_PLATFORM_PAUSE` | `90` | seconds a blocked platform sits out |
 | `SNIPE_BLOCK_MEMORY` | `75` | how long one platform's refusal of one proxy is remembered |
 | `SNIPE_PLATFORM_BLOCK_MIN` | `3` | refusals before a platform may be sat out |
+| `SNIPE_PLATFORM_BLOCK_RATE` | `0.5` | share of a platform's answers that must be refusals |
+| `SCAN_RETRIES` | `1` | retries a refused name once, on a fresh exit IP |
 | `SNIPE_PLATFORM_WAIT` | `300` | seconds a run waits when every platform is paused |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired |

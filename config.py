@@ -179,11 +179,12 @@ SCAN_MAX_NAMES: int = _int("SCAN_MAX_NAMES", 1000000)
 # result list in memory, so past this it is refused and told to stream rather
 # than being allowed to run the process out of memory.
 SCAN_BUFFER_MAX: int = _int("SCAN_BUFFER_MAX", 50000)
-# A scan does not retry by default: at this width a retry costs more throughput
-# than the verdict it buys. It matters more than it looks: every retry of a
-# blocked name spends another slot of the pool's block budget, so retrying a
-# blanket rate limit is what used to exhaust a list fastest.
-SCAN_RETRIES: int = _int("SCAN_RETRIES", 0)
+# A scan retries a refusal once by default. A transient 401/403 through a
+# rotating endpoint lands on a different exit IP on the next attempt, so one
+# retry turns most of those into a real verdict for 4% more requests; a blanket
+# throttle never gets retried because it pauses the platform first (see
+# SNIPE_PLATFORM_BLOCK_RATE). Set 0 for pure throughput on a very wide run.
+SCAN_RETRIES: int = _int("SCAN_RETRIES", 1)
 # Tighter than the check above, because in a scan a dead proxy is pure lost
 # time.
 SCAN_CONNECT_TIMEOUT: float = _float("SCAN_CONNECT_TIMEOUT", 2.0)
@@ -230,6 +231,14 @@ SNIPE_BLOCK_MEMORY: float = _float("SNIPE_BLOCK_MEMORY", 75.0)
 # (at least this many, and at least as many as there are live proxies), not the
 # first refusal of a list that happens to be one line long.
 SNIPE_PLATFORM_BLOCK_MIN: int = _int("SNIPE_PLATFORM_BLOCK_MIN", 3)
+# The *share* of a platform's answers that must be refusals before it can be sat
+# out. This is the guard that was missing: guns.lol intermittently answers 401
+# (a clearance check tied to the exit IP), measured live at 46 refusals out of
+# 1,036 answers -- 4.4%, a healthy run. Counting raw refusals paused the whole
+# platform every few hundred checks at that rate. A pause now needs the platform
+# to be refusing *most* of what it sees, which is what a blanket throttle looks
+# like, while a handful of transient refusals just get retried.
+SNIPE_PLATFORM_BLOCK_RATE: float = _float("SNIPE_PLATFORM_BLOCK_RATE", 0.5)
 # When every platform is sitting out at once, the run waits for the shortest
 # pause to lift and carries on instead of ending. The old behaviour dropped
 # every name that had not been asked about yet. This bounds that wait, after
