@@ -6,7 +6,8 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 import accounts
@@ -22,7 +23,6 @@ class SecurityTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {
             "APP_ORIGIN": ORIGIN, "AUTH_SECRET": "test-only-" + "x" * 40,
             "ACCOUNT_DB_PATH": self.tmp.name + "/accounts.db", "ADMIN_USERS": "operator",
-            "TURNSTILE_SITE_KEY": "site-test", "TURNSTILE_SECRET_KEY": "secret-test",
             "NOWPAYMENTS_API_KEY": "test-key", "NOWPAYMENTS_IPN_SECRET": "test-ipn-key",
             "NOWPAYMENTS_ENABLED": "1", "TRUSTED_PROXY_CIDRS": "", "APP_ENV": "test",
         })
@@ -36,22 +36,25 @@ class SecurityTests(unittest.TestCase):
                 for table in ["payment_receipts", "issued_addresses", "orders", "sessions", "account_hits", "trial_claims", "rate_windows", "users"]:
                     db.execute("DELETE FROM " + table)
         server._runs.clear()
-        self.captcha = patch("accounts.captcha", new=AsyncMock())
-        self.mock_captcha = self.captcha.start()
         self.client = TestClient(server.app, client=('127.0.0.1', 50000))
         self.headers = {"Origin": ORIGIN}
 
     def tearDown(self):
         server._runs.clear()
         self.client.close()
-        self.captcha.stop()
         accounts.store = self.saved
         self.env.stop()
         self.tmp.cleanup()
 
+    def solve(self, client, action):
+        # Read the answer the way a test harness can: from the server-side challenge store.
+        ch = client.get("/auth/challenge?action=" + action).json()
+        entry = accounts.CHALLENGES[ch["id"]]
+        return {"challenge_id": ch["id"], "drag": entry["target"], "word": entry["word"]}
+
     def signup(self, name="firstuser", client=None):
         c = client or self.client
-        r = c.post("/auth/signup", headers=self.headers, json={"username": name, "password": "correct horse 42", "captcha_token": "test"})
+        r = c.post("/auth/signup", headers=self.headers, json={"username": name, "password": "correct horse 42", **self.solve(c, "signup")})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
 
@@ -77,9 +80,9 @@ class SecurityTests(unittest.TestCase):
         r = self.client.post("/auth/logout", headers=self.csrf(data))
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self.client.get("/auth/me").status_code, 401)
-        bad = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"wrong password value", "captcha_token":"test"})
+        bad = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"wrong password value", **self.solve(self.client, "login")})
         self.assertEqual(bad.status_code, 401)
-        good = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"correct horse 42", "captcha_token":"test"})
+        good = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"correct horse 42", **self.solve(self.client, "login")})
         self.assertEqual(good.status_code, 200)
         self.assertEqual(good.json()["user"]["trial_until"], user["trial_until"])
 
@@ -134,7 +137,7 @@ class SecurityTests(unittest.TestCase):
         other.close()
 
     def test_reserved_operator_username_cannot_be_registered(self):
-        r=self.client.post('/auth/signup',headers=self.headers,json={'username':'operator','password':'correct horse 42','captcha_token':'test'})
+        r=self.client.post('/auth/signup',headers=self.headers,json={'username':'operator','password':'correct horse 42',**self.solve(self.client,'signup')})
         self.assertEqual(r.status_code,409)
 
     def test_forwarded_ip_is_ignored_unless_peer_is_explicitly_trusted(self):
@@ -224,22 +227,40 @@ class SecurityTests(unittest.TestCase):
 
 
 class CaptchaTests(unittest.IsolatedAsyncioTestCase):
-    async def test_server_verifies_action_and_hostname_and_fails_closed(self):
-        class Response:
-            def __init__(self,data):self.data=data
-            def raise_for_status(self):pass
-            def json(self):return self.data
-        class Client:
-            async def __aenter__(self):return self
-            async def __aexit__(self,*args):pass
-            async def post(self,*args,**kwargs):return Response(result)
-        result={'success':True,'hostname':'testserver','action':'signup'}
-        with patch.dict(os.environ,{'APP_ORIGIN':ORIGIN,'TURNSTILE_SECRET_KEY':'test','TURNSTILE_SITE_KEY':'test'}),patch('accounts.httpx.AsyncClient',return_value=Client()):
-            await accounts.captcha('token','signup','127.0.0.1')
-            for bad in [{'success':False},{'success':True,'hostname':'evil.example','action':'signup'},{'success':True,'hostname':'testserver','action':'login'}]:
-                result=bad
-                with self.assertRaises(Exception) as caught:await accounts.captcha('token','signup','127.0.0.1')
-                self.assertEqual(caught.exception.status_code,400)
+    def solve(self,action='signup',ip='127.0.0.1'):
+        ch=accounts.new_challenge(action,ip)
+        entry=accounts.CHALLENGES[ch['id']]
+        return SimpleNamespace(challenge_id=ch['id'],drag=entry['target'],word=entry['word'])
+
+    def assert_rejected(self,body,action='signup',ip='127.0.0.1'):
+        with self.assertRaises(Exception) as caught:accounts.captcha(body,action,ip)
+        self.assertEqual(caught.exception.status_code,400)
+
+    async def test_drag_and_word_challenge_accepts_only_the_solved_answer(self):
+        accounts.CHALLENGES.clear()
+        ch=accounts.new_challenge('signup','127.0.0.1')
+        self.assertTrue(ch['word_image'].startswith('data:image/svg+xml;base64,'))
+        self.assertEqual(len(accounts.CHALLENGES[ch['id']]['word']),6)
+        body=self.solve()
+        accounts.captcha(body,'signup','127.0.0.1')
+        self.assert_rejected(body)  # single use: replay fails
+
+        wrong_drag=self.solve(); wrong_drag.drag=(wrong_drag.drag+30)%100
+        self.assert_rejected(wrong_drag)
+
+        wrong_word=self.solve(); wrong_word.word=('A' if wrong_word.word[0]!='A' else 'B')+wrong_word.word[1:]
+        self.assert_rejected(wrong_word)
+
+        lenient=self.solve(); lenient.word=lenient.word.lower()+' '
+        accounts.captcha(lenient,'signup','127.0.0.1')
+
+        self.assert_rejected(self.solve(),action='login')  # bound to action
+        self.assert_rejected(self.solve(),ip='10.0.0.9')  # bound to IP at issue
+
+        expired=self.solve(); accounts.CHALLENGES[expired.challenge_id]['expires']=0
+        self.assert_rejected(expired)
+
+        self.assert_rejected(SimpleNamespace(challenge_id='',drag=-1,word=''))
 
     async def test_trial_expiry_cancels_a_detached_worker(self):
         user={'id':'guard-test','trial_until':time.time()+.1,'paid_until':0,'lifetime':0}

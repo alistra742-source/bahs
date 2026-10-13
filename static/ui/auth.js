@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   const rawFetch = window.fetch.bind(window);
-  const state = { user: null, csrf: '', config: null, mode: 'signup', widget: null, token: '', dialog: null, challengeData: null };
+  const state = { user: null, csrf: '', config: null, mode: 'signup', challenge: null, dragOk: false, dragValue: -1, dialog: null };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   
   async function json(path, options = {}) {
@@ -44,124 +44,97 @@
     notify();
     return state.user;
   }
-  
-  let captchaScript;
-  function loadCaptcha() {
-    if (window.turnstile) return Promise.resolve();
-    if (!captchaScript) captchaScript = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
-      script.onload = resolve;
-      script.onerror = () => reject(new Error('Turnstile could not load.'));
-      document.head.appendChild(script);
-    });
-    return captchaScript;
+
+  // Human check: drag the chip onto the target, then type the distorted word.
+  // Submit stays disabled until both steps are done, and the server accepts one attempt per challenge.
+  function updateSubmit() {
+    const word = document.getElementById('vxWord');
+    const submit = document.querySelector('.auth-submit');
+    if (submit) submit.disabled = !(state.challenge && state.dragOk && word && word.value.trim().length >= 6);
   }
-  
+
   async function setupSecurityChallenge() {
     const box = document.getElementById('authCaptcha');
     if (!box) return;
-    
-    // If Turnstile is configured on backend with live keys
-    if (state.config?.turnstile && state.config?.site_key) {
-      try {
-        await loadCaptcha();
-        if (!state.dialog.open) return;
-        state.widget = turnstile.render('#authCaptcha', {
-          sitekey: state.config.site_key, action: state.mode, theme: 'dark', size: 'flexible',
-          callback: token => { state.token = token; const b = document.querySelector('.auth-submit'); if (b) b.disabled = false; },
-          'expired-callback': () => { state.token = ''; },
-          'error-callback': () => { state.token = ''; fallbackChallenge(); }
-        });
-        return;
-      } catch (e) {
-        // Fallback to integrated tactical challenge
-      }
-    }
-    
-    fallbackChallenge();
-  }
-
-  async function fallbackChallenge() {
-    const box = document.getElementById('authCaptcha');
-    if (!box) return;
+    state.challenge = null; state.dragOk = false; state.dragValue = -1;
+    updateSubmit();
+    box.innerHTML = '<p class="auth-legal">Loading verification…</p>';
     try {
       const ch = await json('/auth/challenge?action=' + encodeURIComponent(state.mode));
-      state.challengeData = ch;
-      state.token = '';
+      if (!state.dialog || !state.dialog.open) return;
+      state.challenge = ch;
       box.innerHTML = `
-        <div class="vortex-captcha-box" style="background:#0e0e13;border:1px solid #2d2d38;border-radius:4px;padding:12px;margin:10px 0;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-            <span style="font:10px var(--mono);color:#c97a45;letter-spacing:0.1em;">TACTICAL BOT DETECTION // 3-PHASE</span>
-            <span style="font:9px var(--mono);color:#7a7a85;">CLICK MATCHING GLYPHS</span>
+        <div class="vx-check">
+          <p class="vx-step">1 / 2 · Drag the chip onto the target</p>
+          <div class="vx-track" id="vxTrack">
+            <div class="vx-zone" style="left:calc((100% - 44px) * ${Number(ch.target)} / 100)"></div>
+            <div class="vx-knob" id="vxKnob" role="slider" tabindex="0" aria-label="Drag the chip onto the target" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">&#x27A4;</div>
           </div>
-          <div style="font:11px var(--mono);color:#d0d0d8;margin-bottom:10px;">Select glyphs: <b style="color:#c97a45;">${ch.required_glyphs.join(' ')}</b></div>
-          <div class="vortex-glyphs" style="display:flex;gap:8px;margin-bottom:10px;">
-            ${ch.glyphs.map((g, idx) => `<button type="button" class="glyph-btn" data-glyph="${g}" style="flex:1;padding:8px 0;background:#16161f;border:1px solid #333340;color:#e8e8ea;font-size:16px;cursor:pointer;border-radius:3px;">${g}</button>`).join('')}
-          </div>
-          <div style="margin-top:6px;">
-            <div style="font:9px var(--mono);color:#888894;margin-bottom:4px;display:flex;justify-content:space-between;">
-              <span>CALIBRATION FREQUENCY:</span> <span id="freqVal">0%</span>
-            </div>
-            <input type="range" id="freqSlider" min="0" max="100" value="0" style="width:100%;accent-color:#c97a45;cursor:pointer;">
-          </div>
-          <div id="captchaStatus" style="font:9px var(--mono);color:#888894;margin-top:8px;text-align:right;">[ CHALLENGE UNRESOLVED ]</div>
-        </div>
-      `;
-      
-      const selectedGlyphs = new Set();
-      const slider = box.querySelector('#freqSlider');
-      const status = box.querySelector('#captchaStatus');
-      const freqVal = box.querySelector('#freqVal');
-      
-      box.querySelectorAll('.glyph-btn').forEach(btn => {
-        btn.onclick = () => {
-          const g = btn.dataset.glyph;
-          if (selectedGlyphs.has(g)) {
-            selectedGlyphs.delete(g);
-            btn.style.borderColor = '#333340';
-            btn.style.background = '#16161f';
-          } else {
-            selectedGlyphs.add(g);
-            btn.style.borderColor = '#c97a45';
-            btn.style.background = '#281c14';
-          }
-          checkResolution();
-        };
-      });
-      
-      slider.oninput = () => {
-        freqVal.textContent = slider.value + '%';
-        checkResolution();
-      };
-      
-      function checkResolution() {
-        const hasAllGlyphs = ch.required_glyphs.every(req => selectedGlyphs.has(req));
-        const glyphsOk = hasAllGlyphs && selectedGlyphs.size === ch.required_glyphs.length;
-        const sliderOk = parseInt(slider.value, 10) >= ch.target;
-        
-        if (glyphsOk && sliderOk) {
-          state.token = ch.challenge;
-          status.textContent = '✓ VERIFIED HUMAN OPERATOR';
-          status.style.color = '#4a7c59';
-          document.getElementById('authError').textContent = '';
-          const submitBtn = document.querySelector('.auth-submit');
-          if (submitBtn) submitBtn.disabled = false;
-        } else {
-          state.token = '';
-          status.textContent = !glyphsOk ? '[ GLYPH MISMATCH ]' : '[ ALIGN FREQUENCY >= ' + ch.target + '% ]';
-          status.style.color = '#c97a45';
-        }
-      }
-    } catch(err) {
-      box.innerHTML = `<div style="font:10px var(--mono);color:#c18a80;">Challenge sync error: ${esc(err.message)}</div>`;
+          <p class="vx-step">2 / 2 · Type the word you see</p>
+          <img class="vx-word" src="${esc(ch.word_image)}" alt="Distorted verification word" draggable="false">
+          <input id="vxWord" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="16" placeholder="type the word" aria-label="Type the word you see">
+          <p id="vxStatus" class="vx-status" role="status">Drag the chip onto the target.</p>
+        </div>`;
+      wireChallenge(box, ch);
+    } catch (err) {
+      box.innerHTML = `<div class="vx-status">Verification could not load: ${esc(err.message)}</div>`;
     }
+  }
+
+  function wireChallenge(box, ch) {
+    const track = box.querySelector('#vxTrack'), knob = box.querySelector('#vxKnob');
+    const status = box.querySelector('#vxStatus'), word = box.querySelector('#vxWord');
+    let dragging = false, value = 0;
+    const travel = () => Math.max(1, track.clientWidth - knob.offsetWidth);
+    const place = px => {
+      const x = Math.min(Math.max(px, 0), travel());
+      knob.style.transform = `translateX(${x}px)`;
+      value = Math.round(x / travel() * 100);
+      knob.setAttribute('aria-valuenow', String(value));
+    };
+    const pxFromEvent = e => e.clientX - track.getBoundingClientRect().left - knob.offsetWidth / 2;
+
+    knob.addEventListener('pointerdown', e => {
+      dragging = true; state.dragOk = false; updateSubmit();
+      knob.setPointerCapture(e.pointerId); knob.classList.add('dragging');
+      place(pxFromEvent(e)); e.preventDefault();
+    });
+    knob.addEventListener('pointermove', e => { if (dragging) place(pxFromEvent(e)); });
+    const release = () => {
+      if (!dragging) return;
+      dragging = false; knob.classList.remove('dragging');
+      const ok = Math.abs(value - ch.target) <= ch.tolerance;
+      state.dragOk = ok; state.dragValue = value;
+      if (ok) {
+        place(travel() * ch.target / 100);
+        status.textContent = 'On target. Now type the word.';
+        word.focus();
+      } else {
+        place(0);
+        status.textContent = 'Not on target. Drag the chip again.';
+      }
+      updateSubmit();
+    };
+    knob.addEventListener('pointerup', release);
+    knob.addEventListener('pointercancel', release);
+    knob.addEventListener('keydown', e => {
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      e.preventDefault();
+      place(value * travel() / 100 + (e.key === 'ArrowRight' ? 2 : -2) * travel() / 100);
+      state.dragOk = false; state.dragValue = value; updateSubmit();
+      status.textContent = 'Use the arrow keys, then press Enter to confirm.';
+    });
+    knob.addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      dragging = true; release();
+    });
+    word.oninput = updateSubmit;
   }
 
   function form() {
     const signup = state.mode === 'signup';
-    if (state.widget !== null && window.turnstile) turnstile.remove(state.widget);
-    state.widget = null; state.token = '';
+    state.challenge = null; state.dragOk = false; state.dragValue = -1;
     state.dialog.innerHTML = `
       <button type="button" class="modal-close" aria-label="Close account form">×</button>
       <div class="modal-mark">VORTEX<span> // 01</span></div><p class="eyebrow">${signup ? 'IDENTITY & SCAN INITIALIZATION' : 'ACCESS GATEWAY'}</p>
@@ -180,7 +153,7 @@
         <button class="btn primary big auth-submit" disabled>${signup ? 'Create account →' : 'Log in →'}</button>
       </form>
       <p class="auth-switch">${signup ? 'Already have an account? <button type="button" data-mode="login">Log in</button>' : 'New here? <button type="button" data-mode="signup">Create account</button>'}</p>
-      <p class="auth-legal">${signup ? 'One trial per eligible IP/device. 60 seconds of full speed sweeps.' : 'Multi-tier anti-bot detection active. Passwords hashed with Argon2id.'}</p>`;
+      <p class="auth-legal">${signup ? 'One trial per eligible IP/device. 60 seconds of full speed sweeps.' : 'Passwords hashed with Argon2id. Every login needs the same human check.'}</p>`;
     
     state.dialog.querySelector('.modal-close').onclick = () => state.dialog.close();
     state.dialog.querySelector('[data-mode]').onclick = e => { state.mode = e.target.dataset.mode; form(); };
@@ -192,8 +165,9 @@
       button.textContent = signup ? 'Creating identity…' : 'Authenticating…';
       
       try {
-        // Fail closed: the security check must be solved before anything is sent.
-        if (!state.token) throw new Error('Complete the security check first.');
+        // Fail closed: the drag and the typed word must both be done, and only the solved challenge is sent.
+        const word = document.getElementById('vxWord');
+        if (!state.challenge || !state.dragOk || !word) throw new Error('Finish the verification first.');
 
         const fields = new FormData(e.target);
         const data = await json('/auth/' + state.mode, {
@@ -203,7 +177,9 @@
             username: fields.get('username'),
             password: fields.get('password'),
             website: fields.get('website'),
-            captcha_token: state.token
+            challenge_id: state.challenge.id,
+            drag: state.dragValue,
+            word: word.value.trim()
           })
         });
         state.user = data.user; state.csrf = data.csrf;
@@ -211,12 +187,12 @@
         location.href = state.user.access ? '/console' : '/buy';
       } catch (err) {
         error.textContent = err.message;
-        state.token = '';
         button.disabled = false;
         button.textContent = signup ? 'Create account →' : 'Log in →';
         setupSecurityChallenge();
       }
     };
+
     setupSecurityChallenge();
   }
 

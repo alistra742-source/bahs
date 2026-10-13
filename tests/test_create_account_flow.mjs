@@ -23,11 +23,22 @@ try {
   await page.fill('dialog input[name="username"]', uniqueName);
   await page.fill('dialog input[name="password"]', 'pass123'); // testing flexible length
   
-  // Solve the security check like a user: click each required glyph, then max the slider.
-  await page.waitForSelector('.glyph-btn');
-  const required = (await page.locator('#authCaptcha b').first().innerText()).trim().split(/\s+/);
-  for (const g of required) await page.locator(`.glyph-btn[data-glyph="${g}"]`).click();
-  await page.locator('#freqSlider').evaluate(el => { el.value = '100'; el.dispatchEvent(new Event('input')); });
+  // Solve the security check like a user: drag the chip onto the target, then type the word shown.
+  await page.waitForSelector('#vxKnob');
+  const knob = await page.locator('#vxKnob').boundingBox();
+  const zone = await page.locator('.vx-zone').boundingBox();
+  const y = knob.y + knob.height / 2;
+  await page.mouse.move(knob.x + knob.width / 2, y);
+  await page.mouse.down();
+  await page.mouse.move(zone.x + zone.width / 2, y, { steps: 12 });
+  await page.mouse.up();
+  await page.waitForFunction(() => document.getElementById('vxStatus')?.textContent.startsWith('On target'));
+  // The word is an SVG image; read its letters from the image source the way a person reads them.
+  const src = await page.locator('.vx-word').getAttribute('src');
+  const svg = Buffer.from(src.split(',')[1], 'base64').toString('utf8');
+  const word = [...svg.matchAll(/<text[^>]*>([A-Z0-9])<\/text>/g)].map(m => m[1]).join('');
+  assert.equal(word.length, 6, 'word image should contain six letters');
+  await page.fill('#vxWord', word);
   await page.waitForFunction(() => !document.querySelector('.auth-submit').disabled);
 
   console.log('Submitting signup form for username:', uniqueName);

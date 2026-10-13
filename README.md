@@ -4,7 +4,7 @@
 > server-side 60-second trial enforcement, PostgreSQL accounts/private hits,
 > and `/buy` + `/account` with $8.99 monthly / $45.99 forever plans.
 > See **[SECURITY.md](SECURITY.md)** and **[.env.example](.env.example)** before running
-> this version: new authentication and CAPTCHA variables are required. The proxy
+> this version: new authentication variables (`AUTH_SECRET`) are required; signup uses a built-in drag-and-type challenge, so no third-party CAPTCHA keys are needed. The proxy
 > pool is operator-managed, not exposed to ordinary accounts. Some older single-user
 > setup/API descriptions below are historical and do not describe these new gates.
 > Crypto checkout is deliberately disabled: free/unlimited public blockchain RPC

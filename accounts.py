@@ -13,7 +13,9 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
+import base64
 import uuid
 from contextlib import contextmanager
 from urllib.parse import urlsplit
@@ -259,59 +261,68 @@ def make_session(user, device):
     return response
 
 
-def create_challenge_token(action: str, ip: str) -> str:
-    now = str(int(time.time()))
-    nonce = secrets.token_hex(16)
-    sig = hmac.new(secret(), f"vortex-challenge:{action}:{ip}:{now}:{nonce}".encode(), hashlib.sha256).hexdigest()
-    return f"vortex_{now}_{nonce}_{sig}"
+# Human check: drag a chip onto a target, then type a distorted word. Each challenge
+# is stored server-side, bound to one IP and action, expires quickly and is consumed
+# on the first attempt, so a solved answer cannot be replayed.
+CHALLENGES: dict[str, dict] = {}
+CHALLENGE_LOCK = threading.Lock()
+CHALLENGE_TTL = 180
+CHALLENGE_CAP = 5000
+DRAG_TOLERANCE = 4
+WORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no I/L/O/0/1: easy to misread, still typable
 
 
-def verify_challenge_token(token: str, action: str, ip: str) -> bool:
-    if not token or not token.startswith("vortex_"):
-        return False
-    parts = token.split("_")
-    if len(parts) != 4:
-        return False
-    _, ts_str, nonce, sig = parts
-    try:
-        ts = int(ts_str)
-    except ValueError:
-        return False
-    if abs(time.time() - ts) > 600:
-        return False
-    expected = hmac.new(secret(), f"vortex-challenge:{action}:{ip}:{ts_str}:{nonce}".encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+def _word_image(word: str) -> str:
+    rnd = secrets.SystemRandom()
+    w, h = 260, 90
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
+             f'<rect width="{w}" height="{h}" fill="#0e0e13"/>']
+    for _ in range(8):
+        parts.append(f'<line x1="{rnd.randint(0, w)}" y1="{rnd.randint(0, h)}" x2="{rnd.randint(0, w)}" y2="{rnd.randint(0, h)}" stroke="#5a5a68" stroke-width="{rnd.uniform(1, 2.5):.1f}"/>')
+    for _ in range(70):
+        parts.append(f'<circle cx="{rnd.randint(0, w)}" cy="{rnd.randint(0, h)}" r="1.2" fill="#4a4a58"/>')
+    x = 16
+    for ch in word:
+        y, rot, size, skew = rnd.randint(50, 68), rnd.randint(-28, 28), rnd.randint(30, 38), rnd.randint(-18, 18)
+        fill = rnd.choice(["#f2f2f4", "#c97a45", "#d8d8de"])
+        parts.append(f'<text x="{x}" y="{y}" font-family="monospace" font-weight="700" font-size="{size}" fill="{fill}" transform="rotate({rot} {x} {y}) skewX({skew})">{ch}</text>')
+        x += rnd.randint(32, 38)
+    parts.append("</svg>")
+    return "data:image/svg+xml;base64," + base64.b64encode("".join(parts).encode()).decode()
 
 
-async def captcha(token, action, ip):
-    if not token:
-        raise HTTPException(400, "Complete the security verification first")
-    if token == "test":
-        return
-    if token.startswith("vortex_"):
-        if verify_challenge_token(token, action, ip):
-            return
-        raise HTTPException(400, "Security verification failed. Please solve the challenge again.")
-    key = os.getenv("TURNSTILE_SECRET_KEY", "")
-    hosts = {urlsplit(o).hostname for o in allowed_origins()}
-    if key and os.getenv("TURNSTILE_SITE_KEY"):
-        async with httpx.AsyncClient(timeout=10) as client:
-            try:
-                response = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", json={"secret": key, "response": token, "remoteip": ip, "idempotency_key": str(uuid.uuid4())})
-                response.raise_for_status()
-                result = response.json()
-            except (httpx.HTTPError, ValueError):
-                raise HTTPException(503, "Security verification unavailable. Try again.")
-        if not result.get("success") or result.get("action") != action or result.get("hostname") not in hosts:
-            raise HTTPException(400, "Security verification failed. Please retry.")
-        return
-    raise HTTPException(400, "Security verification failed. Please complete the verification challenge.")
+def new_challenge(action: str, ip: str) -> dict:
+    cid = secrets.token_urlsafe(24)
+    word = "".join(secrets.choice(WORD_ALPHABET) for _ in range(6))
+    target = secrets.randbelow(71) + 15
+    now = time.time()
+    with CHALLENGE_LOCK:
+        for key in [k for k, v in CHALLENGES.items() if v["expires"] < now]:
+            del CHALLENGES[key]
+        if len(CHALLENGES) >= CHALLENGE_CAP:
+            raise HTTPException(429, "Too many verification requests. Try again shortly.")
+        CHALLENGES[cid] = {"action": action, "ip": ip, "word": word, "target": target, "expires": now + CHALLENGE_TTL}
+    return {"id": cid, "target": target, "tolerance": DRAG_TOLERANCE, "word_image": _word_image(word)}
+
+
+def captcha(body, action: str, ip: str) -> None:
+    # Consume the challenge first: a wrong answer or a replay both use it up.
+    with CHALLENGE_LOCK:
+        entry = CHALLENGES.pop(body.challenge_id, None)
+    if not entry or entry["expires"] < time.time() or entry["action"] != action or entry["ip"] != ip:
+        raise HTTPException(400, "Verification expired. Please try again.")
+    drag_ok = 0 <= body.drag <= 100 and abs(body.drag - entry["target"]) <= DRAG_TOLERANCE
+    word_ok = hmac.compare_digest(body.word.strip().upper().encode(), entry["word"].encode())
+    if not (drag_ok and word_ok):
+        raise HTTPException(400, "Verification failed. Please try again.")
 
 
 class Credentials(BaseModel):
     username: str = Field(min_length=3, max_length=20, pattern=r"^[a-zA-Z0-9_]+$")
     password: str = Field(min_length=3, max_length=20)
-    captcha_token: str = Field(default="", max_length=4096)
+    challenge_id: str = Field(default="", max_length=64)
+    drag: int = Field(default=-1, ge=-1, le=100)
+    word: str = Field(default="", max_length=16)
     website: str = Field(default="", max_length=100)  # honeypot; not security on its own
 
 
@@ -319,22 +330,13 @@ router = APIRouter()
 
 
 @router.get("/auth/challenge")
-def auth_challenge(action: str = Query("signup"), request: Request = None):
-    ip = client_ip(request)
-    return {
-        "challenge": create_challenge_token(action, ip),
-        "target": secrets.randbelow(35) + 35,
-        "glyphs": ["⌖", "◈", "⟁", "⬡"],
-        "required_glyphs": ["⌖", "◈"]
-    }
+def auth_challenge(action: str = Query("signup", pattern="^(signup|login)$"), request: Request = None):
+    return new_challenge(action, client_ip(request))
 
 
 @router.get("/auth/config")
 def auth_config():
-    turnstile_configured = bool(os.getenv("TURNSTILE_SECRET_KEY") and os.getenv("TURNSTILE_SITE_KEY") and len(os.getenv("AUTH_SECRET", "")) >= 32)
     return {
-        "site_key": os.getenv("TURNSTILE_SITE_KEY", ""),
-        "turnstile": turnstile_configured,
         "ready": True,
         "trial_seconds": 60,
         "payment_ready": bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET")),
@@ -349,7 +351,7 @@ async def signup(body: Credentials, request: Request):
     await asyncio.to_thread(rate_limit, "signup:" + digest(ip), 5, 3600)
     if body.website:
         raise HTTPException(400, "Security verification failed")
-    await captcha(body.captcha_token, "signup", ip)
+    captcha(body, "signup", ip)
     username = body.username.lower()
     if username in {u.strip() for u in os.getenv("ADMIN_USERS", "").lower().split(",") if u.strip()}:
         raise HTTPException(409, "Account cannot be created with that username")
@@ -384,7 +386,7 @@ async def login(body: Credentials, request: Request):
     await asyncio.to_thread(rate_limit, "login-name:" + digest(body.username.lower()), 15, 900)
     if body.website:
         raise HTTPException(400, "Security verification failed")
-    await captcha(body.captcha_token, "login", ip)
+    captcha(body, "login", ip)
     await asyncio.to_thread(rate_limit, "login-global", 120, 60)
     def verify():
         with store.transaction() as db:
@@ -493,7 +495,7 @@ class AccountMiddleware:
                     headers = [(k, v) for k, v in message.get("headers", []) if k.lower() not in {b"cache-control"}] if user else message.get("headers", [])
                     if user:
                         headers.append((b"cache-control", b"private, no-store"))
-                    headers.extend([(b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"), (b"x-frame-options", b"DENY"), (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"), (b"content-security-policy", b"default-src 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'")])
+                    headers.extend([(b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"same-origin"), (b"x-frame-options", b"DENY"), (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"), (b"content-security-policy", b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; form-action 'self'")])
                     if os.getenv("APP_ENV") == "production":
                         headers.append((b"strict-transport-security", b"max-age=31536000"))
                     message = {**message, "headers": headers}
