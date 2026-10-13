@@ -36,7 +36,7 @@ the page itself is served `no-cache`, so it has to revalidate.
 |---|---|---|
 | **discord** | its own `unique-username/username-attempt-unauthed` endpoint — a JSON `taken` flag, and a validation 400 that is never read as free | ~140 ms |
 | **instagram** | `web_profile_info` with the web app id | refused from most datacenter IPs |
-| **tiktok** | the profile page, asked with a mobile Safari agent, where its `user-detail` payload decides — with oEmbed only as a fallback, since a 400 from it is not a verdict | ~300 ms, ~1 s when the page confirms |
+| **tiktok** | the profile page, asked with a mobile Safari agent: `userInfo` = held, a bare status object = no live profile — a **lead, never confirmed**, because it cannot tell a free name from one a banned or deactivated account still holds. oEmbed only as a fallback, since a 400 from it is not a verdict | ~300 ms, ~1 s when the page is re-read |
 | **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
 | **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
 | **facebook** | the page as its link-preview agent sees it: `og:title` present = held, a bare `<title>Facebook</title>` fallback = free. Head only — ~29 KB of a page that runs to 5 MB | — |
@@ -65,12 +65,27 @@ impossible names; on Reddit, four handles and four impossible names. **Tumblr wa
 dropped** for failing exactly that: it answers 403 to every exit in a datacenter
 range, so it cannot be checked from a list like this one.
 
-**TikTok does not have digit-only handles, and saying otherwise costs you a
-registration.** `1234567` passes the charset rule and the profile page answers
-"no such user", because there is no account there — so the honest-looking verdict
-is `available` and TikTok's own signup then refuses with *"Couldn't update user.
-Try another one."* The rule is local and free: an all-digit handle is `invalid`
-on TikTok and never reaches a request.
+**On TikTok, "no profile" is not "yours", and the site now says so.** Its profile
+page answers `10221` for a handle it will not resolve — the code TikTok's own web
+bundle maps to `USER_BAN` — and its help centre says a username can be
+unavailable because it is *"claimed by a suspended or deactivated account"*. So
+one answer covers a name nobody has ever held *and* one a banned or deactivated
+account still holds: measured, 25 of 25 random names come back `10221` with an
+empty status message, so it is not a ban report — it is simply the only answer
+TikTok gives, and it does not distinguish the two cases. A free TikTok hit is
+therefore a **lead**: it is never reported confirmed, and the hit carries the
+reason. `statusMsg` is the other half — a non-empty one (*"user banned"*) is
+TikTok declining the handle outright and is reported `banned`, not `available`.
+
+There is no endpoint that settles it either: `/api/uniqueid/check/`, the one
+TikTok's own signup page calls, returns an empty body without a session, and the
+logged-in `/passport/web/login_name/check/` answers *"no permission"*.
+
+Two handles TikTok cannot have at all are still decided locally and for free: an
+all-digit one — `1234567` passes the charset, the page says "no such user", and
+TikTok's change-username then refuses with *"Couldn't update user. Try another
+one."* — and one ending in a period, which its published rule forbids. Both are
+`invalid` on TikTok and never reach a request.
 
 **A platform decides whether to answer based on the client, not only the IP.**
 Facebook and Reddit both answer a *link-preview* agent and refuse nearly
@@ -197,6 +212,10 @@ a rotating endpoint that is a different exit:
 | agrees | free, marked **confirmed** |
 | says the name is held | **taken**, and the correction is counted |
 | cannot answer | free, marked **unconfirmed** — never dressed up as certain |
+
+One platform is exempt from the first row: on **tiktok** an agreeing second read
+is a second sample of the same answer, not proof the handle can be claimed, so a
+free name there stays unconfirmed and says why (`UNPROVABLE_FREE` in `sniper.py`).
 
 Exercised against a stubbed checker that says free and then taken: the run reports
 `taken` with `corrected=True`. Turn it off with `SNIPE_CONFIRM_FREE=false`.

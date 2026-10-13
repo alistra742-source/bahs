@@ -295,7 +295,7 @@ def info() -> dict:
         "honesty": {
             "results": "only available and taken are verdicts; refusals, errors and unreadable answers are health, not results",
             "rates": "checks_per_second counts requests completed, verdicts_per_second counts names resolved",
-            "free": "a free verdict is re-asked once on a different exit and reported confirmed or unconfirmed",
+            "free": "a free verdict is re-asked once on a different exit and reported confirmed or unconfirmed -- except on tiktok, where no second read can prove a handle is claimable, so a free name stays a lead: unconfirmed, and it says so",
         },
         "alerts_enabled": bool(alert_settings.get().get("enabled")),
         # What the UI needs to show a running total for "every name of this
@@ -1765,7 +1765,7 @@ CLAIM_TARGETS: dict[str, dict[str, str]] = {
     "tiktok": {
         "register_url": "https://www.tiktok.com/signup",
         "existing_account": "Profile > Edit profile > Username",
-        "note": "TikTok assigns the handle at signup, and refuses a handle made only of digits.",
+        "note": "TikTok assigns the handle at signup, and refuses a handle made only of digits or one ending in a period. A handle with no profile can still be held by a banned or deactivated account, so a free verdict here is a lead -- check it in the app.",
     },
     "x": {
         "register_url": "https://x.com/i/flow/signup",

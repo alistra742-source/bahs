@@ -54,8 +54,8 @@ rather than assumed:
   oEmbed only resolves the canonical spelling. So a 400 is *confirmed* against
   the profile page, which is authoritative in both directions and resolves any
   case: ``webapp.user-detail`` carrying ``userInfo`` means the handle is held,
-  and TikTok's own ``10221`` means there is no such user. The page has to be
-  asked for with a **mobile Safari** user agent: measured through one datacenter
+  and a bare status object means the page has no live profile for the name. The
+  page has to be asked for with a **mobile Safari** user agent: measured through one datacenter
   endpoint, a desktop UA gets a 1,462-byte "enable JavaScript" shell with no
   verdict in it for a live account and a free name alike, while an iPhone UA
   gets the real 166-202 KB page. That page leads the check for a second
@@ -65,7 +65,17 @@ rather than assumed:
   the page is both the authoritative source and the one that keeps working, and
   one request per name instead of a wasted round trip on every name. A response
   with neither marker is reported as unanswered -- never as available, which is
-  the false positive this whole arrangement exists to kill.
+  the false positive this whole arrangement exists to kill. What the two markers
+  *mean* is the second half of that: 10221 is the code TikTok's own web bundle
+  maps to ``USER_BAN``, its help centre says a username can be unavailable
+  because it is "claimed by a suspended or deactivated account", and the page
+  answers that same code for a name nobody has ever held -- measured: 25 of 25
+  random names come back 10221 with an empty status message, so it is not a ban
+  report. It is simply the only answer there is, and it does not distinguish a
+  free name from a held one, so a free TikTok read is a lead: it is never
+  reported as confirmed, and the detail on the hit says why (``UNPROVABLE_FREE``).
+  A non-empty ``statusMsg`` is the opposite -- TikTok declining the handle
+  outright -- and is reported as ``banned``.
 """
 
 import asyncio
@@ -140,14 +150,31 @@ TIKTOK_IPHONE_UA = (
     "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
 )
 # The profile page's own scope. `webapp.user-detail` opens the block that holds
-# the account; 10221 is TikTok's "no such user" inside it. The window is wide
-# enough to reach the status code that follows the (empty) user block on a free
-# page, and narrow enough that a `uniqueId` in a later script cannot be misread
-# as this account's handle.
+# either the account's `userInfo` or, for a handle the page will not resolve, a
+# bare status object. The window is wide enough to read a `userInfo` block, and
+# narrow enough that a `uniqueId` in a later script cannot be misread as this
+# account's handle.
 TIKTOK_USER_DETAIL = '"webapp.user-detail"'
-TIKTOK_NO_USER = '"statusCode":10221'
 TIKTOK_UNIQUE_ID_RE = re.compile(r'"uniqueId":"([^"]{1,40})"')
 TIKTOK_SCOPE_CHARS = 8000
+# The status object a handle with no live profile gets instead of `userInfo`,
+# e.g. `{"statusCode":10221,"statusMsg":"","needFix":false}`. Read from the head
+# of the block rather than from the whole window, so a status code belonging to
+# some later script cannot be read as this handle's.
+TIKTOK_STATUS_CHARS = 240
+TIKTOK_STATUS_RE = re.compile(r'"statusCode":(\d{3,6})')
+TIKTOK_STATUS_MSG_RE = re.compile(r'"statusMsg":"([^"]{0,80})"')
+# Every code the profile page uses for a handle it will not resolve. 10221 is
+# the one it actually answers with -- and the one TikTok's own web bundle labels
+# USER_BAN; 10202 is its USER_NOT_EXIST and 10223 its USER_FTC. A code that is
+# not on this list is left unanswered rather than read as a free name.
+TIKTOK_NO_PROFILE_CODES = frozenset({"10221", "10202", "10223"})
+# What a free TikTok read is worth, said on the verdict itself: the page cannot
+# tell a name nobody has ever held from one held by an account TikTok has banned
+# or that its owner has deactivated. It answers the same code for both.
+TIKTOK_NO_PROFILE_DETAIL = (
+    "no live profile; TikTok answers the same for banned or deactivated handles"
+)
 GUNS_DEFAULT_TITLE = "guns.lol: Everything you want, right here."
 GUNS_TITLE_RE = re.compile(r"^\s*@[^|]{1,64}\|\s*guns\.lol\s*$", re.I)
 TIKTOK_HANDLE_RE = re.compile(r"/@([A-Za-z0-9._]{1,40})")
@@ -234,7 +261,7 @@ NAMESPACES: dict[str, tuple[re.Pattern[str], str]] = {
 # Platforms that will not take a name made only of digits, however well it
 # matches the charset above. TikTok is the one, and the cost of not knowing is
 # the exact false positive this file exists to kill: "12345678" passes the
-# charset, the profile page answers "no such user" because there is none, the
+# charset, the profile page answers that it holds no profile for it, the
 # dashboard calls it available -- and TikTok's own signup then refuses with
 # "Couldn't update user. Try another one." A handle there has to carry a letter,
 # a period or an underscore. Deciding it locally is free; discovering it from
@@ -242,7 +269,12 @@ NAMESPACES: dict[str, tuple[re.Pattern[str], str]] = {
 # that nobody can claim.
 NO_DIGITS_ONLY = frozenset({"tiktok"})
 
-
+# ...and the other half of the same false positive. TikTok's published rule is
+# that a username cannot end in a period; ``abc.`` passes the charset rule above,
+# the profile page answers "no live profile", and the change then fails with the
+# same generic "Couldn't update user. Try another one." an already-taken name
+# gets. Local, free, and one request per name not spent.
+NO_TRAILING_DOT = frozenset({"tiktok"})
 
 
 def name_fits(platform: str, username: str) -> bool:
@@ -250,13 +282,17 @@ def name_fits(platform: str, username: str) -> bool:
     rule = NAMESPACES.get(platform)
     if rule is not None and rule[0].match(username) is None:
         return False
-    return not (platform in NO_DIGITS_ONLY and username.isdigit())
+    if platform in NO_DIGITS_ONLY and username.isdigit():
+        return False
+    return not (platform in NO_TRAILING_DOT and username.endswith("."))
 
 
 def namespace_note(platform: str, username: str = "") -> str:
     """Why this name cannot exist here, in the user's terms."""
     if platform in NO_DIGITS_ONLY and username.isdigit():
         return f"not valid on {platform}: a handle cannot be all digits"
+    if platform in NO_TRAILING_DOT and username.endswith("."):
+        return f"not valid on {platform}: a handle cannot end with a period"
     rule = NAMESPACES.get(platform)
     return "bad characters or length" if rule is None else f"not valid on {platform}: {rule[1]}"
 
@@ -1360,9 +1396,18 @@ def _tiktok_page_verdict(username: str, body: bytes) -> SnipeResult | None:
 
     TikTok's profile page ships its state as JSON inside
     ``webapp.user-detail``: a live account puts a ``userInfo`` block there, and a
-    handle with no account at all gets ``"statusCode":10221``. The block is a
-    plain string search rather than a parser, because the page is 166-202 KB of
-    markup around it and only this one scope decides anything.
+    handle the page will not resolve gets a bare status object instead. The block
+    is a plain string search rather than a parser, because the page is 166-232 KB
+    of markup around it and only this one scope decides anything.
+
+    The status object is read in two parts, because it is the whole reason this
+    check can be wrong. ``10221`` -- the code TikTok's own web bundle maps to
+    ``USER_BAN`` -- is what a handle gets when there is no live profile of *any*
+    kind: a name nobody has ever held and one held by a banned or deactivated
+    account are the same answer from here, so the verdict says so rather than
+    pretending the second case does not exist. A non-empty ``statusMsg``
+    ("user banned") is TikTok refusing the handle outright, which is a `banned`
+    verdict and never a free name.
     """
     text = body.decode("utf-8", errors="ignore")
     start = text.find(TIKTOK_USER_DETAIL)
@@ -1378,9 +1423,19 @@ def _tiktok_page_verdict(username: str, body: bytes) -> SnipeResult | None:
         return SnipeResult(
             username, "tiktok", "taken", f"@{handle}" if handle != username else "profile exists"
         )
-    if TIKTOK_NO_USER in scope:
-        return SnipeResult(username, "tiktok", "available", "no such user")
-    return None
+    head = scope[:TIKTOK_STATUS_CHARS]
+    status = TIKTOK_STATUS_RE.search(head)
+    if status is None or status.group(1) not in TIKTOK_NO_PROFILE_CODES:
+        return None
+    message = TIKTOK_STATUS_MSG_RE.search(head[status.start() :])
+    if message is not None and message.group(1):
+        # TikTok declining to resolve the handle at all, in its own words. This
+        # is what an unregisterable name comes back as, and it is a slot nobody
+        # can claim -- never a name to send someone to a signup for.
+        return SnipeResult(
+            username, "tiktok", STATUS_BANNED, f"tiktok says {message.group(1)!r}"
+        )
+    return SnipeResult(username, "tiktok", "available", TIKTOK_NO_PROFILE_DETAIL)
 
 
 async def _tiktok_profile(client: httpx.AsyncClient, username: str) -> SnipeResult:
@@ -2150,7 +2205,7 @@ SIGNAL_GUARD = SignalGuard()
 CHECK_NOTES: dict[str, str] = {
     "discord": "username lookup endpoint; a taken/free answer, a validation error is never free",
     "instagram": "web_profile_info; an account returns data, an unknown name a 404",
-    "tiktok": "profile page with a mobile Safari agent; the user-detail payload carries the verdict, oEmbed is only a fallback, a 400 is never a verdict, and an all-digit handle does not exist",
+    "tiktok": "profile page with a mobile Safari agent; userInfo means the handle is held, a status object means no live profile -- which is not the same as claimable, so a free name there stays unconfirmed; oEmbed is only a fallback, a 400 is never a verdict, and an all-digit handle or one ending in a period cannot exist",
     "x": "account lookup; a missing or suspended account reads free",
     "youtube": "channel handle page; the @handle resolves only when it is held",
     "facebook": "profile route read through a link-preview agent; a held name answers or redirects to its own spelling, a free one is redirected to the login wall -- and a control name is read first, because a throttled exit sends everything to the login wall",
@@ -2326,6 +2381,22 @@ class PlatformPacer:
         ]
 
 
+# A free verdict a second read cannot confirm, because the platform will not
+# answer the question the user is really asking. TikTok's profile page answers
+# 10221 -- the code its own web bundle maps to USER_BAN -- for a name nobody has
+# ever held and for one held by a banned or deactivated account alike, and its
+# help centre says a username can be unavailable because it is "claimed by a
+# suspended or deactivated account". Asking again through another exit is a
+# second sample of the same answer, not evidence that the name can be claimed,
+# so the verdict stays unconfirmed and the detail says where the certainty ends.
+# TikTok's own endpoint for the real question, ``/api/uniqueid/check/`` -- the
+# one the signup page calls -- returns an empty body without a session, and the
+# logged-in one (``/passport/web/login_name/check/``) answers "no permission".
+UNPROVABLE_FREE: dict[str, str] = {
+    "tiktok": "a second exit agreed, but only the app can say if it can be claimed",
+}
+
+
 def confirm_check(result: SnipeResult) -> bool:
     """Should an `available` from this check be re-asked before it is reported?
 
@@ -2342,7 +2413,9 @@ async def confirm_available(
 
     Three honest outcomes, and no fourth:
 
-    * the second read agrees -> free, and marked ``confirmed``;
+    * the second read agrees -> free, and marked ``confirmed`` -- except on a
+      platform in ``UNPROVABLE_FREE``, where agreement is not confirmation and
+      the verdict stays unconfirmed by design;
     * the second read says the name is held -> **the taken verdict is what is
       reported**, the first read is discarded and the correction is counted, so
       a name is never offered as free on one exit's word;
@@ -2363,6 +2436,12 @@ async def confirm_available(
         return first
     second.proxy = second_proxy
     if second.status == "available":
+        if platform in UNPROVABLE_FREE:
+            # Agreement here is a second sample of the same answer, and the
+            # answer is not the one the user acts on. Reporting it as confirmed
+            # is what made a TikTok hit look like a name that can be claimed.
+            first.detail = (first.detail + "; " + UNPROVABLE_FREE[platform]).strip("; ")
+            return first
         first.confirmed = True
         first.detail = (first.detail + "; confirmed on a second exit").strip("; ")
         return first
