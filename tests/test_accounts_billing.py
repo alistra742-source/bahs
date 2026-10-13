@@ -51,7 +51,7 @@ class SecurityTests(unittest.TestCase):
 
     def signup(self, name="firstuser", client=None):
         c = client or self.client
-        r = c.post("/auth/signup", headers=self.headers, json={"username": name, "password": "correct horse battery staple", "captcha_token": "test"})
+        r = c.post("/auth/signup", headers=self.headers, json={"username": name, "password": "correct horse 42", "captcha_token": "test"})
         self.assertEqual(r.status_code, 200, r.text)
         return r.json()
 
@@ -79,7 +79,7 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(self.client.get("/auth/me").status_code, 401)
         bad = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"wrong password value", "captcha_token":"test"})
         self.assertEqual(bad.status_code, 401)
-        good = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"correct horse battery staple", "captcha_token":"test"})
+        good = self.client.post("/auth/login", headers=self.headers, json={"username":"firstuser", "password":"correct horse 42", "captcha_token":"test"})
         self.assertEqual(good.status_code, 200)
         self.assertEqual(good.json()["user"]["trial_until"], user["trial_until"])
 
@@ -134,7 +134,7 @@ class SecurityTests(unittest.TestCase):
         other.close()
 
     def test_reserved_operator_username_cannot_be_registered(self):
-        r=self.client.post('/auth/signup',headers=self.headers,json={'username':'operator','password':'correct horse battery staple','captcha_token':'test'})
+        r=self.client.post('/auth/signup',headers=self.headers,json={'username':'operator','password':'correct horse 42','captcha_token':'test'})
         self.assertEqual(r.status_code,409)
 
     def test_forwarded_ip_is_ignored_unless_peer_is_explicitly_trusted(self):

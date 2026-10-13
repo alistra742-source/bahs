@@ -174,7 +174,7 @@ async def checkout(body: Checkout):
     try:
         data = await provider("POST", "/payment", json={
             "price_amount": float(PLANS[body.plan]), "price_currency": "usd", "pay_currency": coin,
-            "order_id": oid, "order_description": "bahs " + body.plan,
+            "order_id": oid, "order_description": "VORTEX " + body.plan,
             "ipn_callback_url": accounts.origin() + "/billing/webhook",
             "payout_address": payout, "payout_currency": coin,
             "is_fixed_rate": True, "is_fee_paid_by_user": True,

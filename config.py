@@ -167,7 +167,7 @@ STATS_PATH: str = _str("STATS_PATH", "data/stats.json")
 ALERT_WEBHOOK: str = _str("ALERT_WEBHOOK", "")
 ALERT_TEMPLATE: str = _str("ALERT_TEMPLATE", "{platform} username available: `{username}`")
 # Posted as the webhook's own name/avatar when set.
-ALERT_USERNAME: str = _str("ALERT_USERNAME", "bahs")
+ALERT_USERNAME: str = _str("ALERT_USERNAME", "VORTEX")
 ALERT_AVATAR: str = _str("ALERT_AVATAR", "")
 # Prepended to the first message of a run, so a role or user can be pinged.
 # Discord only renders a ping when it is in ``content``, never in an embed.

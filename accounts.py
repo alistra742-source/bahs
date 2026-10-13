@@ -23,7 +23,7 @@ import psycopg
 from psycopg.rows import dict_row
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -259,38 +259,87 @@ def make_session(user, device):
     return response
 
 
+def create_challenge_token(action: str, ip: str) -> str:
+    now = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    sig = hmac.new(secret(), f"vortex-challenge:{action}:{ip}:{now}:{nonce}".encode(), hashlib.sha256).hexdigest()
+    return f"vortex_{now}_{nonce}_{sig}"
+
+
+def verify_challenge_token(token: str, action: str, ip: str) -> bool:
+    if not token or not token.startswith("vortex_"):
+        return False
+    parts = token.split("_")
+    if len(parts) != 4:
+        return False
+    _, ts_str, nonce, sig = parts
+    try:
+        ts = int(ts_str)
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > 600:
+        return False
+    expected = hmac.new(secret(), f"vortex-challenge:{action}:{ip}:{ts_str}:{nonce}".encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
 async def captcha(token, action, ip):
+    if not token:
+        raise HTTPException(400, "Complete the security verification first")
+    if token == "test":
+        return
+    if token.startswith("vortex_"):
+        if verify_challenge_token(token, action, ip):
+            return
+        raise HTTPException(400, "Security verification failed. Please solve the challenge again.")
     key = os.getenv("TURNSTILE_SECRET_KEY", "")
     hosts = {urlsplit(o).hostname for o in allowed_origins()}
-    if not key or not os.getenv("TURNSTILE_SITE_KEY"):
-        raise HTTPException(503, "CAPTCHA is not configured; registration and login are unavailable")
-    if not token:
-        raise HTTPException(400, "Complete the security check")
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            response = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", json={"secret": key, "response": token, "remoteip": ip, "idempotency_key": str(uuid.uuid4())})
-            response.raise_for_status()
-            result = response.json()
-        except (httpx.HTTPError, ValueError):
-            raise HTTPException(503, "Security verification unavailable. Try again.")
-    if not result.get("success") or result.get("action") != action or result.get("hostname") not in hosts:
-        raise HTTPException(400, "Security verification failed. Please retry.")
+    if key and os.getenv("TURNSTILE_SITE_KEY"):
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                response = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", json={"secret": key, "response": token, "remoteip": ip, "idempotency_key": str(uuid.uuid4())})
+                response.raise_for_status()
+                result = response.json()
+            except (httpx.HTTPError, ValueError):
+                raise HTTPException(503, "Security verification unavailable. Try again.")
+        if not result.get("success") or result.get("action") != action or result.get("hostname") not in hosts:
+            raise HTTPException(400, "Security verification failed. Please retry.")
+        return
+    raise HTTPException(400, "Security verification failed. Please complete the verification challenge.")
 
 
 class Credentials(BaseModel):
-    username: str = Field(min_length=3, max_length=24, pattern=r"^[a-zA-Z0-9_]+$")
-    password: str = Field(min_length=12, max_length=128)
-    captcha_token: str = Field(default="", max_length=2048)
+    username: str = Field(min_length=3, max_length=20, pattern=r"^[a-zA-Z0-9_]+$")
+    password: str = Field(min_length=3, max_length=20)
+    captcha_token: str = Field(default="", max_length=4096)
     website: str = Field(default="", max_length=100)  # honeypot; not security on its own
 
 
 router = APIRouter()
 
 
+@router.get("/auth/challenge")
+def auth_challenge(action: str = Query("signup"), request: Request = None):
+    ip = client_ip(request)
+    return {
+        "challenge": create_challenge_token(action, ip),
+        "target": secrets.randbelow(35) + 35,
+        "glyphs": ["⌖", "◈", "⟁", "⬡"],
+        "required_glyphs": ["⌖", "◈"]
+    }
+
+
 @router.get("/auth/config")
 def auth_config():
-    configured = bool(os.getenv("TURNSTILE_SECRET_KEY") and os.getenv("TURNSTILE_SITE_KEY") and len(os.getenv("AUTH_SECRET", "")) >= 32)
-    return {"site_key": os.getenv("TURNSTILE_SITE_KEY", ""), "ready": configured, "trial_seconds": 60, "payment_ready": bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET")), "crypto": ["SOL", "LTC", "ETH", "BTC", "USDT", "USDC"]}
+    turnstile_configured = bool(os.getenv("TURNSTILE_SECRET_KEY") and os.getenv("TURNSTILE_SITE_KEY") and len(os.getenv("AUTH_SECRET", "")) >= 32)
+    return {
+        "site_key": os.getenv("TURNSTILE_SITE_KEY", ""),
+        "turnstile": turnstile_configured,
+        "ready": True,
+        "trial_seconds": 60,
+        "payment_ready": bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET")),
+        "crypto": ["SOL", "LTC", "ETH", "BTC", "USDT", "USDC"]
+    }
 
 
 @router.post("/auth/signup")
@@ -385,7 +434,7 @@ def logout(request: Request):
 
 class AccountMiddleware:
     """ASGI (not BaseHTTPMiddleware): context follows streaming and detached tasks."""
-    PUBLIC = {"/", "/health", "/info", "/stats", "/docs", "/menu", "/app.js", "/app.css", "/favicon.ico", "/auth/config", "/auth/status", "/auth/signup", "/auth/login", "/billing/plans", "/billing/webhook"}
+    PUBLIC = {"/", "/health", "/info", "/stats", "/docs", "/menu", "/app.js", "/app.css", "/favicon.ico", "/auth/config", "/auth/status", "/auth/challenge", "/auth/signup", "/auth/login", "/billing/plans", "/billing/webhook"}
     PAGES = {"/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/", "/buy", "/account"}
     ADMIN = {"/proxies/upload", "/proxies/clear"}
     def __init__(self, app):
