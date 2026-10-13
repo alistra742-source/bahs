@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Platforms</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll">
+      <h2>Workspace</h2>
+      <nav class="menu" id="nav"></nav>
+    </div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Platforms</h1>
+      <div class="sep"></div>
+      <span class="sub" id="platSub">—</span>
+      <div class="right">
+        <button class="btn sm ghost" id="platAll">select all</button>
+        <button class="btn sm ghost" id="platNone">clear</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <header><h3>Snipers</h3><div class="sep"></div>
+        <span class="note">a sweep asks every selected sniper about every name</span></header>
+      <div class="body"><div class="pick" id="platList"></div></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>Live per-sniper</h3><div class="sep"></div>
+        <span class="note" id="paceNote">nothing running</span></header>
+      <div class="body">
+        <div class="pace" id="paced" style="margin-bottom:14px"></div>
+        <div class="scroll"><table>
+          <thead><tr><th>sniper</th><th>checked</th><th>available</th><th>taken</th><th>banned</th>
+            <th>refused</th><th>errors</th><th>unreadable</th><th>in flight</th></tr></thead>
+          <tbody id="platRows"><tr><td colspan="9" class="empty">no run yet</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>How each sniper is read</h3></header>
+      <div class="body"><div class="kv" id="howto"></div>
+        <p class="note" style="margin-top:14px">A platform is only ever called free on its own explicit answer —
+          a 404, an empty result list, a page that says the name is unclaimed. A refusal (403/429), a challenge page,
+          or a body without the field we look at becomes a refusal or an unreadable answer and is retried; it never
+          becomes a verdict. A free verdict is then re-asked once on a different exit before it is reported.</p>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+window.PAGE = {
+  name: "platforms", title: "Platforms",
+  init() {
+    App.renderPlats();
+    $("platAll").onclick = () => { App.S.plats = new Set(App.S.info.platforms); App.persist(); App.renderPlats(); count(); };
+    $("platNone").onclick = () => { App.S.plats = new Set(); App.persist(); App.renderPlats(); count(); };
+    $("platList").addEventListener("click", () => setTimeout(count, 0));
+    count();
+    renderHowTo();
+    paint();
+    setInterval(paint, 3000);
+  },
+  onStatus() { paint(); },
+};
+function count() {
+  $("platSub").textContent = App.S.plats.size + " of " + (App.S.info.platforms || []).length + " selected";
+}
+function paint() {
+  const p = (App.S.status && App.S.status.progress) || {};
+  const by = p.by_platform || {};
+  const paced = p.platforms_paced || {};
+  App.renderPaced(paced);
+  const names = App.S.info.platforms || [];
+  const empty = !Object.keys(by).length;
+  $("paceNote").textContent = empty ? "nothing running" : "a sniper held below the run's rate is refusing its share";
+  $("platRows").innerHTML = names.map((n) => {
+    const r = by[n] || {};
+    const cap = paced[n];
+    return `<tr>
+      <td>${App.esc(n)}${cap ? ' <span class="tag">paced</span>' : ""}</td>
+      <td class="num">${App.fmt(r.checked || 0)}</td>
+      <td class="num" style="color:var(--free)">${App.fmt(r.available || 0)}</td>
+      <td class="num" style="color:var(--taken)">${App.fmt(r.taken || 0)}</td>
+      <td class="num">${App.fmt(r.banned || 0)}</td>
+      <td class="num" style="color:var(--warn)">${App.fmt(r.blocked || 0)}</td>
+      <td class="num" style="color:var(--bad)">${App.fmt(r.error || 0)}</td>
+      <td class="num">${App.fmt(r.unanswered || 0)}</td>
+      <td class="num">${cap ? cap.parallel + "/" + cap.ceiling : "—"}</td>
+    </tr>`;
+  }).join("");
+}
+async function renderHowTo() {
+  try {
+    const d = await App.api("/info");
+    const rows = (d.checks || []).map((c) =>
+      `<span>${App.esc(c.platform)}</span><b style="font-weight:400">${App.esc(c.how)}</b>`).join("");
+    $("howto").innerHTML = rows || '<span>see the README</span><b style="font-weight:400">—</b>';
+  } catch (e) { $("howto").innerHTML = ""; }
+}
+App.boot();
+</script>
+</body>
+</html>

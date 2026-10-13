@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Console</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll">
+      <h2>Workspace</h2>
+      <nav class="menu" id="nav"></nav>
+    </div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Console</h1>
+      <div class="sep"></div>
+      <span class="sub" id="runNote"></span>
+      <div class="right">
+        <span class="note" id="poolNote"></span>
+        <button class="btn sm ghost" id="resumeBtn">resume watching</button>
+      </div>
+    </div>
+
+    <div class="kpis" style="margin-bottom:16px">
+      <div class="kpi free"><span>available</span><b id="aAvail">0</b><small>free names</small></div>
+      <div class="kpi taken"><span>taken</span><b id="aTaken">0</b><small>held</small></div>
+      <div class="kpi pace"><span>verdicts / s</span><b id="aVps">0</b><small>names resolved</small></div>
+      <div class="kpi"><span>checks / s</span><b id="aCps">0</b><small>requests done</small></div>
+      <div class="kpi"><span>answered</span><b id="aAns">—</b><small>of all checks</small></div>
+      <div class="kpi"><span>progress</span><b id="aProg">0%</b><small><span id="aCalls">0</span> of <span id="aTotal">0</span></small></div>
+      <div class="kpi"><span>elapsed</span><b id="aElapsed">0s</b><small>wall clock</small></div>
+      <div class="kpi warn"><span>refused</span><b id="aBlocked">0</b><small>platform said no</small></div>
+      <div class="kpi bad"><span>errors</span><b id="aErrors">0</b><small>never arrived</small></div>
+      <div class="kpi"><span>unreadable</span><b id="aUnans">0</b><small>no verdict</small></div>
+    </div>
+    <div class="bar" style="margin:-8px 0 18px"><i id="bar"></i></div>
+
+    <div class="grid two">
+      <div class="card">
+        <header><h3>Snipers</h3><div class="sep"></div>
+          <span class="note" id="platSum"></span>
+          <div class="right">
+            <button class="btn sm ghost" id="platAll">all</button>
+            <button class="btn sm ghost" id="platNone">clear</button>
+          </div></header>
+        <div class="body"><div class="pick" id="platList"></div></div>
+      </div>
+
+      <div class="card">
+        <header><h3>Name spaces</h3><div class="sep"></div>
+          <span class="note" id="spaceSum">nothing selected</span>
+          <div class="right"><button class="btn sm ghost" id="spaceClear">clear</button></div></header>
+        <div class="body">
+          <div id="spaces"></div>
+          <div class="row" style="margin-top:14px">
+            <label class="f" style="margin:0;flex:0 0 150px"><span>cap names (0 = all)</span>
+              <input type="text" id="limit" placeholder="0"></label>
+            <div style="flex:1"></div>
+            <button class="btn primary" id="startBtn">Start sweep</button>
+          </div>
+          <div class="row" style="margin-top:12px">
+            <input type="text" id="quickName" placeholder="one handle — checked against every selected sniper">
+            <button class="btn" id="quickBtn">check one</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid two" style="margin-top:16px">
+      <div class="card">
+        <header><h3>Verdicts</h3><div class="sep"></div>
+          <span class="note">free and taken only — a refusal is not a verdict</span>
+          <div class="right">
+            <div class="chips" id="filters">
+              <button data-f="all" class="on">all</button>
+              <button data-f="available">available</button>
+              <button data-f="taken">taken</button>
+            </div>
+            <button class="btn sm ghost" id="feedClear">clear</button>
+          </div></header>
+        <div class="body"><div class="feed" id="feed"></div></div>
+      </div>
+
+      <div class="card">
+        <header><h3>Run health</h3><div class="sep"></div>
+          <span class="note">what is not a verdict</span></header>
+        <div class="body">
+          <div class="kv" id="health">
+            <span>refused by the platform</span><b id="hBlocked">0</b>
+            <span>errors (never arrived)</span><b id="hErrors">0</b>
+            <span>unreadable answer</span><b id="hUnans">0</b>
+            <span>banned accounts</span><b id="hBanned">0</b>
+            <span>free confirmed twice</span><b id="hConfirmed">0</b>
+            <span>first read corrected</span><b id="hCorrected">0</b>
+            <span>current target</span><b id="target">idle</b>
+          </div>
+          <h3 style="font:600 10px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase;color:var(--dim2);margin:16px 0 8px">Paced snipers</h3>
+          <div class="pace" id="paced"></div>
+          <p class="note" style="margin-top:12px">A slowdown here is a platform that is refusing its share: it is asked
+            slower and keeps producing verdicts, instead of being stopped or reported as a wall of refusals.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+window.PAGE = {
+  name: "console", title: "Console",
+  init() {
+    const A = App, S = A.S;
+    A.renderSpaces(); A.renderFeed();
+    if ($("startBtn")) $("startBtn").onclick = () => A.startSweep();
+    if ($("limit")) $("limit").oninput = () => A.summarise();
+    if ($("quickBtn")) $("quickBtn").onclick = () => A.startSingle(($("quickName").value || "").trim());
+    if ($("quickName")) $("quickName").onkeydown = (e) => { if (e.key === "Enter") A.startSingle($("quickName").value.trim()); };
+    if ($("platAll")) $("platAll").onclick = () => { S.plats = new Set(S.info.platforms); A.persist(); A.renderPlats(); };
+    if ($("platNone")) $("platNone").onclick = () => { S.plats = new Set(); A.persist(); A.renderPlats(); };
+    if ($("spaceClear")) $("spaceClear").onclick = () => { S.spaces = new Set(); A.persist(); A.renderSpaces(); };
+    if ($("feedClear")) $("feedClear").onclick = () => { S.feed = []; A.renderFeed(); };
+    if ($("resumeBtn")) $("resumeBtn").onclick = () => { if (S.run) A.follow(S.run); };
+    if ($("filters")) $("filters").onclick = (e) => {
+      const b = e.target.closest("button"); if (!b) return;
+      S.filter = b.dataset.f; A.persist();
+      for (const x of $("filters").querySelectorAll("button")) x.classList.toggle("on", x === b);
+      A.renderFeed();
+    };
+    applyKpiDetail();
+  },
+  onReattach(st) { A_paint(st); if (S.tuneFollow !== false) App.follow(st.id); },
+  onStatus(st) { A_paint(st); },
+  onResult(ev) { applyKpiDetail(); },
+};
+const A_paint = (st) => { App.applyProgress(st.progress || {}); applyKpiDetail(); };
+function applyKpiDetail() {
+  const p = (App.S.status && App.S.status.progress) || {};
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set("hBlocked", App.fmt(p.rate_limits || 0));
+  set("hErrors", App.fmt(p.error || 0));
+  set("hUnans", App.fmt(p.unanswered || 0));
+  set("hBanned", App.fmt(p.banned || 0));
+  set("hConfirmed", App.fmt(p.confirmed_count || 0));
+  set("hCorrected", App.fmt(p.corrected_count || 0));
+  set("aConfirmed", App.fmt(p.confirmed_count || 0));
+  set("aCorrected", App.fmt(p.corrected_count || 0));
+  const s = $("platSum");
+  if (s) s.textContent = App.S.plats.size + " of " + (App.S.info.platforms || []).length + " selected";
+}
+const $ = (id) => document.getElementById(id);
+App.boot();
+</script>
+</body>
+</html>

@@ -347,6 +347,112 @@ def iter_buckets(buckets: list[dict], words: list[str] | None = None) -> Iterato
         yield from iter_kind(kind, length, words)
 
 
+def _word_pool(length: int, words: list[str] | None) -> list[str]:
+    pool = [w for w in (words if words is not None else load_words()) if len(w) == length]
+    return list(dict.fromkeys(pool))
+
+
+def _draw(kind: str, length: int, pool: list[str] | None, rng: random.Random) -> str:
+    """One name picked uniformly from one bucket's space."""
+    pattern = KIND_PATTERN[kind]
+    if pattern == "words":
+        return rng.choice(pool or [])
+    alphabet = CHARSETS[pattern]
+    return "".join(rng.choice(alphabet) for _ in range(length))
+
+
+def selection_total(buckets: list[dict], words: list[str] | None = None) -> int:
+    """How many names the effective selection holds."""
+    return sum(kind_size(k, L, words) for k, L in effective_buckets(buckets))
+
+
+def iter_selection(
+    buckets: list[dict],
+    words: list[str] | None = None,
+    seed: int | None = None,
+    limit: int | None = None,
+) -> Iterator[str]:
+    """The selection, in uniformly random order, each name once.
+
+    Walking the space in order is what made a run look broken: ``itertools.product``
+    varies the *last* character fastest, so the first 46,656 names of a 5-character
+    alphanumeric space are all ``aaa??`` and the first character does not change
+    until 1.7 million names in. A 50,000-name shuffle window never reaches past
+    ``aa``, so a run reported a wall of names sharing a prefix -- which is exactly
+    what a real random draw does not do.
+
+    Two honest behaviours, and no third:
+
+    * **The selection fits in memory** (at or under ``MAX_ENUMERATION``) and most
+      of it is wanted: every name is built and shuffled globally, so the order is a
+      true random permutation and the selection is complete.
+    * **A cap is smaller than the selection**: names are drawn at random from the
+      whole space, weighted by each bucket's size, with duplicates rejected. A cap
+      of a few thousand out of tens of millions must never materialise the space
+      just to throw nearly all of it away. This is a *sample*, and the run reports
+      the sample size as its total -- progress is measured against what it will
+      actually check, never against a space it is not checking.
+
+    A selection too big to hold in memory with no cap raises here, eagerly, with the
+    size in the message -- rather than quietly checking a fraction of it and calling
+    that done.
+    """
+    specs = effective_buckets(buckets)
+    pools: dict[tuple[str, int], list[str]] = {}
+    sizes: list[tuple[str, int, int]] = []
+    for kind, length in specs:
+        if KIND_PATTERN[kind] == "words":
+            pool = _word_pool(length, words)
+            pools[(kind, length)] = pool
+            sizes.append((kind, length, len(pool)))
+        else:
+            sizes.append((kind, length, kind_size(kind, length, words)))
+    total = sum(size for _, _, size in sizes)
+    if total <= 0:
+        return iter(())
+
+    wants_all = limit is None or int(limit) <= 0 or int(limit) >= total
+    wanted = total if wants_all else int(limit)
+    build = wants_all or wanted > total // 2
+
+    if build and total > config.SELECTION_BUILD_MAX:
+        # Raised eagerly: the caller must be able to answer 400 rather than have
+        # the run die once it is already in flight.
+        raise ValueError(
+            f"that selection is {total:,} names, more than the {config.SELECTION_BUILD_MAX:,} "
+            "one run will build in memory to shuffle. Set a cap and it will check that many "
+            "names drawn at random from the whole space, or drop a bucket or a length."
+        )
+
+    rng = random.Random(seed)
+
+    def produce() -> Iterator[str]:
+        if build:
+            names: list[str] = []
+            for kind, length in specs:
+                names.extend(iter_kind(kind, length, words))
+            rng.shuffle(names)
+            yield from (names if wants_all else names[:wanted])
+            return
+        drawn: dict[str, None] = {}
+        live = [(kind, length, size) for kind, length, size in sizes if size > 0]
+        weights = [size for _, _, size in live]
+        while len(drawn) < wanted:
+            kind, length, _ = rng.choices(live, weights=weights, k=1)[0]
+            drawn.setdefault(_draw(kind, length, pools.get((kind, length)), rng), None)
+        yield from drawn
+
+    return produce()
+
+
+def sample_size(buckets: list[dict], limit: int | None, words: list[str] | None = None) -> int:
+    """How many names a run over this selection will actually check."""
+    total = selection_total(buckets, words)
+    if limit is None or int(limit) <= 0 or int(limit) >= total:
+        return total
+    return int(limit)
+
+
 def buckets_total(buckets: list[dict], words: list[str] | None = None) -> int:
     """How many names the effective selection holds, without building it."""
     return sum(kind_size(kind, length, words) for kind, length in effective_buckets(buckets))

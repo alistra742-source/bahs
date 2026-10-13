@@ -54,10 +54,29 @@ the page itself is served `no-cache`, so it has to revalidate.
 | **wattpad** | `api/v3/users/{name}` — 200 the account, 400 `not found` for a free name | — |
 | **disqus** | profile path, status only | — |
 | **vk** | `vk.com/{name}`, status only | — |
+| **dockerhub** | `hub.docker.com/v2/users/{name}/` — 200 the account, 404 nothing | 384 bytes |
+| **codeberg** | Gitea's `api/v1/users/{name}` — 200 the account, 404 nothing | 764 bytes |
+| **mastodon** | `mastodon.social/api/v1/accounts/lookup?acct=` — 200 the account, 404 nothing | 2.1 KB |
+| **dev.to** | `api/users/by_username?url=` — 200 the user, 404 nothing | 521 bytes |
+| **lichess** | `lichess.org/api/user/{name}` — 200 the player, 404 nothing | 1.7 KB |
+| **huggingface** | `api/users/{name}/overview` — 200 the account, 404 nothing | 15 KB |
+| **gitlab** | `api/v4/users?username=` — a JSON array with an entry taken, `[]` free | 242 vs 2 bytes |
+| **itch.io** | `{name}.itch.io/` — the profile renders, or the site's own 404 does | 92 KB vs 7 KB |
+| **gumroad** | `{name}.gumroad.com` — 200 live, 404 free | 64 KB vs 900 bytes |
+| **myanimelist** | `myanimelist.net/profile/{name}` — 200 taken, 404 free | 98 KB |
 
-The ten added last were each verified through a rotating datacenter endpoint to
-tell a taken handle from a free one; they are not timed yet, so their latency
-column is blank on purpose. **Tumblr was dropped**: it answers 403 to every exit
+The ten newest are all read by their own JSON APIs where one exists, because a
+status code cannot be misread the way a byte count can. Each was verified through
+a rotating datacenter endpoint with two known-held handles and **five names that
+cannot exist**: every impossible name read free on all ten, and every held one
+read taken. The timing column is filled in only where it was measured.
+
+**A stale user agent is a platform-wide outage waiting to happen.** Codeberg
+answers a year-old Chrome version with `403 Access denied, old Chrome version` —
+not per name, per *request*, which looks exactly like the whole datacenter range
+being refused. Chrome 124 is rejected; 141, 147 and 152 are all answered. The
+agent is `USER_AGENT` in the environment now rather than a constant in the source,
+so the version can be moved on without a code change. **Tumblr was dropped**: it answers 403 to every exit
 in a datacenter range, so it cannot be checked from a list like this one.
 **GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
 IP — not a check rate, a limit you hit in a minute and then sit out. Set
@@ -152,15 +171,64 @@ costs is **wall clock**, which is why the dashboard shows an estimate from your
 last measured rate instead of letting you start a three-day run blind. Nothing
 is ever silently sampled — a space over the cap is refused with its real size.
 
-## Name order
+## Name order, and why a run never showed you one letter
 
-Every run shuffles its name list. The enumeration is lazily buffered in blocks of
-`SHUFFLE_WINDOW` (default 50,000) and each block is shuffled with a fresh RNG, so
-two runs over the same selection ask two different questions first and never
-spend the same proxies on the same prefix twice. Any list that fits the window —
-every snipe batch, and any scan selection up to it — is a true full shuffle;
-memory stays flat for a selection of tens of millions. `SHUFFLE_NAMES=false`
-restores the alphabetical order.
+Every run draws its names in a random order across the **whole** space, not in
+enumeration order. The difference is not cosmetic. `itertools.product` varies the
+*last* character fastest, so the first 46,656 names of a 5-character alphanumeric
+space are all `aaa??` and the first character does not change until 1.7 million
+names in. Streaming that space in order — which is what a run used to do — gives a
+wall of names sharing a prefix, and a shuffle window of 50,000 never reaches past
+`aa`.
+
+Two paths, both random, and which one you get is stated:
+
+- **The selection fits in `SELECTION_BUILD_MAX`** (2,000,000 by default): every
+  name is built and shuffled globally, so the order is a true permutation of the
+  space, and a run with no cap checks all of it.
+- **It does not fit**: set a **cap** and that many names are drawn at random from
+  the whole space, weighted by each bucket's size, with duplicates rejected.
+  Measured — `5c` with a cap of 60 gave 60 distinct names across 29 different
+  first characters, and `4l` with no cap put all 26 first letters inside its first
+  150 names.
+
+`limit` is the cap. The run reports the **sample size** as its total, so progress
+is measured against what will actually be checked and never against a space it is
+not checking. A selection over the build limit with no cap is refused, eagerly,
+with the size in the message — never quietly sampled and then called done.
+
+`SHUFFLE_NAMES=false` still restores alphabetical order, for anyone auditing a
+prefix on purpose.
+
+## Two rates, and a free name agreed twice
+
+A single "per second" over a throttled run is the oldest lie in this genre. There
+are two numbers where there used to be one:
+
+- `checks_per_second` — requests the run completed, **refusals included**;
+- `verdicts_per_second` — names actually resolved. This is the real speed.
+
+Both are sent on every progress tick and shown side by side, never in place of
+each other: a run that is 80% refused is fast on the first and slow on the second,
+and the dashboard says both.
+
+**Results are verdicts only** — `available` and `taken`. Refusals, transport errors
+and unreadable answers are counted as run health, because they say something about
+a proxy or a platform and nothing whatever about the name. They are on the page as
+health, never as a result row.
+
+**A free name is re-asked before it is reported.** Free is the one verdict you act
+on, so a check that returns `available` is asked again through the next proxy — on
+a rotating endpoint that is a different exit:
+
+| second read | what is reported |
+| --- | --- |
+| agrees | free, marked **confirmed** |
+| says the name is held | **taken**, and the correction is counted |
+| cannot answer | free, marked **unconfirmed** — never dressed up as certain |
+
+Exercised against a stubbed checker that says free and then taken: the run reports
+`taken` with `corrected=True`. Turn it off with `SNIPE_CONFIRM_FREE=false`.
 
 ## Speed, measured
 
@@ -375,7 +443,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 
 | | |
 |---|---|
-| `GET /` | the dashboard |
+| `GET /` | the console page. The other pages are in the table above — note that `/hits`, `/proxies` and `/settings` as bare paths are the JSON endpoints below, not the pages |
 | `GET /info`, `GET /health` | platforms, generation, counters, and the commit this process is running (`build`) |
 | `GET /menu` | every bucket with its real size |
 | `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
@@ -384,6 +452,9 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /snipe?username=` | one name |
 | `GET /generate` | `letters\|alnum\|numbers\|words` by length |
 | `POST /scan/stop` `POST /snipe/stop` `POST /runs/stop` `GET /runs` | the stop path |
+| `GET /hits` | found free names, newest first, each with whether a second exit confirmed it |
+| `DELETE /hits` | forget them |
+| `GET /runs/{id}`, `GET /runs/{id}/stream` | one run's counters, and following a run that is still going |
 | `GET /claim` | where to register a name |
 | `GET /settings` `POST /settings` `POST /settings/test-webhook` | alerts |
 
@@ -448,42 +519,60 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
 | `LOG_LEVEL` | `info` | |
 
-## The dashboard
+## The pages
 
-One page, no build step, no framework: a greyscale sidebar and a main panel.
-The sidebar is the whole product surface —
+Seven pages, one job each — the sidebar is navigation, not a set of panels stacked
+onto one screen.
 
-- **Snipers**, one row per platform. Nothing is selected to begin with, so the
-  first click picks exactly the platform you clicked; after that clicks add and
-  remove, and the count of free names found on each one sits on its row.
-- **Workspace** — Sweep, Proxies, Alerts, Runtime.
-- **Customize** — sound on a free name, a desktop notification, whether a run is
-  kept when you leave, and whether the feed auto-follows.
-- **Stop run**, always in reach, next to the run's real state (`idle`, `live`,
-  `reader closed — run continues`, `finished`).
+| page | what it is for |
+| --- | --- |
+| `/` | the console: pick snipers and name spaces, start, and watch the verdict feed |
+| `/hits/` | every free name found, its confirmation state, a claim link, CSV export |
+| `/platforms` | the sniper grid, live per-sniper counters, and how each one is read |
+| `/proxies/` | the proxy list |
+| `/alerts` | the Discord webhook |
+| `/settings/` | browser preferences, server facts, and what the site will not do |
+| `/docs` | how a verdict is reached, the run lifecycle, every endpoint |
 
-There is no concurrency box and no "hunt" checkbox: the pacer decides how hard
-to push each platform, and a run is started or stopped, not tuned mid-flight by
-someone guessing at a number. The name-space picker is the grid described above,
-with every cell's real size on it and a running total for the selection.
+**A trailing slash marks a page that shares a name with a JSON endpoint.** `/hits`,
+`/proxies` and `/settings` are APIs and always were, so their pages wear the slash;
+`/platforms`, `/alerts` and `/docs` have no twin. Serving both from one path is how
+a page quietly returns JSON, or the reverse.
 
-**What is verified and what is not.** The served page, the endpoints it calls,
-the run it starts, the reattach, the stop, the per-platform checks and the
-counter arithmetic are all exercised through the server's own HTTP surface —
-including a 12-second reattach that replayed 4,070 buffered lines and then
-followed live. The page's JavaScript is parsed on every check and every element
-id it references is confirmed present in the markup. It has **not** been opened
-in a browser from this environment, so the visual layout, the phone breakpoint
-and the notification/sound toggles are the parts still to be seen by eye.
+The console is the phantom-style layout the genre uses — a row of live counters, a
+sniper grid, a name-space grid, and a verdict feed — but the palette is graphite
+and copper rather than the usual purple neon. Colour is spent only where it carries
+meaning: a free name is the only warm thing on the screen, a taken one is grey, and
+a refusal is a muted red in the health panel. **The verdict feed shows verdicts** —
+`available` and `taken` — with everything else in the health panel next to it.
+
+- **Snipers**, one cell per platform, with the count of free names found on each.
+- **Name spaces** multi-select across kind and length, with every cell's real size
+  and a running total; a selection too large to build says so while you are still
+  choosing, and offers the cap that turns it into a random sample.
+- **Stop run**, always in reach, next to the run's real state.
+
+There is no concurrency box and no "hunt" checkbox: the pacer decides how hard to
+push each platform, and a run is started or stopped, not tuned mid-flight by
+someone guessing at a number.
+
+**What is verified and what is not.** Every page is served and checked for its
+content type through the server's own HTTP surface; the run a page starts, the
+reattach, the stop, the per-platform counters, the hits store, the confirmation
+pass and the counter arithmetic are all exercised the same way. Every page's
+JavaScript is parsed on each check and its element ids confirmed present in the
+markup. It has **not** been opened in a browser from this environment, so the
+visual layout, the phone breakpoint and the notification/sound toggles are the
+parts still to be seen by eye.
 
 ## Layout
 
 ```
-server.py      HTTP surface, the run loop's reporting, alerts wiring
-sniper.py      the proxy pool, the scheduler, and the per-platform checkers
-generator.py   buckets and lazy enumeration
+server.py      HTTP surface, the run loop's reporting, the hits store, alerts wiring
+sniper.py      the proxy pool, the scheduler, and the 30 per-platform checkers
+generator.py   buckets, and the random draw over a space
 proxies.py     parsing and storing the proxy list
 alerts.py      the Discord webhook
-static/        the dashboard (one file, no build step)
+static/        the seven pages, app.css and app.js (no build step)
 wordlists/     og.txt
 ```

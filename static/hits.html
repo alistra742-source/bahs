@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Hits</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll">
+      <h2>Workspace</h2>
+      <nav class="menu" id="nav"></nav>
+    </div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Hits</h1>
+      <div class="sep"></div>
+      <span class="sub" id="hitCount">—</span>
+      <div class="right">
+        <div class="chips" id="hitFilters">
+          <button data-f="all" class="on">all</button>
+          <button data-f="confirmed">confirmed</button>
+          <button data-f="unconfirmed">unconfirmed</button>
+        </div>
+        <input type="text" id="hitPlat" placeholder="platform" style="width:130px">
+        <button class="btn sm" id="csvBtn">csv</button>
+        <button class="btn sm danger" id="clearHits">clear</button>
+      </div>
+    </div>
+
+    <div class="kpis" style="margin-bottom:16px">
+      <div class="kpi free"><span>free names</span><b id="hTotal">0</b><small>found this process</small></div>
+      <div class="kpi pace"><span>confirmed</span><b id="hConf">0</b><small>agreed on a second exit</small></div>
+      <div class="kpi"><span>unconfirmed</span><b id="hUnc">0</b><small>one read only</small></div>
+      <div class="kpi taken"><span>platforms</span><b id="hPlats">0</b><small>with a hit</small></div>
+    </div>
+
+    <div class="card">
+      <header><h3>Found names</h3><div class="sep"></div>
+        <span class="note">every row is a name a checker returned as free — nothing else can land here</span></header>
+      <div class="body">
+        <div class="scroll"><table>
+          <thead><tr><th>name</th><th>platform</th><th>state</th><th>detail</th><th>found</th><th></th></tr></thead>
+          <tbody id="hitRows"><tr><td colspan="6" class="empty">nothing found yet</td></tr></tbody>
+        </table></div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let FILTER = "all", PLAT = "";
+window.PAGE = {
+  name: "hits", title: "Hits",
+  async init() {
+    for (const b of $("hitFilters").querySelectorAll("button")) {
+      b.onclick = () => {
+        FILTER = b.dataset.f;
+        for (const x of $("hitFilters").querySelectorAll("button")) x.classList.toggle("on", x === b);
+        load();
+      };
+    }
+    $("hitPlat").oninput = () => { PLAT = $("hitPlat").value.trim(); load(); };
+    $("csvBtn").onclick = csv;
+    $("clearHits").onclick = async () => {
+      if (!confirm("Forget every found name? A run in flight is not affected.")) return;
+      await App.api("/hits", { method: "DELETE" });
+      App.toast("hits cleared", "ok"); load();
+    };
+    await load();
+  },
+};
+async function load() {
+  const q = new URLSearchParams();
+  if (FILTER !== "all") q.set("confirmed", FILTER === "confirmed" ? "true" : "false");
+  if (PLAT) q.set("platform", PLAT);
+  q.set("limit", "2000");
+  const d = await App.api("/hits?" + q.toString());
+  App.S.hits = d.hits;
+  $("hitCount").textContent = App.fmt(d.count) + " found · " + App.fmt(d.confirmed) + " confirmed";
+  $("hTotal").textContent = App.fmt(d.count);
+  $("hConf").textContent = App.fmt(d.confirmed);
+  $("hUnc").textContent = App.fmt(d.count - d.confirmed);
+  $("hPlats").textContent = App.fmt(new Set(d.hits.map((h) => h.platform)).size);
+  const body = $("hitRows");
+  if (!d.hits.length) { body.innerHTML = '<tr><td colspan="6" class="empty">nothing found yet</td></tr>'; return; }
+  body.innerHTML = d.hits.map((h) => `<tr>
+    <td><b style="color:var(--free)">${App.esc(h.username)}</b></td>
+    <td>${App.esc(h.platform)}</td>
+    <td>${h.confirmed ? '<span class="tag ok">confirmed</span>' : '<span class="tag">unconfirmed</span>'}</td>
+    <td class="dim2">${App.esc(h.detail || "")}</td>
+    <td class="dim2">${new Date(h.at * 1000).toLocaleString("en-GB")}</td>
+    <td><button class="btn sm ghost" data-claim="${App.esc(h.platform)}" data-name="${App.esc(h.username)}">claim</button></td>
+  </tr>`).join("");
+  body.onclick = async (e) => {
+    const b = e.target.closest("button[data-claim]"); if (!b) return;
+    try {
+      const r = await App.api(`/claim?platform=${encodeURIComponent(b.dataset.claim)}&username=${encodeURIComponent(b.dataset.name)}`);
+      window.open(r.url, "_blank", "noopener");
+      App.toast(`${r.platform}: ${r.existing_account}`, "ok");
+    } catch (err) { App.toast("claim: " + err.message, "bad"); }
+  };
+}
+function csv() {
+  const rows = [["username", "platform", "confirmed", "detail", "found"]].concat(
+    App.S.hits.map((h) => [h.username, h.platform, h.confirmed ? "yes" : "no", h.detail || "",
+      new Date(h.at * 1000).toISOString()]));
+  const text = rows.map((r) => r.map((c) => '"' + String(c).replace(/"/g, '""') + '"').join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
+  a.download = "bahs-hits.csv"; a.click();
+}
+App.boot();
+</script>
+</body>
+</html>

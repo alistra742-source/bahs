@@ -82,6 +82,7 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from config import (
+    USER_AGENT,
     CONNECT_TIMEOUT,
     READ_TIMEOUT,
     SHUFFLE_NAMES,
@@ -101,6 +102,7 @@ from config import (
     SNIPE_PLATFORM_PAUSE_MAX,
     SNIPE_PLATFORM_WAIT,
     SNIPE_PROXY_BLOCK_LIMIT,
+    SNIPE_CONFIRM_FREE,
     SNIPE_PROXY_BLOCK_RATE,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
@@ -112,10 +114,8 @@ from config import (
 
 log = logging.getLogger("bahs.sniper")
 
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
+# From config, so the version can be moved on without a code change.
+BROWSER_UA = USER_AGENT
 IG_APP_ID = "936619743392459"
 DISCORD_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) discord/1.0"
 
@@ -260,6 +260,16 @@ PLATFORMS = (
     "wattpad",
     "disqus",
     "vk",
+    "dockerhub",
+    "codeberg",
+    "mastodon",
+    "dev.to",
+    "lichess",
+    "huggingface",
+    "gitlab",
+    "itch.io",
+    "gumroad",
+    "myanimelist",
 )
 
 # A name held by an account the platform has banned. Its own verdict rather than
@@ -486,6 +496,13 @@ class SnipeResult:
     # response we could not read", which blames nobody; FAULT_PROXY is set by
     # `transport_error` when the request never got there at all.
     fault: str = ""
+    # A free verdict that a second, independent read agreed with. False on
+    # everything else, and False on a free name the second read could not check
+    # -- an unconfirmed free name is still reported, but never as a sure thing.
+    confirmed: bool = False
+    # The first read said free and the second said taken. This result is the
+    # correction; the site counts it so a run can be honest about its own errors.
+    corrected: bool = False
 
     @property
     def is_available(self) -> bool:
@@ -1926,6 +1943,285 @@ async def check_vk(client: httpx.AsyncClient, username: str) -> SnipeResult:
     return SnipeResult(username, "vk", "error", f"status {code}")
 
 
+
+# --- Docker Hub ------------------------------------------------------------
+# The v2 user endpoint answers a small JSON object for an account and a 404 for
+# nothing -- the whole verdict is the status, with no body marker to misread.
+DOCKERHUB_USER = "https://hub.docker.com/v2/users/{}/"
+
+
+async def check_dockerhub(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            DOCKERHUB_USER.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "dockerhub", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        uid = body.get("username") if isinstance(body, dict) else None
+        return SnipeResult(username, "dockerhub", "taken", "@" + str(uid) if uid else "account exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "dockerhub", "available", "no such account")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "dockerhub", resp)
+    return SnipeResult(username, "dockerhub", "error", "status {}".format(resp.status_code))
+
+
+# --- Codeberg --------------------------------------------------------------
+# Gitea's own API. 404 is authoritative for "no such user"; anything else that
+# is not a 200 is left unanswered rather than guessed at.
+CODEBERG_USER = "https://codeberg.org/api/v1/users/{}"
+
+
+async def check_codeberg(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            CODEBERG_USER.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "codeberg", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        login = body.get("login") if isinstance(body, dict) else None
+        return SnipeResult(username, "codeberg", "taken", "@" + str(login) if login else "account exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "codeberg", "available", "no such account")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "codeberg", resp)
+    return SnipeResult(username, "codeberg", "error", "status {}".format(resp.status_code))
+
+
+# --- Mastodon (mastodon.social) -------------------------------------------
+# The lookup endpoint resolves one acct on one instance: 200 an account, 404
+# nothing. Handles are case-insensitive on the fediverse, so it is asked lower.
+MASTODON_LOOKUP = "https://mastodon.social/api/v1/accounts/lookup?acct={}"
+
+
+async def check_mastodon(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            MASTODON_LOOKUP.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "mastodon", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        acct = body.get("acct") if isinstance(body, dict) else None
+        return SnipeResult(username, "mastodon", "taken", "@" + str(acct) if acct else "account exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "mastodon", "available", "no such account")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "mastodon", resp)
+    return SnipeResult(username, "mastodon", "error", "status {}".format(resp.status_code))
+
+
+# --- DEV Community ---------------------------------------------------------
+# The by-username lookup returns the user object or a 404. Two paths, one
+# verdict each.
+DEVTO_USER = "https://dev.to/api/users/by_username?url={}"
+
+
+async def check_devto(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            DEVTO_USER.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "dev.to", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        shown = body.get("username") if isinstance(body, dict) else None
+        return SnipeResult(username, "dev.to", "taken", "@" + str(shown) if shown else "account exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "dev.to", "available", "no such account")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "dev.to", resp)
+    return SnipeResult(username, "dev.to", "error", "status {}".format(resp.status_code))
+
+
+# --- Lichess ---------------------------------------------------------------
+# One JSON object per player, a 404 for a handle nobody holds.
+LICHESS_USER = "https://lichess.org/api/user/{}"
+
+
+async def check_lichess(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            LICHESS_USER.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "lichess", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        name = body.get("username") if isinstance(body, dict) else None
+        return SnipeResult(username, "lichess", "taken", "@" + str(name) if name else "player exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "lichess", "available", "no such player")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "lichess", resp)
+    return SnipeResult(username, "lichess", "error", "status {}".format(resp.status_code))
+
+
+# --- Hugging Face ----------------------------------------------------------
+# The user overview endpoint: a JSON object for an account, 404 for nothing.
+HUGGINGFACE_USER = "https://huggingface.co/api/users/{}/overview"
+
+
+async def check_huggingface(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            HUGGINGFACE_USER.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "huggingface", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        name = body.get("user") or body.get("name") if isinstance(body, dict) else None
+        return SnipeResult(username, "huggingface", "taken", "@" + str(name) if name else "account exists")
+    if resp.status_code == 404:
+        return SnipeResult(username, "huggingface", "available", "no such account")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "huggingface", resp)
+    return SnipeResult(username, "huggingface", "error", "status {}".format(resp.status_code))
+
+
+# --- GitLab ----------------------------------------------------------------
+# The users search returns a JSON array: one entry for a handle that exists, an
+# empty array for one that does not. Read as JSON rather than by size, so the
+# verdict is the shape of the answer and not a byte count.
+GITLAB_USERS = "https://gitlab.com/api/v4/users?username={}"
+
+
+async def check_gitlab(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            GITLAB_USERS.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "gitlab", exc)
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        if not isinstance(body, list):
+            return SnipeResult(username, "gitlab", "unanswered", "not a user list")
+        if not body:
+            return SnipeResult(username, "gitlab", "available", "no such account")
+        first = body[0] if isinstance(body[0], dict) else {}
+        return SnipeResult(username, "gitlab", "taken", "@" + str(first.get("username") or username))
+    if resp.status_code in (403, 429):
+        return _blocked(username, "gitlab", resp)
+    return SnipeResult(username, "gitlab", "error", "status {}".format(resp.status_code))
+
+
+# --- itch.io ---------------------------------------------------------------
+# A subdomain per creator: the profile renders, or the site's own 404 does.
+ITCH_PROFILE = "https://{}.itch.io/"
+
+
+async def check_itch(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            ITCH_PROFILE.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "text/html"},
+        )
+    except Exception as exc:
+        return transport_error(username, "itch.io", exc)
+    if resp.status_code == 200:
+        return SnipeResult(username, "itch.io", "taken", "profile page")
+    if resp.status_code == 404:
+        return SnipeResult(username, "itch.io", "available", "no such creator")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "itch.io", resp)
+    return SnipeResult(username, "itch.io", "error", "status {}".format(resp.status_code))
+
+
+# --- Gumroad ---------------------------------------------------------------
+# Same shape as itch: a subdomain that either renders the shop or 404s.
+GUMROAD_SHOP = "https://{}.gumroad.com"
+
+
+async def check_gumroad(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            GUMROAD_SHOP.format(username.lower()),
+            headers={"User-Agent": BROWSER_UA, "Accept": "text/html"},
+        )
+    except Exception as exc:
+        return transport_error(username, "gumroad", exc)
+    if resp.status_code == 200:
+        return SnipeResult(username, "gumroad", "taken", "shop live")
+    if resp.status_code == 404:
+        return SnipeResult(username, "gumroad", "available", "no such shop")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "gumroad", resp)
+    return SnipeResult(username, "gumroad", "error", "status {}".format(resp.status_code))
+
+
+# --- MyAnimeList -----------------------------------------------------------
+# Profile pages: a live profile is a 200, a free name the site's own 404.
+MAL_PROFILE = "https://myanimelist.net/profile/{}"
+
+
+async def check_myanimelist(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            MAL_PROFILE.format(username),
+            headers={"User-Agent": BROWSER_UA, "Accept": "text/html"},
+        )
+    except Exception as exc:
+        return transport_error(username, "myanimelist", exc)
+    if resp.status_code == 200:
+        return SnipeResult(username, "myanimelist", "taken", "profile page")
+    if resp.status_code == 404:
+        return SnipeResult(username, "myanimelist", "available", "no such user")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "myanimelist", resp)
+    return SnipeResult(username, "myanimelist", "error", "status {}".format(resp.status_code))
+
+# One line per platform on how its verdict is reached, served by /info and shown
+# on the Platforms page. A checker that cannot explain itself in a sentence is a
+# checker nobody can audit.
+CHECK_NOTES: dict[str, str] = {
+    "discord": "username lookup endpoint; 200 taken, 404 free, 429 with retry_after honoured",
+    "roblox": "username-to-id lookup; a returned id is taken, an empty list free",
+    "minecraft": "Mojang name lookup; 200 taken, 404 free",
+    "telegram": "t.me page; a live handle renders tgme_page_title, a free one the generic page",
+    "instagram": "web_profile_info; an account returns data, an unknown name a 404",
+    "tiktok": "profile page with a mobile Safari agent; the user-detail payload carries the verdict, oEmbed is only a fallback and a 400 is never a verdict",
+    "x": "account lookup; a missing or suspended account reads free",
+    "github": "api.github.com/users; 200 taken, 404 free (GITHUB_TOKEN raises the hourly limit)",
+    "youtube": "channel handle page; the @handle resolves only when it is held",
+    "guns.lol": "profile page; a ban heading is its own verdict and the clearance interstitial is a refusal, never a free name",
+    "bluesky": "resolveHandle; a DID for a handle that exists, InvalidRequest for one that does not",
+    "kick": "api/v2/channels; 200 the channel, 404 not found",
+    "steam": "vanity URL XML; <steamID64> live, <error> free",
+    "soundcloud": "profile page; a live permalink renders, an unknown one 404s",
+    "dribbble": "profile API; 200 taken, 404 free",
+    "chess.com": "pub/player; 200 the player, 404 not found",
+    "duolingo": "users?username=; an empty list means free",
+    "wattpad": "user page; 200 taken, 404 free",
+    "disqus": "profile page; 200 taken, 404 free",
+    "vk": "profile page; a held short address renders, an unclaimed one does not",
+    "dockerhub": "v2 user API; 200 the account, 404 nothing",
+    "codeberg": "Gitea users API; 200 the account, 404 nothing",
+    "mastodon": "account lookup on mastodon.social; 200 the account, 404 nothing",
+    "dev.to": "by-username lookup; 200 the user, 404 nothing",
+    "lichess": "user API; 200 the player, 404 nothing",
+    "huggingface": "user overview API; 200 the account, 404 nothing",
+    "gitlab": "users search; an array with an entry is taken, an empty array is free",
+    "itch.io": "creator subdomain; the profile renders, or the site's own 404 does",
+    "gumroad": "shop subdomain; 200 live, 404 free",
+    "myanimelist": "profile page; 200 taken, 404 free",
+}
+
+
 CHECKERS = {
     "discord": check_discord,
     "roblox": check_roblox,
@@ -1947,6 +2243,16 @@ CHECKERS = {
     "wattpad": check_wattpad,
     "disqus": check_disqus,
     "vk": check_vk,
+    "dockerhub": check_dockerhub,
+    "codeberg": check_codeberg,
+    "mastodon": check_mastodon,
+    "dev.to": check_devto,
+    "lichess": check_lichess,
+    "huggingface": check_huggingface,
+    "gitlab": check_gitlab,
+    "itch.io": check_itch,
+    "gumroad": check_gumroad,
+    "myanimelist": check_myanimelist,
 }
 
 
@@ -2090,8 +2396,58 @@ class PlatformPacer:
         ]
 
 
+def confirm_check(result: SnipeResult) -> bool:
+    """Should an `available` from this check be re-asked before it is reported?
+
+    Off entirely by SNIPE_CONFIRM_FREE. A result the checker itself flagged as
+    unreadable is never a free name, so it is never confirmed either.
+    """
+    return SNIPE_CONFIRM_FREE and result.status == "available"
+
+
+async def confirm_available(
+    platform: str, username: str, pool: ProxyPool, first: SnipeResult
+) -> SnipeResult:
+    """Ask a free name again through a different exit, and report the truth.
+
+    Three honest outcomes, and no fourth:
+
+    * the second read agrees -> free, and marked ``confirmed``;
+    * the second read says the name is held -> **the taken verdict is what is
+      reported**, the first read is discarded and the correction is counted, so
+      a name is never offered as free on one exit's word;
+    * the second read cannot answer -> the free verdict stands, but it is left
+      unconfirmed, and the site shows it as unconfirmed rather than as sure.
+    """
+    second_proxy = pool.next()
+    if second_proxy is None:
+        first.detail = (first.detail + "; unconfirmed, no second exit").strip("; ")
+        return first
+    try:
+        second = await CHECKERS[platform](pool.client(second_proxy), username)
+    except asyncio.CancelledError:
+        pool.abandon(second_proxy)
+        raise
+    except Exception:
+        first.detail = (first.detail + "; unconfirmed, second read failed").strip("; ")
+        return first
+    second.proxy = second_proxy
+    if second.status == "available":
+        first.confirmed = True
+        first.detail = (first.detail + "; confirmed on a second exit").strip("; ")
+        return first
+    if second.status in FINAL_STATUSES:
+        second.corrected = True
+        second.detail = "held -- first read said free on another exit"
+        return second
+    first.detail = (first.detail + "; unconfirmed, second read was " + second.status).strip("; ")
+    return first
+
+
 # --- the batch ------------------------------------------------------------
-async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResult:
+async def check_once(
+    platform: str, username: str, pool: ProxyPool, confirm: bool | None = None
+) -> SnipeResult:
     """One name on one platform, through the next proxy the pool hands out."""
     proxy = pool.next()
     if proxy is None:
@@ -2109,6 +2465,11 @@ async def check_once(platform: str, username: str, pool: ProxyPool) -> SnipeResu
         result = SnipeResult(username, platform, "error", f"unexpected:{type(exc).__name__}")
     result.latency_ms = (time.perf_counter() - started) * 1000.0
     result.proxy = proxy
+    # A free name is what the user acts on, so it is re-asked once before the
+    # run will call it free. A rotating pool reaches a different exit, which is
+    # the whole point: one exit misreading a platform must not become a "hit".
+    if confirm_check(result) and result.status == "available":
+        result = await confirm_available(platform, username, pool, result)
     # A 407 is the proxy itself demanding credentials, not the target. The
     # checkers see it as an ordinary response, so it is caught here and charged
     # to the proxy -- otherwise an authenticated list with a wrong credential

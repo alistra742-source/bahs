@@ -56,6 +56,17 @@ def _bool(name: str, default: bool) -> bool:
 
 
 # --- Service ---------------------------------------------------------------
+# The user agent every checker sends unless a platform needs its own.
+# This is a knob and not a constant on purpose: codeberg 403s a year-old Chrome
+# version outright ("Access denied, old Chrome version") while answering the
+# same request from a current one, so a UA baked into the source is a
+# time-bomb that shows up as a platform refusing the whole datacenter.
+USER_AGENT: str = _str(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+)
+
 # Railway injects PORT. Bind 0.0.0.0 or the platform cannot reach the process.
 HOST: str = _str("HOST", "0.0.0.0")
 PORT: int = _int("PORT", 8080)
@@ -295,6 +306,15 @@ SNIPE_PLATFORM_BLOCK_RATE: float = _float("SNIPE_PLATFORM_BLOCK_RATE", 0.5)
 # which the run stops and says why rather than waiting forever.
 SNIPE_PLATFORM_WAIT: float = _float("SNIPE_PLATFORM_WAIT", 300.0)
 
+# A free name is the one claim a user acts on -- it is the whole point of the
+# run -- so it is the one verdict worth a second look. When a check comes back
+# `available`, the same name is asked again through the next proxy (a rotating
+# endpoint reaches a different exit), and only a second `available` marks it
+# confirmed. If the second read says taken, the taken verdict is what the run
+# reports and the correction is counted. A second read that cannot answer
+# leaves the name free but *unconfirmed*, and the site says so.
+SNIPE_CONFIRM_FREE: bool = _bool("SNIPE_CONFIRM_FREE", True)
+
 # --- Runs ------------------------------------------------------------------
 # Cap on the simultaneous snipe/scan runs the server will track. The dashboard
 # only ever starts one, but the API is open -- unbounded runs are unbounded
@@ -319,6 +339,15 @@ MIN_POOL_WARN: int = _int("MIN_POOL_WARN", 5)
 # rather than letting anyone start a three-day run by accident. Nothing is ever
 # silently sampled: a space over the cap is refused with its real size.
 MAX_ENUMERATION: int = _int("MAX_ENUMERATION", 100000000)
+
+# The largest selection the service will build in memory in order to shuffle it
+# into a true random order. Above this a run must be given a cap, and the names
+# are drawn at random from the whole space instead -- because the alternative is
+# walking a hundred-million-name space in enumeration order, which is what made a
+# run report a wall of names that all began with the same letters (the last
+# character of an itertools.product varies fastest, so the first 46,656 names of a
+# 5-character alphanumeric space are all `aaa??`).
+SELECTION_BUILD_MAX: int = _int("SELECTION_BUILD_MAX", 2000000)
 # "OG" words for the `words` pattern. The bundled wordlists/og.txt is always
 # used; OG_WORDS_FILE adds (or replaces it with) a bigger list -- one word per
 # line or space separated, # comments ignored -- and OG_WORDS adds inline words.

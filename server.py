@@ -32,6 +32,7 @@ from config import (
     SHUFFLE_NAMES,
     MAX_CONCURRENT_RUNS,
     MAX_ENUMERATION,
+    SELECTION_BUILD_MAX,
     MIN_POOL_WARN,
     PORT,
     SCAN_BUFFER_MAX,
@@ -95,6 +96,43 @@ def _raise_fd_limit() -> int | None:
 _RAISED_FD_LIMIT = _raise_fd_limit()
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# The Hits page needs the free names a run found, and it needs them after the
+# tab that started the run is gone -- so they are kept here, not in a browser.
+# A name can only reach this dict from `_Tally.add`, i.e. from a result the
+# checker actually returned as `available`; nothing else may write to it.
+HITS_MAX = 5000
+_HITS: dict[str, dict] = {}
+_HIT_ORDER: list[str] = []
+
+
+def _record_hit(
+    username: str, platform: str, detail: str, confirmed: bool, corrected: bool, run_id: str
+) -> None:
+    """Remember a free name. Same name twice updates the row, never doubles it."""
+    key = platform + ":" + username.lower()
+    existing = _HITS.get(key)
+    if existing is not None:
+        # A later read is better evidence than an earlier one: a name that came
+        # back confirmed on a rerun is upgraded, and never downgraded silently.
+        existing["confirmed"] = existing["confirmed"] or bool(confirmed)
+        if confirmed:
+            existing["detail"] = detail
+        if run_id:
+            existing["run_id"] = run_id
+        return
+    _HITS[key] = {
+        "username": username,
+        "platform": platform,
+        "detail": detail,
+        "confirmed": bool(confirmed),
+        "corrected": bool(corrected),
+        "run_id": run_id,
+        "at": time.time(),
+    }
+    _HIT_ORDER.append(key)
+    while len(_HIT_ORDER) > HITS_MAX:
+        _HITS.pop(_HIT_ORDER.pop(0), None)
 
 
 def _build_id() -> str:
@@ -172,17 +210,74 @@ async def lifespan(app: FastAPI):
         proxy_list.save()
 
 
-app = FastAPI(title="bahs", version="3.0.0", lifespan=lifespan)
+# docs_url is turned off because /docs is a page of ours now -- the built-in
+# Swagger UI would otherwise shadow it, which is a confusing way to find out that
+# two things wanted the same path. The schema stays at /openapi.json and ReDoc at
+# /redoc.
+app = FastAPI(title="bahs", version="3.0.0", lifespan=lifespan, docs_url=None)
 
 
 # --- site + info ----------------------------------------------------------
+# no-cache (not no-store): the browser may keep a page or a script but must
+# revalidate it, so a redeploy cannot leave an old build being served.
+_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
+def _page(name: str) -> FileResponse:
+    return FileResponse(os.path.join(STATIC_DIR, name), headers=_NO_CACHE)
+
+
+# Each of these is one job, on its own page. Nothing is crammed together: the
+# console starts and watches a run, hits lists what was found, platforms carries
+# the grid, and so on -- the sidebar is the navigation, not a set of panels.
 @app.get("/", include_in_schema=False)
-def site() -> FileResponse:
-    # no-cache (not no-store): the browser may keep the page but must revalidate
-    # it, so a single-file dashboard cannot go on serving an old build.
+def page_console() -> FileResponse:
+    return _page("console.html")
+
+
+@app.get("/hits/", include_in_schema=False)
+def page_hits() -> FileResponse:
+    # A trailing slash, because `/hits` is the JSON API. Two things wanting one
+    # path is a bug that only shows up as a page silently returning JSON or the
+    # other way round -- so the pages that share a name with an endpoint wear the
+    # slash and the API keeps the path it always had.
+    return _page("hits.html")
+
+
+@app.get("/platforms", include_in_schema=False)
+def page_platforms() -> FileResponse:
+    return _page("platforms.html")
+
+
+@app.get("/proxies/", include_in_schema=False)
+def page_proxies() -> FileResponse:
+    return _page("proxies.html")
+
+
+@app.get("/alerts", include_in_schema=False)
+def page_alerts() -> FileResponse:
+    return _page("alerts.html")
+
+
+@app.get("/settings/", include_in_schema=False)
+def page_settings() -> FileResponse:
+    return _page("settings.html")
+
+
+@app.get("/docs", include_in_schema=False)
+def page_docs() -> FileResponse:
+    return _page("docs.html")
+
+
+@app.get("/app.css", include_in_schema=False)
+def asset_css() -> FileResponse:
+    return FileResponse(os.path.join(STATIC_DIR, "app.css"), media_type="text/css", headers=_NO_CACHE)
+
+
+@app.get("/app.js", include_in_schema=False)
+def asset_js() -> FileResponse:
     return FileResponse(
-        os.path.join(STATIC_DIR, "index.html"),
-        headers={"Cache-Control": "no-cache, must-revalidate"},
+        os.path.join(STATIC_DIR, "app.js"), media_type="application/javascript", headers=_NO_CACHE
     )
 
 
@@ -193,6 +288,15 @@ def info() -> dict:
         "service": "bahs",
         "build": BUILD,
         "platforms": list(sniper.PLATFORMS),
+        # One line per platform on how its verdict is reached: the Platforms page
+        # shows them so nobody has to take a verdict on faith.
+        "checks": [{"platform": p, "how": sniper.CHECK_NOTES.get(p, "")} for p in sniper.PLATFORMS],
+        # What the numbers mean, stated once, where the client reads it.
+        "honesty": {
+            "results": "only available and taken are verdicts; refusals, errors and unreadable answers are health, not results",
+            "rates": "checks_per_second counts requests completed, verdicts_per_second counts names resolved",
+            "free": "a free verdict is re-asked once on a different exit and reported confirmed or unconfirmed",
+        },
         "alerts_enabled": bool(alert_settings.get().get("enabled")),
         # What the UI needs to show a running total for "every name of this
         # length" before anyone starts a run.
@@ -201,10 +305,21 @@ def info() -> dict:
             "charset": {name: len(chars) for name, chars in generator.CHARSETS.items()},
             "words_by_length": words,
             "max_enumeration": MAX_ENUMERATION,
+            # The largest selection a run will build in memory and shuffle. Past
+            # it the run needs a cap and samples at random -- the client uses this
+            # to say so before you press start, not after.
+            "selection_build_max": SELECTION_BUILD_MAX,
             "note": "limit omitted or 0 means every name of that length",
         },
         "endpoints": {
-            "GET /": "dashboard",
+            "GET /": "console - start and watch a run",
+            "GET /hits": "found names, newest first, with confirmation state",
+            "GET /platforms": "the sniper grid and live per-platform counters",
+            "GET /proxies": "the proxy list",
+            "GET /alerts": "webhook alerts",
+            "GET /settings": "customisation",
+            "GET /docs": "how a verdict is reached, and every endpoint",
+            "GET /hits": "found names, newest first, with confirmation state",
             "GET /health": "counts: stored proxies, live runs",
             "GET /proxies": "the stored proxy list (add ?format=txt for one per line)",
             "POST /proxies": "save pasted proxies - {text, mode: append|replace}",
@@ -560,11 +675,48 @@ def _runs_status() -> list[dict]:
     return [handle.status() for handle in _runs.values()]
 
 
+@app.get("/hits")
+def hits(
+    platform: str | None = Query(None),
+    confirmed: bool | None = Query(None),
+    limit: int = Query(500, ge=1, le=5000),
+) -> dict:
+    """Every free name the process has found, newest first.
+
+    Only names a checker returned as `available` are here, and each row carries
+    whether a second exit agreed. A name found on one exit's word and never
+    re-confirmed is shown as unconfirmed -- the page is not allowed to present
+    it as a sure thing.
+    """
+    rows = list(_HITS.values())
+    if platform:
+        rows = [r for r in rows if r["platform"].lower() == platform.strip().lower()]
+    if confirmed is not None:
+        rows = [r for r in rows if bool(r["confirmed"]) is confirmed]
+    rows.sort(key=lambda r: r["at"], reverse=True)
+    return {
+        "count": len(_HITS),
+        "returned": len(rows[:limit]),
+        "confirmed": sum(1 for r in _HITS.values() if r["confirmed"]),
+        "hits": rows[:limit],
+    }
+
+
+@app.delete("/hits")
+def clear_hits() -> dict:
+    """Forget the found names. Does not touch a run that is in flight."""
+    removed = len(_HITS)
+    _HITS.clear()
+    _HIT_ORDER.clear()
+    return {"cleared": removed}
+
+
 @app.get("/runs")
 def runs_status() -> dict:
     """Every tracked run, active or just finished."""
     runs = _runs_status()
-    return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS}
+    return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS,
+            "hits_count": len(_HITS)}
 
 
 @app.post("/runs/stop")
@@ -806,10 +958,25 @@ class _Tally:
         # through, because every name is checked once per platform.
         self.total_checks = max(1, names * max(1, len(platforms)))
         self.alerter = alerter
+        # Two meters, because they measure two different things and reporting
+        # the wrong one is how a dashboard lies about its own speed. `meter`
+        # ticks on every result -- requests the run completed, refusals included.
+        # `answer_meter` ticks only on a result that actually answered the
+        # question about the name. A run that is 80% blocked is fast on the first
+        # and slow on the second, and only the second is "names resolved".
         self.meter = sniper.RateMeter()
+        self.answer_meter = sniper.RateMeter()
         self.checked = 0
         self.available = 0
+        self.taken = 0
+        self.errors = 0
+        self.unanswered = 0
+        self.banned = 0
         self.answered = 0
+        self.confirmed = 0
+        self.corrected = 0
+        # Filled by the run's generator so a hit can be traced back to its run.
+        self.run_id = ""
         self.rate_limits = 0
         self.by_status: dict[str, int] = {}
         self.by_platform: dict[str, dict[str, int]] = {p: dict(self._ZERO) for p in platforms}
@@ -825,6 +992,14 @@ class _Tally:
         row["checked"] += 1
         if status in row:
             row[status] += 1
+        if status == "taken":
+            self.taken += 1
+        elif status == "error":
+            self.errors += 1
+        elif status == "unanswered":
+            self.unanswered += 1
+        elif status == "banned":
+            self.banned += 1
         if status == "available":
             self.available += 1
             # Queued, not sent: the alerter digests and posts on its own clock.
@@ -832,6 +1007,17 @@ class _Tally:
                 self.alerter.offer(result.username, result.platform, result.detail)
         if result.answered:
             self.answered += 1
+            self.answer_meter.tick()
+        if getattr(result, "confirmed", False):
+            self.confirmed += 1
+        if getattr(result, "corrected", False):
+            self.corrected += 1
+        if status == "available" and result.username:
+            _record_hit(
+                result.username, result.platform, result.detail,
+                getattr(result, "confirmed", False), getattr(result, "corrected", False),
+                self.run_id,
+            )
         if status == "blocked":
             self.rate_limits += 1
 
@@ -867,9 +1053,20 @@ class _Tally:
             "total_checks": self.total_checks,
             "platforms_count": len(self.platforms),
             "progress": round(self.checked / self.total_checks, 4),
+            # Checks are requests completed; verdicts are names resolved. Both
+            # are sent, explicitly named, and `per_second` stays as an alias of
+            # the check rate so nothing can silently read the flattering number.
+            "checks_per_second": round(self.meter.recent, 1),
+            "verdicts_per_second": round(self.answer_meter.recent, 1),
             "per_second": round(self.meter.recent, 1),
             "average_per_second": round(self.meter.average, 1),
+            "average_verdicts_per_second": round(self.answer_meter.average, 1),
+            "answered": self.answered,
             "available_count": self.available,
+            "taken": self.taken,
+            "banned": self.banned,
+            "error": self.errors,
+            "unanswered": self.unanswered,
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
             "unattempted": self.unattempted,
@@ -880,6 +1077,8 @@ class _Tally:
             # every tick means a tab that attaches mid-run can see the throttle
             # being handled instead of just a stalled counter.
             "platforms_paced": _pace_snapshot(self.pool),
+            "confirmed_count": self.confirmed,
+            "corrected_count": self.corrected,
             **_verdict_report(self.answered, self.checked),
         }
 
@@ -898,6 +1097,12 @@ class _Tally:
             "proxy_misses": self.proxy_misses,
             "unattempted": self.unattempted,
             "elapsed_s": round(self.elapsed, 2),
+            "checks_per_second": round(self.meter.average, 1),
+            "verdicts_per_second": round(self.answer_meter.average, 1),
+            "average_verdicts_per_second": round(self.answer_meter.average, 1),
+            "answered": self.answered,
+            "confirmed_count": self.confirmed,
+            "corrected_count": self.corrected,
             **_verdict_report(self.answered, self.checked),
         }
 
@@ -910,6 +1115,8 @@ def _snipe_row(result: sniper.SnipeResult) -> dict:
         "detail": result.detail,
         "proxy": result.proxy,
         "latency_ms": round(result.latency_ms, 2) if result.latency_ms is not None else None,
+        "confirmed": bool(getattr(result, "confirmed", False)),
+        "corrected": bool(getattr(result, "corrected", False)),
     }
 
 
@@ -1050,6 +1257,7 @@ async def _snipe_ndjson(
     if run:
         run.tally = tally
     run_id = run.id if run else ""
+    tally.run_id = run_id
     last_report = 0.0
     if note:
         yield json.dumps(
@@ -1284,14 +1492,18 @@ def _scan_plan(req: ScanRequest) -> tuple[Iterable[str], int, bool]:
         # Overlapping buckets are dropped before the count, so the number on the
         # dashboard is what will actually be checked rather than a total that
         # double-counts `og` inside `l`.
-        total = generator.buckets_total(specs, req.words)
-        if total > MAX_ENUMERATION:
-            raise HTTPException(
-                400,
-                f"that selection is {total:,} names, over the {MAX_ENUMERATION:,} one run "
-                "will enumerate. Drop a bucket or a length.",
+        # Random draw, not enumeration order. `req.limit` is the cap: left at 0
+        # the whole selection is shuffled and checked (up to the size one run
+        # will build); set, that many names are drawn at random from the whole
+        # space, and `total` below is the sample size so progress is measured
+        # against what will actually be checked.
+        try:
+            generated = generator.iter_selection(
+                specs, words=req.words, seed=req.seed, limit=req.limit
             )
-        generated = generator.iter_buckets(specs, req.words)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        total = generator.sample_size(specs, req.limit, req.words)
     elif req.patterns:
         try:
             drawn = generator.generate_many(
@@ -1345,6 +1557,7 @@ async def _scan_stream(
     if run:
         run.tally = tally
     run_id = run.id if run else ""
+    tally.run_id = run_id
     last_report = 0.0
     yield json.dumps(
         {
@@ -1588,6 +1801,105 @@ CLAIM_TARGETS: dict[str, dict[str, str]] = {
         "register_url": "https://www.tiktok.com/signup",
         "existing_account": "Profile > Edit profile > Username",
         "note": "TikTok assigns the handle at signup.",
+    },    "dockerhub": {
+        "register_url": "https://hub.docker.com/signup",
+        "existing_account": "Account Settings > Username",
+        "note": "A Docker Hub namespace is the account name; it can be renamed once.",
+    },
+    "codeberg": {
+        "register_url": "https://codeberg.org/user/sign_up",
+        "existing_account": "Settings > Account > Username",
+        "note": "Codeberg takes the username at registration and allows a change in settings.",
+    },
+    "mastodon": {
+        "register_url": "https://mastodon.social/auth/sign_up",
+        "existing_account": "Preferences > Profile > Display name (acct is fixed at signup)",
+        "note": "The handle on an instance is fixed at signup; a different instance is a different namespace.",
+    },
+    "dev.to": {
+        "register_url": "https://dev.to/enter",
+        "existing_account": "Settings > Account > Username",
+        "note": "dev.to sets the username at signup and allows one change in Settings.",
+    },
+    "lichess": {
+        "register_url": "https://lichess.org/signup",
+        "existing_account": "no rename path -- the username is permanent",
+        "note": "A Lichess username is permanent once registered.",
+    },
+    "huggingface": {
+        "register_url": "https://huggingface.co/join",
+        "existing_account": "Settings > Account > Username",
+        "note": "The Hugging Face account name is also the namespace for its models and datasets.",
+    },
+    "gitlab": {
+        "register_url": "https://gitlab.com/users/sign_up",
+        "existing_account": "Edit profile > Account > Change username",
+        "note": "GitLab takes the username at signup and allows a change later in the profile.",
+    },
+    "itch.io": {
+        "register_url": "https://itch.io/register",
+        "existing_account": "Settings > Username",
+        "note": "The itch.io subdomain follows the username; changing it changes the profile URL.",
+    },
+    "gumroad": {
+        "register_url": "https://gumroad.com/signup",
+        "existing_account": "Settings > Profile > Custom subdomain",
+        "note": "The Gumroad shop subdomain is chosen at signup and can be changed in settings.",
+    },
+    "myanimelist": {
+        "register_url": "https://myanimelist.net/register.php",
+        "existing_account": "Account Settings > Change Username",
+        "note": "MyAnimeList takes the username at signup and allows a paid change in settings.",
+    },
+    "bluesky": {
+        "register_url": "https://bsky.app/",
+        "existing_account": "Settings > Change handle",
+        "note": "A Bluesky handle is a domain; the .bsky.social one can be changed in settings.",
+    },
+    "kick": {
+        "register_url": "https://kick.com/",
+        "existing_account": "Settings > Account > Username",
+        "note": "Kick takes the username at signup; a change is a paid one.",
+    },
+    "steam": {
+        "register_url": "https://store.steampowered.com/join",
+        "existing_account": "Profile > Edit Profile > Custom URL",
+        "note": "The vanity URL is the custom URL on a Steam profile, not the account name.",
+    },
+    "soundcloud": {
+        "register_url": "https://soundcloud.com/signup",
+        "existing_account": "Settings > Profile > Permalink",
+        "note": "The SoundCloud permalink is what a profile URL carries; it can be changed in settings.",
+    },
+    "dribbble": {
+        "register_url": "https://dribbble.com/signup/new",
+        "existing_account": "Settings > Profile > Username",
+        "note": "Dribbble sets the username at signup and allows a change in profile settings.",
+    },
+    "chess.com": {
+        "register_url": "https://www.chess.com/register",
+        "existing_account": "Settings > Account > Username",
+        "note": "A Chess.com username change requires a paid membership.",
+    },
+    "duolingo": {
+        "register_url": "https://www.duolingo.com/register",
+        "existing_account": "Profile > Settings > Username",
+        "note": "Duolingo takes the username at signup and allows a change in settings.",
+    },
+    "wattpad": {
+        "register_url": "https://www.wattpad.com/signup",
+        "existing_account": "Settings > Account > Username",
+        "note": "The Wattpad username is the profile URL and can be changed in settings.",
+    },
+    "disqus": {
+        "register_url": "https://disqus.com/profile/signup/",
+        "existing_account": "Settings > Account > Username",
+        "note": "A Disqus username is a per-site profile; set at signup, changeable in settings.",
+    },
+    "vk": {
+        "register_url": "https://vk.com/join",
+        "existing_account": "Settings > Edit profile > Short address",
+        "note": "The VK short address is the profile URL on top of the account.",
     },
 }
 

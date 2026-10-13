@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Proxies</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll"><h2>Workspace</h2><nav class="menu" id="nav"></nav></div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Proxies</h1>
+      <div class="sep"></div>
+      <span class="sub" id="pCount">—</span>
+      <div class="right">
+        <a class="btn sm" href="/proxies?format=txt" id="dl">download</a>
+        <button class="btn sm danger" id="pClear">clear all</button>
+      </div>
+    </div>
+
+    <div class="grid two">
+      <div class="card">
+        <header><h3>Add</h3><div class="sep"></div>
+          <span class="note">nothing is validated on paste — what you paste is what a run uses</span></header>
+        <div class="body">
+          <label class="f"><span>one per line</span>
+            <textarea id="pText" placeholder="host:port:user:pass&#10;socks5://user:pass@host:1080&#10;http://host:8080&#10;1.2.3.4:8080"></textarea></label>
+          <div class="row">
+            <button class="btn primary" id="pAdd">Append</button>
+            <button class="btn" id="pReplace">Replace list</button>
+            <label class="btn" style="display:inline-block;cursor:pointer">Upload file
+              <input type="file" id="pFile" accept=".txt,.csv,text/plain" hidden></label>
+          </div>
+          <div class="note" id="pReport" style="margin-top:12px"></div>
+        </div>
+      </div>
+      <div class="card">
+        <header><h3>Stored</h3><div class="sep"></div><span class="note" id="pStat"></span></header>
+        <div class="body">
+          <div class="kv" id="pStats"></div>
+          <div class="scroll" style="margin-top:12px;max-height:380px"><table>
+            <thead><tr><th>proxy</th><th></th></tr></thead>
+            <tbody id="pTable"><tr><td colspan="2" class="empty">none stored</td></tr></tbody>
+          </table></div>
+          <p class="note" style="margin-top:12px">A run rotates the whole list. A proxy a platform refuses is rested and counted
+            apart from one that fails at the transport level: a blanket refusal is not a dead list. Retirement is decided by a
+            <b>rate</b>, so a working endpoint is never retired off a handful of refusals — and the last live proxy is never retired,
+            because retiring the only one ends the run instead of replacing it.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+window.PAGE = {
+  name: "proxies", title: "Proxies",
+  init() {
+    $("pAdd").onclick = () => save("append");
+    $("pReplace").onclick = () => save("replace");
+    $("pClear").onclick = async () => {
+      if (!confirm("Empty the stored proxy list?")) return;
+      const r = await App.api("/proxies/clear", { method: "POST" });
+      App.toast("removed " + r.removed + " proxies", "ok"); load();
+    };
+    $("pFile").onchange = async (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      const text = await f.text();
+      await App.api("/proxies/upload?mode=append", { method: "POST", body: text,
+        headers: { "content-type": "text/plain" } });
+      App.toast("uploaded " + f.name, "ok"); load();
+    };
+    load();
+  },
+  onProxies() { load(); },
+};
+async function save(mode) {
+  const text = $("pText").value;
+  if (!text.trim()) return App.toast("nothing pasted", "bad");
+  try {
+    const r = await App.api("/proxies", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, mode }) });
+    const n = (r.accepted || []).length, bad = (r.rejected || []).length;
+    $("pReport").textContent = `${n} kept, ${bad} dropped — ${r.stored.count} stored`;
+    App.toast(`${n} ${mode === "replace" ? "replaced" : "added"}`, "ok");
+    $("pText").value = ""; load();
+  } catch (e) { App.toast("save failed: " + e.message, "bad"); }
+}
+async function load() {
+  const d = await App.api("/proxies?limit=2000");
+  App.S.proxies = d;
+  $("pCount").textContent = App.fmt(d.count) + " stored";
+  $("pStat").textContent = d.count ? "rotated per check" : "a run needs at least one";
+  const s = d.stats || {};
+  $("pStats").innerHTML = [
+    ["stored", App.fmt(s.count || 0)],
+    ["schemes", Object.entries(s.by_scheme || {}).map(([k, v]) => k + " " + v).join(", ") || "—"],
+    ["with auth", App.fmt(s.with_auth || 0)],
+    ["updated", s.updated ? new Date(s.updated * 1000).toLocaleString("en-GB") : "never"],
+  ].map(([k, v]) => `<span>${k}</span><b style="font-weight:400">${App.esc(v)}</b>`).join("");
+  const body = $("pTable");
+  body.innerHTML = d.proxies.length ? d.proxies.map((p) =>
+    `<tr><td style="font:11.5px/1 var(--mono)">${App.esc(mask(p))}</td>
+      <td class="num"><button class="btn sm ghost" data-p="${App.esc(p)}">remove</button></td></tr>`).join("")
+    : '<tr><td colspan="2" class="empty">none stored</td></tr>';
+  body.onclick = async (e) => {
+    const b = e.target.closest("button[data-p]"); if (!b) return;
+    await App.api("/proxies?proxy=" + encodeURIComponent(b.dataset.p), { method: "DELETE" });
+    App.toast("removed", "ok"); load();
+  };
+  const nav = $("navProx"); if (nav) nav.textContent = App.fmt(d.count);
+}
+const mask = (p) => String(p).replace(/(:\/\/[^:]*:)([^@]*)(@)/, "$1•••••$3");
+App.boot();
+</script>
+</body>
+</html>

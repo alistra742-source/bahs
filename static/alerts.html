@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Alerts</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll"><h2>Workspace</h2><nav class="menu" id="nav"></nav></div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Alerts</h1>
+      <div class="sep"></div>
+      <span class="sub" id="aSub">—</span>
+    </div>
+
+    <div class="grid two">
+      <div class="card">
+        <header><h3>Discord webhook</h3><div class="sep"></div>
+          <label class="tune" style="display:flex;align-items:center;gap:8px;padding:0;margin-left:auto">
+            <input type="checkbox" id="aOn"> <span>enabled</span></label></header>
+        <div class="body">
+          <label class="f"><span>webhook url</span>
+            <input type="text" id="aHook" placeholder="https://discord.com/api/webhooks/…"></label>
+          <label class="f"><span>message template</span>
+            <input type="text" id="aTpl" placeholder="{platform} username available: `{username}`"></label>
+          <div class="row" style="align-items:flex-end">
+            <label class="f" style="flex:1;min-width:130px;margin:0"><span>post as</span><input type="text" id="aUser" placeholder="bahs"></label>
+            <label class="f" style="flex:1;min-width:130px;margin:0"><span>ping</span><input type="text" id="aPing" placeholder="@here, &lt;@&amp;role&gt;"></label>
+          </div>
+          <div class="row" style="margin-top:14px">
+            <button class="btn primary" id="aSave">Save</button>
+            <button class="btn" id="aTest">Send test</button>
+          </div>
+          <div class="note" id="aNote" style="margin-top:12px"></div>
+        </div>
+      </div>
+      <div class="card">
+        <header><h3>Delivery</h3></header>
+        <div class="body">
+          <div class="kv" id="aStats"></div>
+          <p class="note" style="margin-top:14px">Sent straight from the server, never through your proxy list — a webhook URL
+            is a capability and whoever runs a proxy would get it too. A webhook is not a dependency: a run never waits on one,
+            and a failed post is counted, not retried into the run.</p>
+          <p class="note" style="margin-top:10px">Free names are digested into batches so a wide sweep cannot hammer the endpoint
+            into deleting the webhook. Placeholders: <code>{username}</code>, <code>{platform}</code>, <code>{detail}</code>.</p>
+          <p class="note" style="margin-top:10px">Only names the run reports as free are alerted. An unconfirmed free name is
+            still sent, and the message says so — an alert never presents a single exit's word as certain.</p>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+window.PAGE = {
+  name: "alerts", title: "Alerts",
+  async init() {
+    $("aSave").onclick = async () => {
+      const patch = {
+        enabled: $("aOn").checked, webhook: $("aHook").value.trim(),
+        template: $("aTpl").value.trim(), username: $("aUser").value.trim(),
+        ping: $("aPing").value.trim(),
+      };
+      try {
+        const r = await App.api("/settings", { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(patch) });
+        paint(r.alerts); App.toast("saved", "ok");
+      } catch (e) { App.toast("save failed: " + e.message, "bad"); }
+    };
+    $("aTest").onclick = async () => {
+      try {
+        const r = await App.api("/settings/test-webhook", { method: "POST" });
+        $("aNote").textContent = r.sent ? "test delivered" : "not delivered: " + (r.detail || r.error || "no webhook");
+        App.toast(r.sent ? "test sent" : "test failed", r.sent ? "ok" : "bad");
+      } catch (e) { App.toast("test failed: " + e.message, "bad"); }
+    };
+    load();
+  },
+};
+async function load() {
+  const d = await App.api("/settings");
+  paint(d.alerts);
+}
+function paint(a) {
+  if (!a) return;
+  $("aOn").checked = !!a.enabled;
+  $("aHook").value = a.webhook || "";
+  $("aTpl").value = a.template || "";
+  $("aUser").value = a.username || "";
+  $("aPing").value = a.ping || "";
+  $("aSub").textContent = a.enabled ? "armed" : "off";
+  $("aStats").innerHTML = [
+    ["enabled", a.enabled ? "yes" : "no"],
+    ["webhook set", a.webhook_set ? "yes" : "no"],
+    ["batch size", String(a.batch)],
+    ["min interval", a.min_interval + "s"],
+    ["max messages", String(a.max_messages)],
+  ].map(([k, v]) => `<span>${k}</span><b style="font-weight:400">${App.esc(v)}</b>`).join("");
+}
+App.boot();
+</script>
+</body>
+</html>

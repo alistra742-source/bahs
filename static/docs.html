@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs · Docs</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll"><h2>Workspace</h2><nav class="menu" id="nav"></nav></div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar"><h1 id="vTitle">Docs</h1><div class="sep"></div>
+      <span class="sub" id="dBuild">—</span></div>
+
+    <div class="grid two">
+      <div class="card">
+        <header><h3>A run outlives the tab</h3></header>
+        <div class="body">
+          <p class="note">The sweep used to <i>be</i> the HTTP response, so closing the tab, backgrounding the browser or
+            losing signal killed it. It does not any more.</p>
+          <div class="kv" style="margin-top:12px">
+            <span>started by</span><b style="font-weight:400">its own task on the server, not by your request</b>
+            <span>closing the tab</span><b style="font-weight:400">ends a reader, nothing else</b>
+            <span>coming back</span><b style="font-weight:400">index.html auto-reattaches, or press resume watching</b>
+            <span>ends when</span><b style="font-weight:400">you stop it, the named list runs out, or the pool dies to its last proxy</b>
+            <span>a dead pool</span><b style="font-weight:400">ends the run and reports the checks it never made</b>
+          </div>
+          <p class="note" style="margin-top:12px">A server restart or redeploy still ends an in-flight run: the runs live in
+            the process, deliberately. Only the proxy list and the alert settings are written to disk.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <header><h3>Two rates, always both</h3></header>
+        <div class="body">
+          <div class="kv">
+            <span>checks / s</span><b style="font-weight:400">requests the run completed — refusals included</b>
+            <span>verdicts / s</span><b style="font-weight:400">names actually resolved. This is the real speed.</b>
+            <span>answered</span><b style="font-weight:400">share of checks that produced a verdict</b>
+          </div>
+          <p class="note" style="margin-top:12px">A run that is 80% refused is fast on the first number and slow on the second.
+            Both are shown, side by side, so neither can be read alone — a single "per second" figure over a throttled run is
+            the oldest lie in this genre.</p>
+          <p class="note" style="margin-top:10px">Results are verdicts only: <b>available</b> and <b>taken</b>. Refusals, transport
+            errors and unreadable answers are counted as run health, because they say something about a proxy or a platform and
+            nothing at all about the name.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>A free name is agreed twice</h3></header>
+      <div class="body">
+        <p class="note">Free is the one verdict you act on, so it is the one worth a second look. When a check returns
+          <code>available</code>, the same name is asked again through the next proxy — on a rotating endpoint that is a
+          different exit — and only a second <code>available</code> marks it confirmed.</p>
+        <div class="kv" style="margin-top:12px">
+          <span>second read agrees</span><b style="font-weight:400">free, marked confirmed</b>
+          <span>second read says held</span><b style="font-weight:400">the name is reported taken and the correction is counted</b>
+          <span>second read cannot answer</span><b style="font-weight:400">free, but marked unconfirmed — never dressed up as certain</b>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>How each sniper is read</h3><div class="sep"></div>
+        <span class="note">a platform is only called free on its own explicit answer</span></header>
+      <div class="body"><div class="kv" id="howto"></div></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>Every endpoint</h3></header>
+      <div class="body"><div class="kv" id="eps"></div>
+        <p class="note" style="margin-top:12px">OpenAPI is at <a href="/openapi.json"><code>/openapi.json</code></a> (schema) and
+          <a href="/redoc"><code>/redoc</code></a>.</p></div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+window.PAGE = {
+  name: "docs", title: "Docs",
+  init() {
+    const i = App.S.info;
+    $("dBuild").textContent = "build " + i.build + " · " + i.platforms.length + " snipers";
+    $("howto").innerHTML = (i.checks || []).map((c) =>
+      `<span>${App.esc(c.platform)}</span><b style="font-weight:400">${App.esc(c.how)}</b>`).join("");
+    $("eps").innerHTML = Object.entries(i.endpoints || {}).map(([k, v]) =>
+      `<span>${App.esc(k)}</span><b style="font-weight:400">${App.esc(v)}</b>`).join("");
+  },
+};
+App.boot();
+</script>
+</body>
+</html>
