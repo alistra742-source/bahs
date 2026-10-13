@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import deque
@@ -19,6 +20,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from alerts import AlertSettings, Alerter
@@ -51,6 +53,7 @@ from config import (
     SNIPE_POOL_TTL,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_RETRIES,
+    STATS_PATH,
     STORE_PATH,
 )
 
@@ -135,6 +138,105 @@ def _record_hit(
         _HITS.pop(_HIT_ORDER.pop(0), None)
 
 
+class DailyStats:
+    """What the service has checked today, so the landing page can show it.
+
+    The landing page's stats strip used to be decoration: a number that was true
+    of nothing. These are the run's own counters, written when a run ends and
+    kept in a small file so a restart does not reset "today". The date is part of
+    the record, so a stale file rolls over to zero instead of reporting
+    yesterday's sweep as today's.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._data = {"date": "", "checks": 0, "verdicts": 0, "hits": 0, "refused": 0,
+                      "unanswered": 0, "errors": 0, "seconds": 0.0, "runs": 0}
+
+    @staticmethod
+    def _today() -> str:
+        return time.strftime("%Y-%m-%d")
+
+    def load(self) -> None:
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return
+        except (ValueError, OSError) as exc:
+            log.warning("could not read %s (%s); starting today's numbers at zero", self.path, exc)
+            return
+        if isinstance(data, dict) and data.get("date") == self._today():
+            for key in ("checks", "verdicts", "hits", "refused", "unanswered", "errors",
+                        "seconds", "runs"):
+                if isinstance(data.get(key), (int, float)):
+                    self._data[key] = data[key]
+            self._data["date"] = data["date"]
+
+    def save(self) -> None:
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        temp = f"{self.path}.tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(self._data, handle)
+        os.replace(temp, self.path)
+
+    def record(self, run: "RunHandle") -> None:
+        """Fold one finished run's counters in. Never called twice per run."""
+        tally = run.tally
+        if tally is None or getattr(run, "stats_recorded", False):
+            return
+        progress = tally.progress()
+        with self._lock:
+            self._roll()
+            self._data["checks"] += int(progress.get("checked") or 0)
+            self._data["verdicts"] += int(progress.get("answered") or 0)
+            self._data["hits"] += int(progress.get("available_count") or 0)
+            self._data["refused"] += int(progress.get("rate_limits") or 0)
+            self._data["unanswered"] += int(progress.get("unanswered") or 0)
+            self._data["errors"] += int(progress.get("error") or 0)
+            self._data["seconds"] += float(progress.get("elapsed_s") or 0.0)
+            self._data["runs"] += 1
+            run.stats_recorded = True
+        try:
+            self.save()
+        except OSError as exc:  # pragma: no cover - a read-only volume
+            log.warning("could not write %s (%s)", self.path, exc)
+
+    def _roll(self) -> None:
+        today = self._today()
+        if self._data.get("date") != today:
+            self._data = {"date": today, "checks": 0, "verdicts": 0, "hits": 0,
+                          "refused": 0, "unanswered": 0, "errors": 0,
+                          "seconds": 0.0, "runs": 0}
+            self._data["date"] = today
+
+    def snapshot(self, live_checks: int = 0, live_verdicts: int = 0, live_hits: int = 0) -> dict:
+        """Today's numbers with the runs in flight folded in, so the strip moves."""
+        with self._lock:
+            self._roll()
+            data = dict(self._data)
+        checks = data["checks"] + live_checks
+        verdicts = data["verdicts"] + live_verdicts
+        seconds = data["seconds"]
+        return {
+            "date": data["date"],
+            "checks": checks,
+            "verdicts": verdicts,
+            "hits": data["hits"] + live_hits,
+            "refused": data["refused"],
+            "unanswered": data["unanswered"],
+            "errors": data["errors"],
+            "runs": data["runs"],
+            "seconds": round(seconds, 1),
+            # Averaged over the runs' own wall clock, not over the service's
+            # uptime: an idle hour is not a slow hour.
+            "verdicts_per_second": round(verdicts / seconds, 1) if seconds > 0 else 0.0,
+            "checks_per_second": round(checks / seconds, 1) if seconds > 0 else 0.0,
+        }
+
+
 def _build_id() -> str:
     """The commit this process is running, so a live site can be told apart from
     a stale deploy or a cached page.
@@ -181,6 +283,9 @@ BUILD = _build_id()
 
 proxy_list = proxy_list_module.ProxyList(STORE_PATH)
 
+# Today's totals, for the landing page's stats strip.
+daily_stats = DailyStats(STATS_PATH)
+
 # Discord alerts. The environment is the base and the UI can override it, so
 # this is loaded at boot and saved only when someone changes something by hand.
 alert_settings = AlertSettings()
@@ -190,6 +295,7 @@ alert_settings = AlertSettings()
 async def lifespan(app: FastAPI):
     proxy_list.load()
     alert_settings.load()
+    daily_stats.load()
     log.info(
         "bahs up on :%d, %d stored proxies, nofile=%s",
         PORT,
@@ -230,7 +336,17 @@ def _page(name: str) -> FileResponse:
 # Each of these is one job, on its own page. Nothing is crammed together: the
 # console starts and watches a run, hits lists what was found, platforms carries
 # the grid, and so on -- the sidebar is the navigation, not a set of panels.
+#
+# `/` is the front door and `/console` is where the tool lives. The tool used to
+# be `/`, which meant the landing page had nowhere to be, and the console was
+# reached by guessing the root path. Both jobs are now their own page, and every
+# link in the app points at the console explicitly.
 @app.get("/", include_in_schema=False)
+def page_landing() -> FileResponse:
+    return _page("landing.html")
+
+
+@app.get("/console", include_in_schema=False)
 def page_console() -> FileResponse:
     return _page("console.html")
 
@@ -269,6 +385,27 @@ def page_docs() -> FileResponse:
     return _page("docs.html")
 
 
+# The landing page's furniture: section styles, one file per component, and the
+# platform marks. A single mount, because there is a file per component and a
+# route each would be a dozen lines of nothing. `app.css`/`app.js` stay explicit
+# above: they are the app, and they keep their no-cache header.
+app.mount("/ui", StaticFiles(directory=os.path.join(STATIC_DIR, "ui")), name="ui")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> FileResponse:
+    """Browsers ask for this on every single page load.
+
+    Without a route every page logged a 404 in the console, which made "zero
+    page errors" a claim the browser plainly contradicted. The mark is an SVG,
+    so one small file covers every size the tab, bookmark bar and home screen ask
+    for, and it is served for the .ico path as well because that is the path a
+    browser reaches for.
+    """
+    return FileResponse(os.path.join(STATIC_DIR, "ui", "favicon.svg"),
+                        media_type="image/svg+xml")
+
+
 @app.get("/app.css", include_in_schema=False)
 def asset_css() -> FileResponse:
     return FileResponse(os.path.join(STATIC_DIR, "app.css"), media_type="text/css", headers=_NO_CACHE)
@@ -287,6 +424,7 @@ def info() -> dict:
     return {
         "service": "bahs",
         "build": BUILD,
+        "console": "/console",
         "platforms": list(sniper.PLATFORMS),
         # One line per platform on how its verdict is reached: the Platforms page
         # shows them so nobody has to take a verdict on faith.
@@ -295,9 +433,18 @@ def info() -> dict:
         "honesty": {
             "results": "only available and taken are verdicts; refusals, errors and unreadable answers are health, not results",
             "rates": "checks_per_second counts requests completed, verdicts_per_second counts names resolved",
-            "free": "a free verdict is re-asked once on a different exit and reported confirmed or unconfirmed -- except on tiktok, where no second read can prove a handle is claimable, so a free name stays a lead: unconfirmed, and it says so",
+            "free": (
+                "a free verdict is re-asked once on a different exit and reported confirmed or "
+                "unconfirmed -- except on tiktok, where a page read cannot prove a handle is "
+                "claimable, so it stays a lead (unconfirmed, and it says so) unless "
+                "TIKTOK_SESSION_ID is set, in which case TikTok's own validator settles it and "
+                "the hit is confirmed"
+            ),
         },
         "alerts_enabled": bool(alert_settings.get().get("enabled")),
+        # Whether a free TikTok read can be settled by TikTok's own validator.
+        # The UI says which of the two honest answers it will get.
+        "tiktok_validator": bool(sniper.TIKTOK_SESSION_ID.strip()),
         # What the UI needs to show a running total for "every name of this
         # length" before anyone starts a run.
         "generation": {
@@ -312,7 +459,9 @@ def info() -> dict:
             "note": "limit omitted or 0 means every name of that length",
         },
         "endpoints": {
-            "GET /": "console - start and watch a run",
+            "GET /": "the landing page",
+            "GET /console": "the console - start and watch a run",
+            "GET /stats": "today's totals: checked, verdicts, hits, average rates",
             "GET /hits": "found names, newest first, with confirmation state",
             "GET /platforms": "the sniper grid and live per-platform counters",
             "GET /proxies": "the proxy list",
@@ -342,6 +491,34 @@ def info() -> dict:
             "POST /settings": "change the alert settings",
             "POST /settings/test-webhook": "post one test message to the webhook",
         },
+    }
+
+
+@app.get("/stats")
+def stats() -> dict:
+    """Today's totals, with whatever is running right now folded in.
+
+    The landing page's strip reads this. Everything in it is counted from real
+    runs: names actually checked, verdicts actually resolved, free names actually
+    found. A fresh install honestly reports zeroes rather than a flattering
+    placeholder.
+    """
+    live_checks = live_verdicts = live_hits = 0
+    for handle in _runs_status():
+        if not handle.get("active"):
+            continue
+        progress = handle.get("progress") or {}
+        live_checks += int(progress.get("checked") or 0)
+        live_verdicts += int(progress.get("answered") or 0)
+        live_hits += int(progress.get("available_count") or 0)
+    return {
+        "service": "bahs",
+        "build": BUILD,
+        "platforms": len(sniper.PLATFORMS),
+        "proxies": len(proxy_list),
+        "hits_remembered": len(_HITS),
+        "active_runs": sum(1 for h in _runs.values() if h.active),
+        **daily_stats.snapshot(live_checks, live_verdicts, live_hits),
     }
 
 
@@ -482,7 +659,7 @@ class RunHandle:
     __slots__ = (
         "id", "kind", "stop", "started", "finished", "checked", "task", "tally",
         "rows", "keep_rows", "note", "names", "platforms", "final",
-        "_lines", "_first", "_last", "_waiters",
+        "stats_recorded", "_lines", "_first", "_last", "_waiters",
     )
 
     def __init__(self, kind: str) -> None:
@@ -502,6 +679,9 @@ class RunHandle:
         self.names = 0
         self.platforms: list[str] = []
         self.final = False
+        # Set once this run's counters are folded into the day's totals, so a
+        # run that is reaped and re-read cannot be counted twice.
+        self.stats_recorded = False
         self._lines: deque[str] = deque(maxlen=self.BUFFER)
         self._first = 0   # index of the oldest line still held
         self._last = 0    # index one past the newest
@@ -645,6 +825,13 @@ async def _pump(run: RunHandle, lines: AsyncIterator[str]) -> None:
         log.warning("run %s ended on %s", run.id, type(exc).__name__, exc_info=True)
     finally:
         run.close()
+        # The run is done, whatever ended it, so today's totals can have its
+        # numbers. Done here rather than in a client's finally because a run
+        # outlives every reader it ever had.
+        try:
+            daily_stats.record(run)
+        except Exception:  # pragma: no cover - accounting must never kill a run
+            log.warning("could not record run %s in today's totals", run.id, exc_info=True)
 
 
 def _detach(run: RunHandle, lines: AsyncIterator[str]) -> None:
@@ -670,9 +857,23 @@ def _stop_runs(kind: str | None = None, run_id: str | None = None) -> list[str]:
     return stopped
 
 
+@app.get("/runs")
+def runs_status() -> dict:
+    """Every tracked run, active or just finished.
+
+    Newest first. The dict is in insertion order, which is oldest first, and the
+    console reads ``runs[0]`` as "the last run" -- so it was showing the oldest
+    run still in memory (up to RUN_TTL old) as the one that had just finished.
+    """
+    runs = _runs_status()
+    return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS,
+            "hits_count": len(_HITS)}
+
+
 def _runs_status() -> list[dict]:
     _reap_runs()
-    return [handle.status() for handle in _runs.values()]
+    return sorted((handle.status() for handle in _runs.values()),
+                  key=lambda r: r["started"], reverse=True)
 
 
 @app.get("/hits")
@@ -709,14 +910,6 @@ def clear_hits() -> dict:
     _HITS.clear()
     _HIT_ORDER.clear()
     return {"cleared": removed}
-
-
-@app.get("/runs")
-def runs_status() -> dict:
-    """Every tracked run, active or just finished."""
-    runs = _runs_status()
-    return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS,
-            "hits_count": len(_HITS)}
 
 
 @app.post("/runs/stop")
@@ -1077,6 +1270,21 @@ class _Tally:
             # every tick means a tab that attaches mid-run can see the throttle
             # being handled instead of just a stalled counter.
             "platforms_paced": _pace_snapshot(self.pool),
+            # Platforms sat out entirely right now, with how long is left and
+            # why. The sniper grid colours a cell from this, so a throttled
+            # platform looks throttled instead of merely quiet.
+            "platforms_paused": self.pool.paused(),
+            # The pool's own numbers, streamed with the tick: the console's proxy
+            # KPI and the health panel both read them, and a run whose exits are
+            # dying should be able to say so while it is still running rather
+            # than only in the summary at the end.
+            "pool_size": len(self.pool),
+            "pool_alive": self.pool.alive(),
+            "pool_resting": self.pool.resting(),
+            "pool_retired": self.pool.retired(),
+            "pool_blocked": self.pool.blocked(),
+            "proxy_attempts": self.pool.attempts(),
+            "proxy_failures": self.pool.failures(),
             "confirmed_count": self.confirmed,
             "corrected_count": self.corrected,
             **_verdict_report(self.answered, self.checked),
@@ -1093,9 +1301,18 @@ class _Tally:
             "total_checks": self.total_checks,
             "progress": round(self.checked / self.total_checks, 4),
             "available_count": self.available,
+            # The per-status counters the console paints its KPI row and health
+            # panel from. They were only in progress(), so the final `done` line
+            # -- the one everybody reads -- reported taken 0, unanswered 0 and
+            # errors 0 no matter what the run had actually found.
+            "taken": self.taken,
+            "banned": self.banned,
+            "unanswered": self.unanswered,
+            "error": self.errors,
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
             "unattempted": self.unattempted,
+            "current_target": self.current,
             "elapsed_s": round(self.elapsed, 2),
             "checks_per_second": round(self.meter.average, 1),
             "verdicts_per_second": round(self.answer_meter.average, 1),

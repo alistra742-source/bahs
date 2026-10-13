@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>bahs · Docs</title>
+<link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -68,8 +69,26 @@
           <span>second read agrees</span><b style="font-weight:400">free, marked confirmed</b>
           <span>second read says held</span><b style="font-weight:400">the name is reported taken and the correction is counted</b>
           <span>second read cannot answer</span><b style="font-weight:400">free, but marked unconfirmed — never dressed up as certain</b>
-          <span>tiktok</span><b style="font-weight:400">free stays unconfirmed: its profile page answers the same code for a name nobody holds and one held by a banned or deactivated account, so no second read can prove a name is claimable</b>
+          <span>tiktok</span><b style="font-weight:400">free stays unconfirmed: its profile page answers the same code (10221) for a name nobody holds and one held by a banned or deactivated account, so no second read can prove a name is claimable</b>
+          <span>tiktok, with a validator</span><b style="font-weight:400">with <code>TIKTOK_SESSION_ID</code> set, the free read is handed to TikTok's own signup endpoint (<code>/api/uniqueid/check</code>): status 0 is a confirmed hit, 3249 means taken, 3250/3252/3254 mean the handle's shape is refused. Without it the endpoint answers an empty body, and the check stays a lead</b>
         </div>
+        <p class="note" style="margin-top:12px">That cookie is a credential for whatever account it came from: it is read from the environment
+          only, never stored in the settings file this service reads back, and never shown on a page.</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>The site and the tool</h3><div class="sep"></div>
+        <span class="note">one front door, one console</span></header>
+      <div class="body">
+        <div class="kv">
+          <span><a href="/">/</a></span><b style="font-weight:400">the landing page — the pitch, a live stats strip, and the console framed with today's real numbers</b>
+          <span><a href="/console">/console</a></span><b style="font-weight:400">the console itself — snipers, name spaces, the verdict feed, run health</b>
+          <span><a href="/stats">/stats</a></span><b style="font-weight:400">today's totals, counted from finished runs, with anything in flight folded in</b>
+        </div>
+        <p class="note" style="margin-top:12px">Nothing on the landing page is staged: its strip and its framed console read
+          <code>/stats</code>, <code>/info</code>, <code>/runs</code> and <code>/hits</code>. A fresh install shows zeroes and the
+          console's own empty feed, which is what the console shows.</p>
       </div>
     </div>
 
@@ -88,6 +107,12 @@
   </main>
 </div>
 <div class="toast" id="toast"></div>
+<!-- the component layer app.js renders through -->
+<script src="/ui/components/core.js"></script>
+<script src="/ui/components/kpi.js"></script>
+<script src="/ui/components/sniper-cell.js"></script>
+<script src="/ui/components/verdict-feed.js"></script>
+<script src="/ui/components/health-panel.js"></script>
 <script src="/app.js"></script>
 <script>
 "use strict";

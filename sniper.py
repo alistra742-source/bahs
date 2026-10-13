@@ -75,7 +75,13 @@ rather than assumed:
   free name from a held one, so a free TikTok read is a lead: it is never
   reported as confirmed, and the detail on the hit says why (``UNPROVABLE_FREE``).
   A non-empty ``statusMsg`` is the opposite -- TikTok declining the handle
-  outright -- and is reported as ``banned``.
+  outright -- and is reported as ``banned``. ``TIKTOK_SESSION_ID`` closes the
+  ambiguity the page leaves: a free read is then handed to TikTok's validator
+  (``GET /api/uniqueid/check/?aid=1233&unique_id=``, the call the signup page
+  makes, whose ``status_code`` is 0 for claimable, 3249 for held and 3250/3252/
+  3254 for a name TikTok refuses on shape), and a name it clears is confirmed
+  rather than left as a lead. Without the session the endpoint answers an empty
+  body -- measured -- so the check stays honest and unconfirmed.
 """
 
 import asyncio
@@ -123,6 +129,7 @@ from config import (
     SSL_CONTEXT,
     TIKTOK_PAGE_FIRST,
     TIKTOK_PAGE_TIMEOUT,
+    TIKTOK_SESSION_ID,
 )
 
 # The control read a SignalGuard awaits: (outcome, note, exception), with the
@@ -178,6 +185,29 @@ TIKTOK_NO_PROFILE_DETAIL = (
 GUNS_DEFAULT_TITLE = "guns.lol: Everything you want, right here."
 GUNS_TITLE_RE = re.compile(r"^\s*@[^|]{1,64}\|\s*guns\.lol\s*$", re.I)
 TIKTOK_HANDLE_RE = re.compile(r"/@([A-Za-z0-9._]{1,40})")
+# TikTok's own validator. ``status_code`` is the whole answer: 0 means the handle
+# can be claimed, 3249 means it is held, and 3250/3252/3254 are its own refusals
+# of the *shape* of the name -- the same rules this module enforces locally, said
+# back in TikTok's words. Any other code is left unanswered: a validator that
+# changed its vocabulary is not evidence about a name.
+TIKTOK_CHECK = "https://www.tiktok.com/api/uniqueid/check/"
+TIKTOK_CLAIMABLE_CODE = 0
+TIKTOK_HELD_CODE = 3249
+TIKTOK_SHAPE_CODES = {
+    3250: "only letters, numbers, underscores or periods are allowed",
+    3252: "a handle can be up to 24 characters",
+    3254: "a handle cannot be all digits",
+}
+TIKTOK_EXACT_DETAIL = (
+    "TikTok's own validator says the handle can be claimed (status_code 0)"
+)
+TIKTOK_EXACT_CONFIRMED = (
+    "TikTok's own validator answers for this name, not an inference from its pages"
+)
+TIKTOK_EXACT_FAILED = (
+    "the validator could not settle it, so this is still a lead"
+)
+TIKTOK_HELD_DETAIL = "TikTok's own validator says the handle is not available"
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
 # A live profile embeds its own Schema.org block; a free name renders the site's
@@ -1530,6 +1560,81 @@ async def _tiktok_oembed(
     return SnipeResult(username, "tiktok", "error", f"status {resp.status_code}")
 
 
+async def _tiktok_validate(
+    client: httpx.AsyncClient, username: str, handle: str
+) -> SnipeResult | None:
+    """Ask TikTok itself whether a handle can be claimed, or None if it cannot say.
+
+    This is the signup page's own endpoint, so its answer is the decision the user
+    will meet when they try to take the name -- which is exactly what the profile
+    page cannot express. It is 45 bytes of JSON against the page's ~180 KB, and it
+    is only asked when ``TIKTOK_SESSION_ID`` is set, because without a session
+    cookie it answers an empty body.
+
+    ``None`` means the validator had nothing to say: no session, a body without a
+    status code, a transport failure, a refusal, an unrecognised code. The caller
+    keeps the page's free read in that case, so a validator that is logged out or
+    throttled costs certainty but never a verdict. A refusal is deliberately not
+    charged to the proxy either -- the page read on the same exit had just worked,
+    so blaming the exit for it would retire a healthy host.
+    """
+    session = TIKTOK_SESSION_ID.strip()
+    if not session:
+        return None
+    headers = {
+        "User-Agent": TIKTOK_IPHONE_UA,
+        "Accept": "application/json, text/plain, */*",
+        "Referer": TIKTOK_PROFILE.format(handle=handle),
+    }
+    try:
+        resp = await client.get(
+            TIKTOK_CHECK,
+            params={"aid": "1233", "unique_id": handle},
+            headers=headers,
+            cookies={"sessionid": session},
+        )
+    except Exception:
+        return None
+
+    body = _json_or_none(resp)
+    if not isinstance(body, dict):
+        return None
+    code = body.get("status_code", body.get("statusCode"))
+    if isinstance(code, str) and code.strip().isdigit():
+        code = int(code.strip())
+    if not isinstance(code, int):
+        # An empty ``{}`` is what this endpoint answers without a usable session:
+        # a validator that is not logged in, which says nothing about the name.
+        return None
+
+    if code == TIKTOK_CLAIMABLE_CODE:
+        return SnipeResult(username, "tiktok", "available", TIKTOK_EXACT_DETAIL, confirmed=True)
+    if code == TIKTOK_HELD_CODE:
+        return SnipeResult(username, "tiktok", "taken", TIKTOK_HELD_DETAIL)
+    if code in TIKTOK_SHAPE_CODES:
+        return SnipeResult(username, "tiktok", "invalid", f"tiktok says {TIKTOK_SHAPE_CODES[code]}")
+    return None
+
+
+async def _tiktok_settle(
+    client: httpx.AsyncClient, username: str, handle: str, lead: SnipeResult
+) -> SnipeResult:
+    """Settle a free read from the profile page with TikTok's validator, if there is one.
+
+    The page's finding is kept in front of the validator's, because the page is
+    where the name was found and the two together are the whole story: no live
+    profile *and* TikTok says it can be claimed.
+    """
+    if not TIKTOK_SESSION_ID.strip():
+        return lead
+    exact = await _tiktok_validate(client, username, handle)
+    if exact is None:
+        lead.detail = (lead.detail + "; " + TIKTOK_EXACT_FAILED).strip("; ")
+        return lead
+    exact.detail = lead.detail.split(";")[0].strip() + "; " + exact.detail
+    return exact
+
+
 async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
     """The profile page leads; the embed is the cheap fallback, not the base.
 
@@ -1546,6 +1651,13 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
     so ``@Nike`` answers 400 with the same body a free name gets, while the page
     resolves any case to the account that holds it.
 
+    A free read from the page is a *lead*, not a verdict: the code it answers
+    (10221) covers a name nobody has ever held and one held by a banned or
+    deactivated account alike. ``_tiktok_settle`` hands that lead to TikTok's own
+    validator when a session is configured, so the name is confirmed by the same
+    decision the signup page makes -- and left as an honest unconfirmed lead when
+    it is not.
+
     A 400 from the embed is never "available" on its own. Everything else -- a
     403, a 429, an HTML body, an empty one -- is a block or an error.
     """
@@ -1553,6 +1665,8 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
 
     if TIKTOK_PAGE_FIRST:
         page = await _tiktok_profile(client, handle)
+        if page.status == "available":
+            return await _tiktok_settle(client, username, handle, page)
         if page.status in FINAL_STATUSES or page.status == "blocked":
             return page
 
@@ -1565,7 +1679,10 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
         # name, so this is unanswered rather than available, and the pool
         # retries it.
         return SnipeResult(username, "tiktok", "error", "oembed 400, page had no verdict")
-    return await _tiktok_profile(client, handle)
+    tail = await _tiktok_profile(client, handle)
+    if tail.status == "available":
+        return await _tiktok_settle(client, username, handle, tail)
+    return tail
 
 
 # --- Status-only checks -----------------------------------------------------
@@ -2205,7 +2322,7 @@ SIGNAL_GUARD = SignalGuard()
 CHECK_NOTES: dict[str, str] = {
     "discord": "username lookup endpoint; a taken/free answer, a validation error is never free",
     "instagram": "web_profile_info; an account returns data, an unknown name a 404",
-    "tiktok": "profile page with a mobile Safari agent; userInfo means the handle is held, a status object means no live profile -- which is not the same as claimable, so a free name there stays unconfirmed; oEmbed is only a fallback, a 400 is never a verdict, and an all-digit handle or one ending in a period cannot exist",
+    "tiktok": "profile page with a mobile Safari agent; userInfo means the handle is held, a status object means no live profile -- which is not the same as claimable, so a free name is a lead that stays unconfirmed unless TIKTOK_SESSION_ID is set, in which case TikTok's own validator (/api/uniqueid/check) settles it and the hit is confirmed; oEmbed is only a fallback, a 400 is never a verdict, and an all-digit handle or one ending in a period cannot exist",
     "x": "account lookup; a missing or suspended account reads free",
     "youtube": "channel handle page; the @handle resolves only when it is held",
     "facebook": "profile route read through a link-preview agent; a held name answers or redirects to its own spelling, a free one is redirected to the login wall -- and a control name is read first, because a throttled exit sends everything to the login wall",
@@ -2392,6 +2509,8 @@ class PlatformPacer:
 # TikTok's own endpoint for the real question, ``/api/uniqueid/check/`` -- the
 # one the signup page calls -- returns an empty body without a session, and the
 # logged-in one (``/passport/web/login_name/check/``) answers "no permission".
+# With a session configured the validator answers it outright, and a name it
+# clears is confirmed before it ever reaches this pass (``_tiktok_settle``).
 UNPROVABLE_FREE: dict[str, str] = {
     "tiktok": "a second exit agreed, but only the app can say if it can be claimed",
 }
@@ -2401,9 +2520,11 @@ def confirm_check(result: SnipeResult) -> bool:
     """Should an `available` from this check be re-asked before it is reported?
 
     Off entirely by SNIPE_CONFIRM_FREE. A result the checker itself flagged as
-    unreadable is never a free name, so it is never confirmed either.
+    unreadable is never a free name, so it is never confirmed either, and a free
+    name the platform's own validator has already settled (``result.confirmed``)
+    is not re-asked: a second read can only agree or cost a request.
     """
-    return SNIPE_CONFIRM_FREE and result.status == "available"
+    return SNIPE_CONFIRM_FREE and result.status == "available" and not result.confirmed
 
 
 async def confirm_available(
@@ -2436,6 +2557,13 @@ async def confirm_available(
         return first
     second.proxy = second_proxy
     if second.status == "available":
+        if second.confirmed:
+            # The second read settled the name with the platform's own validator
+            # (see _tiktok_settle). That is the evidence a second read normally
+            # only approximates, and it is what turns a lead into a hit.
+            first.confirmed = True
+            first.detail = (first.detail.split(";")[0].strip() + "; " + TIKTOK_EXACT_CONFIRMED)
+            return first
         if platform in UNPROVABLE_FREE:
             # Agreement here is a second sample of the same answer, and the
             # answer is not the one the user acts on. Reporting it as confirmed

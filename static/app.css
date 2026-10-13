@@ -1,17 +1,23 @@
-/* bahs — graphite + copper. Deliberately not the purple-neon every other
-   sniper dashboard wears: the accent is warm, the surfaces are neutral grey,
-   and colour is spent only where it carries meaning (a free name, a refusal). */
+/* bahs — graphite + copper. Deliberately not the purple-neon every other sniper
+   dashboard wears: the accent is warm, the surfaces are neutral grey, and colour
+   is spent only where it carries meaning (a free name, a refusal, a throttled
+   platform). No gradients anywhere; the only glow in the product is under the
+   primary button. */
 :root{
-  --bg:#0c0d0e; --side:#111213; --panel:#15171a; --raise:#1a1d20;
-  --line:#232629; --line2:#2e3236;
-  --ink:#e4e6e8; --dim:#8b9199; --dim2:#5f666d;
-  --accent:#d98f3f;          /* the brand */
-  --free:#e2a95c;            /* a name you can take */
-  --free-soft:rgba(226,169,92,.12);
-  --taken:#79818a;           /* a name somebody holds */
-  --bad:#d2605f; --warn:#c9a227; --pace:#7fa7c9; --hunt:#a08bd6;
-  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
-  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  --bg:#0a0a0b; --side:#0d0d0f; --panel:#121214; --raise:#17171a;
+  --line:#1f1f23; --line2:#2a2a2f;
+  --ink:#e8e8ea; --dim:#8a8a92; --dim2:#5c5c63;
+  --accent:#c97a45;          /* the brand — used sparingly */
+  --free:#c97a45;            /* a name you can take */
+  --free-soft:rgba(201,122,69,.1);
+  --taken:#6f6f78;           /* a name somebody holds */
+  --ok:#4a7c59;              /* muted: health, not confetti */
+  --ok-ink:#6d9b7d;
+  --bad:#8a3a3a;             /* muted refusal */
+  --bad-ink:#b06a63;
+  --warn:#a8863f; --pace:#7f96a8; --paused:#a8735f;
+  --mono:'JetBrains Mono','Geist Mono',ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:'Inter','Geist',-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -19,7 +25,7 @@ body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 var(--sans);
   -webkit-font-smoothing:antialiased;overflow-x:hidden}
 button,input,select,textarea{font:inherit;color:inherit}
 a{color:inherit;text-decoration:none}
-::selection{background:#33302b}
+::selection{background:#2a2118}
 .wrap{display:flex;min-height:100vh}
 
 /* ---- sidebar ---------------------------------------------------------- */
@@ -35,7 +41,7 @@ a{color:inherit;text-decoration:none}
   font:600 10px/1 var(--sans);letter-spacing:.1em;text-transform:uppercase}
 .side h2 button:hover{color:var(--ink)}
 nav.menu{display:flex;flex-direction:column;padding:0 8px;gap:1px}
-nav.menu a{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:5px;
+nav.menu a{display:flex;align-items:center;gap:9px;padding:6px 8px;border-radius:6px;
   color:var(--dim);font-size:12.5px;border:1px solid transparent}
 nav.menu a:hover{background:#181a1c;color:var(--ink)}
 nav.menu a.on{background:#1a1c1e;border-color:var(--line);color:var(--ink)}
@@ -58,7 +64,7 @@ main{flex:1;min-width:0;padding:0 22px 70px}
 .grid{display:grid;gap:14px}
 .grid.two{grid-template-columns:repeat(auto-fit,minmax(min(330px,100%),1fr))}
 .grid.four{grid-template-columns:repeat(auto-fit,minmax(min(150px,100%),1fr))}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:6px}
 .card>header{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}
 .card>header h3{margin:0;font:600 12px/1 var(--sans);letter-spacing:.02em;white-space:nowrap}
 .card>header .right{margin-left:auto;display:flex;align-items:center;gap:8px}
@@ -109,13 +115,15 @@ code{font:11.5px/1 var(--mono);background:#1b1e21;padding:2px 5px;border-radius:
 
 /* ---- kpis ------------------------------------------------------------- */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(140px,100%),1fr));gap:10px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:11px 13px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 13px}
 .kpi span{display:block;font:600 9.5px/1 var(--sans);letter-spacing:.14em;text-transform:uppercase;
-  color:var(--dim2);margin-bottom:7px}
-.kpi b{font:600 21px/1 var(--mono);letter-spacing:-.02em}
+  color:var(--dim);margin-bottom:7px}
+.kpi b{font:600 21px/1 var(--mono);letter-spacing:-.02em;color:var(--ink);font-variant-numeric:tabular-nums}
 .kpi small{display:block;margin-top:5px;font:10.5px/1.4 var(--mono);color:var(--dim2)}
 .kpi.free b{color:var(--free)} .kpi.taken b{color:var(--taken)}
-.kpi.warn b{color:var(--warn)} .kpi.bad b{color:var(--bad)} .kpi.pace b{color:var(--pace)}
+/* State colours on the number itself, lifted just enough to stay readable on
+   near-black: a refusal has to be legible before it can be muted. */
+.kpi.warn b{color:var(--warn)} .kpi.bad b{color:var(--bad-ink)} .kpi.pace b{color:var(--pace)}
 .bar{height:3px;background:#1c1f22;border-radius:2px;overflow:hidden;margin-top:12px}
 .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .25s}
 
@@ -128,6 +136,8 @@ th{position:sticky;top:0;background:var(--panel);font:600 9.5px/1 var(--sans);le
 td.num{font:11.5px/1 var(--mono);text-align:right}
 tr:hover td{background:#181a1d}
 .feed{font:11.5px/1.5 var(--mono);max-height:330px;overflow:auto}
+.feed .available{border-left:2px solid var(--accent);padding-left:7px}
+.feed .taken{border-left:2px solid transparent;padding-left:7px}
 .feed div{display:flex;gap:9px;padding:3px 0;border-bottom:1px solid #1b1e21}
 .feed .t{color:var(--dim2);flex:0 0 62px}
 .feed .u{color:var(--ink)}
@@ -143,13 +153,13 @@ tr:hover td{background:#181a1d}
 .tag.ok{border-color:#4a3a24;color:var(--free);background:var(--free-soft)}
 .tag.bad{border-color:#4a2b2b;color:#e79a9a}
 .chips{display:flex;gap:5px;flex-wrap:wrap}
-.chips button{background:#131518;border:1px solid var(--line);border-radius:99px;padding:4px 10px;
+.chips button{background:#131518;border:1px solid var(--line);border-radius:6px;padding:4px 10px;
   cursor:pointer;font:11px/1 var(--sans);color:var(--dim)}
 .chips button.on{background:#1d1a15;border-color:#4a3a24;color:var(--accent)}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font:11.5px/1.7 var(--mono)}
 .kv span{color:var(--dim2)}
-.pace{display:flex;flex-wrap:wrap;gap:6px}
-.pace b{font:11px/1 var(--mono);color:var(--pace);border:1px solid #26323c;background:#121a20;
+.pacer{display:flex;flex-wrap:wrap;gap:6px}
+.pacer b{font:11px/1 var(--mono);color:var(--pace);border:1px solid #26323c;background:#121a20;
   border-radius:5px;padding:4px 8px}
 .toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:60}
 .toast div{background:#1b1e21;border:1px solid var(--line2);border-left:2px solid var(--accent);
@@ -198,4 +208,57 @@ tr:hover td{background:#181a1d}
   .chips{width:100%}
   .topbar h1{font-size:14px}
   .kpi b{font-size:16px}
+}
+
+/* ---- console: KPI row -------------------------------------------------- */
+/* Six numbers across the top, one flat strip divided by hairlines rather than
+   six floating cards: at a glance it reads as one instrument. Mono, tabular,
+   large -- these are the only numbers on the page big enough to see from a
+   step back, because they are the only ones that answer "is the run working". */
+.kpis.primary{grid-template-columns:repeat(6,minmax(0,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.kpis.primary .kpi{background:var(--panel);border:0;border-radius:0}
+.kpis.primary .kpi b{font:600 26px/1 var(--mono);letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.kpis.primary .kpi span{margin-bottom:9px}
+.kpi .m{font:10px/1 var(--mono);color:var(--dim2);font-style:normal}
+
+/* A secondary row: the same counters, one size down, for the numbers that
+   describe the run rather than judge it. */
+.kpis.secondary .kpi b{font-size:17px;color:var(--ink)}
+
+/* ---- console: sniper grid --------------------------------------------- */
+/* One cell per platform. The mark on the left is the cell's whole state: grey
+   idle, green answering, blue asked slower on purpose, copper sat out by the
+   pacer, red refused. A throttled platform should look throttled, not quiet. */
+.cells{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(172px,100%),1fr));gap:6px}
+.cell{display:flex;align-items:center;gap:8px;background:#131316;border:1px solid var(--line);
+  border-radius:6px;padding:7px 9px;cursor:pointer;text-align:left;color:var(--dim);font-size:12px}
+.cell:hover{border-color:var(--line2);color:var(--ink)}
+.cell i{width:7px;height:7px;border-radius:2px;background:#2c2c31;flex:0 0 auto}
+.cell b{margin-left:auto;font:11px/1 var(--mono);color:var(--dim2);font-variant-numeric:tabular-nums}
+.cell.on{background:#191410;border-color:#3f2c1c;color:var(--ink)}
+.cell.on i{background:var(--accent)}
+.cell.healthy i{background:var(--ok)}
+.cell.paced i{background:var(--pace)}
+.cell.paused i{background:var(--paused)}
+.cell.blocked i{background:var(--bad)}
+.cell.on.healthy i,.cell.on.paced i,.cell.on.paused i,.cell.on.blocked i{outline:1px solid rgba(201,122,69,.35);outline-offset:1px}
+
+/* ---- console: run state in the top bar --------------------------------- */
+.runstate{border:1px solid var(--line);border-radius:6px;padding:6px 10px;background:var(--panel)}
+.runstate.live{border-color:#3f2c1c}
+.runstate.live .dot{background:var(--accent);box-shadow:0 0 0 3px rgba(201,122,69,.14)}
+.runstate.dead .dot{background:var(--bad)}
+.runstate .rid{font:11px/1 var(--mono);color:var(--dim2);border-left:1px solid var(--line);
+  padding-left:9px;margin-left:2px}
+.runstate .rid b{color:var(--dim);font-weight:400}
+
+@media(max-width:860px){
+  .kpis.primary{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .kpis.primary .kpi b{font-size:21px}
+}
+@media(max-width:560px){
+  .kpis.primary{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .kpis.primary .kpi b{font-size:20px}
+  .cells{grid-template-columns:repeat(auto-fill,minmax(min(140px,100%),1fr))}
 }

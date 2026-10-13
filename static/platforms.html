@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>bahs · Platforms</title>
+<link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
@@ -35,14 +36,14 @@
     <div class="card">
       <header><h3>Snipers</h3><div class="sep"></div>
         <span class="note">a sweep asks every selected sniper about every name</span></header>
-      <div class="body"><div class="pick" id="platList"></div></div>
+      <div class="body"><div class="cells" id="platList"></div></div>
     </div>
 
     <div class="card" style="margin-top:16px">
       <header><h3>Live per-sniper</h3><div class="sep"></div>
         <span class="note" id="paceNote">nothing running</span></header>
       <div class="body">
-        <div class="pace" id="paced" style="margin-bottom:14px"></div>
+        <div class="pacer" id="paced" style="margin-bottom:14px"></div>
         <div class="scroll"><table>
           <thead><tr><th>sniper</th><th>checked</th><th>available</th><th>taken</th><th>banned</th>
             <th>refused</th><th>errors</th><th>unreadable</th><th>in flight</th></tr></thead>
@@ -63,6 +64,12 @@
   </main>
 </div>
 <div class="toast" id="toast"></div>
+<!-- the component layer app.js renders through -->
+<script src="/ui/components/core.js"></script>
+<script src="/ui/components/kpi.js"></script>
+<script src="/ui/components/sniper-cell.js"></script>
+<script src="/ui/components/verdict-feed.js"></script>
+<script src="/ui/components/health-panel.js"></script>
 <script src="/app.js"></script>
 <script>
 "use strict";

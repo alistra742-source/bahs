@@ -132,6 +132,26 @@ TIKTOK_PAGE_FIRST: bool = _bool("TIKTOK_PAGE_FIRST", True)
 # a normal check; it is a ceiling, not a wait.
 TIKTOK_PAGE_TIMEOUT: float = _float("TIKTOK_PAGE_TIMEOUT", 15.0)
 
+# TikTok's own validator, ``GET /api/uniqueid/check/`` -- the endpoint the signup
+# page calls when you type a handle -- is the only source that answers the
+# question a free name actually raises: not "is there a live profile" but "can it
+# be claimed". The profile page gives one answer (10221) for a name nobody has
+# ever held and for one held by a banned or deactivated account, so a free read
+# from it is only ever a lead. This endpoint settles it, and it needs a logged-in
+# ``sessionid`` cookie: asked without one it returns an empty body (measured),
+# and the logged-in change-username route answers "no permission".
+#
+# Empty (the default) means the check keeps reporting free TikTok reads as
+# unconfirmed leads, which is honest and works everywhere. Set it and a free
+# name is settled by TikTok itself and reported confirmed.
+#
+# This is a credential for a real account: a sessionid is a bearer token, the
+# account it belongs to can be changed through it, and TikTok expires it on
+# logout or password change. It is read from the environment only -- never from
+# the settings file, which this service serves back over an unauthenticated API.
+# Treat it as a secret, and prefer a throwaway account.
+TIKTOK_SESSION_ID: str = _str("TIKTOK_SESSION_ID", "")
+
 # --- Alerts ----------------------------------------------------------------
 # A Discord webhook told which names came back free. Empty disables alerting.
 # The default template matches the one every tool in this space ships with.
@@ -139,6 +159,11 @@ TIKTOK_PAGE_TIMEOUT: float = _float("TIKTOK_PAGE_TIMEOUT", 15.0)
 # stays the base, so the service runs from Railway variables alone and this file
 # only ever holds what someone changed by hand.
 SETTINGS_PATH: str = _str("SETTINGS_PATH", "data/settings.json")
+# What today's runs actually did. The landing page shows a live strip -- names
+# checked today, hits found, the average verdict rate -- and those numbers have
+# to survive a restart and be the run's own, not a marketing figure. Written when
+# a run ends, reset when the date rolls over.
+STATS_PATH: str = _str("STATS_PATH", "data/stats.json")
 ALERT_WEBHOOK: str = _str("ALERT_WEBHOOK", "")
 ALERT_TEMPLATE: str = _str("ALERT_TEMPLATE", "{platform} username available: `{username}`")
 # Posted as the webhook's own name/avatar when set.

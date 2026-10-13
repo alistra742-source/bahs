@@ -216,6 +216,25 @@ a rotating endpoint that is a different exit:
 One platform is exempt from the first row: on **tiktok** an agreeing second read
 is a second sample of the same answer, not proof the handle can be claimed, so a
 free name there stays unconfirmed and says why (`UNPROVABLE_FREE` in `sniper.py`).
+Measured: 25 of 25 never-existed names come back with the same status code
+(`10221`, the one TikTok's own web bundle maps to `USER_BAN`) as a handle held by
+a banned or deactivated account, so the profile page cannot tell a free name from
+an occupied one.
+
+**TikTok's own validator closes that hole, if you want it closed.** The signup page
+asks `GET /api/uniqueid/check/?aid=1233&unique_id=<name>` and reads `status_code`:
+`0` claimable, `3249` held, `3250`/`3252`/`3254` refused by shape. Point
+`TIKTOK_SESSION_ID` at a logged-in account's `sessionid` cookie and a free TikTok
+read is settled by that call instead of staying a lead: a name it clears is
+reported **confirmed**, and one it says is held is reported `taken` even though the
+profile page called it free. Without the variable the check is unchanged — the
+endpoint answers an empty body to an unauthenticated request.
+
+Treat that cookie as what it is: a bearer token for the account it came from, which
+can be changed through it. It is read from the environment only, never from the
+settings file (this service serves that file back over an API with no
+authentication), and it is never logged or echoed on a page. Use a throwaway
+account.
 
 Exercised against a stubbed checker that says free and then taken: the run reports
 `taken` with `corrected=True`. Turn it off with `SNIPE_CONFIRM_FREE=false`.
@@ -480,6 +499,8 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `PORT` | `8080` | |
 | `STORE_PATH` | `data/proxies.json` | point at a volume |
 | `SETTINGS_PATH` | `data/settings.json` | alert settings |
+| `STATS_PATH` | `data/stats.json` | today's totals, for the landing page |
+| `TIKTOK_SESSION_ID` | — | TikTok `sessionid` cookie, optional: settles a free TikTok name with TikTok's own validator. A credential for a real account — see below |
 | `GITHUB_TOKEN` | — | raises GitHub from 60/hr to 5,000 |
 | `ALERT_WEBHOOK` | — | Discord webhook |
 | `ALERT_TEMPLATE` | `{platform} username available: `{username}`` | |
@@ -522,18 +543,28 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 
 ## The pages
 
-Seven pages, one job each — the sidebar is navigation, not a set of panels stacked
+Eight pages, one job each — the sidebar is navigation, not a set of panels stacked
 onto one screen.
 
 | page | what it is for |
 | --- | --- |
-| `/` | the console: pick snipers and name spaces, start, and watch the verdict feed |
+| `/` | the landing page: the pitch, a live stats strip, and the console framed with today's real numbers |
+| `/console` | the console: pick snipers and name spaces, start, and watch the verdict feed |
 | `/hits/` | every free name found, its confirmation state, a claim link, CSV export |
 | `/platforms` | the sniper grid, live per-sniper counters, and how each one is read |
 | `/proxies/` | the proxy list |
 | `/alerts` | the Discord webhook |
 | `/settings/` | browser preferences, server facts, and what the site will not do |
 | `/docs` | how a verdict is reached, the run lifecycle, every endpoint |
+
+`/` is the front door and `/console` is the tool. The console used to be `/`,
+which left the landing page nowhere to be and made the root path a guess.
+
+**The landing page shows nothing staged.** Its stats strip and its framed console
+are rendered from `/stats`, `/info`, `/runs` and `/hits` — names checked today,
+verdicts resolved, free names found, the run in flight if there is one, and the
+hit list. A fresh install shows zeroes and the console's own empty feed, because
+that is what the console shows.
 
 **A trailing slash marks a page that shares a name with a JSON endpoint.** `/hits`,
 `/proxies` and `/settings` are APIs and always were, so their pages wear the slash;
@@ -547,7 +578,13 @@ meaning: a free name is the only warm thing on the screen, a taken one is grey, 
 a refusal is a muted red in the health panel. **The verdict feed shows verdicts** —
 `available` and `taken` — with everything else in the health panel next to it.
 
-- **Snipers**, one cell per platform, with the count of free names found on each.
+- **The KPI row** leads with six numbers: `checks / s`, `verdicts / s`, hits,
+  refusals, unanswered, and the proxy pool's own health. Units are in the label and
+  the sub-line says what each one counts, so no number can be read as its
+  neighbour. Everything that is not a verdict is under them, in run health.
+- **Snipers**, one cell per platform, with its live check count and its state:
+  idle, healthy, paced, paused (sat out — with the reason and the seconds left), or
+  blocked. A throttled platform looks throttled instead of merely quiet.
 - **Name spaces** multi-select across kind and length, with every cell's real size
   and a running total; a selection too large to build says so while you are still
   choosing, and offers the cap that turns it into a random sample.
@@ -559,11 +596,31 @@ someone guessing at a number.
 
 **What is verified, and how.** The pages are driven in a real headless Chromium:
 each one loads with **zero page errors**, every page renders all seven nav links,
-clicking each of the seven lands on the URL it claims, and the console renders 30
-sniper cells, 16 name-space cells and 10 KPI tiles rather than an empty shell. A
-run is then started from the UI, streams verdicts, and stops. At 390x844 the
-document has **0px of horizontal overflow**, the nav is a sideways-scrolling strip
-with all seven links tappable, and the sniper grid stays two columns.
+and each lands on the URL it claims. The landing page renders its hero, its live
+strip, 16 sniper cells, 16 platform marks and the framed console; `/console`
+renders 16 sniper cells, 6 primary KPI tiles, 5 secondary ones and the health
+panel. A sweep is then started **from the UI**: the cells take their state and
+counts, the two rates move, health fills in, a free name arrives in the feed with
+its confirmation tag, and the landing page's frame follows the same run while it is
+in flight. At 390x844 both pages have **0px of horizontal overflow**. The TikTok
+validator mapping is exercised against a stubbed client — `0`/`3249`/`3250`/`3252`/
+`3254`, an empty body, a refusal, an unknown code, and a second read that confirms —
+because the real endpoint needs a session this box does not have and must not
+have.
+
+Two bugs came out of that pass, and both were about the numbers **after** a run
+ends. The final `done` line is built from the run's summary, which carried
+`available_count` but not `taken`, `unanswered` or `error` — so the KPI row and the
+health panel zeroed themselves the instant the run stopped, which is the moment
+they are actually read; a sweep that found 16 taken names finished saying 0. And
+`/runs` returned its handles in insertion order, oldest first, while the console
+reads `runs[0]` as *the last run*: it was naming a run up to fifteen minutes old as
+the one that had just finished, with that run's numbers beside it. Both are fixed,
+and the check is now a comparison rather than a glance — a sweep is started from
+the UI and every number it paints afterwards is read back against `/runs` for that
+same run id. That is also why the framed console on the landing page no longer
+shows sixteen copper cells: nothing is selected with no run in flight, and the
+accent is spent on free names and the button that starts the work.
 
 That check exists because a per-file syntax check cannot see the class of bug it
 found: `app.js` declared `const $` at global scope and every page's inline script
@@ -581,6 +638,7 @@ sniper.py      the proxy pool, the scheduler, and the 30 per-platform checkers
 generator.py   buckets, and the random draw over a space
 proxies.py     parsing and storing the proxy list
 alerts.py      the Discord webhook
-static/        the seven pages, app.css and app.js (no build step)
+static/        the pages, app.css and app.js (no build step)
+static/ui/     the landing page: components/ (one file each), landing.css, fonts/, logos/
 wordlists/     og.txt
 ```

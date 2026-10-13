@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs — sixteen platforms, one sweep</title>
+<link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
+<meta name="description" content="Proxy-rotated username availability checks across sixteen platforms. Confirmed hits, live console, no sampling.">
+<meta name="theme-color" content="#0a0a0b">
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/ui/fonts.css">
+<link rel="stylesheet" href="/ui/landing.css">
+</head>
+<body class="landing">
+<header class="site-head" id="head"></header>
+<main id="main"></main>
+<div id="foot"></div>
+
+<!-- One file per component. Classic scripts, each wrapped, so any one of them can
+     be loaded (or removed) on its own and a duplicate top-level name cannot take
+     the whole page down. -->
+<script src="/ui/components/core.js"></script>
+<script src="/ui/components/kpi.js"></script>
+<script src="/ui/components/sniper-cell.js"></script>
+<script src="/ui/components/verdict-feed.js"></script>
+<script src="/ui/components/health-panel.js"></script>
+<script src="/ui/components/hero.js"></script>
+<script src="/ui/components/stats-strip.js"></script>
+<script src="/ui/components/console-preview.js"></script>
+<script src="/ui/components/feature-card.js"></script>
+<script src="/ui/components/platform-strip.js"></script>
+<script src="/ui/components/how-it-works.js"></script>
+<script src="/ui/components/pricing-card.js"></script>
+<script src="/ui/components/site-footer.js"></script>
+<script src="/ui/landing.js"></script>
+</body>
+</html>

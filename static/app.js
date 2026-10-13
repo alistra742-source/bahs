@@ -61,7 +61,8 @@ async function api(path, opts) {
 const NAV = [
   // A trailing slash marks the pages that share a name with a JSON endpoint:
   // /hits, /proxies and /settings are APIs, /hits/ and friends are the pages.
-  ["/", "console", "Console"],
+  // The console lives at /console since the landing page took /.
+  ["/console", "console", "Console"],
   ["/hits/", "hits", "Hits"],
   ["/platforms", "platforms", "Platforms"],
   ["/proxies/", "proxies", "Proxies"],
@@ -99,16 +100,25 @@ function persist() {
   localStorage.setItem("bahs.filter", S.filter);
 }
 
-function renderPlats(pace) {
+/* The grid is the shared SniperCell component rather than markup written here,
+   so a cell means the same thing on the console, on the Platforms page and in
+   the preview on the landing page. The state is what carries the meaning: idle,
+   healthy, paced, paused, blocked. */
+/* `progress` is passed in rather than read off S.status: the tick that arrives
+   on the stream is newer than the last /runs poll, and reading the polled copy
+   left every cell at "idle" for eight seconds while names were plainly being
+   resolved. */
+function renderPlats(pace, paused, progress) {
   const el = $("platList");
   if (!el) return;
-  const by = pace || (S.status && S.status.progress && S.status.progress.platforms_paced) || {};
-  el.innerHTML = (S.info.platforms || []).map((p) => {
-    const cap = by[p];
-    const note = cap ? `<small>${cap.parallel}/${cap.ceiling}</small>` : "";
-    return `<button data-p="${esc(p)}" class="${S.plats.has(p) ? "on" : ""}${cap ? " paced" : ""}">
-      <i></i>${esc(p)}${note}</button>`;
-  }).join("");
+  const p = progress || (S.status && S.status.progress) || {};
+  el.innerHTML = UI.cellMarkup({
+    platforms: S.info.platforms || [],
+    selected: S.plats,
+    byPlatform: p.by_platform || {},
+    paced: pace || p.platforms_paced || {},
+    paused: paused || p.platforms_paused || {},
+  });
   el.onclick = (e) => {
     const b = e.target.closest("button");
     if (!b) return;
@@ -199,20 +209,27 @@ function paintRun(st) {
   const line = $("runLine"), span = line && line.querySelector("span");
   const stop = $("stopBtn");
   if (!line) return;
+  const side = $("sideRun") && $("sideRun").querySelector("span");
   line.classList.toggle("live", !!(st && st.active));
+  line.classList.toggle("dead", !!st && !st.active && !!st.stopped);
+  let text, id;
   if (st && st.active) {
-    span.textContent = `${st.kind} run · ${fmt(st.checked)} checks`;
+    text = `${st.kind} run · ${fmt(st.checked)} checks`;
+    id = `run ${st.id}`;
     stop.disabled = false;
-    if (span) { /* keep */ }
-    const note = $("runNoteGlobal");
-    if (note) note.textContent = `run ${st.id}`;
   } else if (st) {
-    span.textContent = `last ${st.kind} run · ${fmt(st.checked)} checks`;
+    text = `last ${st.kind} run · ${fmt(st.checked)} checks`;
+    id = `run ${st.id}`;
     stop.disabled = true;
   } else {
-    span.textContent = "idle";
+    text = "idle";
+    id = "—";
     stop.disabled = true;
   }
+  span.textContent = text;
+  if (side) side.textContent = text;
+  const note = $("runNoteGlobal");
+  if (note) note.textContent = id;
 }
 
 async function pumpRun() {
@@ -248,44 +265,31 @@ async function stopRun() {
 /* ---- stream handling ------------------------------------------------- */
 function applyProgress(p) {
   if (!p) return;
-  K.set("aAvail", fmt(p.available_count), "free");
-  K.set("aTaken", fmt(p.taken || (p.by_status && p.by_status.taken) || 0), "taken");
-  K.set("aVps", (p.verdicts_per_second != null ? p.verdicts_per_second : "—"), "pace");
-  K.set("aCps", (p.checks_per_second != null ? p.checks_per_second : "—"));
-  K.set("aAns", pct(p.answer_rate));
-  K.set("aProg", pct(p.progress));
-  K.set("aElapsed", clock(p.elapsed_s));
-  K.set("aCalls", fmt(p.checked));
-  K.set("aTotal", fmt(p.total_checks));
-  K.set("aBlocked", fmt(p.rate_limits));
-  K.set("aErrors", fmt(p.error || 0), "bad");
-  K.set("aUnans", fmt(p.unanswered || 0));
-  K.set("aConfirmed", fmt(p.confirmed_count || 0));
-  K.set("aCorrected", fmt(p.corrected_count || 0));
+  /* The six numbers that answer "is the run working", from the same component
+     the landing page's preview uses. Re-rendered per tick rather than patched by
+     id: it is nine small elements, and one definition of each number is worth
+     more than the diffing. */
+  if ($("kpiRow")) $("kpiRow").innerHTML = UI.kpiRow(UI.runKpis(p, p), "primary");
+  if ($("kpiRow2")) $("kpiRow2").innerHTML = UI.kpiRow([
+    { label: "taken", value: fmt(p.taken || 0), sub: "held by a live account" },
+    { label: "answered", value: pct(p.answer_rate),
+      sub: `${fmt(p.answered || 0)} of ${fmt(p.checked || 0)} checks` },
+    { label: "progress", value: pct(p.progress),
+      sub: `${fmt(p.checked || 0)} of ${fmt(p.total_checks || 0)}` },
+    { label: "elapsed", value: clock(p.elapsed_s), sub: "wall clock" },
+    { label: "errors", value: fmt(p.error || 0), tone: "bad", sub: "never arrived" },
+  ]);
+  if ($("health")) $("health").innerHTML = UI.healthPanel(UI.healthRows(p, p));
   const bar = $("bar");
   if (bar) bar.style.width = Math.min(100, (p.progress || 0) * 100) + "%";
-  const t = $("target");
-  if (t) t.textContent = p.current_target ? "asking " + p.current_target : "idle";
-  if (p.platforms_paced) renderPaced(p.platforms_paced);
-  if (S.info && S.info.platforms) renderPlats(p.platforms_paced);
+  renderPaced(p.platforms_paced, p.platforms_paused);
+  if (S.info && S.info.platforms) renderPlats(p.platforms_paced, p.platforms_paused, p);
 }
 
-const K = {
-  set(id, value) {
-    const el = $(id);
-    if (!el) return;
-    el.textContent = value;
-    if (arguments.length > 2) el.className = arguments[2];
-  },
-};
-
-function renderPaced(by) {
+function renderPaced(by, paused) {
   const el = $("paced");
   if (!el) return;
-  const rows = Object.entries(by || {});
-  el.innerHTML = rows.length
-    ? rows.map(([k, v]) => `<b>${esc(k)} · ${v.parallel} of ${v.ceiling} in flight</b>`).join("")
-    : '<span class="note">every sniper is at the run\'s full rate</span>';
+  el.innerHTML = UI.pacedChips(by, paused);
 }
 
 function feedLine(ev) {
@@ -306,11 +310,11 @@ function renderFeed() {
   const el = $("feed");
   if (!el) return;
   const rows = S.feed.filter((r) => S.filter === "all" || r.s === S.filter);
-  el.innerHTML = rows.length ? rows.map((r) => `
-    <div class="${r.s}"><span class="t">${r.t}</span>
-      <span class="u">${esc(r.u)}${r.s === "available" && r.c === false ? '<span class="tag">unconfirmed</span>' : ""}</span>
-      <span class="p">${esc(r.p)}</span></div>`).join("")
-    : '<div class="empty">nothing yet — a run puts its verdicts here, free ones first</div>';
+  // One shape for the feed and the hit store, so the shared VerdictFeed can
+  // render either. `c` is the confirmation state: true, false, or unknown.
+  el.innerHTML = UI.verdictFeed(rows.map((r) => ({
+    t: r.t, username: r.u, platform: r.p, status: r.s, confirmed: r.c,
+  })) || []);
 }
 
 function beep() {
@@ -455,6 +459,12 @@ async function boot() {
   } catch (e) { S.menu = []; }
   restore();
   if ($("build")) $("build").textContent = S.info.build;
+  const brand = document.querySelector(".brand");
+  if (brand) {
+    brand.style.cursor = "pointer";
+    brand.title = "back to the landing page";
+    brand.onclick = () => { location.href = "/"; };
+  }
   document.title = "bahs · " + page.title;
   if ($("vTitle")) $("vTitle").textContent = page.title;
   renderNav(page.name);
