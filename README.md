@@ -1,6 +1,6 @@
 # bahs
 
-Username availability across twenty platforms, over your own proxy list.
+Username availability across sixteen platforms, over your own proxy list.
 
 Paste or upload a proxy list, pick the name spaces you want swept, and it checks
 **every** name in them — nothing is sampled. Results stream to the dashboard as
@@ -34,98 +34,69 @@ the page itself is served `no-cache`, so it has to revalidate.
 
 | platform | how the check works | latency from a datacenter IP |
 |---|---|---|
-| **roblox** | its own signup validator — a ~50 byte JSON body whose `code` *is* the verdict | ~130 ms |
-| **minecraft** | `minecraftservices` profile lookup; 200 carries the account, 404 means free | ~290 ms |
-| **github** | `api.github.com/users/{name}` — 200 taken, 404 free | ~130 ms |
-| **telegram** | `t.me/{name}`; a live handle renders `tgme_page_title`, a free one the generic page | ~450 ms |
-| **discord** | `unique-username/username-attempt-unauthed` | ~140 ms |
+| **discord** | its own `unique-username/username-attempt-unauthed` endpoint — a JSON `taken` flag, and a validation 400 that is never read as free | ~140 ms |
 | **instagram** | `web_profile_info` with the web app id | refused from most datacenter IPs |
-| **tiktok** | oEmbed (lower-cased handle) for a public live handle, the profile page for the names oEmbed refuses to embed | ~300 ms, ~1 s when the page confirms |
+| **tiktok** | the profile page, asked with a mobile Safari agent, where its `user-detail` payload decides — with oEmbed only as a fallback, since a 400 from it is not a verdict | ~300 ms, ~1 s when the page confirms |
 | **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
 | **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
-| **guns.lol** | profile page, first 64 KB: Schema.org block or account payload taken, ban heading `banned`, claim offer free | ~860 ms |
-| **bluesky** | `resolveHandle` on `{name}.bsky.social` — a DID for a handle that exists, `InvalidRequest` (63 bytes) for one that does not | 42 vs 63 bytes |
-| **kick** | `api/v2/channels/{name}`, the same JSON its channel page loads — 200 the channel, 404 `Channel not found.` | — |
+| **facebook** | the page as its link-preview agent sees it: `og:title` present = held, a bare `<title>Facebook</title>` fallback = free. Head only — ~29 KB of a page that runs to 5 MB | — |
+| **reddit** | `reddit.com/user/{name}/` through the same agent: the profile's own `og:` metadata = held, the site's generic front page = free | — |
+| **telegram** | `t.me/{name}`; a live handle renders `tgme_page_title`, a free one the generic page | ~450 ms |
+| **github** | `api.github.com/users/{name}` — 200 taken, 404 free | ~130 ms |
+| **roblox** | its own signup validator — a ~50 byte JSON body whose `code` *is* the verdict | ~130 ms |
+| **minecraft** | `minecraftservices` profile lookup; 200 carries the account, 404 means free | ~290 ms |
 | **steam** | the vanity URL's own XML — `<steamID64>` for a live profile, `<error>` for a free one | 6.3 KB vs 144 bytes |
-| **soundcloud** | `soundcloud.com/{name}`, status only: 200 live, 404 unclaimed | — |
-| **dribbble** | profile path, status only | — |
-| **chess.com** | `pub/player/{name}` — 200 the player, 404 `{"code":0,"message":"not found"}` | 528 bytes |
-| **duolingo** | `2017-06-30/users?username=` — 12 bytes of `{"users":[]}` means free | — |
-| **wattpad** | `api/v3/users/{name}` — 200 the account, 400 `not found` for a free name | — |
-| **disqus** | profile path, status only | — |
-| **vk** | `vk.com/{name}`, status only | — |
-| **dockerhub** | `hub.docker.com/v2/users/{name}/` — 200 the account, 404 nothing | 384 bytes |
-| **codeberg** | Gitea's `api/v1/users/{name}` — 200 the account, 404 nothing | 764 bytes |
-| **mastodon** | `mastodon.social/api/v1/accounts/lookup?acct=` — 200 the account, 404 nothing | 2.1 KB |
-| **dev.to** | `api/users/by_username?url=` — 200 the user, 404 nothing | 521 bytes |
-| **lichess** | `lichess.org/api/user/{name}` — 200 the player, 404 nothing | 1.7 KB |
+| **kick** | `api/v2/channels/{name}`, the same JSON its channel page loads — 200 the channel, 404 `Channel not found.` | — |
+| **bluesky** | `resolveHandle` on `{name}.bsky.social` — a DID for a handle that exists, `InvalidRequest` (63 bytes) for one that does not | 42 vs 63 bytes |
+| **guns.lol** | profile page, first 64 KB: Schema.org block or account payload taken, ban heading `banned`, claim offer free | ~860 ms |
 | **huggingface** | `api/users/{name}/overview` — 200 the account, 404 nothing | 15 KB |
-| **gitlab** | `api/v4/users?username=` — a JSON array with an entry taken, `[]` free | 242 vs 2 bytes |
-| **itch.io** | `{name}.itch.io/` — the profile renders, or the site's own 404 does | 92 KB vs 7 KB |
-| **gumroad** | `{name}.gumroad.com` — 200 live, 404 free | 64 KB vs 900 bytes |
-| **myanimelist** | `myanimelist.net/profile/{name}` — 200 taken, 404 free | 98 KB |
 
-The ten newest are all read by their own JSON APIs where one exists, because a
-status code cannot be misread the way a byte count can. Each was verified through
-a rotating datacenter endpoint with two known-held handles and **five names that
-cannot exist**: every impossible name read free on all ten, and every held one
-read taken. The timing column is filled in only where it was measured.
+Sixteen name spaces, picked as the ones a username is worth having on rather than
+every endpoint that can answer a query. The longer tail that used to be here —
+myanimelist, vk, disqus, wattpad, duolingo, dribbble, soundcloud, chess.com,
+dockerhub, codeberg, mastodon, dev.to, lichess, gitlab, itch.io, gumroad — was a
+list nobody was sniping on, and each one was another thing to keep working. What
+a platform *cannot* have is decided locally and for free (`NAMESPACES`): a name
+that cannot exist is reported `invalid` without spending a request on it.
 
-**A stale user agent is a platform-wide outage waiting to happen.** Codeberg
-answers a year-old Chrome version with `403 Access denied, old Chrome version` —
-not per name, per *request*, which looks exactly like the whole datacenter range
-being refused. Chrome 124 is rejected; 141, 147 and 152 are all answered. The
-agent is `USER_AGENT` in the environment now rather than a constant in the source,
-so the version can be moved on without a code change. **Tumblr was dropped**: it answers 403 to every exit
-in a datacenter range, so it cannot be checked from a list like this one.
-**GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
-IP — not a check rate, a limit you hit in a minute and then sit out. Set
-`GITHUB_TOKEN` and the ceiling becomes 5,000.
+Every platform was verified the same way: known-held handles must read taken, and
+**names that cannot exist must read free** — on Facebook, six pages and sixteen
+impossible names; on Reddit, four handles and four impossible names. **Tumblr was
+dropped** for failing exactly that: it answers 403 to every exit in a datacenter
+range, so it cannot be checked from a list like this one.
 
-**guns.lol is read by its signals, not its title.** The site renders the *same*
-default title for a free name and for a banned one, so a title-only test called
-a banned profile free — the dashboard said "available", and registering it
-failed. The check now looks for a live profile's Schema.org block, then for the
-account payload every *registered* handle carries (a banned one has no public
-profile but still has this), and only calls a name free when the page is
-offering to claim *that* name. A 404 is the site's own reserved route (`/api`),
-not a free name.
+**TikTok does not have digit-only handles, and saying otherwise costs you a
+registration.** `1234567` passes the charset rule and the profile page answers
+"no such user", because there is no account there — so the honest-looking verdict
+is `available` and TikTok's own signup then refuses with *"Couldn't update user.
+Try another one."* The rule is local and free: an all-digit handle is `invalid`
+on TikTok and never reaches a request.
 
-**Instagram is the weak one.** It refuses datacenter IPs with a blanket 429
-before your proxy list is involved, so it depends on the list being
-residential-ish. It reports that honestly as `blocked` rather than guessing.
+**A platform decides whether to answer based on the client, not only the IP.**
+Facebook and Reddit both answer a *link-preview* agent and refuse nearly
+everything else: a browser agent gets Facebook's `400 Error` page, and Reddit
+gives every non-crawler a JavaScript shell that says nothing about any name. The
+one agent that answers both is `PREVIEW_UA` in `sniper.py`. This is also why no
+check is pinned to a version-numbered browser string: an agent a platform has
+quietly stopped answering is worse than one it refuses, because an answer still
+arrives and still looks like an answer.
 
-### Two checks used to answer "available" about names that were taken
+**And on those two, a free verdict is control-read before it is believed.** A
+platform that would rather not answer serves the *same* page for a name that is
+held as for one that is not — measured on Facebook with two link-preview agents
+it had begun refusing, where `zuck`, `nasa` and `microsoft` all came back as the
+login wall a free name gets. That reads as `available` for **every name in the
+run**. So `facebook` and `reddit` are asked about a name that is certainly held
+before any free verdict from them stands (`SignalGuard` in `sniper.py`, tuned by
+`SNIPE_SIGNAL_GUARD_TTL` and `SNIPE_SIGNAL_GUARD_AFTER`):
 
-Both are fixed, and both were measured live rather than guessed.
+| the control name reads | what is reported |
+|---|---|
+| held | the free verdict stands, and the run says the control held |
+| free too | **blocked** — the platform refusing to answer — until a later control read says otherwise |
+| cannot be read | **unanswered** — retried on another exit, never reported as available |
 
-**TikTok's 400 is not "no such user".** oEmbed returns it for a name nobody
-holds *and* for a live handle it will not embed, and for any spelling that is
-not the account's own lower-case one. On a random 4-character sample, **7 of the
-9 names oEmbed called missing were real accounts** — `statusCode` 10222,
-`ErrBizUserSecret`, with the account's `uniqueId`, id and follower count still
-in the page. The check now asks oEmbed about the lower-cased handle (a 200 is a
-verdict and costs 45 bytes), and a 400 is *confirmed* against the profile page:
-`webapp.user-detail` carrying `userInfo` means taken, TikTok's own `10221` means
-free, and anything else — a shell, an interstitial — is `unanswered` and never
-"available". The page has to be asked for with a **mobile Safari user agent**: a
-desktop UA is served a 1,462-byte "enable JavaScript" shell to a datacenter IP
-for a live handle and a free name alike (measured), while the iPhone UA gets the
-real 166-202 KB page. That page is what the check leads with, for a second
-reason: **TikTok throttles the embed per exit IP far harder than the page.**
-Measured through one rotating endpoint at 16 concurrent, 56 of 80 embed calls
-came back 429/503 while 80 of 80 page reads were answered in the same window —
-and embed-first paid a wasted round trip on every name, 3.6 names/s against 6.9.
-`TIKTOK_PAGE_FIRST=false` restores the cheap order (45 bytes instead of ~50 KB
-per check, ~880 MB over a 17,576-name sweep) and takes the throttling with it.
-
-**guns.lol renders a banned account's page like a free one.** Same default
-title, no Schema.org block — the ban heading sits at ~9.3 KB and was never read.
-A banned handle cannot be registered either, so it now has its own verdict,
-`banned`, which counts as an answer, never fires an alert, and is a column of
-its own on the dashboard.
-
-## Name spaces
+##  Name spaces
 
 Pick any combination of these. `l` letters a–z, `n` digits, `c` letters+digits,
 `og` dictionary words — and the length.
@@ -152,7 +123,7 @@ quietly checking fewer names than the count implies.
 Lower-case only, deliberately: a handle is case-insensitive for uniqueness on
 every target here, so generating both cases would ask the same question twice.
 Names you paste in are not rewritten — every checker resolves case the way its
-platform does (measured across all twenty, only TikTok needed the request itself
+platform does (measured across all sixteen, only TikTok needed the request itself
 to be lower-cased, which `check_tiktok` does).
 
 ### The ceiling, and why it moved
@@ -292,7 +263,18 @@ answer. Two things fix that:
 - A pause needs real evidence: at least `SNIPE_PLATFORM_BLOCK_MIN` refusals, at
   least one per live proxy, **and** refusals must be at least
   `SNIPE_PLATFORM_BLOCK_RATE` (default 0.5) of everything that platform has
-  answered. Measured live on guns.lol: 46 refusals out of 1,036 answers is 4.4%
+  answered.
+- ...and the platform has to have gone **quiet**: `SNIPE_PLATFORM_QUIET`
+  (default 20s) with nothing answered. A platform that is still resolving names
+  is throttling some of its exits, not refusing the list, and pausing it there
+  throws away every name it would have answered. Measured through one rotating
+  endpoint: discord answered `429 retry_after 1979s` on some requests while other
+  requests through the same endpoint were resolving names, and the pause that
+  followed took those 1979 seconds off a run that was still working — 15 minutes,
+  bounded only by `SNIPE_PLATFORM_PAUSE_MAX`, which is the shape of *it started
+  fast and then slowed to nothing*. Same code path, refusals arriving 60% of the
+  time with successes in between: **1 verdict and a stall before, 99 verdicts and
+  all 400 checks after.** Measured live on guns.lol: 46 refusals out of 1,036 answers is 4.4%
   and is a healthy run — counting raw refusals alone paused the platform every
   few hundred checks. A blanket throttle reads ~100% and still pauses at once.
 - A refused name is retried once by default (`SCAN_RETRIES=1`). Through a

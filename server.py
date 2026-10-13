@@ -1752,6 +1752,51 @@ async def test_webhook() -> dict:
 # account factory: automating signups is what gets an IP range banned and is not
 # something this service will do.
 CLAIM_TARGETS: dict[str, dict[str, str]] = {
+    "discord": {
+        "register_url": "https://discord.com/register",
+        "existing_account": "User Settings > My Account > Username",
+        "note": "Discord adopts a username at signup, or changes it from an existing account's settings.",
+    },
+    "instagram": {
+        "register_url": "https://www.instagram.com/accounts/emailsignup/",
+        "existing_account": "Settings > Edit profile > Username",
+        "note": "Instagram assigns the handle at signup.",
+    },
+    "tiktok": {
+        "register_url": "https://www.tiktok.com/signup",
+        "existing_account": "Profile > Edit profile > Username",
+        "note": "TikTok assigns the handle at signup, and refuses a handle made only of digits.",
+    },
+    "x": {
+        "register_url": "https://x.com/i/flow/signup",
+        "existing_account": "Settings > Your account > Account information > Username",
+        "note": "X assigns the handle at signup and allows changes from settings.",
+    },
+    "youtube": {
+        "register_url": "https://www.youtube.com/handle",
+        "existing_account": "youtube.com/handle",
+        "note": "A YouTube handle is claimed once the channel has one, at /handle.",
+    },
+    "facebook": {
+        "register_url": "https://www.facebook.com/reg/",
+        "existing_account": "Settings & privacy > Settings > Accounts Centre > Username",
+        "note": "Facebook takes the username at signup, or from an existing account's settings.",
+    },
+    "reddit": {
+        "register_url": "https://www.reddit.com/register/",
+        "existing_account": "Settings > Account > Username",
+        "note": "Reddit shows whether a name is free as you type it at signup, and allows one change in settings.",
+    },
+    "telegram": {
+        "register_url": "https://web.telegram.org/",
+        "existing_account": "Settings > Username",
+        "note": "Telegram handles are set inside the app once you have an account.",
+    },
+    "github": {
+        "register_url": "https://github.com/signup",
+        "existing_account": "Settings > Account > Change username",
+        "note": "GitHub redirects the old name to the new one after a change.",
+    },
     "roblox": {
         "register_url": "https://www.roblox.com/signup",
         "existing_account": "Settings > Account Info > Edit username (1000 Robux)",
@@ -1762,144 +1807,30 @@ CLAIM_TARGETS: dict[str, dict[str, str]] = {
         "existing_account": "minecraft.net > Profile > Change username",
         "note": "A Java Edition name is set on the account, not on a profile.",
     },
-    "telegram": {
-        "register_url": "https://web.telegram.org/",
-        "existing_account": "Settings > Username",
-        "note": "Telegram handles are set inside the app once you have an account.",
-    },
-    "x": {
-        "register_url": "https://x.com/i/flow/signup",
-        "existing_account": "Settings > Your account > Account information > Username",
-        "note": "X assigns the handle at signup and allows changes from settings.",
-    },
-    "github": {
-        "register_url": "https://github.com/signup",
-        "existing_account": "Settings > Account > Change username",
-        "note": "GitHub redirects the old name to the new one after a change.",
-    },
-    "youtube": {
-        "register_url": "https://www.youtube.com/handle",
-        "existing_account": "youtube.com/handle",
-        "note": "A YouTube handle is claimed once the channel has one, at /handle.",
-    },
-    "discord": {
-        "register_url": "https://discord.com/register",
-        "existing_account": "User Settings > My Account > Username",
-        "note": "Discord adopts a username at signup, or changes it from an existing account's settings.",
-    },
-    "guns.lol": {
-        "register_url": "https://guns.lol/register",
-        "existing_account": "Dashboard > Settings > Username",
-        "note": "guns.lol assigns the handle when you register.",
-    },
-    "instagram": {
-        "register_url": "https://www.instagram.com/accounts/emailsignup/",
-        "existing_account": "Settings > Edit profile > Username",
-        "note": "Instagram assigns the handle at signup.",
-    },
-    "tiktok": {
-        "register_url": "https://www.tiktok.com/signup",
-        "existing_account": "Profile > Edit profile > Username",
-        "note": "TikTok assigns the handle at signup.",
-    },    "dockerhub": {
-        "register_url": "https://hub.docker.com/signup",
-        "existing_account": "Account Settings > Username",
-        "note": "A Docker Hub namespace is the account name; it can be renamed once.",
-    },
-    "codeberg": {
-        "register_url": "https://codeberg.org/user/sign_up",
-        "existing_account": "Settings > Account > Username",
-        "note": "Codeberg takes the username at registration and allows a change in settings.",
-    },
-    "mastodon": {
-        "register_url": "https://mastodon.social/auth/sign_up",
-        "existing_account": "Preferences > Profile > Display name (acct is fixed at signup)",
-        "note": "The handle on an instance is fixed at signup; a different instance is a different namespace.",
-    },
-    "dev.to": {
-        "register_url": "https://dev.to/enter",
-        "existing_account": "Settings > Account > Username",
-        "note": "dev.to sets the username at signup and allows one change in Settings.",
-    },
-    "lichess": {
-        "register_url": "https://lichess.org/signup",
-        "existing_account": "no rename path -- the username is permanent",
-        "note": "A Lichess username is permanent once registered.",
-    },
-    "huggingface": {
-        "register_url": "https://huggingface.co/join",
-        "existing_account": "Settings > Account > Username",
-        "note": "The Hugging Face account name is also the namespace for its models and datasets.",
-    },
-    "gitlab": {
-        "register_url": "https://gitlab.com/users/sign_up",
-        "existing_account": "Edit profile > Account > Change username",
-        "note": "GitLab takes the username at signup and allows a change later in the profile.",
-    },
-    "itch.io": {
-        "register_url": "https://itch.io/register",
-        "existing_account": "Settings > Username",
-        "note": "The itch.io subdomain follows the username; changing it changes the profile URL.",
-    },
-    "gumroad": {
-        "register_url": "https://gumroad.com/signup",
-        "existing_account": "Settings > Profile > Custom subdomain",
-        "note": "The Gumroad shop subdomain is chosen at signup and can be changed in settings.",
-    },
-    "myanimelist": {
-        "register_url": "https://myanimelist.net/register.php",
-        "existing_account": "Account Settings > Change Username",
-        "note": "MyAnimeList takes the username at signup and allows a paid change in settings.",
-    },
-    "bluesky": {
-        "register_url": "https://bsky.app/",
-        "existing_account": "Settings > Change handle",
-        "note": "A Bluesky handle is a domain; the .bsky.social one can be changed in settings.",
+    "steam": {
+        "register_url": "https://store.steampowered.com/join",
+        "existing_account": "Profile > Edit Profile > Custom URL",
+        "note": "The vanity URL is the custom URL on a Steam profile, not the account name.",
     },
     "kick": {
         "register_url": "https://kick.com/",
         "existing_account": "Settings > Account > Username",
         "note": "Kick takes the username at signup; a change is a paid one.",
     },
-    "steam": {
-        "register_url": "https://store.steampowered.com/join",
-        "existing_account": "Profile > Edit Profile > Custom URL",
-        "note": "The vanity URL is the custom URL on a Steam profile, not the account name.",
+    "bluesky": {
+        "register_url": "https://bsky.app/",
+        "existing_account": "Settings > Change handle",
+        "note": "A Bluesky handle is a domain; the .bsky.social one can be changed in settings.",
     },
-    "soundcloud": {
-        "register_url": "https://soundcloud.com/signup",
-        "existing_account": "Settings > Profile > Permalink",
-        "note": "The SoundCloud permalink is what a profile URL carries; it can be changed in settings.",
+    "guns.lol": {
+        "register_url": "https://guns.lol/register",
+        "existing_account": "Dashboard > Settings > Username",
+        "note": "guns.lol assigns the handle when you register.",
     },
-    "dribbble": {
-        "register_url": "https://dribbble.com/signup/new",
-        "existing_account": "Settings > Profile > Username",
-        "note": "Dribbble sets the username at signup and allows a change in profile settings.",
-    },
-    "chess.com": {
-        "register_url": "https://www.chess.com/register",
-        "existing_account": "Settings > Account > Username",
-        "note": "A Chess.com username change requires a paid membership.",
-    },
-    "duolingo": {
-        "register_url": "https://www.duolingo.com/register",
-        "existing_account": "Profile > Settings > Username",
-        "note": "Duolingo takes the username at signup and allows a change in settings.",
-    },
-    "wattpad": {
-        "register_url": "https://www.wattpad.com/signup",
-        "existing_account": "Settings > Account > Username",
-        "note": "The Wattpad username is the profile URL and can be changed in settings.",
-    },
-    "disqus": {
-        "register_url": "https://disqus.com/profile/signup/",
-        "existing_account": "Settings > Account > Username",
-        "note": "A Disqus username is a per-site profile; set at signup, changeable in settings.",
-    },
-    "vk": {
-        "register_url": "https://vk.com/join",
-        "existing_account": "Settings > Edit profile > Short address",
-        "note": "The VK short address is the profile URL on top of the account.",
+    "huggingface": {
+        "register_url": "https://huggingface.co/join",
+        "existing_account": "Settings > Username",
+        "note": "A Hugging Face username is the account's namespace; it can be renamed in settings.",
     },
 }
 

@@ -57,9 +57,12 @@ def _bool(name: str, default: bool) -> bool:
 
 # --- Service ---------------------------------------------------------------
 # The user agent every checker sends unless a platform needs its own.
-# This is a knob and not a constant on purpose: codeberg 403s a year-old Chrome
-# version outright ("Access denied, old Chrome version") while answering the
-# same request from a current one, so a UA baked into the source is a
+#
+# A knob and not a constant on purpose: platforms decide whether to answer a
+# client at all, and they change their minds. A year-old Chrome version was once
+# refused outright ("Access denied, old Chrome version") while a current one was
+# answered, and two platforms here are only answered at all through a link-preview
+# agent (see PREVIEW_UA in sniper.py). Either way a UA baked into the source is a
 # time-bomb that shows up as a platform refusing the whole datacenter.
 USER_AGENT: str = _str(
     "USER_AGENT",
@@ -99,6 +102,20 @@ READ_TIMEOUT: float = _float("READ_TIMEOUT", 8.0)
 # difference between GitHub being a usable platform and a decorative one. Every
 # other platform here needs nothing.
 GITHUB_TOKEN: str = _str("GITHUB_TOKEN", "")
+
+# --- Confirming a "free" answer ---------------------------------------------
+# Two platforms will answer a name that *is* held with the same fallback page
+# they serve for a name nobody holds, once they stop answering the client that
+# is asking. See SignalGuard in sniper.py for the measurement. So before a free
+# verdict from one of those is trusted, the platform is asked about a name that
+# is certainly held.
+#
+# SNIPE_SIGNAL_GUARD_TTL is how long one control answer stands, in seconds, and
+# SNIPE_SIGNAL_GUARD_AFTER how many free verdicts may lean on it. The product is
+# the longest a signal that has broken can keep producing free verdicts -- 20s x
+# 8 by default. A TTL of zero re-reads the control for every free name.
+SNIPE_SIGNAL_GUARD_TTL: float = _float("SNIPE_SIGNAL_GUARD_TTL", 20.0)
+SNIPE_SIGNAL_GUARD_AFTER: int = _int("SNIPE_SIGNAL_GUARD_AFTER", 8)
 
 # --- TikTok ----------------------------------------------------------------
 # Which source leads the check. The profile page does, by default, because it is
@@ -305,6 +322,16 @@ SNIPE_PLATFORM_BLOCK_RATE: float = _float("SNIPE_PLATFORM_BLOCK_RATE", 0.5)
 # every name that had not been asked about yet. This bounds that wait, after
 # which the run stops and says why rather than waiting forever.
 SNIPE_PLATFORM_WAIT: float = _float("SNIPE_PLATFORM_WAIT", 300.0)
+# A platform is only sat out once it has stopped *answering*. Refusals that
+# arrive among working answers are a throttle on some exits, not a closed
+# platform -- and pausing on them is what turned a run that was still resolving
+# names into a stall. Measured through one rotating endpoint: discord answered
+# 429 "retry_after 1979s" on several requests while other requests through the
+# same endpoint were resolving names normally, and the pause that followed named
+# those 1979 seconds -- 15 minutes off, bounded only by SNIPE_PLATFORM_PAUSE_MAX.
+# This is how long a platform has to go without answering anything before its
+# refusals are allowed to stop the run. Set 0 to pause on the refusal rate alone.
+SNIPE_PLATFORM_QUIET: float = _float("SNIPE_PLATFORM_QUIET", 20.0)
 
 # A free name is the one claim a user acts on -- it is the whole point of the
 # run -- so it is the one verdict worth a second look. When a check comes back

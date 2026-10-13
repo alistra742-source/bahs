@@ -120,7 +120,7 @@ function renderPlats(pace) {
 }
 
 /* The count in the header, refreshed wherever the selection changes -- it used
-   to be written only by the console's own tick, so it read "0 of 30 selected"
+   to be written only by the console's own tick, so it read "0 of N selected"
    with a sniper plainly selected. */
 function paintPlatSum() {
   const el = $("platSum");
