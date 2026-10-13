@@ -28,7 +28,7 @@
       <span class="sub" id="runNote"></span>
       <div class="right">
         <span class="note" id="poolNote"></span>
-        <button class="btn sm ghost" id="resumeBtn">resume watching</button>
+        <button class="btn sm ghost" id="resumeBtn" hidden>resume watching</button>
       </div>
     </div>
 
@@ -156,8 +156,6 @@ function applyKpiDetail() {
   set("hCorrected", App.fmt(p.corrected_count || 0));
   set("aConfirmed", App.fmt(p.confirmed_count || 0));
   set("aCorrected", App.fmt(p.corrected_count || 0));
-  const s = $("platSum");
-  if (s) s.textContent = App.S.plats.size + " of " + (App.S.info.platforms || []).length + " selected";
 }
 const $ = (id) => document.getElementById(id);
 App.boot();

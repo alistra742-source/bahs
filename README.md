@@ -556,14 +556,21 @@ There is no concurrency box and no "hunt" checkbox: the pacer decides how hard t
 push each platform, and a run is started or stopped, not tuned mid-flight by
 someone guessing at a number.
 
-**What is verified and what is not.** Every page is served and checked for its
-content type through the server's own HTTP surface; the run a page starts, the
-reattach, the stop, the per-platform counters, the hits store, the confirmation
-pass and the counter arithmetic are all exercised the same way. Every page's
-JavaScript is parsed on each check and its element ids confirmed present in the
-markup. It has **not** been opened in a browser from this environment, so the
-visual layout, the phone breakpoint and the notification/sound toggles are the
-parts still to be seen by eye.
+**What is verified, and how.** The pages are driven in a real headless Chromium:
+each one loads with **zero page errors**, every page renders all seven nav links,
+clicking each of the seven lands on the URL it claims, and the console renders 30
+sniper cells, 16 name-space cells and 10 KPI tiles rather than an empty shell. A
+run is then started from the UI, streams verdicts, and stops. At 390x844 the
+document has **0px of horizontal overflow**, the nav is a sideways-scrolling strip
+with all seven links tappable, and the sniper grid stays two columns.
+
+That check exists because a per-file syntax check cannot see the class of bug it
+found: `app.js` declared `const $` at global scope and every page's inline script
+declared it too, so the browser threw `SyntaxError: Identifier '$' has already
+been declared`, killed the inline script, and **the sidebar rendered zero links**.
+The file was scoped in an IIFE and the pages were checked as a browser loads them
+from then on. Still unverified by machine: the sound and desktop-notification
+toggles, which need a real audio device and a permission prompt.
 
 ## Layout
 

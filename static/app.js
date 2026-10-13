@@ -1,3 +1,10 @@
+/* Wrapped in an IIFE on purpose. A classic <script> shares one global lexical
+   environment with every other classic script on the page, so this file's
+   top-level `const $` collided with the same declaration in each page's inline
+   script: `SyntaxError: Identifier '$' has already been declared`, which killed
+   the whole inline script -- App.boot() never ran and the sidebar rendered zero
+   links. Only the browser sees this; checking each file on its own does not. */
+(function () {
 /* bahs — shared client. One place decides what a number means, so no page can
    show a flattering version of a run.
  *
@@ -109,6 +116,17 @@ function renderPlats(pace) {
     S.plats.has(p) ? S.plats.delete(p) : S.plats.add(p);
     persist(); renderPlats();
   };
+  paintPlatSum();
+}
+
+/* The count in the header, refreshed wherever the selection changes -- it used
+   to be written only by the console's own tick, so it read "0 of 30 selected"
+   with a sniper plainly selected. */
+function paintPlatSum() {
+  const el = $("platSum");
+  if (!el) return;
+  const total = ((S.info && S.info.platforms) || []).length;
+  el.textContent = `${S.plats.size} of ${total} selected`;
 }
 
 function renderSpaces() {
@@ -120,7 +138,7 @@ function renderSpaces() {
   for (const L of lens) {
     const opts = (S.menu || []).filter((b) => b.length === L);
     html += `<div class="sizes" data-l="${L}">` + opts.map((b) => {
-      const key = b.kind + L;
+      const key = L + b.kind;
       return `<button data-k="${key}" class="${S.spaces.has(key) ? "on" : ""}">${key}
         <b>${fmt(b.size)}</b></button>`;
     }).join("") + `</div>`;
@@ -138,13 +156,15 @@ function renderSpaces() {
 
 function spaceKeys() { return [...S.spaces]; }
 function buckets() {
+  // "3l" -- length then kind, the same order the picker labels and /menu uses.
   return spaceKeys().map((k) => {
-    const m = k.match(/^([a-z]+)(\d+)$/);
-    return { kind: m[1], length: Number(m[2]) };
-  });
+    const m = k.match(/^(\d+)([a-z]+)$/);
+    if (!m) return null;
+    return { kind: m[2], length: Number(m[1]) };
+  }).filter(Boolean);
 }
 function selectionSize() {
-  return (S.menu || []).filter((b) => S.spaces.has(b.kind + b.length))
+  return (S.menu || []).filter((b) => S.spaces.has(b.length + b.kind))
     .reduce((a, b) => a + b.size, 0);
 }
 
@@ -306,6 +326,7 @@ function beep() {
 async function startSweep() {
   if (!S.plats.size) return toast("pick at least one sniper", "bad");
   if (!spaceKeys().length) return toast("pick at least one name space", "bad");
+  if (!buckets().length) return toast("that name-space selection did not parse", "bad");
   if (!S.proxies || !S.proxies.count) return toast("no proxies stored — add some first", "bad");
   const body = { buckets: buckets(), platforms: [...S.plats], stream: true };
   if ($("limit") && Number($("limit").value) > 0) body.limit = Number($("limit").value);
@@ -449,6 +470,8 @@ async function boot() {
 window.App = {
   S, $, api, toast, fmt, esc, pct, clock, boot, renderPlats, renderSpaces, summarise,
   applyProgress, renderPaced, renderFeed, feedLine, startSweep, startSingle, follow,
-  selectionSize, summarise,
+  selectionSize, summarise, paintPlatSum,
   pumpRun, stopRun, renderNav, persist, isVerdict, runStream,
 };
+
+})();
