@@ -407,7 +407,17 @@ def page_docs() -> FileResponse:
 # platform marks. A single mount, because there is a file per component and a
 # route each would be a dozen lines of nothing. `app.css`/`app.js` stay explicit
 # above: they are the app, and they keep their no-cache header.
-app.mount("/ui", StaticFiles(directory=os.path.join(STATIC_DIR, "ui")), name="ui")
+class _NoCacheStatic(StaticFiles):
+    # The scripts and styles here change with every deploy, so they get the same
+    # revalidation header as the pages. Without it a browser can keep an old
+    # auth.js and run a challenge the server no longer issues.
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers.update(_NO_CACHE)
+        return response
+
+
+app.mount("/ui", _NoCacheStatic(directory=os.path.join(STATIC_DIR, "ui")), name="ui")
 
 
 @app.get("/favicon.ico", include_in_schema=False)
