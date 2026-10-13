@@ -5,3 +5,6 @@ uvicorn[standard]==0.54.0
 # httpx[socks] pulls in socksio, which is what makes socks4:// and socks5://
 # proxy URLs work at all -- without it httpx refuses the scheme.
 httpx[socks]==0.28.1
+# Account credentials and PostgreSQL; never store raw passwords or wallet seeds.
+argon2-cffi==25.1.0
+psycopg[binary]==3.2.12

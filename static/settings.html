@@ -4,14 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>bahs · Settings</title>
+<title>VORTEX · Settings</title>
 <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/ui/experience.css">
+<script src="/ui/auth.js"></script>
 </head>
 <body>
 <div class="wrap">
   <aside class="side">
-    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="brand"><b>VORTEX</b><span id="build">—</span></div>
     <div class="side-scroll"><h2>Workspace</h2><nav class="menu" id="nav"></nav></div>
     <div class="side-foot">
       <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
@@ -99,8 +101,8 @@ window.PAGE = {
       App.toast("notifications: " + p, p === "granted" ? "ok" : "bad");
     };
     $("sReset").onclick = () => {
-      localStorage.removeItem("bahs.tune"); localStorage.removeItem("bahs.plats");
-      localStorage.removeItem("bahs.spaces"); localStorage.removeItem("bahs.filter");
+      localStorage.removeItem("VORTEX.tune"); localStorage.removeItem("VORTEX.plats");
+      localStorage.removeItem("VORTEX.spaces"); localStorage.removeItem("VORTEX.filter");
       location.reload();
     };
     $("sClearHits").onclick = async () => {

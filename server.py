@@ -26,6 +26,8 @@ from pydantic import BaseModel, Field
 from alerts import AlertSettings, Alerter
 
 import alerts
+import accounts
+import payments
 import generator
 import proxies as proxy_list_module
 import sniper
@@ -112,30 +114,33 @@ _HIT_ORDER: list[str] = []
 def _record_hit(
     username: str, platform: str, detail: str, confirmed: bool, corrected: bool, run_id: str
 ) -> None:
-    """Remember a free name. Same name twice updates the row, never doubles it."""
-    key = platform + ":" + username.lower()
-    existing = _HITS.get(key)
-    if existing is not None:
-        # A later read is better evidence than an earlier one: a name that came
-        # back confirmed on a rerun is upgraded, and never downgraded silently.
-        existing["confirmed"] = existing["confirmed"] or bool(confirmed)
-        if confirmed:
-            existing["detail"] = detail
-        if run_id:
-            existing["run_id"] = run_id
-        return
-    _HITS[key] = {
-        "username": username,
-        "platform": platform,
-        "detail": detail,
-        "confirmed": bool(confirmed),
-        "corrected": bool(corrected),
-        "run_id": run_id,
-        "at": time.time(),
-    }
-    _HIT_ORDER.append(key)
-    while len(_HIT_ORDER) > HITS_MAX:
-        _HITS.pop(_HIT_ORDER.pop(0), None)
+    """Persist a hit under its authenticated run owner, never a global feed."""
+    uid = accounts.owner_id()
+    with accounts.store.transaction() as db:
+        existing = db.one("SELECT data FROM account_hits WHERE user_id=? AND platform=? AND username=?", (uid, platform, username.lower()))
+        old = json.loads(existing["data"]) if existing else {}
+        row = {"username": username, "platform": platform,
+               "detail": old.get("detail", detail) if old.get("confirmed") and not confirmed else detail,
+               "confirmed": bool(confirmed or old.get("confirmed")), "corrected": bool(corrected),
+               "run_id": run_id, "at": time.time()}
+        db.execute("INSERT INTO account_hits VALUES(?,?,?,?,?) ON CONFLICT(user_id,platform,username) DO UPDATE SET data=excluded.data,at=excluded.at", (uid, platform, username.lower(), json.dumps(row), row["at"]))
+        db.execute("DELETE FROM account_hits WHERE user_id=? AND at NOT IN (SELECT at FROM account_hits WHERE user_id=? ORDER BY at DESC LIMIT ?)", (uid, uid, HITS_MAX))
+
+
+def _owned_hits():
+    with accounts.store.transaction() as db:
+        rows = db.all("SELECT data FROM account_hits WHERE user_id=? ORDER BY at DESC", (accounts.owner_id(),))
+    return [json.loads(r["data"]) for r in rows]
+
+
+def _user_alert_settings():
+    user = accounts.principal()
+    with accounts.store.transaction() as db:
+        row = db.one("SELECT settings FROM users WHERE id=?", (user["id"],))
+    settings = json.loads(row["settings"])
+    return {"webhook": "", "enabled": False, "template": "{username} is available on {platform}",
+            "username": "VORTEX", "avatar": "", "ping": "", "batch": 10,
+            "min_interval": 5, "max_messages": 20, **settings}
 
 
 class DailyStats:
@@ -293,6 +298,8 @@ alert_settings = AlertSettings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await asyncio.to_thread(accounts.store.initialize)
+    payment_monitor = asyncio.create_task(payments.monitor())
     proxy_list.load()
     alert_settings.load()
     daily_stats.load()
@@ -312,6 +319,8 @@ async def lifespan(app: FastAPI):
             if handle.task is not None and not handle.task.done():
                 handle.stop.set()
                 handle.task.cancel()
+        payment_monitor.cancel()
+        await asyncio.gather(payment_monitor, return_exceptions=True)
         await _close_pools()
         proxy_list.save()
 
@@ -320,7 +329,16 @@ async def lifespan(app: FastAPI):
 # Swagger UI would otherwise shadow it, which is a confusing way to find out that
 # two things wanted the same path. The schema stays at /openapi.json and ReDoc at
 # /redoc.
-app = FastAPI(title="bahs", version="3.0.0", lifespan=lifespan, docs_url=None)
+app = FastAPI(title="VORTEX", version="4.0.0", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.add_middleware(accounts.AccountMiddleware)
+app.include_router(accounts.router)
+app.include_router(payments.router)
+
+
+@app.get("/buy", include_in_schema=False)
+@app.get("/account", include_in_schema=False)
+def page_account():
+    return _page("account.html")
 
 
 # --- site + info ----------------------------------------------------------
@@ -422,7 +440,7 @@ def asset_js() -> FileResponse:
 def info() -> dict:
     words = generator.words_by_length()
     return {
-        "service": "bahs",
+        "service": "VORTEX",
         "build": BUILD,
         "console": "/console",
         "platforms": list(sniper.PLATFORMS),
@@ -441,7 +459,7 @@ def info() -> dict:
                 "the hit is confirmed"
             ),
         },
-        "alerts_enabled": bool(alert_settings.get().get("enabled")),
+        "alerts_enabled": False,
         # Whether a free TikTok read can be settled by TikTok's own validator.
         # The UI says which of the two honest answers it will get.
         "tiktok_validator": bool(sniper.TIKTOK_SESSION_ID.strip()),
@@ -512,7 +530,7 @@ def stats() -> dict:
         live_verdicts += int(progress.get("answered") or 0)
         live_hits += int(progress.get("available_count") or 0)
     return {
-        "service": "bahs",
+        "service": "VORTEX",
         "build": BUILD,
         "platforms": len(sniper.PLATFORMS),
         "proxies": len(proxy_list),
@@ -528,7 +546,7 @@ def health() -> dict:
     return {
         "status": "ok",
         "build": BUILD,
-        "proxies": proxy_list.stats(),
+        "proxies": {"count": len(proxy_list)},
         "runs": {"active": sum(1 for r in runs if r["active"]), "tracked": len(runs)},
         "platforms": list(sniper.PLATFORMS),
     }
@@ -542,6 +560,8 @@ def get_proxies(
     format: str = Query("json", pattern="^(json|txt)$"),
 ) -> object:
     """The stored list, paged for the table and complete for the download."""
+    if not accounts.public_user(accounts.principal())["admin"]:
+        return {"count": len(proxy_list), "offset": 0, "returned": 0, "proxies": [], "stats": {"count": len(proxy_list)}, "managed": True}
     stored = proxy_list.all()
     if format == "txt":
         return PlainTextResponse("\n".join(stored))
@@ -659,11 +679,12 @@ class RunHandle:
     __slots__ = (
         "id", "kind", "stop", "started", "finished", "checked", "task", "tally",
         "rows", "keep_rows", "note", "names", "platforms", "final",
-        "stats_recorded", "_lines", "_first", "_last", "_waiters",
+        "stats_recorded", "_lines", "_first", "_last", "_waiters", "owner",
     )
 
     def __init__(self, kind: str) -> None:
         self.id = uuid.uuid4().hex[:12]
+        self.owner = accounts.owner_id()
         self.kind = kind
         self.stop = asyncio.Event()
         self.started = time.time()
@@ -799,8 +820,7 @@ def _open_run(kind: str) -> RunHandle:
         if handle.kind == kind:
             raise HTTPException(
                 409,
-                f"a {kind} run is already in flight ({handle.id}) -- reattach with "
-                f"GET /runs/{handle.id}/stream, or stop it with POST /runs/stop",
+                f"A {kind} run is already in flight. Retry when the worker is free.",
             )
     if len(active) >= MAX_CONCURRENT_RUNS:
         raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
@@ -824,6 +844,7 @@ async def _pump(run: RunHandle, lines: AsyncIterator[str]) -> None:
     except Exception as exc:  # pragma: no cover - the generators are guarded
         log.warning("run %s ended on %s", run.id, type(exc).__name__, exc_info=True)
     finally:
+        run.finish()
         run.close()
         # The run is done, whatever ended it, so today's totals can have its
         # numbers. Done here rather than in a client's finally because a run
@@ -837,6 +858,26 @@ async def _pump(run: RunHandle, lines: AsyncIterator[str]) -> None:
 def _detach(run: RunHandle, lines: AsyncIterator[str]) -> None:
     """Start a run in the background. Its HTTP response is only a window on it."""
     run.task = asyncio.create_task(_pump(run, lines))
+    user = accounts.principal()
+    if not user["lifetime"]:
+        async def expiry_guard():
+            deadline = max(user["trial_until"], user["paid_until"])
+            while run.active:
+                await asyncio.sleep(max(0, deadline - time.time()))
+                # A purchase during a trial may have extended this account.
+                # Reread at the deadline, not on every result.
+                deadline = await asyncio.to_thread(accounts.access_deadline, user["id"])
+                if deadline > time.time():
+                    if deadline == float("inf"):
+                        return
+                    continue
+                run.stop.set()
+                # Hard expiry: don't let an in-flight retry outlive its entitlement.
+                if run.task and not run.task.done():
+                    run.task.cancel()
+                return
+        guard = asyncio.create_task(expiry_guard())
+        run.task.add_done_callback(lambda task: guard.cancel())
 
 
 NDJSON_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
@@ -846,7 +887,7 @@ def _stop_runs(kind: str | None = None, run_id: str | None = None) -> list[str]:
     """Signal stop to the runs matching ``kind``/``run_id``; return their ids."""
     stopped: list[str] = []
     for rid, handle in _runs.items():
-        if not handle.active:
+        if handle.owner != accounts.owner_id() or not handle.active:
             continue
         if run_id and rid != run_id:
             continue
@@ -867,12 +908,13 @@ def runs_status() -> dict:
     """
     runs = _runs_status()
     return {"count": len(runs), "runs": runs, "max": MAX_CONCURRENT_RUNS,
-            "hits_count": len(_HITS)}
+            "hits_count": len(_owned_hits())}
 
 
 def _runs_status() -> list[dict]:
     _reap_runs()
-    return sorted((handle.status() for handle in _runs.values()),
+    user = accounts.CURRENT_USER.get()
+    return sorted((handle.status() for handle in _runs.values() if user and handle.owner == user["id"]),
                   key=lambda r: r["started"], reverse=True)
 
 
@@ -889,16 +931,17 @@ def hits(
     re-confirmed is shown as unconfirmed -- the page is not allowed to present
     it as a sure thing.
     """
-    rows = list(_HITS.values())
+    owned = _owned_hits()
+    rows = list(owned)
     if platform:
         rows = [r for r in rows if r["platform"].lower() == platform.strip().lower()]
     if confirmed is not None:
         rows = [r for r in rows if bool(r["confirmed"]) is confirmed]
     rows.sort(key=lambda r: r["at"], reverse=True)
     return {
-        "count": len(_HITS),
+        "count": len(owned),
         "returned": len(rows[:limit]),
-        "confirmed": sum(1 for r in _HITS.values() if r["confirmed"]),
+        "confirmed": sum(1 for r in owned if r["confirmed"]),
         "hits": rows[:limit],
     }
 
@@ -906,9 +949,8 @@ def hits(
 @app.delete("/hits")
 def clear_hits() -> dict:
     """Forget the found names. Does not touch a run that is in flight."""
-    removed = len(_HITS)
-    _HITS.clear()
-    _HIT_ORDER.clear()
+    with accounts.store.transaction() as db:
+        removed = db.execute("DELETE FROM account_hits WHERE user_id=?", (accounts.owner_id(),)).rowcount
     return {"cleared": removed}
 
 
@@ -938,7 +980,7 @@ def run_status(run_id: str) -> dict:
     """One run's counters -- what a returning tab paints before it reattaches."""
     _reap_runs()
     handle = _runs.get(run_id)
-    if handle is None:
+    if handle is None or handle.owner != accounts.owner_id():
         raise HTTPException(404, "no such run")
     return handle.status()
 
@@ -952,7 +994,7 @@ async def run_stream(run_id: str, since: int = Query(-1, ge=-1)) -> StreamingRes
     """
     _reap_runs()
     handle = _runs.get(run_id)
-    if handle is None:
+    if handle is None or handle.owner != accounts.owner_id():
         raise HTTPException(404, "no such run")
     return StreamingResponse(
         handle.follow(handle.start_index if since < 0 else since),
@@ -1078,8 +1120,8 @@ class SnipeRequest(BaseModel):
     usernames: list[str] = Field(default_factory=list)
     username: str | None = None
     platforms: list[str] | None = None
-    concurrency: int | None = None
-    retries: int | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=256)
+    retries: int | None = Field(default=None, ge=0, le=5)
     # Stream each verdict as its own NDJSON line instead of buffering the batch.
     stream: bool = False
 
@@ -1330,7 +1372,8 @@ def _snipe_row(result: sniper.SnipeResult) -> dict:
         "platform": result.platform,
         "status": result.status,
         "detail": result.detail,
-        "proxy": result.proxy,
+        # Proxy URLs often contain passwords. Never expose worker credentials.
+        "proxy": "managed exit",
         "latency_ms": round(result.latency_ms, 2) if result.latency_ms is not None else None,
         "confirmed": bool(getattr(result, "confirmed", False)),
         "corrected": bool(getattr(result, "corrected", False)),
@@ -1543,16 +1586,20 @@ async def snipe_batch(req: SnipeRequest):
     run = _open_run("snipe")
     run.names, run.platforms, run.note = len(names), platforms, note
     run.keep_rows = not req.stream
-    alerter = Alerter(alert_settings.get())
+    alerter = Alerter(_user_alert_settings())
     _detach(
         run,
         _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run, alerter),
     )
     if req.stream:
         return StreamingResponse(
-            run.follow(0), media_type="application/x-ndjson", headers=NDJSON_HEADERS
+            run.follow(0), media_type="application/x-ndjson",            headers=NDJSON_HEADERS
         )
-    await run.task
+    try:
+        await asyncio.shield(run.task)
+    except asyncio.CancelledError:
+        if not run.stop.is_set():
+            raise
     return _buffered_report(run, pool, note, alerter, len(names), False)
 
 
@@ -1680,8 +1727,8 @@ class ScanRequest(BaseModel):
     limit: int | None = None
     seed: int | None = None
     words: list[str] | None = None
-    concurrency: int | None = None
-    retries: int | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=256)
+    retries: int | None = Field(default=None, ge=0, le=5)
     stream: bool = False
 
 
@@ -1896,7 +1943,7 @@ async def scan(req: ScanRequest):
     run = _open_run("scan")
     run.names, run.platforms, run.note = names_total, platforms, note
     run.keep_rows = not req.stream
-    alerter = Alerter(alert_settings.get())
+    alerter = Alerter(_user_alert_settings())
     _detach(
         run,
         _scan_stream(
@@ -1905,12 +1952,16 @@ async def scan(req: ScanRequest):
     )
     if req.stream:
         return StreamingResponse(
-            run.follow(0), media_type="application/x-ndjson", headers=NDJSON_HEADERS
+            run.follow(0), media_type="application/x-ndjson",            headers=NDJSON_HEADERS
         )
     # Buffered: wait for the run rather than driving it. A dropped client does
     # not take the run with it -- it still finishes and stays readable from
     # /runs/{id}.
-    await run.task
+    try:
+        await asyncio.shield(run.task)
+    except asyncio.CancelledError:
+        if not run.stop.is_set():
+            raise
     return _buffered_report(run, pool, note, alerter, names_total, truncated)
 
 
@@ -1918,7 +1969,7 @@ async def scan(req: ScanRequest):
 def _public_alert_settings() -> dict:
     """Settings as the UI sees them. The webhook url is a capability, so it is
     never logged and never echoed anywhere but here."""
-    effective = alert_settings.get()
+    effective = _user_alert_settings()
     webhook = str(effective.get("webhook") or "")
     return {
         "enabled": bool(effective.get("enabled")),
@@ -1952,15 +2003,24 @@ def get_settings() -> dict:
 def save_settings(patch: AlertPatch) -> dict:
     """Change the alert settings. Anything left out keeps its current value."""
     changes = {k: v for k, v in patch.model_dump().items() if v is not None}
-    alert_settings.update(changes)
-    log.info("alert settings updated: %s", sorted(changes))
+    if changes.get("webhook"):
+        import re
+        if not re.fullmatch(r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", changes["webhook"]):
+            raise HTTPException(400, "Use a Discord webhook URL")
+    with accounts.store.transaction() as db:
+        row = db.one("SELECT settings FROM users WHERE id=?", (accounts.owner_id(),))
+        settings = json.loads(row["settings"])
+        settings.update(changes)
+        if changes.get("webhook") and "enabled" not in changes:
+            settings["enabled"] = True
+        db.execute("UPDATE users SET settings=? WHERE id=?", (json.dumps(settings), accounts.owner_id()))
     return {"alerts": _public_alert_settings()}
 
 
 @app.post("/settings/test-webhook")
 async def test_webhook() -> dict:
     """Post one message so the webhook can be seen to land, not assumed to."""
-    return await alerts.post_test(alert_settings.get())
+    return await alerts.post_test(_user_alert_settings())
 
 
 # --- claiming -------------------------------------------------------------

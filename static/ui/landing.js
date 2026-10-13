@@ -16,13 +16,13 @@
 
   function header(build) {
     $("head").innerHTML = `<div class="inner">
-        <a class="mark" href="/">bahs</a>
+        <a class="mark" href="/">VORTEX</a>
         <span class="build" id="build">${UI.esc(build || "")}</span>
         <nav>
-          <a href="/platforms">Platforms</a>
-          <a href="/docs">Docs</a>
-          <a href="/hits/">Hits</a>
-          <a class="btn primary" href="/console">Launch console</a>
+          <a class="nav-detail" href="#previewSlot">The console</a>
+          <a class="nav-detail" href="#pricing">Pricing</a>
+          <button class="nav-quiet" data-auth="login" data-account-label>Log in</button>
+          <button class="btn primary" data-auth="signup">Get started ↗</button>
         </nav>
       </div>`;
   }
@@ -134,8 +134,10 @@
   async function load(first) {
     let stats = null, runs = null, hits = null;
     try { stats = await api("/stats"); } catch (e) { /* the strip says so */ }
-    try { runs = await api("/runs"); } catch (e) { /* no run to show */ }
-    try { hits = await api("/hits?limit=8"); } catch (e) { /* empty feed */ }
+    if (window.Auth && Auth.state.user) {
+      try { runs = await api("/runs"); } catch (e) { /* no private run */ }
+      try { hits = await api("/hits?limit=8"); } catch (e) { /* no private feed */ }
+    }
     if (!stats) {
       const stamp = $("stamp");
       if (stamp) stamp.textContent = "the API is not answering — nothing on this page is invented to cover for it";
@@ -158,7 +160,19 @@
     shell();
     wireMarks();
     await load(true);
-    setInterval(() => load(false), 5000);
+    if (window.Auth) {
+      await Auth.ready; await Auth.refresh();
+      if (!Auth.state.user && new URLSearchParams(location.search).get('auth')) Auth.open('login');
+    }
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (!reduce && 'IntersectionObserver' in window) {
+      document.documentElement.classList.add('motion-ready');
+      const observer = new IntersectionObserver(entries => entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('reveal-in'); observer.unobserve(e.target); } }), {threshold:0.07});
+      document.querySelectorAll('.feats,.platforms,.how,.pricing').forEach(el => {el.classList.add('reveal-wait');observer.observe(el);});
+    }
+    const labels = ['@your_next_handle','@a_new_identity','@find_your_edge','@make_it_yours']; let index = 0;
+    setInterval(() => { const el = document.getElementById('demoTarget'); if(el && !document.hidden && !reduce) el.textContent = labels[++index % labels.length]; }, 2800);
+    setInterval(() => { if(!document.hidden) load(false); }, 5000);
   }
 
   document.addEventListener("DOMContentLoaded", boot);

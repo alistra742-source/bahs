@@ -1,5 +1,16 @@
 # bahs
 
+> **Account/access update:** the animated landing page now uses signup/login,
+> server-side 60-second trial enforcement, PostgreSQL accounts/private hits,
+> and `/buy` + `/account` with $8.99 monthly / $45.99 forever plans.
+> See **[SECURITY.md](SECURITY.md)** and **[.env.example](.env.example)** before running
+> this version: new authentication and CAPTCHA variables are required. The proxy
+> pool is operator-managed, not exposed to ordinary accounts. Some older single-user
+> setup/API descriptions below are historical and do not describe these new gates.
+> Crypto checkout is deliberately disabled: free/unlimited public blockchain RPC
+> is not guaranteed, and the optional processor integration has fees and requires
+> explicit acceptance, credentials, and live verification. No wallet seed is used.
+
 Username availability across sixteen platforms, over your own proxy list.
 
 Paste or upload a proxy list, pick the name spaces you want swept, and it checks

@@ -19,7 +19,7 @@
         : "today's numbers, straight from the service."}</p>
       <div class="frame">
         <div class="chrome">
-          <i class="dot ${live ? "live" : ""}"></i><b>bahs</b>
+          <i class="dot ${live ? "live" : ""}"></i><b>VORTEX</b>
           <span class="path">/console</span>
           <span class="tag ${live ? "ok" : ""}">${live ? "run in flight" : "today"}</span>
         </div>

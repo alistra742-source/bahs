@@ -16,4 +16,4 @@ EXPOSE 8080
 
 # Bind 0.0.0.0 so the platform proxy can reach the process. Exec form via sh
 # so $PORT is expanded at runtime.
-CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --no-proxy-headers --port ${PORT:-8080}"]

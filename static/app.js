@@ -5,7 +5,7 @@
    the whole inline script -- App.boot() never ran and the sidebar rendered zero
    links. Only the browser sees this; checking each file on its own does not. */
 (function () {
-/* bahs — shared client. One place decides what a number means, so no page can
+/* VORTEX — shared client. One place decides what a number means, so no page can
    show a flattering version of a run.
  *
  * The rule this file exists to enforce: two rates are always shown, never one.
@@ -68,6 +68,8 @@ const NAV = [
   ["/proxies/", "proxies", "Proxies"],
   ["/alerts", "alerts", "Alerts"],
   ["/settings/", "settings", "Settings"],
+  ["/buy", "buy", "Buy access ↗"],
+  ["/account", "account", "Account"],
   ["/docs", "docs", "Docs"],
 ];
 
@@ -84,20 +86,20 @@ function renderNav(active) {
 /* ---- selection ------------------------------------------------------- */
 function restore() {
   try {
-    Object.assign(S.tune, JSON.parse(localStorage.getItem("bahs.tune") || "{}"));
-    const p = JSON.parse(localStorage.getItem("bahs.plats") || "[]");
+    Object.assign(S.tune, JSON.parse(localStorage.getItem("VORTEX.tune") || "{}"));
+    const p = JSON.parse(localStorage.getItem("VORTEX.plats") || "[]");
     if (Array.isArray(p)) S.plats = new Set(p);
-    const s = JSON.parse(localStorage.getItem("bahs.spaces") || '["3l"]');
+    const s = JSON.parse(localStorage.getItem("VORTEX.spaces") || '["3l"]');
     if (Array.isArray(s) && s.length) S.spaces = new Set(s);
-    const f = localStorage.getItem("bahs.filter");
+    const f = localStorage.getItem("VORTEX.filter");
     if (f) S.filter = f;
   } catch (e) { /* a corrupt store must not stop the page */ }
 }
 function persist() {
-  localStorage.setItem("bahs.tune", JSON.stringify(S.tune));
-  localStorage.setItem("bahs.plats", JSON.stringify([...S.plats]));
-  localStorage.setItem("bahs.spaces", JSON.stringify([...S.spaces]));
-  localStorage.setItem("bahs.filter", S.filter);
+  localStorage.setItem("VORTEX.tune", JSON.stringify(S.tune));
+  localStorage.setItem("VORTEX.plats", JSON.stringify([...S.plats]));
+  localStorage.setItem("VORTEX.spaces", JSON.stringify([...S.spaces]));
+  localStorage.setItem("VORTEX.filter", S.filter);
 }
 
 /* The grid is the shared SniperCell component rather than markup written here,
@@ -450,6 +452,15 @@ async function loadProxies() {
 }
 
 async function boot() {
+  if (window.Auth) {
+    await Auth.ready;
+    if (!Auth.state.user) { location.replace('/?auth=login'); return; }
+    const foot = document.querySelector('.side-foot');
+    if (foot) foot.insertAdjacentHTML('afterbegin', '<a href="/account" data-account-label></a><span data-access-clock></span><button class="btn sm ghost" data-logout>Log out</button>');
+    const main = document.querySelector('main');
+    if (main) main.insertAdjacentHTML('afterbegin', '<div class="access-banner"><span data-access-clock></span><a href="/buy">Buy access ↗</a></div>');
+    Auth.refresh();
+  }
   const page = window.PAGE || { name: "console", title: "Console" };
   try { S.info = await api("/info"); } catch (e) {
     toast("API unreachable: " + e.message, "bad"); return;
@@ -465,7 +476,7 @@ async function boot() {
     brand.title = "back to the landing page";
     brand.onclick = () => { location.href = "/"; };
   }
-  document.title = "bahs · " + page.title;
+  document.title = "VORTEX · " + page.title;
   if ($("vTitle")) $("vTitle").textContent = page.title;
   renderNav(page.name);
   renderPlats(); if ($("spaces")) { renderSpaces(); }

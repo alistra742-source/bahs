@@ -4,14 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>bahs · Hits</title>
+<title>VORTEX · Hits</title>
 <link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/ui/experience.css">
+<script src="/ui/auth.js"></script>
 </head>
 <body>
 <div class="wrap">
   <aside class="side">
-    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="brand"><b>VORTEX</b><span id="build">—</span></div>
     <div class="side-scroll">
       <h2>Workspace</h2>
       <nav class="menu" id="nav"></nav>
@@ -128,7 +130,7 @@ function csv() {
   const text = rows.map((r) => r.map((c) => '"' + String(c).replace(/"/g, '""') + '"').join(",")).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
-  a.download = "bahs-hits.csv"; a.click();
+  a.download = "VORTEX-hits.csv"; a.click();
 }
 App.boot();
 </script>
