@@ -49,7 +49,8 @@ class SecurityTests(unittest.TestCase):
     def solve(self, client, action):
         # Read the answer the way a test harness can: from the server-side challenge store.
         ch = client.get("/auth/challenge?action=" + action).json()
-        entry = accounts.CHALLENGES[ch["id"]]
+        with accounts.store.transaction() as db:
+            entry = db.one("SELECT word,target FROM challenges WHERE id=?", (ch["id"],))
         return {"challenge_id": ch["id"], "drag": entry["target"], "word": entry["word"]}
 
     def signup(self, name="firstuser", client=None):
@@ -227,22 +228,49 @@ class SecurityTests(unittest.TestCase):
 
 
 class CaptchaTests(unittest.IsolatedAsyncioTestCase):
-    def solve(self,action='signup',ip='127.0.0.1'):
-        ch=accounts.new_challenge(action,ip)
-        entry=accounts.CHALLENGES[ch['id']]
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {"ACCOUNT_DB_PATH": self.tmp.name + "/accounts.db", "APP_ENV": "test"})
+        self.env.start()
+        self.saved = accounts.store
+        accounts.store = accounts.Store(os.getenv("TEST_DATABASE_URL", ""))
+        accounts.store.initialize()
+        if accounts.store.pg:
+            with accounts.store.transaction() as db:
+                db.execute("DELETE FROM challenges")
+
+    def tearDown(self):
+        accounts.store = self.saved
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def entry(self, challenge_id):
+        with accounts.store.transaction() as db:
+            return db.one("SELECT action,word,target,expires FROM challenges WHERE id=?", (challenge_id,))
+
+    def solve(self,action='signup'):
+        ch=accounts.new_challenge(action)
+        entry=self.entry(ch['id'])
         return SimpleNamespace(challenge_id=ch['id'],drag=entry['target'],word=entry['word'])
 
-    def assert_rejected(self,body,action='signup',ip='127.0.0.1'):
-        with self.assertRaises(Exception) as caught:accounts.captcha(body,action,ip)
+    def assert_rejected(self,body,action='signup'):
+        with self.assertRaises(Exception) as caught:accounts.captcha(body,action)
         self.assertEqual(caught.exception.status_code,400)
 
+    async def test_challenge_survives_a_new_store_instance(self):
+        # Challenges live in the database, so another process or a restart can still verify them.
+        ch=accounts.new_challenge('signup')
+        restarted=accounts.Store(os.getenv("TEST_DATABASE_URL", ""))
+        accounts.store=restarted
+        entry=self.entry(ch['id'])
+        accounts.captcha(SimpleNamespace(challenge_id=ch['id'],drag=entry['target'],word=entry['word']),'signup')
+
     async def test_drag_and_word_challenge_accepts_only_the_solved_answer(self):
-        accounts.CHALLENGES.clear()
-        ch=accounts.new_challenge('signup','127.0.0.1')
+        ch=accounts.new_challenge('signup')
         self.assertTrue(ch['word_image'].startswith('data:image/svg+xml;base64,'))
-        self.assertEqual(len(accounts.CHALLENGES[ch['id']]['word']),6)
+        self.assertEqual(len(self.entry(ch['id'])['word']),6)
         body=self.solve()
-        accounts.captcha(body,'signup','127.0.0.1')
+        accounts.captcha(body,'signup')
         self.assert_rejected(body)  # single use: replay fails
 
         wrong_drag=self.solve(); wrong_drag.drag=(wrong_drag.drag+30)%100
@@ -252,12 +280,15 @@ class CaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assert_rejected(wrong_word)
 
         lenient=self.solve(); lenient.word=lenient.word.lower()+' '
-        accounts.captcha(lenient,'signup','127.0.0.1')
+        accounts.captcha(lenient,'signup')
 
         self.assert_rejected(self.solve(),action='login')  # bound to action
-        self.assert_rejected(self.solve(),ip='10.0.0.9')  # bound to IP at issue
+        # Not bound to IP: a proxy can change the client address between GET and POST.
+        moved=self.solve(); accounts.captcha(moved,'signup')
 
-        expired=self.solve(); accounts.CHALLENGES[expired.challenge_id]['expires']=0
+        expired=self.solve()
+        with accounts.store.transaction() as db:
+            db.execute("UPDATE challenges SET expires=0 WHERE id=?", (expired.challenge_id,))
         self.assert_rejected(expired)
 
         self.assert_rejected(SimpleNamespace(challenge_id='',drag=-1,word=''))

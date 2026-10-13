@@ -13,7 +13,6 @@ import os
 import re
 import secrets
 import sqlite3
-import threading
 import time
 import base64
 import uuid
@@ -72,6 +71,11 @@ CREATE TABLE IF NOT EXISTS issued_addresses (
 );
 CREATE INDEX IF NOT EXISTS order_user ON orders(user_id,created);
 CREATE INDEX IF NOT EXISTS session_expiry ON sessions(expires);
+CREATE TABLE IF NOT EXISTS challenges (
+ id TEXT PRIMARY KEY, action TEXT NOT NULL, word TEXT NOT NULL,
+ target INTEGER NOT NULL, expires DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS challenge_expiry ON challenges(expires);
 """
 
 
@@ -261,12 +265,11 @@ def make_session(user, device):
     return response
 
 
-# Human check: drag a chip onto a target, then type a distorted word. Each challenge
-# is stored server-side, bound to one IP and action, expires quickly and is consumed
-# on the first attempt, so a solved answer cannot be replayed.
-CHALLENGES: dict[str, dict] = {}
-CHALLENGE_LOCK = threading.Lock()
-CHALLENGE_TTL = 180
+# Human check: drag a chip onto a target, then type a distorted word. Challenges are
+# stored in the database (not process memory), so they survive restarts and work across
+# instances. Each one is bound to an action, expires quickly and is consumed on the first
+# attempt, so a solved answer cannot be replayed.
+CHALLENGE_TTL = 600  # generous: slow solvers and proxy hops must not be punished
 CHALLENGE_CAP = 5000
 DRAG_TOLERANCE = 4
 WORD_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no I/L/O/0/1: easy to misread, still typable
@@ -291,25 +294,27 @@ def _word_image(word: str) -> str:
     return "data:image/svg+xml;base64," + base64.b64encode("".join(parts).encode()).decode()
 
 
-def new_challenge(action: str, ip: str) -> dict:
+def new_challenge(action: str) -> dict:
     cid = secrets.token_urlsafe(24)
     word = "".join(secrets.choice(WORD_ALPHABET) for _ in range(6))
     target = secrets.randbelow(71) + 15
     now = time.time()
-    with CHALLENGE_LOCK:
-        for key in [k for k, v in CHALLENGES.items() if v["expires"] < now]:
-            del CHALLENGES[key]
-        if len(CHALLENGES) >= CHALLENGE_CAP:
+    with store.transaction() as db:
+        db.execute("DELETE FROM challenges WHERE expires<?", (now,))
+        if db.one("SELECT COUNT(*) AS n FROM challenges")["n"] >= CHALLENGE_CAP:
             raise HTTPException(429, "Too many verification requests. Try again shortly.")
-        CHALLENGES[cid] = {"action": action, "ip": ip, "word": word, "target": target, "expires": now + CHALLENGE_TTL}
+        db.execute("INSERT INTO challenges(id,action,word,target,expires) VALUES(?,?,?,?,?)",
+                   (cid, action, word, target, now + CHALLENGE_TTL))
     return {"id": cid, "target": target, "tolerance": DRAG_TOLERANCE, "word_image": _word_image(word)}
 
 
-def captcha(body, action: str, ip: str) -> None:
+def captcha(body, action: str) -> None:
     # Consume the challenge first: a wrong answer or a replay both use it up.
-    with CHALLENGE_LOCK:
-        entry = CHALLENGES.pop(body.challenge_id, None)
-    if not entry or entry["expires"] < time.time() or entry["action"] != action or entry["ip"] != ip:
+    with store.transaction() as db:
+        entry = db.one("DELETE FROM challenges WHERE id=? RETURNING action,word,target,expires", (body.challenge_id,))
+    # No IP binding: the requesting IP can differ between the challenge GET and the
+    # POST behind a proxy, which made valid answers fail as "expired".
+    if not entry or entry["expires"] < time.time() or entry["action"] != action:
         raise HTTPException(400, "Verification expired. Please try again.")
     drag_ok = 0 <= body.drag <= 100 and abs(body.drag - entry["target"]) <= DRAG_TOLERANCE
     word_ok = hmac.compare_digest(body.word.strip().upper().encode(), entry["word"].encode())
@@ -331,7 +336,7 @@ router = APIRouter()
 
 @router.get("/auth/challenge")
 def auth_challenge(action: str = Query("signup", pattern="^(signup|login)$"), request: Request = None):
-    return new_challenge(action, client_ip(request))
+    return new_challenge(action)
 
 
 @router.get("/auth/config")
@@ -351,7 +356,7 @@ async def signup(body: Credentials, request: Request):
     await asyncio.to_thread(rate_limit, "signup:" + digest(ip), 5, 3600)
     if body.website:
         raise HTTPException(400, "Security verification failed")
-    captcha(body, "signup", ip)
+    await asyncio.to_thread(captcha, body, "signup")
     username = body.username.lower()
     if username in {u.strip() for u in os.getenv("ADMIN_USERS", "").lower().split(",") if u.strip()}:
         raise HTTPException(409, "Account cannot be created with that username")
@@ -386,7 +391,7 @@ async def login(body: Credentials, request: Request):
     await asyncio.to_thread(rate_limit, "login-name:" + digest(body.username.lower()), 15, 900)
     if body.website:
         raise HTTPException(400, "Security verification failed")
-    captcha(body, "login", ip)
+    await asyncio.to_thread(captcha, body, "login")
     await asyncio.to_thread(rate_limit, "login-global", 120, 60)
     def verify():
         with store.transaction() as db:

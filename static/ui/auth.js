@@ -56,12 +56,14 @@
   async function setupSecurityChallenge() {
     const box = document.getElementById('authCaptcha');
     if (!box) return;
+    const mode = state.mode;
     state.challenge = null; state.dragOk = false; state.dragValue = -1;
     updateSubmit();
     box.innerHTML = '<p class="auth-legal">Loading verification…</p>';
     try {
-      const ch = await json('/auth/challenge?action=' + encodeURIComponent(state.mode));
-      if (!state.dialog || !state.dialog.open) return;
+      const ch = await json('/auth/challenge?action=' + encodeURIComponent(mode));
+      // Ignore a late response: the user may have switched between signup and login meanwhile.
+      if (!state.dialog || !state.dialog.open || state.mode !== mode || !document.getElementById('authCaptcha')) return;
       state.challenge = ch;
       box.innerHTML = `
         <div class="vx-check">
