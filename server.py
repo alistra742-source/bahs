@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Iterable, Iterator
 from contextlib import asynccontextmanager
 
@@ -160,6 +161,13 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # A run outlives its client by design, so shutting the process down is
+        # the one thing that has to reach in and stop it -- otherwise a detached
+        # sweep is still holding sockets while the loop is closing.
+        for handle in list(_runs.values()):
+            if handle.task is not None and not handle.task.done():
+                handle.stop.set()
+                handle.task.cancel()
         await _close_pools()
         proxy_list.save()
 
@@ -208,7 +216,9 @@ def info() -> dict:
             "POST /snipe/stop": "stop every in-flight /snipe batch",
             "POST /scan": "generate and check in bulk (NDJSON with stream=true)",
             "POST /scan/stop": "stop every in-flight /scan",
-            "GET /runs": "in-flight and just-finished runs",
+            "GET /runs": "in-flight and just-finished runs, with live counters",
+            "GET /runs/{id}": "one run's counters",
+            "GET /runs/{id}/stream": "reattach to a run that is still going",
             "POST /runs/stop": "stop all runs, or the one named by ?run_id=",
             "GET /generate": "candidate usernames: letters | alnum | numbers | words, by length",
             "POST /generate": "the same for several patterns at once",
@@ -334,16 +344,31 @@ def clear_proxies() -> dict:
 
 # --- run control ----------------------------------------------------------
 class RunHandle:
-    """One in-flight snipe or scan, cancellable from another HTTP request.
+    """One in-flight snipe or scan -- and it outlives whoever is watching it.
 
-    A streaming endpoint holds one of these. Setting ``stop`` makes the generator
-    stop dispatching, cancel its in-flight checks and finish, so ``/runs/stop``
-    is a real halt rather than the client merely closing its socket. Every
-    mutation happens on the event loop with no awaits between read and write, so
-    no lock is needed.
+    The run is driven by its own task, not by the HTTP response that started it,
+    because a sweep is not something a browser tab should be able to kill by
+    being closed, backgrounded, or losing signal. Every NDJSON line it produces
+    is appended to a bounded ring buffer, and readers follow that buffer: the tab
+    that started the run, a tab that comes back to it later
+    (``GET /runs/{id}/stream``), or nobody at all. The run ends when it runs out
+    of names, when the pool is exhausted, or when ``stop`` is set from
+    ``/scan/stop`` -- and for no other reason.
+
+    ``stop`` and every other mutation happen on the event loop with no awaits
+    between the read and the write, so no lock is needed.
     """
 
-    __slots__ = ("id", "kind", "stop", "started", "finished", "checked")
+    # How many NDJSON lines are held for a reader that arrives late. A wide run
+    # emits far more than this, so a tab that reattaches sees the recent tail and
+    # the counters rather than the whole history -- which is what it draws.
+    BUFFER = 4000
+
+    __slots__ = (
+        "id", "kind", "stop", "started", "finished", "checked", "task", "tally",
+        "rows", "keep_rows", "note", "names", "platforms", "final",
+        "_lines", "_first", "_last", "_waiters",
+    )
 
     def __init__(self, kind: str) -> None:
         self.id = uuid.uuid4().hex[:12]
@@ -352,6 +377,20 @@ class RunHandle:
         self.started = time.time()
         self.finished: float | None = None
         self.checked = 0
+        self.task: asyncio.Task | None = None
+        self.tally: "_Tally | None" = None
+        # Only a buffered run keeps its rows: a streamed one would hold the whole
+        # sweep in memory for a client that is being handed every line anyway.
+        self.rows: list[dict] = []
+        self.keep_rows = False
+        self.note = ""
+        self.names = 0
+        self.platforms: list[str] = []
+        self.final = False
+        self._lines: deque[str] = deque(maxlen=self.BUFFER)
+        self._first = 0   # index of the oldest line still held
+        self._last = 0    # index one past the newest
+        self._waiters: list[asyncio.Event] = []
 
     @property
     def active(self) -> bool:
@@ -361,35 +400,144 @@ class RunHandle:
         if self.finished is None:
             self.finished = time.time()
 
+    # --- the feed ---------------------------------------------------------
+    def emit(self, line: str) -> None:
+        """Publish one NDJSON line: into the ring buffer and out to readers."""
+        self._lines.append(line)
+        self._last += 1
+        self._first = self._last - len(self._lines)
+        for waiter in self._waiters:
+            waiter.set()
+
+    def close(self) -> None:
+        """No more lines are coming, so a reader following the live edge ends."""
+        self.final = True
+        for waiter in self._waiters:
+            waiter.set()
+
+    @property
+    def start_index(self) -> int:
+        """The oldest line still held, for a reader that wants the whole tail."""
+        return self._first
+
+    async def follow(self, since: int = 0) -> AsyncIterator[str]:
+        """Yield the run's lines from ``since``, then live ones, until it ends.
+
+        Closing this generator -- which is exactly what a client going away does
+        -- removes this reader and nothing else. The run is untouched.
+        """
+        index = max(0, since)
+        waiter = asyncio.Event()
+        self._waiters.append(waiter)
+        try:
+            while True:
+                while index < self._last:
+                    if index < self._first:
+                        # This reader fell further behind than the buffer holds.
+                        # Skip to the oldest line still here rather than replaying
+                        # history that is already gone.
+                        index = self._first
+                    yield self._lines[index - self._first]
+                    index += 1
+                if self.final and index >= self._last:
+                    return
+                waiter.clear()
+                # No await between the check above and this wait, so a line
+                # emitted in between cannot be missed.
+                await waiter.wait()
+        finally:
+            if waiter in self._waiters:
+                self._waiters.remove(waiter)
+
     def status(self) -> dict:
-        return {
+        out = {
             "id": self.id,
             "kind": self.kind,
             "started": self.started,
             "finished": self.finished,
             "checked": self.checked,
+            "names": self.names,
+            "platforms": self.platforms,
+            "note": self.note,
             "stopping": self.stop.is_set(),
             "active": self.active,
+            "final": self.final,
+            "cursor": self._last,
             "elapsed_s": round((self.finished or time.time()) - self.started, 2),
         }
+        if self.tally is not None:
+            out["progress"] = self.tally.progress()
+        return out
 
 
 _runs: dict[str, RunHandle] = {}
 
 
+# How long a finished run stays readable after it ends. A tab that was closed
+# (or a phone that slept) comes back to the tail of its run rather than to
+# nothing, and a run that ended while nobody was watching can still be read.
+RUN_TTL: float = 900.0
+
+
 def _reap_runs() -> None:
-    for run_id in [rid for rid, handle in _runs.items() if not handle.active]:
+    """Drop runs that finished long enough ago that nobody is coming back."""
+    now = time.time()
+    for run_id in [
+        rid for rid, handle in _runs.items()
+        if handle.finished is not None and now - handle.finished > RUN_TTL
+    ]:
         _runs.pop(run_id, None)
 
 
 def _open_run(kind: str) -> RunHandle:
-    """Register a run, refusing once ``MAX_CONCURRENT_RUNS`` are in flight."""
+    """Register a run: one per kind, and up to ``MAX_CONCURRENT_RUNS`` overall.
+
+    One run per kind because the proxy pool is cached per kind: a second run of
+    the same kind would reset the first one's retirements and strikes out from
+    under it (and share its warm tunnels). Refusing says so honestly, and names
+    the run that is already going so the caller can reattach to that one instead
+    of losing it.
+    """
     _reap_runs()
-    if len(_runs) >= MAX_CONCURRENT_RUNS:
+    active = [handle for handle in _runs.values() if handle.active]
+    for handle in active:
+        if handle.kind == kind:
+            raise HTTPException(
+                409,
+                f"a {kind} run is already in flight ({handle.id}) -- reattach with "
+                f"GET /runs/{handle.id}/stream, or stop it with POST /runs/stop",
+            )
+    if len(active) >= MAX_CONCURRENT_RUNS:
         raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
     handle = RunHandle(kind)
     _runs[handle.id] = handle
     return handle
+
+
+async def _pump(run: RunHandle, lines: AsyncIterator[str]) -> None:
+    """Drive a run to completion, publishing every line it produces.
+
+    Nothing here depends on a client being connected: this task owns the sweep.
+    Closing the tab, losing signal or backgrounding the browser ends a *reader*,
+    never this.
+    """
+    try:
+        async for line in lines:
+            run.emit(line)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - the generators are guarded
+        log.warning("run %s ended on %s", run.id, type(exc).__name__, exc_info=True)
+    finally:
+        run.close()
+
+
+def _detach(run: RunHandle, lines: AsyncIterator[str]) -> None:
+    """Start a run in the background. Its HTTP response is only a window on it."""
+    run.task = asyncio.create_task(_pump(run, lines))
+
+
+NDJSON_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
 
 
 def _stop_runs(kind: str | None = None, run_id: str | None = None) -> list[str]:
@@ -438,6 +586,34 @@ def stop_scan() -> dict:
     """Stop every in-flight /scan."""
     stopped = _stop_runs(kind="scan")
     return {"stopped": stopped, "runs": _runs_status()}
+
+
+@app.get("/runs/{run_id}")
+def run_status(run_id: str) -> dict:
+    """One run's counters -- what a returning tab paints before it reattaches."""
+    _reap_runs()
+    handle = _runs.get(run_id)
+    if handle is None:
+        raise HTTPException(404, "no such run")
+    return handle.status()
+
+
+@app.get("/runs/{run_id}/stream")
+async def run_stream(run_id: str, since: int = Query(-1, ge=-1)) -> StreamingResponse:
+    """Follow a run that is already going. Cutting this does not stop it.
+
+    ``since`` is the cursor from ``GET /runs/{id}``; the default replays the
+    oldest lines still buffered, which is what a tab that just came back wants.
+    """
+    _reap_runs()
+    handle = _runs.get(run_id)
+    if handle is None:
+        raise HTTPException(404, "no such run")
+    return StreamingResponse(
+        handle.follow(handle.start_index if since < 0 else since),
+        media_type="application/x-ndjson",
+        headers=NDJSON_HEADERS,
+    )
 
 
 # --- the pool -------------------------------------------------------------
@@ -700,6 +876,10 @@ class _Tally:
             "current_target": self.current,
             "elapsed_s": round(self.elapsed, 2),
             "by_platform": self.by_platform,
+            # Platforms the pacer is asking slower right now. Sending it with
+            # every tick means a tab that attaches mid-run can see the throttle
+            # being handled instead of just a stalled counter.
+            "platforms_paced": _pace_snapshot(self.pool),
             **_verdict_report(self.answered, self.checked),
         }
 
@@ -733,7 +913,14 @@ def _snipe_row(result: sniper.SnipeResult) -> dict:
     }
 
 
+def _pace_snapshot(pool: sniper.ProxyPool) -> dict:
+    """The pacer's current per-platform caps, or empty when there is no pacer."""
+    pace = getattr(pool, "pace", None)
+    return pace.snapshot() if pace is not None else {}
+
+
 def _pool_report(pool: sniper.ProxyPool) -> dict:
+    pace = getattr(pool, "pace", None)
     return {
         "pool_size": len(pool),
         "pool_alive": pool.alive(),
@@ -754,6 +941,13 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         # Platforms sat out because they refused the whole list, so a throttle is
         # visible per platform instead of hidden in the blocked count.
         "platforms_paused": pool.paused(),
+        # Platforms the run is deliberately asking *slower*, with the numbers
+        # behind the decision. That is what a throttle looks like when it is
+        # being handled rather than merely survived: the platform keeps producing
+        # verdicts, and the dashboard can say which one was cut and by how much
+        # instead of showing a wall of refusals.
+        "platforms_paced": _pace_snapshot(pool),
+        "pace_adjustments": pace.recent() if pace is not None else [],
         "skipped": pool.skipped,
     }
 
@@ -768,6 +962,38 @@ async def _snipe_ready(
     retries = SNIPE_RETRIES if req.retries is None else max(0, req.retries)
     pool, note = await _prepare_pool("snipe", concurrency)
     return names, platforms, pool, concurrency, retries, note
+
+
+def _buffered_report(
+    run: RunHandle,
+    pool: sniper.ProxyPool,
+    note: str,
+    alerter: Alerter | None,
+    names_total: int,
+    truncated: bool,
+) -> dict:
+    """A finished buffered run as one JSON document.
+
+    Built from the run rather than from a list this request collected, so the
+    answer is the same whether the caller stayed connected for it or came back
+    to it afterwards.
+    """
+    tally = run.tally or _Tally(names_total, run.platforms, alerter, pool)
+    rows = run.rows
+    available = [r for r in rows if r["status"] == "available"]
+    return {
+        "run_id": run.id,
+        "stopped": run.stop.is_set(),
+        "names": names_total,
+        "truncated": truncated,
+        "platforms": run.platforms,
+        "pool_note": note,
+        "available": available,
+        "results": rows,
+        "alerts": _alert_report(alerter),
+        **_pool_report(pool),
+        **tally.summary(),
+    }
 
 
 def _alert_report(alerter: Alerter | None) -> dict:
@@ -821,6 +1047,8 @@ async def _snipe_ndjson(
     response open.
     """
     tally = _Tally(len(names), platforms, alerter, pool)
+    if run:
+        run.tally = tally
     run_id = run.id if run else ""
     last_report = 0.0
     if note:
@@ -846,9 +1074,12 @@ async def _snipe_ndjson(
                 yield json.dumps({"type": "heartbeat", **tally.progress()}) + "\n"
                 continue
             tally.add(result)
+            row = _snipe_row(result)
             if run:
                 run.checked = tally.checked
-            yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
+                if run.keep_rows:
+                    run.rows.append(row)
+            yield json.dumps({"type": "result", **row}) + "\n"
             now = time.perf_counter()
             if tally.checked % 10 == 0 and (now - last_report) >= 0.12:
                 last_report = now
@@ -879,55 +1110,25 @@ async def snipe_batch(req: SnipeRequest):
     """Check names against the platforms, through the stored proxies.
 
     JSON by default; ``"stream": true`` returns the same data as NDJSON, one
-    result per line, so a big batch lands incrementally.
+    result per line, so a big batch lands incrementally. As with /scan the run is
+    detached from the response: it finishes whether or not anybody is still
+    reading, and ``GET /runs/{id}/stream`` picks it up again.
     """
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
     run = _open_run("snipe")
+    run.names, run.platforms, run.note = len(names), platforms, note
+    run.keep_rows = not req.stream
     alerter = Alerter(alert_settings.get())
+    _detach(
+        run,
+        _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run, alerter),
+    )
     if req.stream:
         return StreamingResponse(
-            _snipe_ndjson(names, platforms, pool, concurrency, retries, note, run, alerter),
-            media_type="application/x-ndjson",
-            # Nothing between here and the browser may buffer the stream.
-            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+            run.follow(0), media_type="application/x-ndjson", headers=NDJSON_HEADERS
         )
-    try:
-        results = [
-            result
-            async for result in sniper.iter_snipes(
-                names,
-                platforms,
-                pool,
-                concurrency=concurrency,
-                retries=retries,
-                stop=run.stop,
-            )
-            if result.status not in (sniper.WAITING_STATUS, sniper.HEARTBEAT_STATUS)
-        ]
-    finally:
-        run.finish()
-    # The same tally the streaming path uses, so a buffered run reports the same
-    # counters -- the per-platform split and the proxy-miss count used to exist
-    # only on the streaming path, which made the two ways of asking the same
-    # question answer differently.
-    tally = _Tally(len(names), platforms, alerter, pool)
-    for result in results:
-        tally.add(result)
-    await _finish_alerts(alerter)
-    rows = [_snipe_row(r) for r in results]
-    available = [r for r in rows if r["status"] == "available"]
-    return {
-        "run_id": run.id,
-        "stopped": run.stop.is_set(),
-        "names": len(names),
-        "platforms": platforms,
-        "pool_note": note,
-        "available": available,
-        "results": rows,
-        "alerts": _alert_report(alerter),
-        **_pool_report(pool),
-        **tally.summary(),
-    }
+    await run.task
+    return _buffered_report(run, pool, note, alerter, len(names), False)
 
 
 @app.get("/snipe")
@@ -937,41 +1138,7 @@ async def snipe_one(
 ):
     """Same thing for one name, from the query string."""
     req = SnipeRequest(username=username, platforms=platform)
-    names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
-    run = _open_run("snipe")
-    alerter = Alerter(alert_settings.get())
-    results: list[sniper.SnipeResult] = []
-    try:
-        results = [
-            r
-            async for r in sniper.iter_snipes(
-                names,
-                platforms,
-                pool,
-                concurrency=concurrency,
-                retries=retries,
-                stop=run.stop,
-            )
-            if r.status != sniper.WAITING_STATUS
-        ]
-    finally:
-        run.finish()
-    tally = _Tally(len(names), platforms, alerter, pool)
-    for result in results:
-        tally.add(result)
-    await _finish_alerts(alerter)
-    rows = [_snipe_row(r) for r in results]
-    available = [r for r in rows if r["status"] == "available"]
-    return {
-        "names": len(names),
-        "platforms": platforms,
-        "pool_note": note,
-        "available": available,
-        "results": rows,
-        "alerts": _alert_report(alerter),
-        **_pool_report(pool),
-        **tally.summary(),
-    }
+    return await snipe_batch(req)
 
 
 # --- generation -----------------------------------------------------------
@@ -1091,11 +1258,7 @@ class ScanRequest(BaseModel):
     concurrency: int | None = None
     retries: int | None = None
     stream: bool = False
-    # A "hunt": stop the moment any name comes back free. A 3-letter sweep is
-    # 46,656 names, and once one is claimed the answer is in hand -- grinding
-    # through the other 46,000 spends the whole pool for nothing. Off by
-    # default because a sweep is usually collecting *every* free name.
-    stop_on_available: bool = False
+
 
 
 def _scan_plan(req: ScanRequest) -> tuple[Iterable[str], int, bool]:
@@ -1169,22 +1332,20 @@ async def _scan_stream(
     note: str = "",
     run: RunHandle | None = None,
     alerter: Alerter | None = None,
-    stop_on_available: bool = False,
 ) -> AsyncIterator[str]:
     """NDJSON: one verdict per line, progress as it goes, then a summary.
 
     ``run.stop`` is what makes the dashboard's Stop button real: the dispatch
     loop in ``iter_snipes`` sees the same event, so a stop cancels the checks
-    already in flight instead of only ending the response.
-
-    With ``stop_on_available`` the run ends the moment a name comes back free,
-    which is what a hunt for a scarce name wants: the answer is in hand, and the
-    rest of the list is not worth the pool it would spend.
+    already in flight instead of only ending the response. Nothing else ends a
+    run -- a client going away is not a reason, which is why this generator is
+    pumped by the run's own task rather than by the response that started it.
     """
     tally = _Tally(names_total, platforms, alerter, pool)
+    if run:
+        run.tally = tally
     run_id = run.id if run else ""
     last_report = 0.0
-    hunted = False
     yield json.dumps(
         {
             "type": "start",
@@ -1217,12 +1378,12 @@ async def _scan_stream(
                 yield json.dumps({"type": "heartbeat", **tally.progress()}) + "\n"
                 continue
             tally.add(result)
+            row = _snipe_row(result)
             if run:
                 run.checked = tally.checked
-            yield json.dumps({"type": "result", **_snipe_row(result)}) + "\n"
-            if stop_on_available and result.status == "available":
-                hunted = True
-                break
+                if run.keep_rows:
+                    run.rows.append(row)
+            yield json.dumps({"type": "result", **row}) + "\n"
             now = time.perf_counter()
             if tally.checked % 10 == 0 and (now - last_report) >= 0.12:
                 last_report = now
@@ -1259,7 +1420,7 @@ async def _scan_stream(
         {
             "type": "done",
             "run_id": run_id,
-            "stopped": bool(run and run.stop.is_set()) or hunted,
+            "stopped": bool(run and run.stop.is_set()),
             "names": names_total,
             "platforms": platforms,
             "pool_note": note,
@@ -1270,8 +1431,7 @@ async def _scan_stream(
             "duration_ms": round(tally.elapsed * 1000, 1),
             "alerts": _alert_report(alerter),
             **_pool_report(pool),
-            # After _pool_report, whose stop_reason is empty on a clean hunt.
-            "stop_reason": "stopped at the first free name" if hunted else pool.stop_reason,
+            "stop_reason": pool.stop_reason,
             **tally.summary(),
         }
     ) + "\n"
@@ -1283,6 +1443,12 @@ async def scan(req: ScanRequest):
 
     NDJSON by default so a long run can be watched live; ``"stream": false``
     buffers the same data into one JSON document.
+
+    Either way the run itself is detached: it is driven by its own task and the
+    response is only a window on it. Closing the tab, losing signal or
+    backgrounding the browser ends the *window*, not the sweep -- it keeps
+    checking until you stop it or the pool is exhausted, and
+    ``GET /runs/{id}/stream`` picks the feed back up where it is.
     """
     names, names_total, truncated = _scan_plan(req)
     platforms = sniper.normalize_platforms(req.platforms)
@@ -1298,63 +1464,24 @@ async def scan(req: ScanRequest):
         )
     pool, note = await _prepare_pool("scan", concurrency)
     run = _open_run("scan")
+    run.names, run.platforms, run.note = names_total, platforms, note
+    run.keep_rows = not req.stream
     alerter = Alerter(alert_settings.get())
-
-    if not req.stream:
-        try:
-            results = []
-            async for result in sniper.iter_snipes(
-                names,
-                platforms,
-                pool,
-                concurrency=concurrency,
-                retries=retries,
-                stop=run.stop,
-            ):
-                if result.status in (sniper.WAITING_STATUS, sniper.HEARTBEAT_STATUS):
-                    continue
-                results.append(result)
-                if req.stop_on_available and result.status == "available":
-                    break
-        finally:
-            run.finish()
-        tally = _Tally(names_total, platforms, alerter, pool)
-        for result in results:
-            tally.add(result)
-        await _finish_alerts(alerter)
-        rows = [_snipe_row(r) for r in results]
-        available = [r for r in rows if r["status"] == "available"]
-        return {
-            "run_id": run.id,
-            "stopped": run.stop.is_set(),
-            "names": names_total,
-            "truncated": truncated,
-            "platforms": platforms,
-            "pool_note": note,
-            "available": available,
-            "results": rows,
-            "alerts": _alert_report(alerter),
-            **_pool_report(pool),
-            **tally.summary(),
-        }
-
-    return StreamingResponse(
+    _detach(
+        run,
         _scan_stream(
-            names,
-            names_total,
-            platforms,
-            pool,
-            concurrency,
-            retries,
-            truncated,
-            note,
-            run,
-            alerter,
-            stop_on_available=req.stop_on_available,
+            names, names_total, platforms, pool, concurrency, retries, truncated, note, run, alerter
         ),
-        media_type="application/x-ndjson",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+    if req.stream:
+        return StreamingResponse(
+            run.follow(0), media_type="application/x-ndjson", headers=NDJSON_HEADERS
+        )
+    # Buffered: wait for the run rather than driving it. A dropped client does
+    # not take the run with it -- it still finishes and stays readable from
+    # /runs/{id}.
+    await run.task
+    return _buffered_report(run, pool, note, alerter, names_total, truncated)
 
 
 # --- alert settings -------------------------------------------------------

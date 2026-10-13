@@ -2,931 +2,919 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bahs — username availability</title>
-<!-- Inline so the dashboard makes no request the server has no route for. -->
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230a0b10'/%3E%3Crect x='7' y='7' width='18' height='18' rx='6' fill='%236c5ce7'/%3E%3C/svg%3E">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>bahs</title>
 <style>
 :root{
-  --bg:#0a0b10; --panel:#12141c; --panel2:#171a24; --line:#232735; --line2:#2e3346;
-  --text:#e8ecf5; --dim:#8b93a8; --dim2:#5d6579;
-  --acc:#6c5ce7; --acc2:#00e0b8; --ok:#2ee6a8; --warn:#ffb020; --bad:#ff5f6d; --info:#4aa8ff;
-  --mono:ui-monospace,SFMono-Regular,"JetBrains Mono",Menlo,monospace;
-  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --bg:#0d0e0f; --panel:#141516; --raise:#1a1c1e; --line:#24272a; --line2:#2e3236;
+  --ink:#dfe2e6; --dim:#8e959d; --dim2:#666d75;
+  --ok:#4fd48c; --warn:#d8a442; --bad:#e0575f; --pace:#6fa8dc; --hold:#a99bff;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.45}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 var(--sans);
+  -webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:0;
-  background:
-   radial-gradient(900px 500px at 12% -8%,rgba(108,92,231,.16),transparent 60%),
-   radial-gradient(700px 420px at 100% 0%,rgba(0,224,184,.10),transparent 60%)}
-.shell{position:relative;z-index:1;display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100%}
-/* ---------- sidebar ---------- */
-.side{min-width:0;border-right:1px solid var(--line);padding:20px 14px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:6px;background:rgba(10,11,16,.6)}
-.brand{display:flex;align-items:center;gap:9px;padding:4px 8px 18px}
-.brand .dot{width:10px;height:10px;border-radius:3px;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 0 14px rgba(108,92,231,.8)}
-.brand b{font-size:15px;letter-spacing:.5px}
-.brand span{font-size:10px;color:var(--dim2);font-family:var(--mono)}
-.nav{display:flex;flex-direction:column;gap:3px}
-.nav button{all:unset;cursor:pointer;display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;color:var(--dim);font-weight:500;transition:.12s}
-.nav button:hover{background:var(--panel);color:var(--text)}
-.nav button.on{background:linear-gradient(90deg,rgba(108,92,231,.22),rgba(108,92,231,.05));color:#fff;box-shadow:inset 0 0 0 1px var(--line2)}
-.nav .ico{width:18px;text-align:center;opacity:.9}
-.nav .tag{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--dim2)}
-.side .foot{margin-top:auto;font-size:11px;color:var(--dim2);font-family:var(--mono);padding:10px 8px;line-height:1.7}
-.side .foot b{color:var(--dim)}
-/* ---------- main ---------- */
-main{min-width:0;padding:26px 30px 90px;max-width:1500px}
-.view{display:none}.view.on{display:block;animation:fade .18s ease}
-@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
-h1{font-size:21px;margin:0 0 3px;letter-spacing:-.2px}
-.sub{color:var(--dim);font-size:13px;margin-bottom:22px}
-.card{min-width:0;background:linear-gradient(180deg,var(--panel),rgba(18,20,28,.6));border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
-.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.9px;color:var(--dim);margin:0 0 14px;font-weight:600}
-.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
-/* A wide table scrolls sideways *inside* this box. min-width:0 matters: without
-   it the table's intrinsic width travels up through .card and main, and the
-   whole page -- not the table -- becomes wider than the phone. */
-.scroll{min-width:0;overflow:auto;-webkit-overflow-scrolling:touch}
-table{min-width:520px}
-th{white-space:nowrap}
-#platTable{min-width:0}
-.reswrap{position:relative}
-.reswrap::after{content:"";position:absolute;top:0;right:0;bottom:0;width:26px;pointer-events:none;
-  background:linear-gradient(90deg,transparent,rgba(10,11,16,.85))}
-/* ---------- controls ---------- */
-button.btn{all:unset;cursor:pointer;padding:9px 15px;border-radius:9px;font-weight:600;font-size:13px;text-align:center;transition:.12s;border:1px solid var(--line2);color:var(--text)}
-button.btn:hover{border-color:var(--acc);background:rgba(108,92,231,.12)}
-button.btn.primary{background:linear-gradient(135deg,var(--acc),#8b7cf6);border-color:transparent;color:#fff}
-button.btn.primary:hover{filter:brightness(1.13)}
-button.btn.danger{border-color:rgba(255,95,109,.4);color:#ffb4ba}
-button.btn.danger:hover{background:rgba(255,95,109,.14);border-color:var(--bad)}
-button.btn.ghost{border-color:transparent;color:var(--dim);padding:6px 9px}
-button.btn.ghost:hover{color:var(--text);background:var(--panel2)}
-button.btn:disabled{opacity:.42;cursor:not-allowed;filter:none}
-input[type=text],input[type=number],textarea,select{width:100%;background:#0d0f16;border:1px solid var(--line2);color:var(--text);border-radius:9px;padding:9px 11px;font-family:var(--mono);font-size:12.5px;outline:none;transition:.12s}
-input:focus,textarea:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(108,92,231,.14)}
-textarea{min-height:110px;resize:vertical;line-height:1.5}
-label.fld{display:block;font-size:11px;color:var(--dim);margin:0 0 6px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px}
-input[type=range]{width:100%;accent-color:var(--acc)}
-.sw{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none;font-size:12.5px;color:var(--dim)}
-.sw input{display:none}
-.sw i{width:34px;height:19px;border-radius:20px;background:var(--line2);position:relative;transition:.16s;flex:none}
-.sw i::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#7c8299;transition:.16s}
-.sw input:checked + i{background:rgba(46,230,168,.35)}
-.sw input:checked + i::after{left:17px;background:var(--ok)}
-.chips{display:flex;gap:7px;flex-wrap:wrap}
-.chip{cursor:pointer;user-select:none;padding:6px 11px;border-radius:8px;border:1px solid var(--line2);font-family:var(--mono);font-size:12px;color:var(--dim);transition:.12s}
-.chip:hover{border-color:var(--acc);color:var(--text)}
-.chip.on{background:rgba(108,92,231,.2);border-color:var(--acc);color:#fff}
-/* ---------- buckets ---------- */
-.bucketrow{display:grid;grid-template-columns:52px repeat(4,1fr);gap:9px;align-items:center;margin-bottom:9px}
-.bhead{font-size:10.5px;color:var(--dim2);font-family:var(--mono);text-transform:uppercase;letter-spacing:.6px}
-.bucketrow .len{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--dim)}
-.bucket{cursor:pointer;border:1px solid var(--line2);border-radius:10px;padding:8px 10px;background:#0d0f16;transition:.12s;position:relative;overflow:hidden}
-.bucket:hover{border-color:var(--acc)}
-.bucket.on{border-color:var(--acc);background:linear-gradient(135deg,rgba(108,92,231,.25),rgba(0,224,184,.09))}
-.bucket .k{font-family:var(--mono);font-size:12.5px;font-weight:700;color:var(--text)}
-.bucket .n{font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:2px;overflow:hidden;white-space:nowrap}
-.bucket .d{font-size:10px;color:var(--dim2);margin-top:3px}
-.bucket.redun{opacity:.4}
-.bucket .x{position:absolute;top:5px;right:7px;font-size:9px;color:var(--warn);font-family:var(--mono)}
-/* ---------- stats ---------- */
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(126px,1fr));gap:11px}
-.tile{background:#0d0f16;border:1px solid var(--line);border-radius:11px;padding:12px 13px}
-.tile .l{font-size:10px;color:var(--dim2);text-transform:uppercase;letter-spacing:.7px;font-family:var(--mono)}
-.tile .v{font-family:var(--mono);font-size:23px;font-weight:700;margin-top:5px;letter-spacing:-.5px}
-.tile.ok .v{color:var(--ok)}.tile.bad .v{color:var(--bad)}.tile.warn .v{color:var(--warn)}
-.tile.info .v{color:var(--info)}.tile.acc .v{color:var(--acc2)}
-.bar{height:7px;border-radius:6px;background:#0d0f16;border:1px solid var(--line);overflow:hidden;margin:14px 0 8px}
-.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .25s}
-.mono{font-family:var(--mono)}
-.dim{color:var(--dim)}.dim2{color:var(--dim2)}
-/* ---------- tables ---------- */
-table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:.7px;color:var(--dim2);padding:0 10px 8px;font-weight:600;font-family:var(--mono)}
-td{padding:7px 10px;border-top:1px solid var(--line);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
-tbody tr:hover{background:rgba(108,92,231,.07)}
-.pill{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px}
-.s-available{background:rgba(46,230,168,.16);color:var(--ok)}
-.s-taken{background:rgba(139,147,168,.13);color:var(--dim)}
-.s-banned{background:rgba(255,95,109,.1);color:#ff8a94}
-.s-invalid{background:rgba(255,176,32,.14);color:var(--warn)}
-.s-blocked{background:rgba(108,92,231,.2);color:#a99bff}
-.s-error{background:rgba(255,95,109,.15);color:var(--bad)}
-.s-unanswered{background:rgba(255,255,255,.07);color:var(--dim2)}
-.scroll{max-height:390px;overflow:auto}
-.scroll::-webkit-scrollbar{width:9px;height:9px}
-.scroll::-webkit-scrollbar-thumb{background:var(--line2);border-radius:9px}
-.note{border-left:2px solid var(--acc);background:rgba(108,92,231,.08);padding:9px 12px;border-radius:0 8px 8px 0;font-size:12.5px;color:var(--dim);margin:10px 0}
-.note.warn{border-color:var(--warn);background:rgba(255,176,32,.08)}
-.note.bad{border-color:var(--bad);background:rgba(255,95,109,.08)}
-.empty{text-align:center;color:var(--dim2);padding:34px;font-size:13px}
-.kv{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
-.kv:last-child{border:0}
-.kv span:first-child{color:var(--dim)}
-/* ---------- log ---------- */
-.log{font-family:var(--mono);font-size:11.5px;max-height:190px;overflow:auto;background:#0a0c12;border:1px solid var(--line);border-radius:10px;padding:11px}
-.log div{padding:2px 0;color:var(--dim)}
-.log .ok{color:var(--ok)}.log .bad{color:var(--bad)}.log .warn{color:var(--warn)}
-.sticky{position:fixed;right:0;bottom:0;z-index:5;background:rgba(10,11,16,.9);backdrop-filter:blur(9px);border-top:1px solid var(--line);padding:11px 30px;display:none;gap:22px;align-items:center;font-family:var(--mono);font-size:12px}
-.sticky.on{display:flex}
-.sticky b{color:var(--acc2)}
-.toast{position:fixed;right:20px;bottom:20px;z-index:20;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
-.toast div{background:var(--panel2);border:1px solid var(--line2);border-left:3px solid var(--acc);padding:10px 14px;border-radius:9px;font-size:12.5px;animation:fade .18s}
+  background:radial-gradient(1100px 520px at 76% -14%,rgba(255,255,255,.035),transparent 62%)}
+a{color:inherit}
+button,input,select,textarea{font:inherit;color:inherit}
+::selection{background:#2b3036}
+.wrap{display:flex;min-height:100vh;position:relative;z-index:1}
+.side{width:236px;flex:0 0 236px;background:#101112;border-right:1px solid var(--line);
+  display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:baseline;gap:8px;padding:15px 16px 13px;border-bottom:1px solid var(--line)}
+.brand b{font:600 15px/1 var(--mono);letter-spacing:.14em;text-transform:lowercase}
+.brand span{font:11px/1 var(--mono);color:var(--dim2)}
+.side-scroll{flex:1;overflow:auto;padding:6px 0 12px}
+.side h2{display:flex;align-items:center;justify-content:space-between;margin:14px 16px 7px;
+  font:600 10px/1 var(--sans);letter-spacing:.16em;text-transform:uppercase;color:var(--dim2)}
+.side h2 button{background:none;border:0;padding:2px 4px;color:var(--dim2);font:600 10px/1 var(--sans);
+  letter-spacing:.1em;cursor:pointer;text-transform:uppercase}
+.side h2 button:hover{color:var(--ink)}
+.plats{display:flex;flex-direction:column;padding:0 8px}
+.plat{display:flex;align-items:center;gap:9px;padding:5px 8px;border-radius:5px;cursor:pointer;
+  border:1px solid transparent;font:12px/1.2 var(--sans);color:var(--dim)}
+.plat:hover{background:#17191b;color:var(--ink)}
+.plat.on{background:#191c1d;border-color:var(--line2);color:var(--ink)}
+.plat i{width:6px;height:6px;border-radius:2px;background:#33383d;flex:0 0 auto}
+.plat.on i{background:var(--ok)}
+.plat small{margin-left:auto;font:10px/1 var(--mono);color:var(--dim2)}
+.plat.paced small{color:var(--pace)}
+nav.menu{display:flex;flex-direction:column;padding:0 8px}
+nav.menu button{display:flex;align-items:center;gap:9px;background:none;border:0;border-radius:5px;
+  padding:6px 8px;text-align:left;color:var(--dim);cursor:pointer;font-size:12.5px}
+nav.menu button:hover{background:#17191b;color:var(--ink)}
+nav.menu button.on{background:#191c1d;color:var(--ink);box-shadow:inset 2px 0 0 var(--ok)}
+nav.menu b{margin-left:auto;font:10px/1 var(--mono);color:var(--dim2)}
+.tune{display:flex;flex-direction:column;gap:2px;padding:0 8px}
+.tune label{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;cursor:pointer;
+  font-size:12px;color:var(--dim)}
+.tune label:hover{background:#17191b;color:var(--ink)}
+.tune input{accent-color:var(--ok);width:13px;height:13px}
+.side-foot{border-top:1px solid var(--line);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.runline{display:flex;align-items:center;gap:7px;font:11px/1.3 var(--mono);color:var(--dim)}
+.runline .dot{width:7px;height:7px;border-radius:50%;background:#3a3f44;flex:0 0 auto}
+.runline.live .dot{background:var(--ok);box-shadow:0 0 0 3px rgba(79,212,140,.14)}
+.runline.halted .dot{background:var(--bad)}
+main{flex:1;min-width:0;padding:0 22px 60px}
+.topbar{display:flex;align-items:center;gap:14px;padding:15px 0 13px;border-bottom:1px solid var(--line);
+  position:sticky;top:0;background:linear-gradient(#0d0e0f 78%,rgba(13,14,15,.86));z-index:5}
+.topbar h1{margin:0;font:600 13px/1 var(--sans);letter-spacing:.02em}
+.topbar .sep{flex:1}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;
+  padding:3px 9px;font:11px/1 var(--mono);color:var(--dim);background:#121314;cursor:pointer}
+.chip b{color:var(--ink);font-weight:600}
+.chip:hover{border-color:var(--line2)}
+.chip.on{border-color:#33413a;background:#141a17;color:var(--ink)}
+.chip.s-available b{color:var(--ok)} .chip.s-taken b{color:var(--dim)} .chip.s-banned b{color:var(--bad)}
+.chip.s-blocked b{color:var(--hold)} .chip.s-error b{color:var(--bad)} .chip.s-unanswered b{color:var(--dim2)}
+.view{padding-top:18px}
+.grid{display:grid;gap:16px}
+@media(min-width:1150px){.grid.two{grid-template-columns:minmax(0,1.12fr) minmax(0,.88fr)}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card>header{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line)}
+.card>header h3{margin:0;font:600 11px/1 var(--sans);letter-spacing:.15em;text-transform:uppercase;color:var(--dim)}
+.card>header .sep{flex:1}
+.card .body{padding:14px}
+.note{font:11.5px/1.5 var(--sans);color:var(--dim2)}
+.note.warn{color:var(--warn)} .note.bad{color:var(--bad)} .note.ok{color:var(--ok)}
+.btn{background:#1b1e20;border:1px solid var(--line2);border-radius:6px;padding:7px 13px;cursor:pointer;
+  font-size:12.5px;color:var(--ink)}
+.btn:hover{background:#22262a}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.primary{background:#e8eaec;color:#101112;border-color:#e8eaec;font-weight:600}
+.btn.primary:hover{background:#fff}
+.btn.danger{border-color:#3a2426;color:#e8a0a4}
+.btn.danger:hover{background:#241517}
+.btn.ghost{background:none}
+.btn.sm{padding:4px 9px;font-size:11.5px;border-radius:5px}
+input[type=text],input[type=password],textarea,select{background:#101112;border:1px solid var(--line2);
+  border-radius:6px;padding:7px 10px;width:100%;outline:none;font-size:12.5px}
+input:focus,textarea:focus,select:focus{border-color:#3d444b}
+textarea{font-family:var(--mono);font-size:11.5px;min-height:112px;resize:vertical}
+label.f{display:block;margin-bottom:11px}
+label.f>span{display:block;margin-bottom:5px;font:600 10px/1 var(--sans);letter-spacing:.13em;
+  text-transform:uppercase;color:var(--dim2)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.space{border:1px solid var(--line);border-radius:7px;overflow:hidden;background:#111213}
+.space .lens{display:grid;grid-template-columns:44px repeat(4,1fr);border-bottom:1px solid var(--line)}
+.space .lens b{padding:7px 9px;font:600 10px/1 var(--sans);letter-spacing:.12em;text-transform:uppercase;
+  color:var(--dim2);background:#141617;border-right:1px solid var(--line)}
+.space .lens b:last-child{border-right:0}
+.space .cells{display:grid;grid-template-columns:44px repeat(4,1fr)}
+.space .cells>i{display:flex;align-items:center;padding:7px 9px;font:600 11px/1 var(--mono);color:var(--dim2);
+  border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.space .cells>i:last-child{border-right:0}
+.space .cells>button{background:#121314;border:0;border-right:1px solid var(--line);border-bottom:1px solid var(--line);
+  padding:8px 9px;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:3px;min-width:0}
+.space .cells>button:hover{background:#171a1c}
+.space .cells>button.on{background:#141d18;box-shadow:inset 0 0 0 1px #2c4a3a}
+.space .cells>button span{font:600 11.5px/1 var(--mono);color:var(--ink)}
+.space .cells>button em{font:10.5px/1 var(--mono);color:var(--dim2);font-style:normal}
+.space .cells>button.on span{color:var(--ok)}
+.space .cells>button.dim{opacity:.4;cursor:not-allowed}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.stat{background:#121314;padding:10px 12px}
+.stat span{display:block;font:600 9.5px/1 var(--sans);letter-spacing:.13em;text-transform:uppercase;color:var(--dim2)}
+.stat b{display:block;margin-top:5px;font:600 17px/1.1 var(--mono);
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.stat b.ok{color:var(--ok)} .stat b.bad{color:var(--bad)} .stat b.warn{color:var(--warn)}
+.bar{height:3px;background:#1c1f21;border-radius:2px;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;width:0;background:var(--ok);transition:width .3s}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:8px 10px;font:600 9.5px/1 var(--sans);letter-spacing:.13em;text-transform:uppercase;
+  color:var(--dim2);border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid #1b1e20;font:11.5px/1.35 var(--mono);color:var(--dim)}
+tbody tr:hover{background:#161819}
+td.name{color:var(--ink)}
+tr.free td.name{color:var(--ok)}
+td.dim2{color:var(--dim2)}
+.pill{display:inline-block;padding:2px 7px;border-radius:4px;font:600 9.5px/1.5 var(--sans);
+  letter-spacing:.08em;text-transform:uppercase}
+.s-available{background:rgba(79,212,140,.14);color:var(--ok)}
+.s-taken{background:rgba(142,149,157,.12);color:var(--dim)}
+.s-banned{background:rgba(224,87,95,.13);color:#f08b92}
+.s-invalid{background:rgba(216,164,66,.14);color:var(--warn)}
+.s-blocked{background:rgba(169,155,255,.14);color:var(--hold)}
+.s-error{background:rgba(224,87,95,.12);color:var(--bad)}
+.s-unanswered{background:rgba(255,255,255,.06);color:var(--dim2)}
+.scroll{max-height:420px;overflow:auto}
+.log{font:11px/1.6 var(--mono);color:var(--dim);max-height:212px;overflow:auto;background:#101112;
+  border:1px solid var(--line);border-radius:7px;padding:10px 12px}
+.log div{white-space:pre-wrap;word-break:break-word}
+.log .t{color:var(--dim2)}
+.log .ok{color:var(--ok)} .log .warn{color:var(--warn)} .log .bad{color:var(--bad)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font:11.5px/1.6 var(--mono)}
+.kv span{color:var(--dim2)}
+.pace{display:flex;flex-wrap:wrap;gap:6px}
+.pace b{font:11px/1 var(--mono);color:var(--pace);border:1px solid #24333f;background:#111820;
+  border-radius:5px;padding:4px 8px}
+.toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:60}
+.toast div{background:#1b1e20;border:1px solid var(--line2);border-left:2px solid var(--ok);border-radius:6px;
+  padding:9px 13px;font-size:12.5px;max-width:340px;box-shadow:0 12px 34px rgba(0,0,0,.5)}
 .toast div.bad{border-left-color:var(--bad)}
-.toast div.ok{border-left-color:var(--ok)}
-/* Phone rules live at the END of the sheet on purpose. Several of these
-   override properties the base rules set further down (the bucket grid, the
-   table font, button padding); placed above them they lost on source order
-   and the phone quietly rendered the desktop metrics. */
-/* Two layouts: a sidebar on a desktop, a sticky top bar on a phone. The old
-   rule collapsed the column to 64px and hid the brand but kept the nav labels,
-   so on a phone the labels spilled over the content. */
-@media(max-width:900px){
-  .shell{grid-template-columns:minmax(0,1fr)}
-  .grid2{grid-template-columns:minmax(0,1fr)}
-  .side{position:sticky;top:0;height:auto;flex-direction:row;align-items:center;gap:6px;
-        padding:8px 10px;border-right:0;border-bottom:1px solid var(--line);
-        background:rgba(10,11,16,.95);backdrop-filter:blur(10px);z-index:6;overflow-x:auto}
-  .side::-webkit-scrollbar{display:none}
-  .brand{padding:0 4px 0 0;flex:none}
-  .brand b,.brand span{display:none}
-  .nav{display:grid;grid-template-columns:repeat(4,1fr);gap:2px;flex:1}
-  .nav button{padding:9px 2px;font-size:12px;white-space:nowrap;justify-content:center;gap:0}
-  .nav .ico{display:none}
-  .nav .tag{display:none}
-  .side .foot{display:none}
-  main{padding:15px 12px 104px}
-  h1{font-size:18px}
-  .sub{font-size:12.5px;margin-bottom:15px}
-  .card{padding:13px;border-radius:12px;margin-bottom:12px}
-  .tiles{grid-template-columns:repeat(auto-fit,minmax(94px,1fr));gap:7px}
-  .tile{padding:9px 10px}
-  .tile .v{font-size:18px}
-  .bucketrow{grid-template-columns:24px repeat(4,1fr);gap:4px;margin-bottom:6px}
-  .bucket{padding:6px 5px;border-radius:8px}
-  .bucket .k{font-size:11px}
-  .bucket .n{font-size:8.4px;letter-spacing:-.3px}
-  .bucket .d{display:none}
-  .bucket .x{display:none}
-  .bhead{font-size:8.5px;letter-spacing:0}
-  .bucketrow .len{font-size:13px}
-  .sticky{left:0;padding:8px 12px;gap:11px;flex-wrap:wrap;font-size:11px}
-  .toast{right:10px;left:10px;bottom:78px;align-items:stretch}
-  table{font-size:11.5px}
-  td,th{padding:6px 7px}
-  .scroll{max-height:none}
-  .log{max-height:230px}
-  button.btn{padding:8px 12px;font-size:12.5px}
-  .row{gap:8px}
+@media(max-width:820px){
+  .wrap{flex-direction:column}
+  .side{width:auto;flex:none;height:auto;position:static;border-right:0;border-bottom:1px solid var(--line)}
+  .side-scroll{max-height:none}
+  .plats{flex-direction:row;flex-wrap:wrap}
+  .plat{width:auto}
+  main{padding:0 14px 60px}
 }
-@media(min-width:901px){
-  .sticky{left:220px}
-}
-
 </style>
 </head>
 <body>
-<div class="shell">
+<div class="wrap">
   <aside class="side">
-    <div class="brand"><span class="dot"></span><b>bahs</b><span>v3</span></div>
-    <nav class="nav" id="nav">
-      <button data-view="dash" class="on"><span class="ico">◎</span>Dashboard</button>
-      <button data-view="proxies"><span class="ico">⇄</span>Proxies<span class="tag" id="navProxies">0</span></button>
-      <button data-view="results"><span class="ico">≡</span>Results<span class="tag" id="navResults">0</span></button>
-      <button data-view="settings"><span class="ico">⚙</span>Alerts</button>
-    </nav>
-    <div class="foot">
-      <div><b id="footPlat">…</b> platforms</div>
-      <div><b id="footProx">0</b> proxies</div>
-      <div id="footRuns">idle</div>
+    <div class="brand"><b>bahs</b><span id="build">—</span></div>
+    <div class="side-scroll">
+      <h2>Snipers <button id="noPlats">clear</button></h2>
+      <div class="plats" id="platList"></div>
+      <h2>Workspace</h2>
+      <nav class="menu" id="nav">
+        <button data-v="sweep" class="on">Sweep <b id="nFree">0</b></button>
+        <button data-v="proxies">Proxies <b id="nProx">0</b></button>
+        <button data-v="alerts">Alerts</button>
+        <button data-v="about">Runtime</button>
+      </nav>
+      <h2>Customize</h2>
+      <div class="tune">
+        <label><input type="checkbox" id="snd"> Sound on a free name</label>
+        <label><input type="checkbox" id="notif"> Desktop notification</label>
+        <label><input type="checkbox" id="keep"> Keep a run after I leave</label>
+        <label><input type="checkbox" id="follow"> Auto-follow the live feed</label>
+      </div>
+    </div>
+    <div class="side-foot">
+      <div class="runline" id="runLine"><i class="dot"></i><span>idle</span></div>
+      <button class="btn danger" id="stopBtn" disabled>Stop run</button>
     </div>
   </aside>
+
   <main>
-    <!-- ================= DASHBOARD ================= -->
-    <section class="view on" id="v-dash">
-      <h1>Dashboard</h1>
-      <div class="sub">Pick the name spaces to sweep, then run. Every name in a space is checked — nothing is sampled.</div>
+    <div class="topbar">
+      <h1 id="vTitle">Sweep</h1>
+      <div class="sep"></div>
+      <div class="chips" id="filters"></div>
+    </div>
 
-      <div class="grid2">
+    <section class="view" id="v-sweep">
+      <div class="grid two">
         <div class="card">
-          <h2>Name space</h2>
-          <div id="buckets"></div>
-          <div class="row" style="margin-top:14px;justify-content:space-between">
-            <div class="mono" style="font-size:13px">Selected: <b id="selCount" style="color:var(--acc2)">0</b> names</div>
-            <div class="row" style="gap:6px">
-              <button class="btn ghost" id="pickShort" title="Select letters, digits and words at lengths 3 and 4">quick 3+4</button>
-              <button class="btn ghost" id="pickNil" title="Deselect everything">clear</button>
+          <header><h3>Name spaces</h3><div class="sep"></div>
+            <span class="note" id="spaceSum">nothing selected</span>
+            <button class="btn sm ghost" id="spaceClear">clear</button></header>
+          <div class="body"><div id="spaces"></div>
+            <div class="note" id="spaceNote" style="margin-top:10px"></div></div>
+        </div>
+
+        <div class="card">
+          <header><h3>Run</h3><div class="sep"></div>
+            <button class="btn sm ghost" id="quickBtn">check one name</button></header>
+          <div class="body">
+            <div class="row" style="margin-bottom:12px">
+              <input type="text" id="quickName" placeholder="single handle — checks every selected sniper"
+                     style="flex:1;min-width:150px">
             </div>
+            <div class="row">
+              <button class="btn primary" id="startBtn">Start sweep</button>
+              <button class="btn" id="resumeBtn" hidden>Resume watching</button>
+              <span class="note" id="runNote"></span>
+            </div>
+            <div class="stats" style="margin-top:14px">
+              <div class="stat"><span>checked</span><b id="sChecked">0</b></div>
+              <div class="stat"><span>names</span><b id="sNames">0</b></div>
+              <div class="stat"><span>per sec</span><b id="sRate">0</b></div>
+              <div class="stat"><span>free</span><b class="ok" id="sFree">0</b></div>
+              <div class="stat"><span>answer rate</span><b id="sAns">—</b></div>
+              <div class="stat"><span>blocked</span><b class="warn" id="sLimit">0</b></div>
+              <div class="stat"><span id="sMissLabel">remaining</span><b id="sMiss">0</b></div>
+              <div class="stat"><span>proxies</span><b id="sPool">0</b></div>
+            </div>
+            <div class="bar"><i id="bar"></i></div>
+            <div class="runline" style="margin-top:10px" id="targetLine"><i class="dot"></i><span id="target">idle</span></div>
           </div>
-          <div id="redundant"></div>
-        </div>
-
-        <div class="card">
-          <h2>Run</h2>
-          <label class="fld">Platforms</label>
-          <div class="chips" id="plats" style="margin-bottom:16px"></div>
-          <label class="fld">Concurrency — <span id="concVal" class="mono">256</span></label>
-          <input type="range" id="conc" min="8" max="1024" step="8" value="256">
-          <div class="dim2" style="font-size:11.5px;margin:4px 0 16px">Checks in flight. Throughput tracks connections ÷ latency, so this only helps as far as your proxies can carry it.</div>
-          <label class="fld" style="display:flex;align-items:center;gap:8px;cursor:pointer">
-            <input type="checkbox" id="hunt" style="width:auto;margin:0">
-            <span>Stop at the first free name <span class="dim2">(hunt)</span></span>
-          </label>
-          <div class="dim2" style="font-size:11.5px;margin:4px 0 16px">A 3-letter space is 46,656 names; once one comes back free there is nothing left to learn, so the sweep ends there instead of spending the pool on the rest.</div>
-          <div class="row" style="gap:9px">
-            <button class="btn primary" id="start" style="flex:1">Start sweep</button>
-            <button class="btn danger" id="stop" disabled>Stop</button>
-          </div>
-          <div id="est" class="note" style="margin-top:14px"></div>
         </div>
       </div>
 
-      <div class="card">
-        <h2>Live</h2>
-        <div class="bar"><i id="pbar"></i></div>
-        <div class="tiles">
-          <div class="tile"><div class="l">Checked</div><div class="v" id="tChecked">0</div></div>
-          <div class="tile info"><div class="l">Progress</div><div class="v" id="tProg">0%</div></div>
-          <div class="tile acc"><div class="l">Checks/s</div><div class="v" id="tRate">0</div></div>
-          <div class="tile ok"><div class="l">Available</div><div class="v" id="tAvail">0</div></div>
-          <div class="tile warn"><div class="l">Rate limits</div><div class="v" id="tLimit">0</div></div>
-          <div class="tile bad"><div class="l">Proxy misses</div><div class="v" id="tMiss">0</div></div>
-          <div class="tile"><div class="l">Elapsed</div><div class="v" id="tTime">0:00</div></div>
-          <div class="tile"><div class="l">Answered</div><div class="v" id="tAns">0%</div></div>
+      <div class="card" style="margin-top:16px">
+        <header><h3>Platforms</h3><div class="sep"></div><span class="note" id="paceNote"></span></header>
+        <div class="body">
+          <div class="pace" id="paced"></div>
+          <div class="scroll"><table id="platTable"><tbody><tr><td class="dim2">No run yet.</td></tr></tbody></table></div>
         </div>
-        <div class="mono dim" style="margin-top:12px;font-size:12px">Target: <span id="target">—</span> <span class="dim2" id="buildTag"></span></div>
       </div>
 
-      <div class="grid2">
+      <div class="card" style="margin-top:16px">
+        <header><h3>Results</h3><div class="sep"></div>
+          <span class="note" id="rNote"></span>
+          <button class="btn sm ghost" id="csvBtn">csv</button></header>
+        <div class="body"><div class="scroll"><table id="rTable"><tbody><tr><td class="dim2">Nothing yet.</td></tr></tbody></table></div></div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <header><h3>Log</h3><div class="sep"></div><button class="btn sm ghost" id="logClear">clear</button></header>
+        <div class="body"><div class="log" id="log"></div></div>
+      </div>
+    </section>
+
+    <section class="view" id="v-proxies" hidden>
+      <div class="grid two">
         <div class="card">
-          <h2>Per platform</h2>
-          <div class="scroll"><table id="platTable"><tbody><tr><td class="empty">Start a sweep to see each platform.</td></tr></tbody></table></div>
+          <header><h3>Add proxies</h3></header>
+          <div class="body">
+            <label class="f"><span>Paste a list — one per line</span>
+              <textarea id="pText" placeholder="host:port:user:pass&#10;socks5://user:pass@host:1080&#10;http://host:8080"></textarea></label>
+            <div class="row">
+              <button class="btn primary" id="pAdd">Append</button>
+              <button class="btn" id="pReplace">Replace list</button>
+              <label class="btn" style="display:inline-block">Upload file
+                <input type="file" id="pFile" accept=".txt,.csv,text/plain" hidden></label>
+              <button class="btn danger" id="pClear">Clear all</button>
+            </div>
+            <div class="note" id="pReport" style="margin-top:12px"></div>
+          </div>
         </div>
         <div class="card">
-          <h2>Activity</h2>
-          <div class="log" id="log"></div>
+          <header><h3>Stored</h3><div class="sep"></div><span class="note" id="pCount">—</span></header>
+          <div class="body">
+            <div class="kv" id="pStats"></div>
+            <div class="scroll" style="margin-top:12px;max-height:360px">
+              <table id="pTable"><tbody></tbody></table></div>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px"><div class="body">
+        <p class="note">A run rotates the whole list. A proxy the platform refuses is rested and counted
+        separately from one that fails at the transport level — a blanket rate limit is not a dead list.
+        Nothing here is scraped or pre-validated: what you paste is exactly what a run uses.</p></div></div>
+    </section>
+
+    <section class="view" id="v-alerts" hidden>
+      <div class="grid two">
+        <div class="card">
+          <header><h3>Discord webhook</h3><div class="sep"></div>
+            <label class="tune" style="padding:0"><input type="checkbox" id="aOn"> enabled</label></header>
+          <div class="body">
+            <label class="f"><span>Webhook url</span><input type="text" id="aHook" placeholder="https://discord.com/api/webhooks/…"></label>
+            <label class="f"><span>Message template</span>
+              <input type="text" id="aTpl" placeholder="{platform} username available: `{username}`"></label>
+            <div class="row" style="align-items:flex-end">
+              <label class="f" style="flex:1;min-width:130px"><span>Post as</span><input type="text" id="aUser" placeholder="bahs"></label>
+              <label class="f" style="flex:1;min-width:130px"><span>Ping</span><input type="text" id="aPing" placeholder="@here, <@&role>"></label>
+            </div>
+            <div class="note">Sent straight from the server, never through your proxy list — a webhook URL
+              is a capability and whoever runs a proxy would get it too. A webhook is not a dependency: a
+              run never waits on one.</div>
+            <div class="row" style="margin-top:12px">
+              <button class="btn primary" id="aSave">Save</button>
+              <button class="btn" id="aTest">Send test</button>
+            </div>
+            <div class="note" id="aNote" style="margin-top:12px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <header><h3>Delivery</h3></header>
+          <div class="body">
+            <div class="kv" id="aStats"></div>
+            <p class="note" style="margin-top:12px">Free names are digested into batches so a wide sweep
+              cannot hammer the endpoint into deleting the webhook. Placeholders: <code>{username}</code>,
+              <code>{platform}</code>, <code>{detail}</code>.</p>
+          </div>
         </div>
       </div>
     </section>
 
-    <!-- ================= PROXIES ================= -->
-    <section class="view" id="v-proxies">
-      <h1>Proxies</h1>
-      <div class="sub">Your list is the pool. Nothing is scraped, nothing is validated ahead of time — what you paste is what a run rotates over.</div>
-      <div class="card">
-        <h2>Add</h2>
-        <textarea id="pPaste" placeholder="host:port&#10;user:pass@host:port&#10;socks5://host:port&#10;# comments and blank lines are ignored"></textarea>
-        <div class="row" style="margin-top:11px">
-          <button class="btn primary" id="pAppend">Add to list</button>
-          <button class="btn" id="pReplace">Replace list</button>
-          <button class="btn" id="pUpload">Upload .txt</button>
-          <input type="file" id="pFile" accept=".txt,text/plain" style="display:none">
-          <span class="dim2 mono" id="pInfo" style="font-size:11.5px"></span>
+    <section class="view" id="v-about" hidden>
+      <div class="grid two">
+        <div class="card">
+          <header><h3>Runtime</h3></header>
+          <div class="body"><div class="kv" id="about"></div></div>
         </div>
-        <div id="pReport"></div>
+        <div class="card">
+          <header><h3>How a verdict is reached</h3></header>
+          <div class="body"><div class="note" id="howto"></div></div>
+        </div>
       </div>
-      <div class="card">
-        <h2>Stored <span class="dim2 mono" id="pCount"></span></h2>
-        <div class="row" style="margin-bottom:11px">
-          <button class="btn ghost" id="pDownload">Download .txt</button>
-          <button class="btn ghost" id="pCopyAll">Copy all</button>
-          <button class="btn ghost" id="pClear" style="color:var(--bad)">Clear list</button>
-        </div>
-        <div class="scroll"><table id="pTable"><tbody></tbody></table></div>
-      </div>
-    </section>
-
-    <!-- ================= RESULTS ================= -->
-    <section class="view" id="v-results">
-      <h1>Results</h1>
-      <div class="sub">Held in this tab only — nothing is stored server-side.</div>
-      <div class="card">
-        <div class="row" style="justify-content:space-between;margin-bottom:12px">
-          <div class="chips" id="filters"></div>
-          <div class="row" style="gap:7px">
-            <button class="btn ghost" id="rCopy">Copy available</button>
-            <button class="btn ghost" id="rCsv">CSV</button>
-            <button class="btn ghost" id="rWipe" style="color:var(--bad)">Clear</button>
-          </div>
-        </div>
-        <div class="reswrap"><div class="scroll"><table id="rTable"><tbody></tbody></table></div></div>
-        <div class="dim2 mono" style="font-size:11.5px;margin-top:10px" id="rNote"></div>
-      </div>
-    </section>
-
-    <!-- ================= SETTINGS ================= -->
-    <section class="view" id="v-settings">
-      <h1>Alerts</h1>
-      <div class="sub">Post the names that come back free to a Discord webhook, digested into batches.</div>
-      <div class="card">
-        <h2>Discord webhook</h2>
-        <label class="fld">Webhook URL</label>
-        <input type="text" id="sHook" placeholder="https://discord.com/api/webhooks/…">
-        <div class="row" style="margin:13px 0">
-          <label class="sw"><input type="checkbox" id="sOn"><i></i>Enabled</label>
-          <span class="dim2" style="font-size:11.5px">A URL with enabled off stores the webhook but stays quiet.</span>
-        </div>
-        <div class="grid2">
-          <div><label class="fld">Message template</label><input type="text" id="sTpl"></div>
-          <div><label class="fld">Ping (first message only)</label><input type="text" id="sPing" placeholder="@here or &lt;@&amp;roleid&gt;"></div>
-          <div><label class="fld">Webhook name</label><input type="text" id="sUser"></div>
-          <div><label class="fld">Avatar URL</label><input type="text" id="sAvatar"></div>
-        </div>
-        <div class="row" style="margin-top:16px">
-          <button class="btn primary" id="sSave">Save</button>
-          <button class="btn" id="sTest">Send test</button>
-          <span class="dim2 mono" style="font-size:11.5px">Placeholders: {username} {platform} {detail}</span>
-        </div>
-        <div id="sNote"></div>
-      </div>
-      <div class="card">
-        <h2>How a run behaves</h2>
-        <div class="kv"><span>Enumeration</span><span id="kMax">—</span></div>
-        <div class="kv"><span>Platform pause on blanket 429</span><span>that platform sits out, the rest continue</span></div>
-        <div class="kv"><span>Account creation</span><span>never — you claim it yourself</span></div>
+      <div class="card" style="margin-top:16px">
+        <header><h3>Endpoints</h3></header>
+        <div class="body"><div class="kv" id="eps"></div></div>
       </div>
     </section>
   </main>
 </div>
-
-<div class="sticky" id="sticky">
-  <span>checked <b id="sbChecked">0</b></span>
-  <span><b id="sbRate">0</b>/s</span>
-  <span>available <b id="sbAvail">0</b></span>
-  <span>blocked <b id="sbLimit">0</b></span>
-  <span>pool <b id="sbPool">0</b></span>
-  <span id="sbTarget" class="dim2"></span>
-</div>
 <div class="toast" id="toast"></div>
 <script>
-/* ============================ state ============================ */
+"use strict";
 const $ = (id) => document.getElementById(id);
 const S = {
-  info: null, menu: [], kinds: {}, buckets: [], plats: [], sel: new Set(),
-  results: [], filter: 'all', held: 0, running: false, ac: null,
-  rate: Number(localStorage.getItem('bahs.rate') || 0), last: null, avail: [],
+  info:null, menu:[], kinds:{}, plats:new Set(), spaces:new Set(),
+  results:[], counts:{}, free:[], filter:'all', held:0,
+  run:null, ac:null, view:'sweep', cursor:0, lastRun:null, proxies:null, alerts:null,
+  tune:{snd:false, notif:false, keep:true, follow:true},
 };
-const MAXROWS = 20000, SHOWROWS = 400;
-const fmt = (n) => (n === null || n === undefined) ? '—' : Number(n).toLocaleString();
-const clock = (s) => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
-const plat = (n) => `${n} platform${n === 1 ? '' : 's'}`;
-const kb = (b) => b < 1024 ? b+' B' : b < 1048576 ? (b/1024).toFixed(1)+' KB' : (b/1048576).toFixed(1)+' MB';
-
-function toast(msg, kind='') {
+const SHOW = 400, HOLD = 6000;
+const fmt = (n) => (n == null ? '—' : Number(n).toLocaleString('en-US'));
+const clock = (s) => { s = Math.max(0, Math.round(s||0));
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), x = s%60;
+  return (h ? h + 'h ' : '') + (h || m ? m + 'm ' : '') + x + 's'; };
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function toast(msg, kind){
   const el = document.createElement('div');
-  el.className = kind; el.textContent = msg;
-  $('toast').appendChild(el);
+  if (kind === 'bad') el.className = 'bad';
+  el.textContent = msg; $('toast').appendChild(el);
   setTimeout(() => el.remove(), 4200);
 }
-function logline(text, kind='') {
-  const box = $('log');
+function line(msg, kind){
+  const t = new Date().toLocaleTimeString('en-GB');
   const el = document.createElement('div');
-  el.className = kind;
-  el.textContent = new Date().toLocaleTimeString() + '  ' + text;
-  box.appendChild(el);
-  while (box.children.length > 220) box.removeChild(box.firstChild);
-  box.scrollTop = box.scrollHeight;
+  el.innerHTML = `<span class="t">${t}</span> <span class="${kind||''}">${esc(msg)}</span>`;
+  const log = $('log'); log.appendChild(el);
+  while (log.childNodes.length > 400) log.removeChild(log.firstChild);
+  log.scrollTop = log.scrollHeight;
 }
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  if (!res.ok) {
-    let detail = res.status + ' ' + res.statusText;
-    try { const j = await res.json(); if (j.detail) detail = j.detail; } catch (e) {}
-    throw new Error(detail);
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw:text }; }
+  if (!r.ok) throw new Error((data && (data.detail || data.error)) || ('HTTP ' + r.status));
+  return data;
+}
+async function boot(){
+  try { S.info = await api('/info'); } catch (e) { toast('API unreachable: ' + e.message, 'bad'); return; }
+  $('build').textContent = S.info.build;
+  document.title = 'bahs ' + S.info.build;
+  const menu = await api('/menu');
+  S.menu = menu.buckets; S.kinds = menu.kinds;
+  restore();
+  renderPlats(); renderSpaces(); renderFilters(); renderResults();
+  await loadProxies(); await loadAlerts(); renderAbout();
+  await checkLive();
+  setInterval(pollProxies, 20000);
+  setInterval(checkLive, 8000);
+}
+function restore(){
+  const t = JSON.parse(localStorage.getItem('bahs.tune') || '{}');
+  Object.assign(S.tune, t);
+  $('snd').checked = !!S.tune.snd; $('notif').checked = !!S.tune.notif;
+  $('keep').checked = !!S.tune.keep; $('follow').checked = !!S.tune.follow;
+  const p = JSON.parse(localStorage.getItem('bahs.plats') || '[]');
+  if (Array.isArray(p)) S.plats = new Set(p);
+  const s = JSON.parse(localStorage.getItem('bahs.spaces') || '["3l"]');
+  if (Array.isArray(s) && s.length) S.spaces = new Set(s);
+}
+function persist(){
+  localStorage.setItem('bahs.tune', JSON.stringify(S.tune));
+  localStorage.setItem('bahs.plats', JSON.stringify([...S.plats]));
+  localStorage.setItem('bahs.spaces', JSON.stringify([...S.spaces]));
+}
+let lastByPlatform = {}, lastPaced = {};
+function renderPlats(by){
+  by = by || lastByPlatform;
+  $('platList').innerHTML = (S.info.platforms || []).map(p => {
+    const on = S.plats.has(p);
+    const st = by[p] || {};
+    const tail = st.available ? `<small>${fmt(st.available)}</small>` : '';
+    return `<div class="plat ${on?'on':''} ${st.parallel?'paced':''}" data-p="${esc(p)}" title="${esc(p)}">
+      <i></i><span>${esc(p)}</span>${tail}</div>`;
+  }).join('');
+  for (const el of $('platList').querySelectorAll('.plat')){
+    el.onclick = () => {
+      const p = el.dataset.p;
+      if (S.plats.has(p)) S.plats.delete(p); else S.plats.add(p);
+      persist(); renderPlats(); renderSpaces();
+    };
   }
-  return res.headers.get('content-type')?.includes('json') ? res.json() : res.text();
 }
-/* ============================ buckets ============================ */
-/* The same rule the server applies before it counts: a name space inside another
-   selected space is not extra coverage, it is the same names twice. */
-function isRedundant(b) {
-  const has = (k, l) => S.sel.has(k + l);
-  const l = b.length;
-  if (b.kind === 'og') return has('c', l) || has('l', l) ? (has('c',l) ? 'c'+l : 'l'+l) : null;
-  if (b.kind === 'l' || b.kind === 'n') return has('c', l) ? 'c'+l : null;
-  return null;
-}
-function selectedTotal() {
-  let total = 0;
-  for (const b of S.menu) {
-    if (!S.sel.has(b.label)) continue;
-    if (isRedundant(b)) continue;
-    total += b.size;
-  }
-  return total;
-}
-function renderBuckets() {
-  const lengths = [...new Set(S.menu.map(b => b.length))].sort((a, b) => a - b);
-  const order = ['l', 'n', 'c', 'og'];
-  let html = '<div class="bucketrow"><div class="bhead"></div>' +
-    order.map(k => `<div class="bhead">${S.kinds[k] || k}</div>`).join('') + '</div>';
-  for (const len of lengths) {
-    html += `<div class="bucketrow"><div class="len">${len}</div>`;
-    for (const kind of order) {
-      const b = S.menu.find(x => x.kind === kind && x.length === len);
-      if (!b) { html += '<div></div>'; continue; }
-      const on = S.sel.has(b.label);
-      const red = on ? isRedundant(b) : null;
-      html += `<div class="bucket ${on ? 'on' : ''} ${red ? 'redun' : ''}" data-label="${b.label}">
-        ${red ? `<span class="x">in ${red}</span>` : ''}
-        <div class="k">${b.label}</div>
-        <div class="n" title="${b.size.toLocaleString()} names">${fmt(b.size)}</div>
-        <div class="d">${red ? 'already covered' : b.detail}</div></div>`;
+function renderSpaces(){
+  const kinds = ['l','n','c','og'];
+  const lens = [...new Set(S.menu.map(b => b.length))].sort((a,b) => a-b);
+  let html = '<div class="space"><div class="lens"><b>len</b>' +
+    kinds.map(k => `<b>${esc(S.kinds[k] || k)}</b>`).join('') + '</div>';
+  for (const len of lens){
+    html += '<div class="cells"><i>' + len + '</i>';
+    for (const k of kinds){
+      const b = S.menu.find(x => x.length === len && x.kind === k);
+      if (!b){ html += '<button class="dim" disabled></button>'; continue; }
+      const on = S.spaces.has(b.label);
+      const off = b.size === 0 || b.size > (S.info.generation.max_enumeration || 1e12);
+      html += `<button class="${on?'on':''} ${off?'dim':''}" data-b="${b.label}" ${off?'disabled':''}
+        title="${esc(b.detail)}"><span>${b.label}</span><em>${fmt(b.size)}</em></button>`;
     }
     html += '</div>';
   }
-  $('buckets').innerHTML = html;
-  for (const el of $('buckets').querySelectorAll('.bucket')) {
+  $('spaces').innerHTML = html + '</div>';
+  for (const el of $('spaces').querySelectorAll('button[data-b]')){
     el.onclick = () => {
-      const label = el.dataset.label;
-      S.sel.has(label) ? S.sel.delete(label) : S.sel.add(label);
-      renderBuckets(); updateEstimate();
+      const l = el.dataset.b;
+      if (S.spaces.has(l)) S.spaces.delete(l); else S.spaces.add(l);
+      persist(); renderSpaces();
     };
   }
-  const total = selectedTotal();
-  $('selCount').textContent = fmt(total);
-  const red = S.menu.filter(b => S.sel.has(b.label) && isRedundant(b));
-  $('redundant').innerHTML = red.length
-    ? `<div class="note warn">${red.length} selected space${red.length>1?'s are':' is'} already inside another selection, so ${red.length>1?'they are':'it is'} dropped — the run checks each name once, not twice.</div>`
+  const sel = S.menu.filter(b => S.spaces.has(b.label));
+  const eff = effective(sel);
+  const total = eff.reduce((a, b) => a + b.size, 0);
+  const dropped = sel.length - eff.length;
+  $('spaceSum').textContent = sel.length
+    ? `${sel.map(s => s.label).join(' · ')} = ${fmt(total)} names`
+    : 'nothing selected';
+  const p = S.plats.size || 1;
+  const est = S.lastRun && S.lastRun.rate ? total * p / S.lastRun.rate : null;
+  $('spaceNote').innerHTML = sel.length
+    ? `${fmt(total)} names across ${fmt(p)} sniper${p>1?'s':''} = <b>${fmt(total*p)}</b> checks`
+      + (est ? ` · at ${Math.round(S.lastRun.rate)}/s that is about <b>${clock(est)}</b>` : '')
+      + (dropped ? ` · ${dropped} selection${dropped>1?'s':''} already inside a wider one, so it will not be asked twice` : '')
     : '';
-  return total;
+  $('startBtn').disabled = !sel.length || !S.plats.size;
 }
-/* The run costs names x platforms, not names. Quoting the name count alone is
-   how a "17,576 name" sweep turns into 175,760 checks on ten platforms. */
-function updateEstimate() {
-  const names = selectedTotal();
-  const plats = S.plats.filter(p => p.on).length || 1;
-  const checks = names * plats;
-  const rate = S.rate || 60;
-  const src = S.rate ? `last measured ${Math.round(S.rate)}/s` : `an assumed 60/s`;
-  if (!names) { $('est').innerHTML = 'Nothing selected yet.'; return; }
-  const secs = checks / rate;
-  const span = secs < 90 ? secs.toFixed(1) + 's'
-    : secs < 5400 ? (secs / 60).toFixed(1) + ' min'
-    : secs < 172800 ? (secs / 3600).toFixed(1) + ' hours'
-    : (secs / 86400).toFixed(1) + ' days';
-  const over = names > (S.info?.generation?.max_enumeration || 1e8);
-  $('est').innerHTML = `<b>${names.toLocaleString()}</b> names × <b>${plats}</b> platform${plats > 1 ? 's' : ''} = `
-    + `≈ <b>${checks.toLocaleString()}</b> checks, at ${src} ≈ <b>${span}</b>. `
-    + `Throughput tracks your connections ÷ platform latency, so that is the honest number rather than a promise.`
-    + (over ? `<br><span style="color:var(--bad)">Over the ${fmt(S.info.generation.max_enumeration)} ceiling — the server will refuse it.</span>` : '');
+function effective(sel){
+  const has = (k, len) => sel.some(s => s.kind === k && s.length === len);
+  return sel.filter(s => {
+    if (s.kind === 'og' && (has('c', s.length) || has('l', s.length))) return false;
+    if ((s.kind === 'l' || s.kind === 'n') && has('c', s.length)) return false;
+    return true;
+  });
 }
-/* ============================ platforms ============================ */
-function renderPlats() {
-  $('plats').innerHTML = S.plats.map(p =>
-    `<span class="chip ${p.on ? 'on' : ''}" data-p="${p.name}">${p.name}</span>`).join('');
-  for (const el of $('plats').querySelectorAll('.chip')) {
-    el.onclick = () => {
-      const p = S.plats.find(x => x.name === el.dataset.p);
-      if (S.plats.filter(x => x.on).length === 1 && p.on) { toast('Keep at least one platform', 'bad'); return; }
-      p.on = !p.on; renderPlats(); updateEstimate();
-    };
+function view(v){
+  S.view = v;
+  for (const s of ['sweep','proxies','alerts','about']) $('v-' + s).hidden = (s !== v);
+  for (const b of $('nav').querySelectorAll('button')) b.classList.toggle('on', b.dataset.v === v);
+  $('vTitle').textContent = {sweep:'Sweep', proxies:'Proxies', alerts:'Alerts', about:'Runtime'}[v];
+}
+$('nav').onclick = (e) => { const b = e.target.closest('button'); if (b) view(b.dataset.v); };
+$('noPlats').onclick = () => { S.plats.clear(); persist(); renderPlats(); renderSpaces(); };
+$('spaceClear').onclick = () => { S.spaces.clear(); persist(); renderSpaces(); };
+for (const id of ['snd','notif','keep','follow']){
+  $(id).onchange = () => { S.tune[id] = $(id).checked; persist(); };
+}
+function spaces(){ return S.menu.filter(b => S.spaces.has(b.label)).map(b => ({kind:b.kind, length:b.length})); }
+function setMiss(label, value, cls){
+  $('sMissLabel').textContent = label;
+  const b = $('sMiss');
+  b.textContent = fmt(value);
+  b.className = cls || '';
+}
+function setRunState(text, cls){
+  const l = $('runLine');
+  l.className = 'runline ' + (cls || '');
+  l.querySelector('span').textContent = text;
+  $('stopBtn').disabled = cls !== 'live';
+}
+function paintFromStatus(r){
+  const p = r.progress || {};
+  $('sChecked').textContent = fmt(r.checked);
+  $('sNames').textContent = fmt(r.names);
+  $('sRate').textContent = Math.round(p.per_second || 0);
+  $('sFree').textContent = fmt(p.available_count || 0);
+  $('sLimit').textContent = fmt(p.rate_limits || 0);
+  setMiss(r.active ? 'remaining' : 'never asked',
+          r.active ? (p.unattempted || 0) : (p.unattempted || 0) + (p.proxy_misses || 0),
+          r.active ? '' : 'bad');
+  $('sAns').textContent = p.answer_rate != null ? Math.round(p.answer_rate * 100) + '%' : '—';
+  $('sPool').textContent = fmt(S.proxies ? S.proxies.count : 0);
+  $('bar').style.width = Math.min(100, (p.progress || 0) * 100) + '%';
+  lastPaced = p.platforms_paced || lastPaced;
+  if (p.by_platform) { lastByPlatform = p.by_platform; renderPlatTable(p.by_platform); }
+}
+async function checkLive(){
+  let data;
+  try { data = await api('/runs'); } catch (e) { return; }
+  const runs = data.runs || [];
+  const active = runs.find(r => r.active);
+  if (active){
+    if (S.run !== active.id){
+      S.run = active.id; S.cursor = 0; S.watching = true;
+      $('resumeBtn').hidden = false;
+      paintFromStatus(active);
+      setRunState(`${active.kind} run ${active.id} watching`, 'live');
+      line(`a ${active.kind} run is still going — ${fmt(active.checked)} checks so far. Watching it.`, 'warn');
+      if (S.tune.follow) follow(active.id);
+    } else {
+      paintFromStatus(active);
+    }
+    return;
+  }
+  if (S.watching){
+    S.watching = false;
+    setRunState('finished', '');
+  }
+  const last = runs[0];
+  if (last && !S.watching && !S.held){
+    $('resumeBtn').hidden = false;
+    $('runNote').textContent = `last run ${last.id} · ${fmt(last.checked)} checks · ${last.kind}`;
   }
 }
-/* ============================ run ============================ */
-let clockTimer = null;
-function setRunning(on) {
-  S.running = on;
-  if (on && !clockTimer) clockTimer = setInterval(() => { if (S.live) { S.live.elapsed = (performance.now() - S.live.startedAt) / 1000; paintLive(); } }, 1000);
-  if (!on && clockTimer) { clearInterval(clockTimer); clockTimer = null; }
-  $('start').disabled = on; $('start').textContent = on ? 'Running…' : 'Start sweep';
-  $('stop').disabled = !on;
-  $('sticky').classList.toggle('on', on);
-  ['conc','pickShort','pickNil'].forEach(id => $(id).disabled = on);
-}
-/* The dashboard is counted in the browser, from the result lines themselves, so
-   a number moves the moment a check lands rather than on some server tick. The
-   server's progress line is still used for the rate and the clock, which the
-   browser cannot know. */
-const POOL_MISS = new Set(['proxies exhausted this run', 'no proxies saved']);
-const FINAL = new Set(['available', 'taken', 'invalid']);
-const zeroRow = () => ({ checked: 0, available: 0, taken: 0, invalid: 0, blocked: 0, error: 0, unanswered: 0 });
-
-function liveReset(total, plats) {
-  S.live = {
-    checked: 0, avail: 0, limits: 0, misses: 0, answered: 0, total, plats,
-    byStatus: {}, byPlat: {}, stamps: [], rate: 0, elapsed: 0, startedAt: performance.now(),
-  };
-}
-function liveAdd(ev) {
-  const L = S.live;
-  L.checked++;
-  if (ev.status === 'available') L.avail++;
-  if (ev.status === 'blocked') L.limits++;
-  if (POOL_MISS.has(ev.detail)) L.misses++;
-  if (FINAL.has(ev.status)) L.answered++;
-  L.byStatus[ev.status] = (L.byStatus[ev.status] || 0) + 1;
-  const row = L.byPlat[ev.platform] || (L.byPlat[ev.platform] = zeroRow());
-  row.checked++;
-  if (ev.status in row) row[ev.status]++;
-  const now = performance.now();
-  L.stamps.push(now);
-  // Results inside the last second *are* checks per second. Dividing by a span
-  // needed a floor to avoid nonsense on a burst, and that floor read a fast run
-  // as zero: 73 checks in 0.15s reported 0/s.
-  while (L.stamps.length && now - L.stamps[0] > 1000) L.stamps.shift();
-  L.rate = L.stamps.length;
-  L.elapsed = (now - L.startedAt) / 1000;
-}
-function paintLive() {
-  const L = S.live; if (!L) return;
-  const pct = L.total ? Math.min(100, (L.checked / L.total) * 100) : 0;
-  $('tChecked').textContent = fmt(L.checked);
-  $('tProg').textContent = pct < 1 && L.checked ? '<1%' : Math.round(pct) + '%';
-  $('tRate').textContent = Math.round(L.rate);
-  $('tAvail').textContent = fmt(L.avail);
-  $('tLimit').textContent = fmt(L.limits);
-  $('tMiss').textContent = fmt(L.misses);
-  $('tTime').textContent = clock(L.elapsed);
-  $('tAns').textContent = Math.round((L.answered / Math.max(1, L.checked)) * 100) + '%';
-  $('pbar').style.width = pct + '%';
-  $('sbChecked').textContent = `${fmt(L.checked)}/${fmt(L.total || 0)}`;
-  $('sbRate').textContent = Math.round(L.rate);
-  $('sbAvail').textContent = fmt(L.avail);
-  $('sbLimit').textContent = fmt(L.limits);
-  $('sbPool').textContent = fmt(S.proxies?.count ?? 0);
-  renderPlatTable(L.byPlat);
-}
-/* A server line refines the model rather than replacing it: its counters are
-   authoritative but arrive after the browser already counted those results, and
-   a counter that ticks backwards looks broken. */
-function serverTick(p) {
-  const L = S.live; if (!L) return;
-  const bump = (k, v) => { if (typeof v === 'number') L[k] = Math.max(L[k], v); };
-  bump('checked', p.checked); bump('avail', p.available_count);
-  bump('limits', p.rate_limits); bump('misses', p.proxy_misses);
-  if (p.total_checks) L.total = p.total_checks;
-  if (typeof p.elapsed_s === 'number') L.elapsed = p.elapsed_s;
-  if (p.per_second) L.rate = p.per_second;
-  if (p.current_target) $('sbTarget').textContent = '\u2192 ' + p.current_target;
-  if (p.by_platform && p.checked === L.checked) L.byPlat = p.by_platform;
-  paintLive();
-}
-function renderPlatTable(by) {
-  if (!by) return;
-  const keys = Object.keys(by);
-  /* Two failure columns, because they mean opposite things: `errors` is the
-     transport failing -- evidence about the proxy list -- while `no answer` is
-     the platform handing back something unreadable, which is not the list's
-     fault. One merged column is how a run on a flaky host read as "proxies
-     exhausted". */
-  $('platTable').innerHTML = '<thead><tr><th>platform</th><th>checked</th><th>free</th><th>taken</th>'
-    + '<th title="the name is held by a banned account -- nobody can claim it">banned</th>'
-    + '<th title="the platform refused this exit IP">blocked</th>'
-    + '<th title="the proxy could not carry the request -- this is the list">errors</th>'
-    + '<th title="the platform answered something unreadable -- not the list">no answer</th></tr></thead><tbody>'
-    + keys.map(k => {
-        const r = by[k];
-        return `<tr><td>${esc(k)}</td><td>${fmt(r.checked)}</td><td style="color:var(--ok)">${fmt(r.available)}</td>
-          <td class="dim">${fmt(r.taken)}</td><td style="color:#ff8a94">${fmt(r.banned || 0)}</td>
-          <td style="color:#a99bff">${fmt(r.blocked)}</td>
-          <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td>
-          <td class="dim2">${fmt(r.unanswered || 0)}</td></tr>`;
-      }).join('') + '</tbody>';
-}
-async function start() {
-  const total = selectedTotal();
-  if (!total) return toast('Pick at least one name space', 'bad');
-  if (!S.proxies || !S.proxies.count) return toast('No proxies stored — add some on the Proxies tab', 'bad');
-  const buckets = S.menu.filter(b => S.sel.has(b.label) && !isRedundant(b))
-                        .map(b => ({ kind: b.kind, length: b.length }));
-  const platforms = S.plats.filter(p => p.on).map(p => p.name);
-  const concurrency = Number($('conc').value);
-  S.results = []; S.held = 0; S.avail = []; S.counts = {};
-  liveReset(total * platforms.length, platforms.length);
-  S.waitingOn = false;
-  paintLive(); renderResults(); renderFilters();
-  setRunning(true);
-  $('target').textContent = `${fmt(total)} names \u00d7 ${plat(platforms.length)} = ${fmt(total * platforms.length)} checks`;
-  logline(`start — ${fmt(total)} names \u00d7 ${plat(platforms.length)}, ${concurrency} concurrent`, 'ok');
+async function start(){
+  if (!S.plats.size) return toast('pick at least one sniper', 'bad');
+  if (!S.spaces.size) return toast('pick at least one name space', 'bad');
+  if (!S.proxies || !S.proxies.count) { view('proxies'); return toast('no proxies stored — add some first', 'bad'); }
+  resetRun();
+  line(`sweep — ${$('spaceSum').textContent.replace(/^.*= /, '')} × ${S.plats.size} sniper(s)`, 'ok');
   S.ac = new AbortController();
-  let res;
   try {
-    res = await fetch('/scan', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: S.ac.signal,
-      body: JSON.stringify({ buckets, platforms, concurrency, stream: true,
-        stop_on_available: !!($('hunt') && $('hunt').checked) }),
+    const r = await fetch('/scan', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({buckets: spaces(), platforms: [...S.plats], stream: true}),
+      signal: S.ac.signal,
     });
-  } catch (e) { setRunning(false); return logline('could not reach the server: ' + e.message, 'bad'); }
-  if (!res.ok) {
-    let msg = res.status + ' ' + res.statusText;
-    try { const j = await res.json(); if (j.detail) msg = j.detail; } catch (e) {}
-    setRunning(false); toast(msg, 'bad'); return logline('refused: ' + msg, 'bad');
+    if (!r.ok){
+      let d = {}; try { d = await r.json(); } catch (e) {}
+      throw new Error(d.detail || ('HTTP ' + r.status));
+    }
+    await read(r);
+  } catch (e){
+    if (e.name !== 'AbortError'){ line('stream error: ' + e.message, 'bad'); toast(e.message, 'bad'); }
   }
-  const reader = res.body.getReader(), dec = new TextDecoder();
-  let buf = '', lastPaint = 0, lastTile = 0;
+  S.watching = false;
+  setRunState(S.held ? 'finished' : 'reader closed — run continues', S.held ? '' : 'halted');
+  renderResults();
+}
+async function follow(runId){
+  S.watching = true;
+  S.ac = new AbortController();
   try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        let ev; try { ev = JSON.parse(line); } catch (e) { continue; }
-        if (ev.type === 'result') {
-          S.counts[ev.status] = (S.counts[ev.status] || 0) + 1;
-          if (ev.status === 'available') S.avail.push(ev);
-          if (S.held < MAXROWS || ev.status === 'available') { S.results.push(ev); S.held++; }
-          if (S.waitingOn) { S.waitingOn = false; logline('a proxy came back \u2014 resuming', 'ok'); }
-          liveAdd(ev);
-          const now = performance.now();
-          // Tiles are ~20 text writes, cheap enough to keep current; the table
-          // is up to 400 rows, so it repaints on its own slower clock.
-          if (now - lastTile > 90) { lastTile = now; paintLive(); }
-          if (now - lastPaint > 320) { lastPaint = now; renderResults(); renderFilters(); }
-        } else if (ev.type === 'waiting') {
-          // The run has nothing to dispatch: every proxy is resting. Say so once
-          // per episode and keep the counters painted, because silence here is
-          // what made a waiting run look like a broken one.
-          serverTick(ev);
-          if (!S.waitingOn) {
-            S.waitingOn = true;
-            logline(ev.detail, 'warn');
-          }
-          $('sbTarget').textContent = '\u23f3 ' + ev.detail;
-        } else if (ev.type === 'progress') {
-          serverTick(ev);
-        } else if (ev.type === 'heartbeat') {
-          /* Not a row: the server's keep-alive for a slow stretch. Repaint the
-             live counters so a slow run still looks alive instead of frozen. */
-          serverTick(ev);
-          if (S.waitingOn) { S.waitingOn = false; logline('a proxy came back \u2014 resuming', 'ok'); }
-        } else if (ev.type === 'start') {
-          $('target').textContent = `${fmt(ev.names)} names \u00d7 ${plat(ev.platforms.length)} = ${fmt(ev.names * ev.platforms.length)} checks`;
-          if (ev.pool_note) logline(ev.pool_note, 'warn');
-        } else if (ev.type === 'note') {
-          if (ev.pool_note) logline(ev.pool_note, 'warn');
-        } else if (ev.type === 'done') {
-          finish(ev);
-        }
-      }
+    const r = await fetch(`/runs/${runId}/stream`, { signal: S.ac.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    await read(r);
+  } catch (e){
+    if (e.name !== 'AbortError') line('reattach failed: ' + e.message, 'bad');
+  }
+  S.watching = false;
+  renderResults();
+  setRunState('finished', '');
+  checkLive();
+}
+function resetRun(){
+  S.results = []; S.counts = {}; S.free = []; S.held = 0;
+  lastByPlatform = {}; lastPaced = {};
+  renderResults(); renderFilters(); renderPlats();
+  $('sFree').textContent = '0'; $('sLimit').textContent = '0';
+  setMiss('remaining', 0, '');
+  $('sAns').textContent = '—'; $('bar').style.width = '0%';
+  $('platTable').innerHTML = '<tbody><tr><td class="dim2">Waiting for the first checks…</td></tr></tbody>';
+  $('paced').innerHTML = ''; $('paceNote').textContent = '';
+}
+async function read(res){
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  setRunState('live', 'live');
+  while (true){
+    const {value, done} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream:true});
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0){
+      const raw = buf.slice(0, nl); buf = buf.slice(nl + 1);
+      if (!raw.trim()) continue;
+      try { handle(JSON.parse(raw)); } catch (e) { line('unreadable line from the server', 'bad'); }
     }
-  } catch (e) {
-    /* `Load failed` / `Failed to fetch` is the connection dropping, not the run
-       necessarily ending: on a phone the socket can be cut while the server is
-       still working. Say which it was and let the results stand. */
-    if (e.name !== 'AbortError') {
-      logline('connection lost mid-run (' + e.message + ') \u2014 ' + fmt(S.live?.checked || 0)
-        + ' checks were seen; the rest may still be running on the server', 'bad');
-    }
+  }
+}
+function handle(ev){
+  if (ev.run_id && ev.run_id !== S.run){ S.run = ev.run_id; $('resumeBtn').hidden = true; }
+  switch (ev.type){
+    case 'start':
+      $('sNames').textContent = fmt(ev.names);
+      $('runNote').textContent = `${fmt(ev.names)} names × ${(ev.platforms||[]).length} sniper(s)`;
+      if (ev.pool_note) line(ev.pool_note, 'warn');
+      break;
+    case 'note': if (ev.pool_note) line(ev.pool_note, 'warn'); break;
+    case 'waiting': line(ev.detail, 'warn'); $('target').textContent = ev.detail; break;
+    case 'heartbeat': break;
+    case 'progress': paint(ev); break;
+    case 'result': addResult(ev); break;
+    case 'done': finish(ev); break;
+  }
+}
+function paint(p){
+  $('sChecked').textContent = fmt(p.checked);
+  $('sNames').textContent = fmt(p.names || 0);
+  $('sRate').textContent = Math.round(p.per_second || 0);
+  $('sFree').textContent = fmt(p.available_count || 0);
+  $('sLimit').textContent = fmt(p.rate_limits || 0);
+  // Filing the untouched remainder as failures would make every live sweep look
+  // broken; the loss is only real once the run stops.
+  setMiss('remaining', p.unattempted || 0, '');
+  $('sAns').textContent = p.answer_rate != null ? Math.round(p.answer_rate * 100) + '%' : '—';
+  $('bar').style.width = Math.min(100, (p.progress || 0) * 100) + '%';
+  if (p.current_target) $('target').textContent = '→ ' + p.current_target;
+  lastPaced = p.platforms_paced || lastPaced;
+  if (p.by_platform){ lastByPlatform = p.by_platform; renderPlatTable(p.by_platform); renderPlats(); }
+  $('nFree').textContent = fmt(S.free.length);
+}
+function addResult(r){
+  S.results.push(r);
+  S.counts[r.status] = (S.counts[r.status] || 0) + 1;
+  if (r.status === 'available'){ S.free.push(r); ding(r); }
+  if (S.results.length > HOLD){
+    const idx = S.results.findIndex(x => x.status !== 'available');
+    if (idx >= 0) S.results.splice(idx, 1); else S.held++;
   }
   renderResults(); renderFilters();
-  setRunning(false);
 }
-function finish(d) {
-  serverTick(d);
-  const L = S.live;
-  if (L && typeof d.checked === 'number') { L.checked = Math.max(L.checked, d.checked); }
-  if (L && d.by_platform) L.byPlat = d.by_platform;
-  if (L && d.elapsed_s) L.elapsed = d.elapsed_s;
-  if (L && typeof d.total_checks === 'number' && d.total_checks) L.total = d.total_checks;
-  if (L && d.answer_rate !== undefined) L.answerRate = d.answer_rate;
-  paintLive();
-  if (d.per_second) { S.rate = d.per_second; localStorage.setItem('bahs.rate', String(d.per_second)); }
-  const paused = Object.keys(d.platforms_paused || {});
-  /* "done" was a lie whenever the pool died at name 6 of 500: the line said the
-     run finished, and the only hint otherwise was in a field nobody reads. */
-  const ended = d.stopped ? 'stopped' : (d.stop_reason ? 'stopped early' : 'done');
-  logline(`${ended} — ${fmt(d.checked)} checked, ${fmt(d.available_count)} available, ${fmt(d.rate_limits)} rate-limited`
-    + (d.proxy_misses ? `, ${fmt(d.proxy_misses)} never checked` : '')
-    + (d.skipped ? `, ${fmt(d.skipped)} skipped` : '') + ` in ${clock(d.elapsed_s)} (${Math.round(d.per_second || 0)}/s)`,
+function finish(d){
+  S.held = S.results.length;
+  S.lastRun = {rate: d.per_second || 0, at: Date.now()};
+  paint(d);
+  lastPaced = d.platforms_paced || lastPaced;
+  if (d.by_platform) renderPlatTable(d.by_platform);
+  const ended = d.stopped ? 'stopped by hand' : (d.stop_reason ? 'stopped early' : 'finished');
+  line(`${ended} — ${fmt(d.checked)} of ${fmt(d.total_checks)} checks, ${fmt(d.available_count)} free, `
+    + `${fmt(d.rate_limits)} blocked, in ${clock(d.elapsed_s)} (${Math.round(d.per_second || 0)}/s)`,
     d.available_count ? 'ok' : '');
-  for (const p of paused) logline(`${p} sat out: ${d.platforms_paused[p].reason}`, 'warn');
-  if (d.stop_reason) logline(d.stop_reason, 'bad');
-  /* A name nobody asked about is not an error, but it is not a checked name
-     either, and the results table is now free of fake rows so it cannot be
-     spotted there. Said out loud here, once. */
+  for (const [p, v] of Object.entries(d.platforms_paused || {}))
+    line(`${p} sat out — ${v.reason || v}`, 'warn');
+  if (d.stop_reason) line(d.stop_reason, 'bad');
+  for (const [p, v] of Object.entries(d.platforms_paced || {}))
+    line(`${p} was asked slower — ${v.parallel} of ${v.ceiling} in flight — it was refusing, and sitting it out would lose the names`, 'warn');
   const missed = (d.unattempted || 0) + (d.proxy_misses || 0);
-  if (missed) logline(`${fmt(missed)} checks were never made — nothing left in the pool could carry them, so they are not counted as errors`, 'bad');
-  /* The two failure kinds get told apart here, because this is the line
-     everybody reads and "911 errors" is useless without knowing whose. */
-  const unans = (L && L.byStatus.unanswered) || 0;
-  if (unans) logline(`${fmt(unans)} checks got no readable answer from the platform — not the proxies' doing`, 'warn');
+  setMiss('never asked', missed, missed ? 'bad' : '');
+  if (missed) line(`${fmt(missed)} checks were never made — nothing left in the pool could carry them`, 'bad');
   const att = d.proxy_attempts || 0, fl = d.proxy_failures || 0;
-  if (att >= 20 && fl / att >= 0.1) {
-    logline(`the proxies failed ${Math.round(fl / att * 100)}% of ${fmt(att)} requests at the transport level — that is the list, not the names`, 'bad');
-  }
-  if (d.pool_retired) logline(`${fmt(d.pool_retired)} of ${fmt(d.pool_size)} proxies were written off for this run`, 'warn');
-  if (d.alerts?.enabled) logline(`alerts — ${d.alerts.sent} sent, ${d.alerts.failed} failed`);
-  updateEstimate();
+  if (att >= 20 && fl / att >= 0.1)
+    line(`the proxies failed ${Math.round(fl/att*100)}% of ${fmt(att)} requests — that is the list, not the names`, 'bad');
+  if (d.alerts && d.alerts.enabled) line(`alerts — ${d.alerts.sent} sent, ${d.alerts.failed} failed`);
+  $('runNote').textContent = `${ended} · ${fmt(d.checked)} of ${fmt(d.total_checks)} checks`;
+  renderSpaces();
+  if (d.available_count) toast(`${fmt(d.available_count)} free name${d.available_count===1?'':'s'} — check the results`);
 }
-async function stopRun() {
-  try { await api('/scan/stop', { method: 'POST' }); } catch (e) {}
-  if (S.ac) S.ac.abort();
-  setRunning(false);
-  logline('stop requested', 'warn');
+async function stopRun(){
+  try {
+    await api(S.run ? `/runs/stop?run_id=${encodeURIComponent(S.run)}` : '/runs/stop', {method:'POST'});
+    line('stop requested', 'warn');
+    setRunState('stopping…', 'live');
+  } catch (e) { toast('stop failed: ' + e.message, 'bad'); }
 }
-/* ============================ results ============================ */
+$('startBtn').onclick = start;
+$('stopBtn').onclick = stopRun;
+$('resumeBtn').onclick = () => { if (S.run) follow(S.run); };
+$('quickBtn').onclick = quick;
+$('quickName').onkeydown = (e) => { if (e.key === 'Enter') quick(); };
+async function quick(){
+  const name = $('quickName').value.trim().replace(/^@/, '');
+  if (!name) return toast('type a handle first', 'bad');
+  if (!S.plats.size) return toast('pick at least one sniper', 'bad');
+  const qs = [...S.plats].map(p => 'platform=' + encodeURIComponent(p)).join('&');
+  line(`single check — ${name}`, 'ok');
+  try {
+    const d = await api(`/snipe?username=${encodeURIComponent(name)}&${qs}`);
+    for (const r of d.results || []) addResult(r);
+    line(`${name}: ` + (d.results || []).map(r => `${r.platform} ${r.status}`
+      + (r.detail ? ' (' + r.detail + ')' : '')).join(' · '),
+      (d.available || []).length ? 'ok' : '');
+  } catch (e) { toast(e.message, 'bad'); }
+}
 const FILTERS = ['all','available','taken','banned','invalid','blocked','error','unanswered'];
-function renderFilters() {
-  const c = S.counts || {};
-  const total = Object.values(c).reduce((a, b) => a + b, 0);
+function renderFilters(){
+  const total = Object.values(S.counts).reduce((a,b) => a+b, 0);
   $('filters').innerHTML = FILTERS.map(f =>
-    `<span class="chip ${S.filter === f ? 'on' : ''}" data-f="${f}">${f}${f === 'all' ? ' ' + fmt(total) : ' ' + fmt(c[f] || 0)}</span>`
+    `<span class="chip s-${f} ${S.filter===f?'on':''}" data-f="${f}">${f} <b>${fmt(f==='all'?total:(S.counts[f]||0))}</b></span>`
   ).join('');
-  for (const el of $('filters').querySelectorAll('.chip')) {
+  for (const el of $('filters').querySelectorAll('.chip'))
     el.onclick = () => { S.filter = el.dataset.f; renderFilters(); renderResults(); };
-  }
-  $('navResults').textContent = fmt(total);
+  $('nFree').textContent = fmt(S.free.length);
 }
-function renderResults() {
-  const rows = (S.filter === 'all' ? S.results : S.results.filter(r => r.status === S.filter));
-  const view = rows.slice(-SHOWROWS).reverse();
-  if (!view.length) {
-    $('rTable').innerHTML = '<tbody><tr><td class="empty">Nothing yet — start a sweep.</td></tr></tbody>';
-  } else {
-    $('rTable').innerHTML = '<thead><tr><th>name</th><th>platform</th><th>status</th><th>detail</th><th>latency</th><th></th></tr></thead><tbody>'
-      + view.map(r => `<tr>
-          <td style="color:${r.status === 'available' ? 'var(--ok)' : 'inherit'}">${esc(r.username)}</td>
-          <td class="dim">${esc(r.platform)}</td>
-          <td><span class="pill s-${r.status}">${r.status}</span></td>
-          <td class="dim2">${esc(r.detail || '')}</td>
-          <td class="dim2">${r.latency_ms ? Math.round(r.latency_ms) + 'ms' : '—'}</td>
-          <td>${r.status === 'available' ? `<button class="btn ghost" data-claim="${esc(r.platform)}|${esc(r.username)}">claim ↗</button>` : ''}</td>
-        </tr>`).join('') + '</tbody>';
-  }
-  for (const el of $('rTable').querySelectorAll('[data-claim]')) {
+function rows(){
+  return S.filter === 'all' ? S.results : S.results.filter(r => r.status === S.filter);
+}
+function renderResults(){
+  const all = rows();
+  const view = all.slice(-SHOW).reverse();
+  $('rNote').textContent = S.filter === 'all'
+    ? `${fmt(all.length)} held · showing the last ${Math.min(SHOW, all.length)}`
+    : `${fmt(all.length)} ${S.filter} · showing the last ${Math.min(SHOW, all.length)}`;
+  if (!view.length){ $('rTable').innerHTML = '<tbody><tr><td class="dim2">Nothing yet.</td></tr></tbody>'; return; }
+  $('rTable').innerHTML = '<thead><tr><th>name</th><th>sniper</th><th>status</th><th>detail</th><th>ms</th><th></th></tr></thead><tbody>'
+    + view.map(r => `<tr class="${r.status==='available'?'free':''}">
+        <td class="name">${esc(r.username)}</td>
+        <td class="dim2">${esc(r.platform)}</td>
+        <td><span class="pill s-${esc(r.status)}">${esc(r.status)}</span></td>
+        <td class="dim2">${esc(r.detail || '')}</td>
+        <td class="dim2">${r.latency_ms ? Math.round(r.latency_ms) : '—'}</td>
+        <td>${r.status === 'available' ? `<button class="btn sm ghost" data-claim="${esc(r.platform)}|${esc(r.username)}">claim</button>` : ''}</td>
+      </tr>`).join('') + '</tbody>';
+  for (const el of $('rTable').querySelectorAll('[data-claim]')){
     el.onclick = async () => {
       const [platform, username] = el.dataset.claim.split('|');
       try {
         const info = await api(`/claim?platform=${encodeURIComponent(platform)}&username=${encodeURIComponent(username)}`);
         window.open(info.url, '_blank', 'noopener');
-        logline(`claim ${platform}/${username} — opening ${info.url}`, 'ok');
-      } catch (e) { toast('claim failed: ' + e.message, 'bad'); }
+        line(`claim ${platform}/${username} — ${info.url}`, 'ok');
+      } catch (e) { toast(e.message, 'bad'); }
     };
   }
-  $('rNote').textContent = S.held > MAXROWS
-    ? `Holding the first ${fmt(MAXROWS)} rows plus every available name (${fmt(S.avail.length)}); the counters above are the real totals.`
-    : `Showing the latest ${Math.min(SHOWROWS, rows.length)} of ${fmt(rows.length)} rows held in this tab.`;
 }
-const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-/* ============================ proxies ============================ */
-async function loadProxies() {
-  const data = await api('/proxies');
+function renderPlatTable(by){
+  const keys = Object.keys(by || {});
+  if (!keys.length) return;
+  $('platTable').innerHTML =
+    '<thead><tr><th>sniper</th><th>checked</th><th>free</th><th>taken</th><th>banned</th>'
+    + '<th>blocked</th><th>errors</th><th>no answer</th></tr></thead><tbody>'
+    + keys.map(k => {
+        const r = by[k];
+        return `<tr><td class="name">${esc(k)}</td><td>${fmt(r.checked)}</td>
+          <td style="color:var(--ok)">${fmt(r.available)}</td>
+          <td>${fmt(r.taken)}</td>
+          <td style="color:var(--bad)">${fmt(r.banned || 0)}</td>
+          <td style="color:var(--hold)">${fmt(r.blocked)}</td>
+          <td style="color:${r.error ? 'var(--bad)' : 'inherit'}">${fmt(r.error)}</td>
+          <td class="dim2">${fmt(r.unanswered || 0)}</td></tr>`;
+      }).join('') + '</tbody>';
+  const box = $('paced');
+  const paced = Object.entries(lastPaced || {});
+  box.innerHTML = paced.map(([k, v]) => `<b>${esc(k)} · ${v.parallel} of ${v.ceiling} in flight</b>`).join('');
+  $('paceNote').textContent = paced.length
+    ? 'a paced sniper is being asked slower because it was refusing answers — it keeps its names instead of sitting out'
+    : '';
+}
+$('logClear').onclick = () => { $('log').innerHTML = ''; };
+$('csvBtn').onclick = () => {
+  const cols = ['username','platform','status','detail','proxy','latency_ms'];
+  const csv = [cols.join(',')].concat(S.results.map(r =>
+    cols.map(c => JSON.stringify(r[c] ?? '')).join(',')));
+  const url = URL.createObjectURL(new Blob([csv.join('\n')], {type:'text/csv'}));
+  const a = document.createElement('a');
+  a.href = url; a.download = 'bahs-results.csv'; a.click();
+  URL.revokeObjectURL(url);
+};
+async function loadProxies(){ try { paintProxies(await api('/proxies')); } catch (e) {} }
+async function pollProxies(){ try { paintProxies(await api('/proxies')); } catch (e) {} }
+function paintProxies(data){
   S.proxies = data;
   const st = data.stats || {};
-  $('pCount').textContent = `— ${fmt(data.count)} · ${Object.entries(st.by_scheme || {}).map(([k, v]) => k + '\u00d7' + v).join(' ') || 'no schemes yet'}`;
-  $('navProxies').textContent = fmt(data.count);
-  $('footProx').textContent = fmt(data.count);
+  $('nProx').textContent = fmt(data.count);
+  $('sPool').textContent = fmt(data.count);
+  $('pCount').textContent = `${fmt(data.count)} stored`;
+  $('pStats').innerHTML = [
+    ['proxies', fmt(data.count)],
+    ['schemes', Object.entries(st.by_scheme || {}).map(([k,v]) => k + ' ×' + v).join('  ') || 'none'],
+    ['with credentials', fmt(st.with_auth || 0)],
+    ['updated', st.updated ? new Date(st.updated * 1000).toLocaleString() : 'never'],
+  ].map(([k,v]) => `<span>${esc(k)}</span><b>${esc(v)}</b>`).join('');
   const list = data.proxies || [];
   $('pTable').innerHTML = list.length
-    ? '<tbody>' + list.slice(0, 500).map(p =>
-        `<tr><td>${esc(p)}</td><td style="width:60px"><button class="btn ghost" data-drop="${esc(p)}">drop</button></td></tr>`).join('')
-      + '</tbody>'
-    : '<tbody><tr><td class="empty">No proxies stored. Paste a list above.</td></tr></tbody>';
-  for (const el of $('pTable').querySelectorAll('[data-drop]')) {
+    ? '<tbody>' + list.slice(0, 400).map(p =>
+        `<tr><td class="name">${esc(p)}</td><td style="width:56px;text-align:right">
+          <button class="btn sm ghost" data-drop="${esc(p)}">drop</button></td></tr>`).join('') + '</tbody>'
+    : '<tbody><tr><td class="dim2">No proxies stored yet.</td></tr></tbody>';
+  for (const el of $('pTable').querySelectorAll('[data-drop]')){
     el.onclick = async () => {
-      await api('/proxies?proxy=' + encodeURIComponent(el.dataset.drop), { method: 'DELETE' });
+      await api('/proxies?proxy=' + encodeURIComponent(el.dataset.drop), {method:'DELETE'});
       loadProxies();
     };
   }
-  $('pInfo').textContent = st.updated ? 'updated ' + new Date(st.updated * 1000).toLocaleString() : '';
 }
-/* The server answers with `stored` as a stats object and `rejected` as a sample
-   list plus `rejected_count` for the total -- so read the fields that exist
-   rather than stringifying an object into the message. */
-function report(r) {
-  const bits = [];
-  if (r.added !== undefined) bits.push(`${fmt(r.added)} ${r.mode === 'replace' ? 'stored' : 'added'}`);
-  if (r.stored && typeof r.stored === 'object') bits.push(`${fmt(r.stored.count)} in the list now`);
-  if (r.duplicates) bits.push(`${fmt(r.duplicates)} already there`);
-  if (r.rejected_count) bits.push(`${fmt(r.rejected_count)} rejected`);
-  if (r.rejected?.length) bits.push('e.g. ' + r.rejected.slice(0, 3).join(', '));
-  $('pReport').innerHTML = bits.length ? `<div class="note">${esc(bits.join(' · '))}</div>` : '';
-}
-async function saveProxies(mode) {
-  const text = $('pPaste').value;
-  if (!text.trim()) return toast('Nothing pasted', 'bad');
+async function paste(mode){
+  const text = $('pText').value;
+  if (!text.trim()) return toast('paste something first', 'bad');
   try {
-    const r = await api('/proxies', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, mode }) });
-    report(r); $('pPaste').value = ''; await loadProxies();
-    const total = (r.stored && r.stored.count) || 0;
-    toast(`${mode === 'replace' ? 'Replaced' : 'Added'} — ${fmt(total)} in the list`, 'ok');
-  } catch (e) { toast(e.message, 'bad'); }
+    const d = await api('/proxies', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({text, mode})});
+    $('pReport').innerHTML = `<span class="note ok">${d.mode === 'replace' ? 'replaced' : 'appended'} — `
+      + `${fmt(d.added)} saved, ${fmt(d.duplicates)} duplicate(s), ${fmt(d.rejected_count || 0)} line(s) rejected</span>`
+      + ((d.rejected || []).length ? `<div class="note bad">e.g. ${esc(d.rejected.slice(0,3).join(' · '))}</div>` : '');
+    $('pText').value = '';
+    loadProxies();
+  } catch (e) { $('pReport').innerHTML = `<span class="note bad">${esc(e.message)}</span>`; }
 }
-/* ============================ settings ============================ */
-async function loadSettings() {
-  const s = (await api('/settings')).alerts;
-  $('sHook').value = s.webhook || ''; $('sOn').checked = !!s.enabled;
-  $('sTpl').value = s.template || ''; $('sPing').value = s.ping || '';
-  $('sUser').value = s.username || ''; $('sAvatar').value = s.avatar || '';
-  return s;
-}
-async function saveSettings() {
-  try {
-    const body = { webhook: $('sHook').value.trim(), enabled: $('sOn').checked, template: $('sTpl').value,
-      ping: $('sPing').value, username: $('sUser').value, avatar: $('sAvatar').value.trim() };
-    const s = (await api('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body) })).alerts;
-    $('sNote').innerHTML = `<div class="note">Saved. Alerts are <b>${s.enabled ? 'on' : 'off'}</b>${s.webhook_set ? '' : ' — no webhook URL set yet'}.</div>`;
-    toast('Settings saved', 'ok');
-  } catch (e) { toast(e.message, 'bad'); }
-}
-async function testHook() {
-  $('sNote').innerHTML = '<div class="note">Sending…</div>';
-  try {
-    const r = await api('/settings/test-webhook', { method: 'POST' });
-    $('sNote').innerHTML = r.ok
-      ? '<div class="note">Test delivered — check the channel.</div>'
-      : `<div class="note bad">Not delivered: ${esc(r.error || (r.failed + ' failed'))}</div>`;
-  } catch (e) { $('sNote').innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
-}
-/* ============================ wiring ============================ */
-for (const b of $('nav').querySelectorAll('button')) {
-  b.onclick = () => {
-    for (const o of $('nav').querySelectorAll('button')) o.classList.toggle('on', o === b);
-    for (const v of document.querySelectorAll('.view')) v.classList.toggle('on', v.id === 'v-' + b.dataset.view);
-  };
-}
-$('start').onclick = start;
-$('stop').onclick = stopRun;
-$('conc').oninput = (e) => $('concVal').textContent = e.target.value;
-$('pickNil').onclick = () => { S.sel.clear(); renderBuckets(); updateEstimate(); };
-$('pickShort').onclick = () => {
-  S.sel.clear();
-  for (const b of S.menu) if ((b.length === 3 || b.length === 4) && ['l','n','og'].includes(b.kind)) S.sel.add(b.label);
-  renderBuckets(); updateEstimate();
-};
-$('pAppend').onclick = () => saveProxies('append');
-$('pReplace').onclick = () => saveProxies('replace');
-$('pUpload').onclick = () => $('pFile').click();
-$('pFile').onchange = async (e) => {
-  const f = e.target.files[0]; if (!f) return;
-  const text = await f.text();
-  try {
-    const r = await api('/proxies/upload', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: text });
-    report(r); await loadProxies(); toast('Uploaded ' + f.name, 'ok');
-  } catch (err) { toast(err.message, 'bad'); }
-  e.target.value = '';
-};
-$('pDownload').onclick = async () => {
-  const txt = await api('/proxies?format=txt');
-  const url = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
-  const a = document.createElement('a'); a.href = url; a.download = 'proxies.txt'; a.click();
-  URL.revokeObjectURL(url);
-};
-$('pCopyAll').onclick = async () => {
-  const txt = await api('/proxies?format=txt');
-  await navigator.clipboard.writeText(txt); toast('Copied ' + txt.split('\n').filter(Boolean).length + ' lines', 'ok');
-};
+$('pAdd').onclick = () => paste('append');
+$('pReplace').onclick = () => paste('replace');
 $('pClear').onclick = async () => {
-  if (!confirm('Empty the stored proxy list?')) return;
-  await api('/proxies/clear', { method: 'POST' }); await loadProxies(); toast('List cleared', 'ok');
+  if (!confirm('Remove every stored proxy?')) return;
+  await api('/proxies/clear', {method:'POST'}); loadProxies();
 };
-$('rCopy').onclick = async () => {
-  if (!S.avail.length) return toast('Nothing available yet', 'bad');
-  await navigator.clipboard.writeText(S.avail.map(r => r.username).join('\n'));
-  toast(`Copied ${S.avail.length} available names`, 'ok');
-};
-$('rCsv').onclick = () => {
-  const rows = [['username','platform','status','detail','proxy','latency_ms']]
-    .concat(S.results.map(r => [r.username, r.platform, r.status, r.detail || '', r.proxy || '', r.latency_ms ?? '']));
-  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
-  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
-  const a = document.createElement('a'); a.href = url; a.download = 'bahs-results.csv'; a.click();
-  URL.revokeObjectURL(url);
-};
-$('rWipe').onclick = () => { S.results = []; S.avail = []; S.held = 0; S.counts = {}; renderResults(); renderFilters(); };
-$('sSave').onclick = saveSettings;
-$('sTest').onclick = testHook;
-
-/* ============================ init ============================ */
-(async function init() {
+$('pFile').onchange = async (e) => {
+  const file = e.target.files[0]; if (!file) return;
   try {
-    S.info = await api('/info');
-    const menu = await api('/menu');
-    S.menu = menu.buckets; S.kinds = menu.kinds;
-    $('kMax').textContent = fmt(menu.max_enumeration) + ' names per run';
-    S.plats = S.info.platforms.map((name, i) => ({ name, on: true }));
-    $('footPlat').textContent = S.plats.length;
-    // Which build is actually serving this page. "I still see the old
-    // bug" is unanswerable from the outside without it.
-    if (S.info.build) $('buildTag').textContent = '· build ' + S.info.build;
-    $('conc').value = 256; $('concVal').textContent = '256';
-    for (const b of S.menu) if (['3l','3n','3og'].includes(b.label)) S.sel.add(b.label);
-    renderBuckets(); renderPlats(); updateEstimate(); renderFilters(); renderResults();
-    await loadProxies(); await loadSettings();
-    logline('ready — ' + S.plats.length + ' platforms, ' + fmt(S.proxies.count) + ' proxies', 'ok');
-    if (!S.proxies.count) logline('add proxies on the Proxies tab before starting a sweep', 'warn');
-    setInterval(async () => {
-      try {
-        const h = await api('/health');
-        $('footRuns').textContent = h.runs.active ? h.runs.active + ' run(s) live' : 'idle';
-        $('footProx').textContent = fmt(h.proxies.count);
-      } catch (e) {}
-    }, 5000);
-  } catch (e) {
-    logline('init failed: ' + e.message, 'bad');
-    $('est').innerHTML = '<span style="color:var(--bad)">Could not load the API: ' + esc(e.message) + '</span>';
+    const d = await api('/proxies/upload?mode=replace', {method:'POST', body: await file.text()});
+    $('pReport').innerHTML = `<span class="note ok">uploaded — ${fmt(d.added)} saved, `
+      + `${fmt(d.rejected_count || 0)} rejected</span>`;
+    loadProxies();
+  } catch (err) { toast(err.message, 'bad'); }
+};
+async function loadAlerts(){
+  try {
+    const d = await api('/settings');
+    const a = d.alerts || {};
+    $('aOn').checked = !!a.enabled;
+    $('aHook').value = a.webhook || '';
+    $('aTpl').value = a.template || '';
+    $('aUser').value = a.username || '';
+    $('aPing').value = a.ping || '';
+    $('aStats').innerHTML = [
+      ['enabled', a.enabled ? 'yes' : 'no'],
+      ['webhook set', a.webhook_set ? 'yes' : 'no'],
+      ['batch', fmt(a.batch)],
+      ['min interval', (a.min_interval ?? '—') + 's'],
+      ['max messages', fmt(a.max_messages)],
+    ].map(([k,v]) => `<span>${esc(k)}</span><b>${esc(v)}</b>`).join('');
+    S.alerts = a;
+  } catch (e) {}
+}
+$('aSave').onclick = async () => {
+  try {
+    await api('/settings', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({enabled: $('aOn').checked, webhook: $('aHook').value.trim(),
+        template: $('aTpl').value, username: $('aUser').value, ping: $('aPing').value})});
+    $('aNote').innerHTML = '<span class="note ok">Saved.</span>';
+    loadAlerts();
+  } catch (e) { $('aNote').innerHTML = `<span class="note bad">${esc(e.message)}</span>`; }
+};
+$('aTest').onclick = async () => {
+  $('aNote').innerHTML = '<span class="note">Sending…</span>';
+  try {
+    const r = await api('/settings/test-webhook', {method:'POST'});
+    $('aNote').innerHTML = r.ok ? '<span class="note ok">Test posted.</span>'
+      : `<span class="note bad">${esc(r.error || 'failed')}</span>`;
+  } catch (e) { $('aNote').innerHTML = `<span class="note bad">${esc(e.message)}</span>`; }
+};
+function renderAbout(){
+  const g = S.info.generation || {};
+  $('about').innerHTML = [
+    ['build', S.info.build], ['service', S.info.service],
+    ['snipers', (S.info.platforms || []).length],
+    ['name order', g.name_order],
+    ['max enumeration', fmt(g.max_enumeration)],
+    ['alerts', S.info.alerts_enabled ? 'enabled' : 'off'],
+  ].map(([k,v]) => `<span>${esc(k)}</span><b>${esc(v)}</b>`).join('');
+  $('howto').innerHTML = `A verdict is only reported when a platform's own answer produced it:
+    <b>available</b> is a name nobody holds, <b>taken</b> one that exists, <b>banned</b> one held by a
+    banned account, <b>invalid</b> one that platform cannot accept. A refusal is <b>blocked</b> — the exit
+    is rested and retried, and that sniper is asked slower rather than sat out — a failed tunnel is
+    <b>error</b>, and an answer nobody could read is <b>unanswered</b>, which blames nobody. Names the
+    pool could never carry are counted as never asked instead of being filed as errors, and a run that
+    stopped still says why.`;
+  $('eps').innerHTML = Object.entries(S.info.endpoints || {})
+    .map(([k,v]) => `<span>${esc(k)}</span><b style="font-weight:400">${esc(v)}</b>`).join('');
+}
+let audioCtx = null;
+function ding(r){
+  if (S.tune.snd){
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = 'triangle'; o.frequency.value = 880;
+      g.gain.value = .06; o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + .12);
+    } catch (e) {}
   }
-})();
+  if (S.tune.notif && 'Notification' in window && Notification.permission === 'granted'){
+    try { new Notification(`${r.username} is free on ${r.platform}`, {body: r.detail || ''}); } catch (e) {}
+  }
+  document.title = `(${S.free.length} free) bahs`;
+}
+$('notif').onchange = () => {
+  if ($('notif').checked && 'Notification' in window && Notification.permission === 'default')
+    Notification.requestPermission();
+};
+boot();
 </script>
 </body>
 </html>

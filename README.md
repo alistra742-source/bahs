@@ -1,11 +1,15 @@
 # bahs
 
-Username availability across ten platforms, over your own proxy list.
+Username availability across twenty platforms, over your own proxy list.
 
 Paste or upload a proxy list, pick the name spaces you want swept, and it checks
 **every** name in them — nothing is sampled. Results stream to the dashboard as
 they land, free names can go straight to a Discord webhook, and a platform that
 rate-limits the whole pool sits out while the rest of the run continues.
+
+A run is not tied to the tab. Close the page, lose signal, put the phone down —
+the sweep keeps going, and coming back reattaches to the same run, buffer and
+all, until you press **Stop** or the pool genuinely dies.
 
 Nothing is scraped. Nothing is validated ahead of time. The list you paste is
 exactly what a run rotates over.
@@ -40,7 +44,21 @@ the page itself is served `no-cache`, so it has to revalidate.
 | **x** | `x.com/{handle}` — status only, never the body | ~500 ms |
 | **youtube** | `youtube.com/@{handle}` — status only | ~120 ms |
 | **guns.lol** | profile page, first 64 KB: Schema.org block or account payload taken, ban heading `banned`, claim offer free | ~860 ms |
+| **bluesky** | `resolveHandle` on `{name}.bsky.social` — a DID for a handle that exists, `InvalidRequest` (63 bytes) for one that does not | 42 vs 63 bytes |
+| **kick** | `api/v2/channels/{name}`, the same JSON its channel page loads — 200 the channel, 404 `Channel not found.` | — |
+| **steam** | the vanity URL's own XML — `<steamID64>` for a live profile, `<error>` for a free one | 6.3 KB vs 144 bytes |
+| **soundcloud** | `soundcloud.com/{name}`, status only: 200 live, 404 unclaimed | — |
+| **dribbble** | profile path, status only | — |
+| **chess.com** | `pub/player/{name}` — 200 the player, 404 `{"code":0,"message":"not found"}` | 528 bytes |
+| **duolingo** | `2017-06-30/users?username=` — 12 bytes of `{"users":[]}` means free | — |
+| **wattpad** | `api/v3/users/{name}` — 200 the account, 400 `not found` for a free name | — |
+| **disqus** | profile path, status only | — |
+| **vk** | `vk.com/{name}`, status only | — |
 
+The ten added last were each verified through a rotating datacenter endpoint to
+tell a taken handle from a free one; they are not timed yet, so their latency
+column is blank on purpose. **Tumblr was dropped**: it answers 403 to every exit
+in a datacenter range, so it cannot be checked from a list like this one.
 **GitHub needs a token.** Unauthenticated its API allows 60 requests an hour per
 IP — not a check rate, a limit you hit in a minute and then sit out. Set
 `GITHUB_TOKEN` and the ceiling becomes 5,000.
@@ -93,23 +111,30 @@ its own on the dashboard.
 Pick any combination of these. `l` letters a–z, `n` digits, `c` letters+digits,
 `og` dictionary words — and the length.
 
-| | 3 | 4 | 5 |
-|---|---|---|---|
-| **l** | 17,576 | 456,976 | 11,881,376 |
-| **n** | 1,000 | 10,000 | 100,000 |
-| **c** | 46,656 | 1,679,616 | 60,466,176 |
-| **og** | 431 | 1,418 | 2,157 |
+| | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|
+| **l** | 676 | 17,576 | 456,976 | 11,881,376 |
+| **n** | 100 | 1,000 | 10,000 | 100,000 |
+| **c** | 1,296 | 46,656 | 1,679,616 | 60,466,176 |
+| **og** | 82 | 431 | 1,418 | 2,157 |
+
+The picker is a grid: a length down the side, a kind across the top, and any
+number of cells selected at once — `2c` and `3c` and `4c` in one go if that is
+what you want. The size shown on each cell is computed, not guessed, and the sum
+of your selection is printed under the grid with an estimate from your last
+measured rate, so a three-hour sweep says so before it starts.
 
 Overlapping selections are dropped before the count: `og` words are letters, so
 `3og` inside `3l` adds nothing, and `l`/`n` are both inside `c`. Selecting `3l`
 and `3og` checks 17,576 names, not 18,007 — "every combination" never means the
-same name twice.
+same name twice. The dashboard says which selections it dropped, rather than
+quietly checking fewer names than the count implies.
 
 Lower-case only, deliberately: a handle is case-insensitive for uniqueness on
 every target here, so generating both cases would ask the same question twice.
 Names you paste in are not rewritten — every checker resolves case the way its
-platform does (measured across all ten, only TikTok needed the request itself to
-be lower-cased, which `check_tiktok` does).
+platform does (measured across all twenty, only TikTok needed the request itself
+to be lower-cased, which `check_tiktok` does).
 
 ### The ceiling, and why it moved
 
@@ -211,6 +236,25 @@ answer. Two things fix that:
   raw count of 40 and ended the sweep; its own panel showed the traffic. A host
   that is genuinely blanket-blocked reads ~100% and is still retired.
 
+### The pacer: the platform that refuses gets asked slower, not dropped
+
+Sitting a platform out loses its names, and hammering a refusing platform is
+what produced the refusals in the first place. So between those two extremes a
+platform that keeps refusing is now **paced down**: over a window of
+`SNIPE_PLATFORM_PACE_WINDOW` (12) answers, refusals at or above
+`SNIPE_PLATFORM_PACE_RATE` (0.3) **halve** that platform's in-flight allowance,
+down to a floor of `SNIPE_PLATFORM_MIN_PARALLEL` (1); a window at or under
+`SNIPE_PLATFORM_PACE_RECOVER` (0.1) grows it back by one. Quick to cut, slow to
+grow is what stops a platform oscillating between throttled and hammered.
+Pacing never drops a name — the checks queue up, they do not disappear — and the
+dashboard shows which snipers are cut and by how much, live, so a slow platform
+looks slowed rather than broken.
+
+Measured on the pacer in isolation: at 50% refusals the ceiling walks 16 → 8 → 4
+→ 2 → 1, and at 0% it climbs back to 16, with no name skipped in either case. It
+is the same principle as the pause below — a refusal is a rate, not a verdict —
+applied one level down, per platform instead of per run.
+
 **guns.lol and Instagram still need residential-ish exits.** Both sit behind a
 challenge that refuses datacenter ranges outright — the 403 is the exit IP, not
 your tooling. A global *datacenter* rotating proxy will get 403s from them no
@@ -223,6 +267,33 @@ counted as `unattempted` (`proxy_misses` covers the narrower case of a name the
 pool refused when it was handed one) and the run stops with the reason. Filing
 them as errors is what filled the results table with hundreds of "proxies
 exhausted" lines and made a dead list look like a broken scanner.
+
+## A run outlives the tab
+
+The sweep used to be the HTTP response. Closing the tab, backgrounding the
+browser or losing signal cancelled it, so the run — and every name it had not
+reached yet — went with the reader. What a run needed was to not be a reader.
+
+Now the run is a task on the server, and the response is only a window on it:
+
+- **Closing the tab does not stop the sweep.** The task owns the checks; ending
+  a reader ends nothing else. Verified by killing the reading client mid-run and
+  watching the counters keep climbing with nobody attached.
+- **Coming back reattaches.** Every line is kept in a bounded buffer, and
+  `GET /runs/{id}/stream` replays what you missed and then follows live. A tab
+  that was away for a minute gets the minute, not a gap — verified at 912 lines
+  replayed, and at 4,070 lines on a reattach that then continued the run.
+- **Only Stop, or a dead pool, ends it.** `POST /runs/stop` (or the sidebar's
+  Stop button) stops it; independently, a run whose pool is fully retired stops
+  with its reason instead of reporting the remainder as errors.
+- **One run per kind** is enforced with a `409` that names the run already in
+  flight, so a second tab cannot reset the first one's retirements and strikes
+  out from under it — it reattaches to it instead. A finished run stays readable
+  for `RUN_TTL` (900 s) so a phone that was asleep still finds its results.
+
+Progress is reported against **checks**, not names: a 3-letter sweep over three
+platforms is 52,728 checks, and reporting it against 17,576 names showed 0% on a
+run that was a third done.
 
 ## A flaky proxy no longer ends the run
 
@@ -308,7 +379,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /info`, `GET /health` | platforms, generation, counters, and the commit this process is running (`build`) |
 | `GET /menu` | every bucket with its real size |
 | `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
-| `POST /scan` | `{buckets:[{kind,length}], platforms, concurrency, stream, stop_on_available}` |
+| `POST /scan` | `{buckets:[{kind,length}], platforms, stream}` — the whole selection is swept |
 | `POST /snipe` | the same for explicit `usernames` |
 | `GET /snipe?username=` | one name |
 | `GET /generate` | `letters\|alnum\|numbers\|words` by length |
@@ -325,10 +396,10 @@ connection), and a `done` summary. A run that dies mid-response still ends with
 a `done` line carrying the reason, instead of the browser reporting only
 `stream error: Load failed`.
 
-`stop_on_available: true` ends a run the moment any name comes back free — the
-"hunt" checkbox on the dashboard. A 3-letter space is 46,656 names, and once one
-is claimed the answer is in hand, so there is no reason to keep spending the
-pool on the rest.
+A run is stopped with `POST /runs/stop?run_id=`, not by closing the socket: the
+socket is only a reader. `GET /runs` lists what is going and what just finished,
+`GET /runs/{id}` is one run's counters for a tab that just returned, and
+`GET /runs/{id}/stream?since=` replays from its buffer and then follows.
 
 ## Environment
 
@@ -361,6 +432,11 @@ pool on the rest.
 | `SNIPE_PLATFORM_BLOCK_RATE` | `0.5` | share of a platform's answers that must be refusals |
 | `SCAN_RETRIES` | `1` | retries a refused name once, on a fresh exit IP |
 | `SNIPE_PLATFORM_WAIT` | `300` | seconds a run waits when every platform is paused |
+| `SNIPE_PLATFORM_PACE_WINDOW` | `12` | answers a platform's in-flight allowance is judged on |
+| `SNIPE_PLATFORM_PACE_RATE` | `0.3` | refusals share that halves the allowance |
+| `SNIPE_PLATFORM_PACE_RECOVER` | `0.1` | refusals share that lets it grow back by one |
+| `SNIPE_PLATFORM_MIN_PARALLEL` | `1` | floor the allowance can be cut to |
+| `RUN_TTL` | `900` | seconds a finished run stays reattachable |
 | `SNIPE_PLATFORM_PAUSE_MAX` | `900` | cap when the platform names a `retry_after` |
 | `SNIPE_PROXY_BLOCK_LIMIT` | `40` | blocks before a proxy is retired (see rate) |
 | `SNIPE_PROXY_BLOCK_RATE` | `0.8` | share of a proxy's answers that must be refusals to retire it |
@@ -372,27 +448,33 @@ pool on the rest.
 | `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
 | `LOG_LEVEL` | `info` | |
 
-## The dashboard on a phone
+## The dashboard
 
-The phone view is verified in a real browser, not assumed: Chromium at a 390 px
-viewport and at 1440 px, with the document width compared to the viewport and
-every element checked for crossing it.
+One page, no build step, no framework: a greyscale sidebar and a main panel.
+The sidebar is the whole product surface —
 
-Two things that were wrong and are now measured rather than guessed:
+- **Snipers**, one row per platform. Nothing is selected to begin with, so the
+  first click picks exactly the platform you clicked; after that clicks add and
+  remove, and the count of free names found on each one sits on its row.
+- **Workspace** — Sweep, Proxies, Alerts, Runtime.
+- **Customize** — sound on a free name, a desktop notification, whether a run is
+  kept when you leave, and whether the feed auto-follows.
+- **Stop run**, always in reach, next to the run's real state (`idle`, `live`,
+  `reader closed — run continues`, `finished`).
 
-- **The page was 550 px wide in a 390 px viewport.** `table{min-width:520px}`
-  is what makes a wide table scroll sideways, but the table's intrinsic width
-  travelled up through `.card`, `.grid2` and `main` — every one of them a grid
-  item with the default `min-width:auto` — and the whole page grew instead of
-  the table. The wrappers now carry `min-width:0`, so the tables scroll **inside**
-  their own box and the document is exactly the viewport width (390 = 390).
-- **The entire `@media(max-width:900px)` block sat above the rules it overrides.**
-  Same specificity, decided by source order, and the desktop rules came later —
-  so the bucket grid, the table font and the button padding quietly stayed at
-  desktop metrics on a phone. That is why the sizes in the name-space grid kept
-  getting clipped (`1,679,6` instead of `1,679,616`) no matter how many times the
-  numbers were shrunk. The phone block now lives at the end of the sheet, with a
-  comment saying why it has to.
+There is no concurrency box and no "hunt" checkbox: the pacer decides how hard
+to push each platform, and a run is started or stopped, not tuned mid-flight by
+someone guessing at a number. The name-space picker is the grid described above,
+with every cell's real size on it and a running total for the selection.
+
+**What is verified and what is not.** The served page, the endpoints it calls,
+the run it starts, the reattach, the stop, the per-platform checks and the
+counter arithmetic are all exercised through the server's own HTTP surface —
+including a 12-second reattach that replayed 4,070 buffered lines and then
+followed live. The page's JavaScript is parsed on every check and every element
+id it references is confirmed present in the markup. It has **not** been opened
+in a browser from this environment, so the visual layout, the phone breakpoint
+and the notification/sound toggles are the parts still to be seen by eye.
 
 ## Layout
 

@@ -352,7 +352,7 @@ def buckets_total(buckets: list[dict], words: list[str] | None = None) -> int:
     return sum(kind_size(kind, length, words) for kind, length in effective_buckets(buckets))
 
 
-def menu(lengths: Iterable[int] = (3, 4, 5)) -> list[dict]:
+def menu(lengths: Iterable[int] = (2, 3, 4, 5)) -> list[dict]:
     """The size of every bucket the dashboard offers, for the picker."""
     word_counts = words_by_length()
     out: list[dict] = []

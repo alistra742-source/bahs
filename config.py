@@ -236,6 +236,30 @@ SHUFFLE_NAMES: bool = _bool("SHUFFLE_NAMES", True)
 # it) is shuffled in full.
 SHUFFLE_WINDOW: int = _int("SHUFFLE_WINDOW", 50000)
 
+# --- Platform pacing -------------------------------------------------------
+# A platform is not paced by the run's concurrency. One host answering 429 to a
+# third of its requests still gets the whole window thrown at it until the
+# refusal *rate* crosses SNIPE_PLATFORM_BLOCK_RATE and the platform is sat out
+# for a minute and a half -- which is both the wrong shape (a hard stop instead
+# of a slower ask) and the reason a throttled run reads as a wall of `blocked`.
+# Instead every platform carries its own in-flight allowance, adjusted from what
+# it answers: refusals dominate -> halve it; answers come back clean -> grow it
+# back one at a time. A throttled platform slows down and keeps producing
+# verdicts, and the run never stops to do it.
+# How many checks a platform's allowance is judged on before it is adjusted.
+SNIPE_PLATFORM_PACE_WINDOW: int = _int("SNIPE_PLATFORM_PACE_WINDOW", 12)
+# The share of that window that has to be refusals before the allowance is
+# halved. Measured on a datacenter range: tiktok's embed endpoint refused 70% of
+# requests and discord's API 13-20% -- both of those halve; a handful of
+# transient 401s (4%, measured on guns.lol) does not.
+SNIPE_PLATFORM_PACE_RATE: float = _float("SNIPE_PLATFORM_PACE_RATE", 0.3)
+# Once a window comes back at or under a third of that rate, the allowance grows
+# again by one. Slow to grow, quick to cut: that is what keeps a platform from
+# oscillating between throttled and hammered.
+SNIPE_PLATFORM_PACE_RECOVER: float = _float("SNIPE_PLATFORM_PACE_RECOVER", 0.1)
+# The floor an allowance can be cut to. One request at a time is still a run.
+SNIPE_PLATFORM_MIN_PARALLEL: int = _int("SNIPE_PLATFORM_MIN_PARALLEL", 1)
+
 # --- Platform throttling ---------------------------------------------------
 # A platform that has refused every proxy in the list is sat out for this long
 # rather than hammered. A blanket 429 is per platform: discord refusing the whole

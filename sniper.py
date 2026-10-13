@@ -93,6 +93,10 @@ from config import (
     SNIPE_PER_PROXY,
     SNIPE_PLATFORM_BLOCK_MIN,
     SNIPE_PLATFORM_BLOCK_RATE,
+    SNIPE_PLATFORM_MIN_PARALLEL,
+    SNIPE_PLATFORM_PACE_RATE,
+    SNIPE_PLATFORM_PACE_RECOVER,
+    SNIPE_PLATFORM_PACE_WINDOW,
     SNIPE_PLATFORM_PAUSE,
     SNIPE_PLATFORM_PAUSE_MAX,
     SNIPE_PLATFORM_WAIT,
@@ -212,6 +216,16 @@ NAMESPACES: dict[str, tuple[re.Pattern[str], str]] = {
     ),
     "youtube": (re.compile(r"^[A-Za-z0-9._-]{3,30}$"), "3-30 of a-z A-Z 0-9 . _ -"),
     "guns.lol": (re.compile(r"^[A-Za-z0-9._-]{3,32}$"), "3-32 of a-z A-Z 0-9 . _ -"),
+    "bluesky": (re.compile(r"^[A-Za-z0-9-]{3,63}$"), "3-63 of a-z A-Z 0-9 -"),
+    "kick": (re.compile(r"^[A-Za-z0-9_-]{3,25}$"), "3-25 of a-z A-Z 0-9 _ -"),
+    "steam": (re.compile(r"^[A-Za-z0-9_-]{3,32}$"), "3-32 of a-z A-Z 0-9 _ -"),
+    "soundcloud": (re.compile(r"^[A-Za-z0-9_-]{3,25}$"), "3-25 of a-z A-Z 0-9 _ -"),
+    "dribbble": (re.compile(r"^[A-Za-z0-9-]{2,30}$"), "2-30 of a-z A-Z 0-9 -"),
+    "chess.com": (re.compile(r"^[A-Za-z0-9_-]{3,25}$"), "3-25 of a-z A-Z 0-9 _ -"),
+    "duolingo": (re.compile(r"^[A-Za-z0-9_-]{3,30}$"), "3-30 of a-z A-Z 0-9 _ -"),
+    "wattpad": (re.compile(r"^[A-Za-z0-9_-]{3,25}$"), "3-25 of a-z A-Z 0-9 _ -"),
+    "disqus": (re.compile(r"^[A-Za-z0-9-]{3,32}$"), "3-32 of a-z A-Z 0-9 -"),
+    "vk": (re.compile(r"^[A-Za-z0-9._]{2,32}$"), "2-32 of a-z A-Z 0-9 . _"),
 }
 
 
@@ -236,6 +250,16 @@ PLATFORMS = (
     "github",
     "youtube",
     "guns.lol",
+    "bluesky",
+    "kick",
+    "steam",
+    "soundcloud",
+    "dribbble",
+    "chess.com",
+    "duolingo",
+    "wattpad",
+    "disqus",
+    "vk",
 )
 
 # A name held by an account the platform has banned. Its own verdict rather than
@@ -1651,6 +1675,257 @@ async def check_x(client: httpx.AsyncClient, username: str) -> SnipeResult:
 
 
 
+# --- Bluesky ---------------------------------------------------------------
+# resolveHandle answers a DID for a handle that exists and an InvalidRequest for
+# one that does not -- 42 bytes against 63, measured. Only the default
+# bsky.social namespace can be asked this way, and that is exactly the namespace
+# a new account is given, so the name being checked is the local part.
+BSKY_RESOLVE = "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle={}.bsky.social"
+
+
+async def check_bluesky(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    handle = username.lower()
+    try:
+        resp = await client.get(
+            BSKY_RESOLVE.format(handle),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "bluesky", exc)
+
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        did = str((body or {}).get("did") or "") if isinstance(body, dict) else ""
+        if did:
+            return SnipeResult(username, "bluesky", "taken", did)
+        return SnipeResult(username, "bluesky", "error", "no did in body")
+    if resp.status_code == 400:
+        # InvalidRequest: nothing holds that handle in the bsky.social namespace.
+        # Only read as *free* because the name was already lower-cased and has to
+        # pass the namespace rule to get here -- a syntax failure would otherwise
+        # look identical.
+        return SnipeResult(username, "bluesky", "available", "handle is unclaimed")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "bluesky", resp)
+    return SnipeResult(username, "bluesky", "error", f"status {resp.status_code}")
+
+
+# --- Kick ------------------------------------------------------------------
+# The same JSON the site's own channel page loads. 200 carries the channel,
+# 404 is `{"error":"Not Found","message":"Channel not found."}`.
+KICK_CHANNEL = "https://kick.com/api/v2/channels/{}"
+
+
+async def check_kick(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    handle = username.lower()
+    try:
+        resp = await client.get(
+            KICK_CHANNEL.format(handle),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "kick", exc)
+
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        slug = str((body or {}).get("slug") or "") if isinstance(body, dict) else ""
+        if slug:
+            return SnipeResult(username, "kick", "taken", f"@{slug}")
+        return SnipeResult(username, "kick", "error", "no channel in body")
+    if resp.status_code == 404:
+        return SnipeResult(username, "kick", "available", "no channel")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "kick", resp)
+    return SnipeResult(username, "kick", "error", f"status {resp.status_code}")
+
+
+# --- Steam -----------------------------------------------------------------
+# The vanity URL's own XML view: a live profile renders <steamID64>, a free
+# vanity renders <error> instead -- 6.3 KB against 144 bytes, measured. Cheap
+# enough that the whole page is not worth reading.
+STEAM_XML = "https://steamcommunity.com/id/{}/?xml=1"
+
+
+async def check_steam(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            STEAM_XML.format(username),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/xml, text/xml"},
+        )
+    except Exception as exc:
+        return transport_error(username, "steam", exc)
+
+    if resp.status_code in (403, 429):
+        return _blocked(username, "steam", resp)
+    if resp.status_code != 200:
+        return SnipeResult(username, "steam", "error", f"status {resp.status_code}")
+    body = resp.content
+    if b"<steamID64>" in body:
+        match = re.search(rb"<steamID>([^<]{1,64})</steamID>", body)
+        detail = match.group(1).decode("utf-8", "ignore") if match else "profile exists"
+        return SnipeResult(username, "steam", "taken", detail)
+    if b"<error>" in body:
+        return SnipeResult(username, "steam", "available", "no such vanity url")
+    return SnipeResult(username, "steam", "error", "unrecognised xml")
+
+
+# --- SoundCloud ------------------------------------------------------------
+# A live profile is a 200; an unclaimed path is a 404. Both pages are large, so
+# only the status is read.
+async def check_soundcloud(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    code, err = await _status_only(
+        client, f"https://soundcloud.com/{username}", {"User-Agent": BROWSER_UA, "Accept": "text/html"}
+    )
+    if err:
+        return transport_error(username, "soundcloud", err)
+    if code == 200:
+        return SnipeResult(username, "soundcloud", "taken", "profile exists")
+    if code == 404:
+        return SnipeResult(username, "soundcloud", "available", "404")
+    if code in (401, 403, 429):
+        return SnipeResult(username, "soundcloud", "blocked", f"status {code}")
+    return SnipeResult(username, "soundcloud", "error", f"status {code}")
+
+
+# --- Dribbble --------------------------------------------------------------
+async def check_dribbble(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    handle = username.lower()
+    code, err = await _status_only(
+        client, f"https://dribbble.com/{handle}", {"User-Agent": BROWSER_UA, "Accept": "text/html"}
+    )
+    if err:
+        return transport_error(username, "dribbble", err)
+    if code == 200:
+        return SnipeResult(username, "dribbble", "taken", f"@{handle}")
+    if code == 404:
+        return SnipeResult(username, "dribbble", "available", "404")
+    if code in (401, 403, 429):
+        return SnipeResult(username, "dribbble", "blocked", f"status {code}")
+    return SnipeResult(username, "dribbble", "error", f"status {code}")
+
+
+# --- Chess.com -------------------------------------------------------------
+# Its public player API: 200 carries the player, 404 is
+# `{"code":0,"message":"not found"}` -- 528 bytes, measured.
+CHESS_PLAYER = "https://api.chess.com/pub/player/{}"
+
+
+async def check_chess(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    handle = username.lower()
+    try:
+        resp = await client.get(
+            CHESS_PLAYER.format(handle),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "chess.com", exc)
+
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        if isinstance(body, dict) and body.get("username"):
+            return SnipeResult(username, "chess.com", "taken", f"@{body['username']}")
+        return SnipeResult(username, "chess.com", "error", "no player in body")
+    if resp.status_code == 404:
+        return SnipeResult(username, "chess.com", "available", "no player")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "chess.com", resp)
+    return SnipeResult(username, "chess.com", "error", f"status {resp.status_code}")
+
+
+# --- Duolingo --------------------------------------------------------------
+# An empty user list is the free answer: 12 bytes of `{"users":[]}` against a
+# ~1.9 KB profile for a name that exists.
+DUO_USERS = "https://www.duolingo.com/2017-06-30/users?username={}"
+
+
+async def check_duolingo(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            DUO_USERS.format(username),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "duolingo", exc)
+
+    if resp.status_code in (403, 429):
+        return _blocked(username, "duolingo", resp)
+    if resp.status_code != 200:
+        return SnipeResult(username, "duolingo", "error", f"status {resp.status_code}")
+    body = _json_or_none(resp)
+    users = body.get("users") if isinstance(body, dict) else None
+    if users is None:
+        return SnipeResult(username, "duolingo", "error", "no users field in body")
+    if users:
+        return SnipeResult(username, "duolingo", "taken", str(users[0].get("username") or "profile exists"))
+    return SnipeResult(username, "duolingo", "available", "no such user")
+
+
+# --- Wattpad ---------------------------------------------------------------
+# A public user API: 200 with the account, 400 with `not found` for a free name.
+WATTPAD_USER = "https://www.wattpad.com/api/v3/users/{}"
+
+
+async def check_wattpad(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    try:
+        resp = await client.get(
+            WATTPAD_USER.format(username),
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
+        )
+    except Exception as exc:
+        return transport_error(username, "wattpad", exc)
+
+    if resp.status_code == 200:
+        body = _json_or_none(resp)
+        # `username` is the handle; `name` is the display name and is often empty
+        # even on an account with thousands of stories.
+        handle = str((body or {}).get("username") or "") if isinstance(body, dict) else ""
+        if handle:
+            return SnipeResult(username, "wattpad", "taken", handle)
+        return SnipeResult(username, "wattpad", "error", "no account in body")
+    if resp.status_code == 400:
+        body = _json_or_none(resp)
+        message = str((body or {}).get("message") or "") if isinstance(body, dict) else ""
+        if "not found" in message.lower():
+            return SnipeResult(username, "wattpad", "available", "no such user")
+        return SnipeResult(username, "wattpad", "error", "unexpected 400 body")
+    if resp.status_code in (403, 429):
+        return _blocked(username, "wattpad", resp)
+    return SnipeResult(username, "wattpad", "error", f"status {resp.status_code}")
+
+
+# --- Disqus ----------------------------------------------------------------
+async def check_disqus(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    handle = username.lower()
+    code, err = await _status_only(
+        client, f"https://disqus.com/by/{handle}/", {"User-Agent": BROWSER_UA, "Accept": "text/html"}
+    )
+    if err:
+        return transport_error(username, "disqus", err)
+    if code == 200:
+        return SnipeResult(username, "disqus", "taken", f"@{handle}")
+    if code == 404:
+        return SnipeResult(username, "disqus", "available", "404")
+    if code in (401, 403, 429):
+        return SnipeResult(username, "disqus", "blocked", f"status {code}")
+    return SnipeResult(username, "disqus", "error", f"status {code}")
+
+
+# --- VK --------------------------------------------------------------------
+async def check_vk(client: httpx.AsyncClient, username: str) -> SnipeResult:
+    code, err = await _status_only(
+        client, f"https://vk.com/{username}", {"User-Agent": BROWSER_UA, "Accept": "text/html"}
+    )
+    if err:
+        return transport_error(username, "vk", err)
+    if code == 200:
+        return SnipeResult(username, "vk", "taken", "profile exists")
+    if code == 404:
+        return SnipeResult(username, "vk", "available", "404")
+    if code in (401, 403, 429):
+        return SnipeResult(username, "vk", "blocked", f"status {code}")
+    return SnipeResult(username, "vk", "error", f"status {code}")
+
+
 CHECKERS = {
     "discord": check_discord,
     "roblox": check_roblox,
@@ -1662,6 +1937,16 @@ CHECKERS = {
     "github": check_github,
     "youtube": check_youtube,
     "guns.lol": check_guns,
+    "bluesky": check_bluesky,
+    "kick": check_kick,
+    "steam": check_steam,
+    "soundcloud": check_soundcloud,
+    "dribbble": check_dribbble,
+    "chess.com": check_chess,
+    "duolingo": check_duolingo,
+    "wattpad": check_wattpad,
+    "disqus": check_disqus,
+    "vk": check_vk,
 }
 
 
@@ -1712,6 +1997,97 @@ class RateMeter:
     @property
     def average(self) -> float:
         return self.count / max(self.elapsed, self._MIN_RATE_SPAN)
+
+
+class PlatformPacer:
+    """How much of each platform is allowed in flight, adjusted from its answers.
+
+    A run's concurrency is a *global* budget and a throttle is *per platform*.
+    Throwing the whole window at a host that is refusing a third of what it
+    answers is what turns a throttled platform into a column of `blocked` rows
+    and, once the refusal rate crosses the pause threshold, a 90-second sit-out
+    where nothing at all is asked. Pacing the platform keeps it producing
+    verdicts at whatever rate it will accept instead.
+
+    The rule is the usual one for a signal you cannot see directly: cut hard
+    when the refusals arrive, grow back one at a time when they stop. Every
+    adjustment is recorded with the platform and the numbers behind it, so a run
+    can say which platform it slowed down and why rather than just looking
+    slow.
+    """
+
+    def __init__(self, platforms: Iterable[str], ceiling: int) -> None:
+        self.ceiling = max(1, int(ceiling))
+        self.caps: dict[str, int] = {p: self.ceiling for p in platforms}
+        self.inflight: dict[str, int] = {p: 0 for p in platforms}
+        self._seen: dict[str, int] = {}
+        self._blocked: dict[str, int] = {}
+        self.adjustments: deque[tuple[str, int, int, float]] = deque(maxlen=64)
+        self._window = max(4, SNIPE_PLATFORM_PACE_WINDOW)
+
+    def allows(self, platform: str) -> bool:
+        """May this platform take another check right now?"""
+        return self.inflight.get(platform, 0) < self.caps.get(platform, self.ceiling)
+
+    def start(self, platform: str) -> None:
+        self.inflight[platform] = self.inflight.get(platform, 0) + 1
+
+    def finish(self, platform: str, blocked: bool | None) -> None:
+        """Release the in-flight slot and judge the platform on what came back.
+
+        ``None`` means the check produced no result at all (it was dropped), so
+        the slot is released without counting as an answer -- otherwise a run
+        that lost tasks would read as a platform recovering on no evidence.
+        """
+        if not platform:
+            return
+        if self.inflight.get(platform):
+            self.inflight[platform] -= 1
+        if blocked is None:
+            return
+        self._seen[platform] = self._seen.get(platform, 0) + 1
+        if blocked:
+            self._blocked[platform] = self._blocked.get(platform, 0) + 1
+        if self._seen[platform] < self._window:
+            return
+        share = self._blocked.get(platform, 0) / self._seen[platform]
+        cap = self.caps.get(platform, self.ceiling)
+        if share >= SNIPE_PLATFORM_PACE_RATE:
+            new = max(SNIPE_PLATFORM_MIN_PARALLEL, cap // 2)
+        elif share <= SNIPE_PLATFORM_PACE_RECOVER:
+            new = min(self.ceiling, cap + 1)
+        else:
+            new = cap
+        self._seen[platform] = 0
+        self._blocked[platform] = 0
+        if new != cap:
+            self.caps[platform] = new
+            self.adjustments.append((platform, cap, new, time.monotonic()))
+            log.info(
+                "pacing %s: %d -> %d in flight (%d%% refusals of the last %d)",
+                platform, cap, new, round(share * 100), self._window,
+            )
+
+    def snapshot(self) -> dict[str, dict[str, object]]:
+        """The platforms held below the run's ceiling, for the dashboard."""
+        out: dict[str, dict[str, object]] = {}
+        for platform, cap in self.caps.items():
+            if cap >= self.ceiling:
+                continue
+            out[platform] = {
+                "parallel": cap,
+                "ceiling": self.ceiling,
+                "in_flight": self.inflight.get(platform, 0),
+            }
+        return out
+
+    def recent(self, limit: int = 6) -> list[dict]:
+        """The last few adjustments, newest last."""
+        now = time.monotonic()
+        return [
+            {"platform": p, "was": a, "now": b, "seconds_ago": round(now - t, 1)}
+            for p, a, b, t in list(self.adjustments)[-limit:]
+        ]
 
 
 # --- the batch ------------------------------------------------------------
@@ -1814,6 +2190,10 @@ async def iter_snipes(
     # proxy: 192 of 256 rows were that message, and at concurrency 256 the run
     # finished the whole list without ever saying why.
     window = max(1, min(concurrency * window_factor, max(1, pool.alive() * pool.per_proxy)))
+    # Each platform answers for its own share of that window. The pool keeps the
+    # pacer so a report can say which platform a run slowed down for.
+    pace = PlatformPacer(platforms, max(1, concurrency))
+    pool.pace = pace
 
     async def one(platform: str, username: str) -> SnipeResult | None:
         async with sem:
@@ -1888,7 +2268,13 @@ async def iter_snipes(
     jobs = job_stream(ordered, platforms)
     jobs_done = False
     held: tuple[str, str, str] | None = None
-    pending: dict[asyncio.Task, None] = {}
+    # Jobs a platform's allowance would not take yet. They go round again on the
+    # next pass rather than being dropped, so a paced platform slows the run
+    # instead of ending its share of it.
+    deferred: deque[tuple[str, str, str]] = deque()
+    # task -> the platform it was dispatched for, so a finished check can be
+    # released against the right allowance.
+    pending: dict[asyncio.Task, str] = {}
     # Timestamp of the last "everything is cooling down" note, so a proxy that
     # alternates fail/answer cannot turn it into a line per check.
     cooling_note = -1e9
@@ -1908,7 +2294,9 @@ async def iter_snipes(
             # Collect anything already finished before deciding what to do next,
             # so the wait below can never spin on tasks that are done but unread.
             for task in [t for t in pending if t.done()]:
+                platform = pending.get(task, "")
                 result = harvest(task)
+                pace.finish(platform, None if result is None else result.status == "blocked")
                 if result is not None:
                     answered += 1 if result.answered else 0
                     yield result
@@ -1964,9 +2352,21 @@ async def iter_snipes(
                         "dispatching to whichever returns first",
                     )
 
-            while not jobs_done and len(pending) < window:
+            # `deferred` has to be drained even once the job list is spent, or a
+            # paced platform's last held-back names are dropped at the end of the
+            # run -- which is exactly the "checks were never made" this file has
+            # spent so long eliminating.
+            # A pass may hand a job back to `deferred` at most `window` times.
+            # Without that bound a paced platform whose single held-back job is
+            # popped and re-appended spins here forever: the allowance never
+            # frees while this loop is running, so nothing changes between the
+            # pop and the append.
+            rotations = 0
+            while (not jobs_done or deferred) and len(pending) < window:
                 if held is not None:
                     item, held = held, None
+                elif deferred:
+                    item = deferred.popleft()
                 else:
                     item = next(jobs, None)
                     if item is None:
@@ -1985,10 +2385,21 @@ async def iter_snipes(
                     skipped += 1
                     pool.skipped = skipped
                     continue
+                if not pace.allows(platform):
+                    # Its allowance is full: this is the platform being asked
+                    # slower than the run would like, which is the whole point.
+                    # The job goes to the back of this pass, and the wait below
+                    # is what frees the allowance for the next one.
+                    deferred.append(item)
+                    rotations += 1
+                    if rotations >= window:
+                        break
+                    continue
                 if pool.usable() == 0:
                     held = item
                     break
-                pending[asyncio.create_task(one(platform, username))] = None
+                pending[asyncio.create_task(one(platform, username))] = platform
+                pace.start(platform)
 
             if jobs_done and not pending:
                 break
@@ -2026,7 +2437,9 @@ async def iter_snipes(
             for task in done:
                 if task is stop_task:
                     continue
+                platform = pending.get(task, "")
                 result = harvest(task)
+                pace.finish(platform, None if result is None else result.status == "blocked")
                 if result is not None:
                     answered += 1 if result.answered else 0
                     yield result
