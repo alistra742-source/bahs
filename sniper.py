@@ -535,10 +535,38 @@ def proxy_fault(exc: BaseException) -> bool:
     return False
 
 
+def mask_proxy(proxy: str) -> str:
+    """A proxy URL with its credentials removed, for the log.
+
+    The endpoint is all a diagnostic needs, and a log line is where a
+    password survives for years -- the platform's log store, a pasted bug
+    report, a screenshot. So the userinfo is replaced and the host is kept.
+    """
+    if "@" not in proxy:
+        return proxy
+    prefix, _, host = proxy.rpartition("@")
+    scheme, sep, _userinfo = prefix.partition("://")
+    return f"{scheme}{sep}***@{host}" if sep else f"***@{host}"
+
+
 def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeResult":
-    """The request did not reach a verdict -- say who that implicates."""
+    """The request did not reach a verdict -- say who that implicates.
+
+    The exception's *message* is kept alongside its class name: the name is
+    what a row shows (``ProxyError``) and the message is what says why
+    (``Tunnel connection failed: 403 Forbidden``). Only the log reads the
+    latter -- the row has no room for it -- so a run can be diagnosed from
+    the platform log without being reproduced.
+    """
     fault = FAULT_PROXY if proxy_fault(exc) else FAULT_TARGET
-    return SnipeResult(username, platform, "error", type(exc).__name__, fault=fault)
+    return SnipeResult(
+        username,
+        platform,
+        "error",
+        type(exc).__name__,
+        fault=fault,
+        cause=f"{type(exc).__name__}: {exc}",
+    )
 
 
 def shuffled(names: Iterable[str], window: int = SHUFFLE_WINDOW) -> Iterator[str]:
@@ -584,6 +612,10 @@ class SnipeResult:
     # The first read said free and the second said taken. This result is the
     # correction; the site counts it so a run can be honest about its own errors.
     corrected: bool = False
+    # The raw exception behind an ``error``, message included. Never sent to a
+    # client and never shown in a row -- it exists so the log line for a failed
+    # check says what actually went wrong instead of only naming the exception.
+    cause: str = ""
 
     @property
     def is_available(self) -> bool:
@@ -818,6 +850,12 @@ class ProxyPool:
             pass
 
     def _retire(self, proxy: str) -> None:
+        # Every request already in flight reports after this, and each of them
+        # asks to retire the same proxy again. The state changes are idempotent,
+        # but the log line is not: retiring twice should not read as two
+        # different endpoints, or as a list that is dying faster than it is.
+        if proxy in self._retired:
+            return
         self._retired.add(proxy)
         self._resting.pop(proxy, None)
         client = self._clients.pop(proxy, None)
@@ -825,6 +863,19 @@ class ProxyPool:
             # Free the sockets immediately; a retired proxy's warm pool is dead
             # weight against the process fd budget.
             self._close_later(client)
+        # Retirement is the pool's verdict on the *list*, and the one decision a
+        # user has to act on, so it lands in the log with the numbers it was
+        # taken on rather than only in the run summary.
+        log.warning(
+            "proxy %s retired for this run: %d attempts, %d transport "
+            "failures, %d platform refusals; %d of %d proxies left",
+            mask_proxy(proxy),
+            self._attempts.get(proxy, 0),
+            self._failed.get(proxy, 0),
+            self._blocks.get(proxy, 0),
+            self.alive(),
+            len(self._all),
+        )
 
     def report(
         self,
@@ -923,6 +974,15 @@ class ProxyPool:
                 self._retire(proxy)
             elif self._block_cooldown > 0:
                 self._resting[proxy] = time.time() + self._block_cooldown
+                log.debug(
+                    "proxy %s refused by %s (%d refusals of %d answers); "
+                    "resting %.0fs",
+                    mask_proxy(proxy),
+                    platform or "?",
+                    blocks,
+                    seen,
+                    self._block_cooldown,
+                )
             return
 
         self._failed[proxy] = self._failed.get(proxy, 0) + 1
@@ -962,6 +1022,15 @@ class ProxyPool:
             self._retire(proxy)
         elif self._cooldown > 0:
             self._resting[proxy] = time.time() + self._cooldown
+            log.debug(
+                "proxy %s resting %.0fs after a transport failure on %s "
+                "(%d failures of %d attempts)",
+                mask_proxy(proxy),
+                self._cooldown,
+                platform or "?",
+                failed,
+                attempts,
+            )
 
     def attempts(self) -> int:
         """Requests proxies carried, and how many failed at the transport level.
@@ -2598,6 +2667,9 @@ async def check_once(
     proxy = pool.next()
     if proxy is None:
         detail = POOL_MISS_DETAILS[0] if len(pool) else POOL_MISS_DETAILS[1]
+        # Dropped by the run rather than filed as a row, so it is only ever a
+        # log line -- but it is the line that says the pool ran out mid-name.
+        log.debug("nothing to check %s/%s through: %s", platform, username, detail)
         return SnipeResult(username, platform, "error", detail)
     started = time.perf_counter()
     try:
@@ -2637,6 +2709,24 @@ async def check_once(
         # proxy; only the timeout additionally rests the host it came from.
         result.status = STATUS_UNANSWERED
     pool.report(proxy, outcome, platform, result.retry_after)
+    # One line per check, and the only place a run's traffic is legible as
+    # traffic. Everything that is not a verdict -- a transport error, a
+    # refusal, an answer nobody could read -- is INFO, because a failure that
+    # is only counted is a number nobody can act on, and because a run that
+    # stops early otherwise leaves no record of *why* each check ended the way
+    # it did. Verdicts are DEBUG: a sweep of millions of names must not bury
+    # those failures under its own success.
+    level = logging.DEBUG if result.status in FINAL_STATUSES else logging.INFO
+    log.log(
+        level,
+        "check %s/%s -> %s (%s) via %s in %.0f ms",
+        platform,
+        username,
+        result.status,
+        result.cause or result.detail or "-",
+        mask_proxy(result.proxy or "direct"),
+        result.latency_ms or 0.0,
+    )
     return result
 
 
@@ -2701,6 +2791,30 @@ async def iter_snipes(
     # pacer so a report can say which platform a run slowed down for.
     pace = PlatformPacer(platforms, max(1, concurrency))
     pool.pace = pace
+    # A run's settings otherwise exist only in the request that started it, which
+    # a streaming client sends once and nobody reads back.
+    log.info(
+        "run starting: %d platform(s) [%s], concurrency %d, retries %d, "
+        "window %d, pool %d of %d usable at %d connection(s) each",
+        len(platforms),
+        ", ".join(platforms),
+        concurrency,
+        retries,
+        window,
+        pool.usable(),
+        len(pool),
+        pool.per_proxy,
+    )
+
+    def stopping(reason: str) -> None:
+        """End the run with the pool's own words, and say so in the log.
+
+        The reason is what the dashboard prints; the log is where an operator
+        sees it without opening the app, at the moment it is decided rather
+        than only in the summary at the end.
+        """
+        pool.stop_reason = reason
+        log.warning("run stopping early: %s", reason)
 
     async def one(platform: str, username: str) -> SnipeResult | None:
         async with sem:
@@ -2813,7 +2927,7 @@ async def iter_snipes(
             # list against a pool that is not there. Checked only once a pool
             # miss has been seen, because alive() walks the whole list.
             if pool.misses and pool.alive() == 0:
-                pool.stop_reason = pool.exhausted_reason()
+                stopping(pool.exhausted_reason())
                 break
 
             # Any platform that has now refused the whole pool is sat out with
@@ -2832,7 +2946,7 @@ async def iter_snipes(
                 if pause_since == 0.0:
                     pause_since = now_m
                 if now_m - pause_since >= SNIPE_PLATFORM_WAIT:
-                    pool.stop_reason = pool.blocked_reason()
+                    stopping(pool.blocked_reason())
                     break
                 if now_m - cooling_note > 5.0:
                     cooling_note = now_m
@@ -2925,7 +3039,7 @@ async def iter_snipes(
             # it asleep, then "the list is dead". A proxy in a cooldown is not a
             # pool that cannot be used, and only retirement decides that now.
             if not jobs_done and not pending:
-                pool.stop_reason = pool.exhausted_reason()
+                stopping(pool.exhausted_reason())
                 break
 
             if not pending:
@@ -2953,7 +3067,7 @@ async def iter_snipes(
                     answered += 1 if result.answered else 0
                     yield result
             if pool.misses and pool.alive() == 0:
-                pool.stop_reason = pool.exhausted_reason()
+                stopping(pool.exhausted_reason())
                 break
             # Any platform that has now refused the whole pool is sat out with
             # the reason the platform gave. The run continues on the platforms
@@ -2971,7 +3085,7 @@ async def iter_snipes(
                 if pause_since == 0.0:
                     pause_since = now_m
                 if now_m - pause_since >= SNIPE_PLATFORM_WAIT:
-                    pool.stop_reason = pool.blocked_reason()
+                    stopping(pool.blocked_reason())
                     break
                 if now_m - cooling_note > 5.0:
                     cooling_note = now_m
@@ -2997,3 +3111,18 @@ async def iter_snipes(
                 # We are being torn down by the caller; cancel() above already
                 # reached every task, so there is nothing left to await.
                 pass
+        # The run's own arithmetic, in one line: what it got through, what it
+        # could not, and the pool's numbers -- the counters a summary of
+        # verdicts alone cannot show, and the record of a run that ended early.
+        log.info(
+            "run finished: %d answered, %d skipped, %d never reached a proxy, "
+            "%d of %d proxies retired, %d attempts / %d failures%s",
+            answered,
+            skipped,
+            pool.misses,
+            pool.retired(),
+            len(pool),
+            pool.attempts(),
+            pool.failures(),
+            f", stop_reason: {pool.stop_reason}" if pool.stop_reason else "",
+        )

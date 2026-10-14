@@ -570,7 +570,24 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |
 | `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
-| `LOG_LEVEL` | `info` | |
+| `LOG_LEVEL` | `info` | `debug` logs every verdict and the HTTP wire itself |
+
+### What gets logged
+
+At the default `LOG_LEVEL=info` a run writes one line per check that did **not**
+produce a verdict — the platform, the name, the outcome and the exact reason
+(a transport error keeps the exception's own message, so `ProxyError` is not
+all you get), plus the exit it went through and how long it took. Alongside
+those: every free name found, every proxy retired (with the attempts, failures
+and refusals it was judged on), every platform paused, each stop request, and a
+`starting` / `done` pair per run carrying the settings it began with and the
+totals it ended with — including `stop_reason` when it ended early.
+
+`LOG_LEVEL=debug` turns on everything else: one line per verdict, the pool's
+rest and hand-out decisions, and httpx's own per-request lines — the last of
+which is what says which connection was refused, and when. Proxy URLs are
+logged with their credentials masked either way, so the log never carries a
+password.
 
 ## The pages
 

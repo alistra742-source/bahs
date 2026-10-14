@@ -63,10 +63,17 @@ logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# LOG_LEVEL=debug is the one setting that means "log everything", and
+# everything includes the wire: httpx's own per-request lines are what say
+# which connection was refused and when. Clamping them to WARNING whatever the
+# level was meant a debug run still showed nothing about the requests that
+# were failing.
+_DEBUG = LOG_LEVEL.strip().upper() == "DEBUG"
 # httpx logs one INFO line per request and a run issues thousands of them, which
 # buries the progress lines that matter. Errors still surface at WARNING.
-for _noisy in ("httpx", "httpcore"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+if not _DEBUG:
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bahs.server")
 
 
@@ -96,7 +103,10 @@ class _QuietStaticAccess(logging.Filter):
         return not (isinstance(path, str) and path.startswith(self.STATIC))
 
 
-logging.getLogger("uvicorn.access").addFilter(_QuietStaticAccess())
+# The access filter exists for one reason: a page load wrote twenty lines of
+# furniture for every line that mattered. Under debug nothing is furniture.
+if not _DEBUG:
+    logging.getLogger("uvicorn.access").addFilter(_QuietStaticAccess())
 
 
 def _raise_fd_limit() -> int | None:
@@ -957,6 +967,9 @@ def _stop_runs(kind: str | None = None, run_id: str | None = None) -> list[str]:
             continue
         handle.stop.set()
         stopped.append(rid)
+        log.info("stop requested for %s run %s", handle.kind, rid)
+    if stopped:
+        log.info("stopping %d run(s): %s", len(stopped), ", ".join(stopped))
     return stopped
 
 
@@ -1299,6 +1312,14 @@ class _Tally:
             self.banned += 1
         if status == "available":
             self.available += 1
+            # A hit is the product, and there are few of them, so it goes in the
+            # log at INFO where it can be read back long after the tab is gone.
+            log.info(
+                "hit: %s is available on %s (%s)",
+                result.username,
+                result.platform,
+                result.detail,
+            )
             # Queued, not sent: the alerter digests and posts on its own clock.
             if self.alerter is not None:
                 self.alerter.offer(result.username, result.platform, result.detail)
@@ -1481,6 +1502,66 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
     }
 
 
+def _log_run_start(
+    kind: str,
+    run_id: str,
+    names: int,
+    platforms: list[str],
+    concurrency: int,
+    retries: int,
+    pool: sniper.ProxyPool,
+    note: str,
+) -> None:
+    """Say, in the platform log, exactly what a run was asked to do.
+
+    A run's settings otherwise exist only in the request that started it,
+    which a streaming client sends once and nobody ever reads back. This is
+    the line an operator can find again after a sweep behaved oddly.
+    """
+    log.info(
+        "%s run %s starting: %d names x %d platform(s) [%s], concurrency %d, "
+        "retries %d, pool %d of %d usable at %d connection(s) each, note: %s",
+        kind,
+        run_id,
+        names,
+        len(platforms),
+        ", ".join(platforms),
+        concurrency,
+        retries,
+        pool.alive(),
+        len(pool),
+        pool.per_proxy,
+        note or "none",
+    )
+
+
+def _log_run_end(kind: str, run_id: str, tally: "_Tally", pool: sniper.ProxyPool) -> None:
+    """The one line that sums a run up: what it checked, found and stopped for."""
+    summary = tally.summary()
+    log.info(
+        "%s run %s done: %d checks, %d answers, %d available, %d errors, "
+        "%d unanswered, %d blocked, %d proxy misses, %d unattempted, "
+        "%.1f checks/s, %.1fs, pool %d/%d retired, %d attempts / %d failures%s",
+        kind,
+        run_id,
+        summary["checked"],
+        summary["answered"],
+        summary["available_count"],
+        summary["error"],
+        summary["unanswered"],
+        summary["rate_limits"],
+        summary["proxy_misses"],
+        summary["unattempted"],
+        summary["checks_per_second"],
+        summary["elapsed_s"],
+        pool.retired(),
+        len(pool),
+        pool.attempts(),
+        pool.failures(),
+        f", stop_reason: {pool.stop_reason}" if pool.stop_reason else "",
+    )
+
+
 async def _snipe_ready(
     req: SnipeRequest,
 ) -> tuple[list[str], list[str], sniper.ProxyPool, int, int, str]:
@@ -1585,6 +1666,9 @@ async def _snipe_ndjson(
         yield json.dumps(
             {"type": "note", "run_id": run_id, "pool_note": note, "pool_size": len(pool)}
         ) + "\n"
+    _log_run_start(
+        "snipe", run_id, len(names), platforms, concurrency, retries, pool, note
+    )
     try:
         async for result in sniper.iter_snipes(
             names,
@@ -1619,6 +1703,7 @@ async def _snipe_ndjson(
         if run:
             run.finish()
         await _finish_alerts(alerter)
+    _log_run_end("snipe", run_id, tally, pool)
     yield json.dumps(
         {
             "type": "done",
@@ -1897,6 +1982,9 @@ async def _scan_stream(
             "target_rate": SCAN_TARGET_RATE,
         }
     ) + "\n"
+    _log_run_start(
+        "scan", run_id, names_total, platforms, concurrency, retries, pool, note
+    )
 
     try:
         async for result in sniper.iter_snipes(
@@ -1933,6 +2021,7 @@ async def _scan_stream(
         # browser reports as `stream error: Load failed` with no explanation.
         # Emit a real `done` so the dashboard can say what happened.
         log.exception("scan run failed mid-stream")
+        _log_run_end("scan", run_id, tally, pool)
         yield json.dumps({
             "type": "done",
             "run_id": run_id,
@@ -1953,6 +2042,7 @@ async def _scan_stream(
         if run:
             run.finish()
         await _finish_alerts(alerter)
+    _log_run_end("scan", run_id, tally, pool)
 
     rate = tally.meter.average
     yield json.dumps(
