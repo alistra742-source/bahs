@@ -19,6 +19,10 @@
       ["refused by a platform", UI.fmt(q.pool_blocked || 0)],
       ["requests carried", UI.fmt(q.proxy_attempts || 0)],
       ["failed at the transport", UI.fmt(q.proxy_failures || 0)],
+      // A run that ended because of the pool rather than because it ran out of
+      // names. "every platform throttled the whole list" and "the list is dead"
+      // look identical in the error column; this is the line that separates them.
+      ...(q.stop_reason ? [["stopped early", q.stop_reason]] : []),
     ];
   };
 
@@ -27,6 +31,8 @@
     return [
       ["refused by the platform", UI.fmt(p.rate_limits || 0)],
       ["errors (never arrived)", UI.fmt(p.error || 0)],
+      // Every name answering "error" is a proxy talking, not a platform verdict.
+      ["proxies skipped", UI.fmt(p.skipped || 0)],
       ["unreadable answer", UI.fmt(p.unanswered || 0)],
       ["banned accounts", UI.fmt(p.banned || 0)],
       ["free confirmed twice", UI.fmt(p.confirmed_count || 0)],

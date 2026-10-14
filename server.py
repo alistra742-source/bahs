@@ -70,6 +70,35 @@ for _noisy in ("httpx", "httpcore"):
 log = logging.getLogger("bahs.server")
 
 
+class _QuietStaticAccess(logging.Filter):
+    """Drop the access-log line for a static asset that was served.
+
+    One page load is two stylesheets, one script per component, two fonts and the
+    icon, and each wrote its own line to the platform log. Twenty lines of
+    furniture per page is how the one line that matters -- a run starting, a 402,
+    a proxy refused -- gets buried.
+
+    Only successful asset fetches are dropped: anything 4xx/5xx still lands, and
+    so does every non-asset path, so a missing file or a rejected request cannot
+    hide in here.
+    """
+
+    STATIC = ("/ui/", "/app.css", "/app.js", "/favicon.ico")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        # uvicorn.access logs (client, method, path, http_version, status).
+        try:
+            path, status = record.args[2], record.args[4]
+        except (IndexError, TypeError):  # pragma: no cover - a different log format
+            return True
+        if not isinstance(status, int) or status >= 400:
+            return True
+        return not (isinstance(path, str) and path.startswith(self.STATIC))
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietStaticAccess())
+
+
 def _raise_fd_limit() -> int | None:
     """Lift RLIMIT_NOFILE so a wide run cannot hit EMFILE.
 
@@ -286,7 +315,7 @@ def _build_id() -> str:
 
 BUILD = _build_id()
 
-proxy_list = proxy_list_module.ProxyList(STORE_PATH)
+proxy_list = proxy_list_module.ProxyList(STORE_PATH, mirror=proxy_list_module.StoreMirror())
 
 # Today's totals, for the landing page's stats strip.
 daily_stats = DailyStats(STATS_PATH)

@@ -89,9 +89,14 @@ window.PAGE = {
     $("pFile").onchange = async (e) => {
       const f = e.target.files[0]; if (!f) return;
       const text = await f.text();
-      await App.api("/proxies/upload?mode=append", { method: "POST", body: text,
-        headers: { "content-type": "text/plain" } });
-      App.toast("uploaded " + f.name, "ok"); load();
+      try {
+        const r = await App.api("/proxies/upload?mode=append", { method: "POST", body: text,
+          headers: { "content-type": "text/plain" } });
+        const n = r.added || 0, bad = r.rejected_count || 0;
+        $("pReport").textContent = `${n} kept, ${bad} dropped — ${r.stored.count} stored`;
+        App.toast(`${f.name}: ${n} added${bad ? ", " + bad + " dropped" : ""}`, n ? "ok" : "bad");
+      } catch (e) { App.toast(f.name + ": " + e.message, "bad"); }
+      load();
     };
     load();
   },
@@ -103,9 +108,12 @@ async function save(mode) {
   try {
     const r = await App.api("/proxies", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ text, mode }) });
-    const n = (r.accepted || []).length, bad = (r.rejected || []).length;
-    $("pReport").textContent = `${n} kept, ${bad} dropped — ${r.stored.count} stored`;
-    App.toast(`${n} ${mode === "replace" ? "replaced" : "added"}`, "ok");
+    // The API answers with `added`, `duplicates` and `rejected_count`; reading
+    // `accepted` off it reported 0 kept for every paste, which is exactly what
+    // makes a working list look like it never saved.
+    const n = r.added || 0, bad = r.rejected_count || 0, dup = r.duplicates || 0;
+    $("pReport").textContent = `${n} kept, ${bad} dropped, ${dup} duplicate — ${r.stored.count} stored`;
+    App.toast(`${n} ${mode === "replace" ? "replaced" : "added"}${bad ? ", " + bad + " dropped" : ""}`, n ? "ok" : "bad");
     $("pText").value = ""; load();
   } catch (e) { App.toast("save failed: " + e.message, "bad"); }
 }

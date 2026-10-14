@@ -80,6 +80,13 @@ CREATE TABLE IF NOT EXISTS challenges (
  target INTEGER NOT NULL, expires DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS challenge_expiry ON challenges(expires);
+-- The proxy list's durable copy. The container filesystem is rebuilt from the
+-- image on every deploy, so data/proxies.json does not survive one -- this table
+-- does. One row: the list is a single global pool, not per-account. (No
+-- semicolons in this comment: the schema is split on them.)
+CREATE TABLE IF NOT EXISTS proxy_store (
+ id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL
+);
 """
 
 # Columns added after the first deploy. CREATE TABLE IF NOT EXISTS does not add

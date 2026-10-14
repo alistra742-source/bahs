@@ -39,8 +39,9 @@ pip install -r requirements.txt
 uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 
-Open `http://localhost:8080`. On Railway, `PORT` is injected; point `STORE_PATH`
-at a volume so the proxy list and settings survive a deploy.
+Open `http://localhost:8080`. On Railway, `PORT` is injected. The proxy list is
+kept in the database as well as in `data/proxies.json`, so it survives a deploy
+without a volume; `STORE_PATH` only decides where the local cache sits.
 
 The dashboard's Live card prints the commit it is running (`build 9597c9d`), from
 `RAILWAY_GIT_COMMIT_SHA` or the checkout's `HEAD`, and `/health` and `/info`
@@ -515,7 +516,7 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | variable | default | |
 |---|---|---|
 | `PORT` | `8080` | |
-| `STORE_PATH` | `data/proxies.json` | point at a volume |
+| `STORE_PATH` | `data/proxies.json` | local cache — the database copy is the store |
 | `SETTINGS_PATH` | `data/settings.json` | alert settings |
 | `STATS_PATH` | `data/stats.json` | today's totals, for the landing page |
 | `TIKTOK_SESSION_ID` | — | TikTok `sessionid` cookie, optional: settles a free TikTok name with TikTok's own validator. A credential for a real account — see below |

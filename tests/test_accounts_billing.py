@@ -13,6 +13,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 import accounts
 import payments
+import proxies as proxies_module
 import server
 import wallets
 
@@ -446,6 +447,65 @@ class SecurityTests(unittest.TestCase):
             row = db.one("SELECT granted,status FROM orders WHERE id=?", (order["id"],))
         self.assertEqual((row["granted"], row["status"]), (1, "finished"))
         self.assertEqual(self.client.get("/admin/orders").json()["awaiting"], 0)
+
+
+class ProxyPersistenceTests(unittest.TestCase):
+    """The proxy list has to outlive a deploy, and a deploy wipes data/.
+
+    Railway rebuilds the container filesystem from the image, so the JSON file
+    is gone on the next boot while the database is not. Losing the list is what
+    turns a working setup into "no proxies saved yet" on every run.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = patch.dict(os.environ, {
+            "ACCOUNT_DB_PATH": self.tmp.name + "/accounts.db", "APP_ENV": "test", "STORE_PATH": self.tmp.name + "/proxies.json",
+        })
+        self.env.start()
+        self.saved = accounts.store
+        accounts.store = accounts.Store("")
+        accounts.store.initialize()
+        self.path = self.tmp.name + "/proxies.json"
+
+    def tearDown(self):
+        accounts.store = self.saved
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def test_the_database_copy_survives_a_lost_file(self):
+        first = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
+        self.assertEqual(first.replace(["http://192.0.2.10:8080", "socks5://192.0.2.11:1080"]), 2)
+        first.save()
+        self.assertTrue(os.path.exists(self.path))
+        os.remove(self.path)  # the next deploy starts from an empty filesystem
+        second = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
+        self.assertEqual(second.load(), 2)
+        self.assertEqual(second.all(), ["http://192.0.2.10:8080", "socks5://192.0.2.11:1080"])
+
+    def test_the_newest_copy_wins(self):
+        mirror = proxies_module.StoreMirror()
+        newer = proxies_module.ProxyList(self.path, mirror=mirror)
+        newer.replace(["http://192.0.2.20:8080"])
+        newer.save()
+        # A stale file left behind by an older process must not beat the database.
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"updated": newer.updated - 60, "proxies": ["http://192.0.2.99:8080"]}, handle)
+        reader = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
+        self.assertEqual(reader.load(), 1)
+        self.assertEqual(reader.all(), ["http://192.0.2.20:8080"])
+
+    def test_a_mirror_that_cannot_write_still_keeps_the_file_working(self):
+        class Broken:
+            def load(self):
+                return [], 0.0
+            def save(self, proxies, updated):
+                raise RuntimeError("database gone")
+        listing = proxies_module.ProxyList(self.path, mirror=Broken())
+        listing.replace(["http://192.0.2.30:8080"])
+        listing.save()  # must not raise: the file is still a usable store
+        again = proxies_module.ProxyList(self.path)
+        self.assertEqual(again.load(), 1)
 
 
 class MigrationTests(unittest.TestCase):
