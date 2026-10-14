@@ -431,8 +431,15 @@ function handleEvent(ev) {
     applyProgress(ev);
     S.watching = false;
     if ($("runNote")) {
-      $("runNote").textContent = ev.stopped ? "stopped on request" : "finished";
+      // A run can end for a reason the user must see: the pool was retired
+      // (a dead proxy list) or every platform sat out a throttle. Cancelling
+      // that down to "finished" is how a run that checked nothing looked like a
+      // completed sweep. The server puts the sentence in stop_reason.
+      $("runNote").textContent = ev.stop_reason
+        ? ev.stop_reason
+        : (ev.stopped ? "stopped on request" : "finished");
     }
+    if (ev.stop_reason && $("poolNote")) $("poolNote").textContent = ev.stop_reason;
     const name = $("runLine") && $("runLine").querySelector("span");
     if (name) name.textContent = `last run · ${fmt(ev.checked)} checks · ${ev.verdicts_per_second}/s verdicts`;
     pumpRun();

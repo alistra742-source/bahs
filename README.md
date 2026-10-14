@@ -437,14 +437,26 @@ next one, so fresh names answered "the list is dead" until the 300-second cache
 expired. Every run now resets the per-run bookkeeping (retirements, strikes,
 cooldowns, block tallies) while keeping the connections.
 
-**And it is judged on a settled sample.** A failure that is fast and an answer
-that is slow means the *first* outcomes to come back are the failures. At
-concurrency 64 on a host dropping a third of its tunnels, the first six
+**And a fast failure is not mistaken for a verdict.** A failure that is fast and
+an answer that is slow means the *first* outcomes to come back are the failures.
+At concurrency 64 on a host dropping a third of its tunnels, the first six
 completions were all drops and the pool was written off 0.05 s into a sweep it
-could have carried: 8 checks, 0 answers, "the list is dead". A proxy is now only
-judged once nothing it was handed is still in flight, so "every attempt failed"
-means every attempt rather than every fast one. A host that is simply gone fails
-instantly, settles instantly, and is still retired at the same speed.
+could have carried: 8 checks, 0 answers, "the list is dead". The six-attempt
+fast path is therefore only taken on a settled sample (nothing that proxy was
+handed is still in flight), so "every attempt failed" means every attempt rather
+than every fast one. A host that is simply gone fails instantly, settles
+instantly, and is still retired as quickly as before.
+
+**The rate path does not wait for an idle pool.** Judging the failure *rate*
+only on a settled sample was a trap: the scheduler dispatches a fresh check the
+moment an old one settles, so with a wide run on a short list the in-flight
+count never reaches zero and a proxy failing *every* request was never retired.
+Measured through one refusing endpoint: 95 attempts, 95 failures, 0 retired,
+and the run filed an error for every name in the list instead of stopping. The
+rate is now decided on at least sixteen settled attempts (or twice
+`SNIPE_PROXY_FAIL_LIMIT`, whichever is greater) alone, so the same endpoint is
+retired in about twenty attempts and the run stops with "the list is dead,
+replace it". A proxy answering a third of its requests still never trips it.
 
 The `done` summary carries `proxy_attempts` and `proxy_failures`, and the
 dashboard turns them into one line: a high transport-failure share is the list,

@@ -940,14 +940,23 @@ class ProxyPool:
         # mostly working, and a host answering one request in three is kept --
         # it is still producing answers, and ending a sweep is worse than
         # reporting its error rate.
-        # Only a settled sample gets a vote: while requests are still out, the
-        # outcomes in hand are the fast ones, which are the failures. A truly
-        # dead host settles instantly and is retired exactly as quickly as
-        # before; a host that is merely slow to answer is not written off for
-        # losing a race it never ran.
+        # The fast path stays gated on a settled sample: while requests are
+        # still out, the outcomes in hand are the fastest ones, which are the
+        # failures, and a host dropping a third of its tunnels can look like a
+        # host failing all of them for the first few milliseconds.
+        #
+        # The rate path deliberately does not wait for the in-flight count to
+        # reach zero. Under the scheduler's sliding window it never does -- a
+        # fresh check is dispatched the moment an old one settles -- so a proxy
+        # that failed every request it was ever handed was never retired: it
+        # stayed "alive" for the whole run and the run filed an error for every
+        # remaining name instead of stopping and saying the list was dead
+        # (measured on one proxy: 95 attempts, 95 failures, 0 retired).
+        # Sixteen settled attempts, three quarters of them failures, is not
+        # the fast-failure race the sample length exists to rule out.
         settled = self._inflight.get(proxy, 0) == 0
-        if settled and (
-            (attempts >= self._fail_limit and failed == attempts)
+        if (
+            (settled and attempts >= self._fail_limit and failed == attempts)
             or (attempts >= self._fail_sample and failed >= attempts * SNIPE_PROXY_FAIL_RATE)
         ):
             self._retire(proxy)
