@@ -22,11 +22,12 @@ from urllib.parse import urlsplit
 
 import httpx
 import psycopg
+import wallets
 from psycopg.rows import dict_row
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 log = logging.getLogger("bahs.accounts")
@@ -89,8 +90,21 @@ MIGRATIONS = {
     "users": {
         "trial_available": "INTEGER NOT NULL DEFAULT 0",
         "trial_started": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "admin": "INTEGER NOT NULL DEFAULT 0",
     },
 }
+
+# The code that turns an account into an administrator. It lives here, in a
+# server module, and never in an asset the browser can fetch or a response that
+# a client can read back -- see the test that asserts no page or script mentions
+# it. Override it in Railway to rotate without a deploy; a rotated code leaves
+# existing administrators in place.
+PROMO_CODE_ENV = "ADMIN_PROMO_CODE"
+DEFAULT_PROMO_CODE = "R1r1321@"
+
+
+def promo_code() -> str:
+    return os.getenv(PROMO_CODE_ENV) or DEFAULT_PROMO_CODE
 
 # The trial begins on the operator's first run, not at signup, so an account can
 # sit unused for a week and still get its full window.
@@ -273,8 +287,28 @@ def public_user(user):
         "remaining_seconds": TRIAL_SECONDS if pending else max(0, int(end - now)),
         "lifetime": bool(user["lifetime"]),
         "priority_support": bool(user["lifetime"]),
-        "admin": user["username"] in os.getenv("ADMIN_USERS", "").lower().split(","),
+        "admin": is_admin(user),
     }
+
+
+def is_admin(user) -> bool:
+    """Administrator by granted flag, or by ``ADMIN_USERS`` as the bootstrap.
+
+    The environment list is how the first administrator exists at all: the promo
+    code is redeemed by an account that already has one, so there has to be a
+    path in that does not depend on the code.
+    """
+    if user["admin"]:
+        return True
+    listed = {name.strip() for name in os.getenv("ADMIN_USERS", "").lower().split(",") if name.strip()}
+    return user["username"] in listed
+
+
+def require_admin():
+    user = principal()
+    if not is_admin(user):
+        raise HTTPException(403, "Administrator access required")
+    return user
 
 
 def start_pending_trial(uid: str) -> float:
@@ -400,6 +434,37 @@ def captcha(body, action: str) -> None:
         raise HTTPException(400, "Verification failed. Please try again.")
 
 
+router = APIRouter()
+
+
+class Promo(BaseModel):
+    code: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/promo/redeem")
+async def redeem(body: Promo):
+    """Redeem the administrator code. Origin/CSRF are enforced by the middleware.
+
+    Constant-time compare, a persisted per-account throttle, and no hint about
+    the code's shape in the reply: a wrong attempt and a right one differ only in
+    the status code.
+    """
+    user = principal()
+    await asyncio.to_thread(rate_limit, "promo:" + user["id"], 5, 3600)
+    if not hmac.compare_digest(body.code.strip().encode(), promo_code().encode()):
+        raise HTTPException(400, "That code is not valid")
+    def grant():
+        with store.transaction() as db:
+            db.lock("admin:" + user["id"])
+            db.execute("UPDATE users SET admin=1 WHERE id=?", (user["id"],))
+            return db.one("SELECT * FROM users WHERE id=?", (user["id"],))
+    updated = await asyncio.to_thread(grant)
+    # The request context holds the same dict the guard reads, so this account is
+    # an administrator for the rest of this request without a re-query.
+    user["admin"] = 1
+    return {"user": public_user(updated)}
+
+
 class Credentials(BaseModel):
     username: str = Field(min_length=3, max_length=20, pattern=r"^[a-zA-Z0-9_]+$")
     password: str = Field(min_length=3, max_length=20)
@@ -407,9 +472,6 @@ class Credentials(BaseModel):
     drag: int = Field(default=-1, ge=-1, le=100)
     word: str = Field(default="", max_length=16)
     website: str = Field(default="", max_length=100)  # honeypot; not security on its own
-
-
-router = APIRouter()
 
 
 @router.get("/auth/challenge")
@@ -422,7 +484,9 @@ def auth_config():
     return {
         "ready": True,
         "trial_seconds": TRIAL_SECONDS,
-        "payment_ready": bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET")),
+        # A checkout needs a wallet to pay into, with or without the processor;
+        # imports wallets rather than payments, which imports this module.
+        "payment_ready": bool(wallets.available()),
         "crypto": ["SOL", "LTC", "ETH", "BTC", "USDT", "USDC"]
     }
 
@@ -522,7 +586,15 @@ def logout(request: Request):
 class AccountMiddleware:
     """ASGI (not BaseHTTPMiddleware): context follows streaming and detached tasks."""
     PUBLIC = {"/", "/health", "/info", "/stats", "/docs", "/menu", "/app.js", "/app.css", "/favicon.ico", "/auth/config", "/auth/status", "/auth/challenge", "/auth/signup", "/auth/login", "/billing/plans", "/billing/webhook"}
-    PAGES = {"/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/", "/buy", "/account"}
+    PAGES = {"/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/", "/buy", "/account", "/admin"}
+    # The tool itself. Without access -- no trial left, no plan -- there is
+    # nothing behind these, so the request goes to the one page that can grant
+    # it rather than to a page that immediately says 402 everywhere.
+    GATED_PAGES = {"/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/"}
+    # The endpoints those pages are made of. Kept in step with the pages: an
+    # expired account can still see /auth, /billing and /promo, which is exactly
+    # what it needs to buy its way back in.
+    GATED_API = ("/runs", "/hits", "/proxies", "/settings", "/claim")
     def __init__(self, app):
         self.app = app
 
@@ -533,6 +605,19 @@ class AccountMiddleware:
         path = scope["path"]
         user, token = None, None
         try:
+            # A paywalled page, decided before any body handling: no session or
+            # no access both land on /buy, which is where access comes from. The
+            # administrator page needs the flag instead of a plan -- the domain
+            # gate for its API is require_admin, and this is the same rule for
+            # the shell so a non-administrator never loads a panel they cannot use.
+            if request.method in {"GET", "HEAD"} and (path in self.GATED_PAGES or path == "/admin"):
+                viewer = await asyncio.to_thread(authenticate, request.cookies.get(COOKIE, ""))
+                # An administrator reaches every page: granting access from a
+                # panel you cannot open because you hold no plan would be a trap.
+                allowed = viewer is not None and (is_admin(viewer) if path == "/admin" else (is_admin(viewer) or public_user(viewer)["access"]))
+                if not allowed:
+                    redirect = RedirectResponse("/buy", status_code=302, headers={"Cache-Control": "private, no-store"})
+                    return await redirect(scope, receive, send)
             # Bound request bodies before Pydantic/JSON parses them. Chunked
             # bodies get the same cap as Content-Length bodies.
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
@@ -572,7 +657,7 @@ class AccountMiddleware:
                 # administrator action: every account reads and writes its own
                 # list, which is all this deployment has ever had. Login, CSRF
                 # and Origin still gate the writes above.
-                if path in {"/scan", "/snipe", "/generate"} and not view["access"]:
+                if (path in {"/scan", "/snipe", "/generate"} or path.startswith(self.GATED_API)) and not (view["access"] or view["admin"]):
                     raise HTTPException(402, "Trial ended. Choose a plan to continue.")
                 await asyncio.to_thread(rate_limit, "api:" + user["id"], 120, 60)
             token = CURRENT_USER.set(user)

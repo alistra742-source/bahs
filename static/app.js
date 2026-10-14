@@ -58,29 +58,55 @@ async function api(path, opts) {
   return data;
 }
 
+/* Every entry carries what it takes to be shown: "app" needs access (a plan, or
+   a trial that has not run out), "admin" needs the administrator flag, "open" is
+   for anyone. A tab that leads to a 402 is worse than no tab -- the server
+   enforces the same rule, this is only what stops it being offered. */
 const NAV = [
   // A trailing slash marks the pages that share a name with a JSON endpoint:
   // /hits, /proxies and /settings are APIs, /hits/ and friends are the pages.
   // The console lives at /console since the landing page took /.
-  ["/console", "console", "Console"],
-  ["/hits/", "hits", "Hits"],
-  ["/platforms", "platforms", "Platforms"],
-  ["/proxies/", "proxies", "Proxies"],
-  ["/alerts", "alerts", "Alerts"],
-  ["/settings/", "settings", "Settings"],
-  ["/buy", "buy", "Buy access ↗"],
-  ["/account", "account", "Account"],
-  ["/docs", "docs", "Docs"],
+  ["/console", "console", "Console", "app"],
+  ["/hits/", "hits", "Hits", "app"],
+  ["/platforms", "platforms", "Platforms", "app"],
+  ["/proxies/", "proxies", "Proxies", "app"],
+  ["/alerts", "alerts", "Alerts", "app"],
+  ["/settings/", "settings", "Settings", "app"],
+  ["/buy", "buy", "Buy access ↗", "open"],
+  ["/account", "account", "Account", "open"],
+  ["/docs", "docs", "Docs", "open"],
+  ["/admin", "admin", "Admin", "admin"],
 ];
+
+/* The pages that need access. Kept in step with the server's GATED_PAGES. */
+const GATED_PAGES = new Set(["console", "hits", "platforms", "proxies", "alerts", "settings"]);
+
+function navAllowed(gate) {
+  const u = window.Auth && Auth.state.user;
+  if (gate === "open") return true;
+  if (!u) return false;
+  if (gate === "admin") return !!u.admin;
+  return !!(u.access || u.admin);
+}
 
 function renderNav(active) {
   const el = $("nav");
   if (!el) return;
-  el.innerHTML = NAV.map(([href, key, label]) => {
+  el.innerHTML = NAV.filter((entry) => navAllowed(entry[3])).map(([href, key, label]) => {
     const badge = key === "hits" ? '<em id="navHits">0</em>'
       : key === "proxies" ? '<em id="navProx">0</em>' : "";
     return `<a href="${href}" class="${key === active ? "on" : ""}">${label}${badge}</a>`;
   }).join("");
+}
+
+/* Access can end while a page is open -- a trial runs out mid-sweep. The server
+   refuses the next request with 402; this sends the tab where the traffic goes. */
+function guardAccess() {
+  const u = window.Auth && Auth.state.user;
+  const page = (window.PAGE && PAGE.name) || "";
+  if (!GATED_PAGES.has(page)) return;
+  if (u && (u.access || u.admin)) return;
+  location.replace("/buy");
 }
 
 /* ---- selection ------------------------------------------------------- */
@@ -479,6 +505,10 @@ async function boot() {
   document.title = "VORTEX · " + page.title;
   if ($("vTitle")) $("vTitle").textContent = page.title;
   renderNav(page.name);
+  // One listener for the session: a plan bought in another tab, a trial that
+  // just ran out, a promotion just granted -- the sidebar follows it.
+  window.addEventListener("accountchange", () => { renderNav(page.name); guardAccess(); });
+  guardAccess();
   renderPlats(); if ($("spaces")) { renderSpaces(); }
   const stop = $("stopBtn"); if (stop) stop.onclick = stopRun;
   await loadProxies();
@@ -492,7 +522,7 @@ window.App = {
   S, $, api, toast, fmt, esc, pct, clock, boot, renderPlats, renderSpaces, summarise,
   applyProgress, renderPaced, renderFeed, feedLine, startSweep, startSingle, follow,
   selectionSize, summarise, paintPlatSum,
-  pumpRun, stopRun, renderNav, persist, isVerdict, runStream,
+  pumpRun, stopRun, renderNav, persist, isVerdict, runStream, navAllowed,
 };
 
 })();

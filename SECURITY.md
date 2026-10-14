@@ -9,6 +9,7 @@ Use Railway's private Variables interface, not chat or Git, for credentials.
 - `AUTH_SECRET`: randomly generated, stable secret of at least 32 characters. Rotation invalidates sessions/device signatures and changes the trial signal hashes, so retain it and migrate hashes before rotation if trial continuity is required.
 - Human check (no third-party keys): signup/login require a server-issued drag-to-target and distorted-word challenge. Each challenge is random, expires after 3 minutes, is bound to the requesting IP and action, and is consumed on the first attempt. Submit stays disabled until both steps are done. A missing or failed challenge fails closed.
 - `ADMIN_USERS`: comma-separated lower-case existing usernames. Listed usernames are reserved against public signup to prevent privilege squatting, and the account is flagged `admin` in `/auth/status`. It no longer gates the proxy list: every account manages its own list, which is the only model this deployment has. Create the intended account before adding its name to `ADMIN_USERS`.
+- `ADMIN_PROMO_CODE`: optional override for the access code that turns an account into an administrator. Blank uses the constant compiled into `accounts.py`. The code is compared with `hmac.compare_digest`, is throttled to five attempts per hour per account, exists only in a server module, and is never served to a browser, logged, or echoed in a response -- a test walks `static/` and the served pages to keep it that way. Rotating it leaves existing administrators in place.
 - `TRUSTED_PROXY_CIDRS`: only the Railway-confirmed ingress CIDRs. Uvicorn must run with `--no-proxy-headers`. Without verified ingress configuration users may share the proxy's apparent IP and therefore lose trial eligibility. Never trust arbitrary X-Forwarded-For or wildcard CIDRs.
 - `AUTH_ALLOWED_ORIGINS`: optional exact additional origins. Leave empty in production unless genuinely needed.
 
@@ -23,6 +24,16 @@ An eligible signup holds 60 seconds of trial time that does not begin until the 
 New check/generate requests receive 402 on expiry. Detached workers have an expiry guard that signals and cancels ongoing work; logout doesn't renew access. Runs and their streams are owner-scoped; hits and alert settings are per-account in PostgreSQL. The process's shared worker pool permits one active scan/snipe per kind; it is not a horizontally scalable job queue, and runtime runs do not survive process restart. Persistent hits/accounts/invoices do survive restart.
 
 There is no password recovery, email verification, MFA, or user account-deletion UI yet. Do not sell this as an audited, feature-complete identity service. Priority support is an entitlement flag for Forever; no staffed support contact/ticket system has been configured.
+
+## Access, the paywall and grants
+
+Access is one question: does this account hold a plan, or a trial that has not run out. An administrator holds access implicitly -- granting from a panel you cannot open would be a trap.
+
+- **Pages**: `/console`, `/hits/`, `/platforms`, `/proxies/`, `/alerts` and `/settings/` redirect (302) to `/buy` for a session without access, and for no session at all. `/buy`, `/account`, `/docs`, `/` and the whole `/auth`, `/billing` and `/promo` surface stay open, because a paywall with no way through is a dead end. The sidebar mirrors the same rule, and re-renders when the session changes.
+- **Endpoints**: `/runs`, `/hits`, `/proxies`, `/settings`, `/claim` and `/scan`, `/snipe`, `/generate` answer 402 without access. The rule lives in `AccountMiddleware`, next to login, CSRF and Origin, so hiding a tab is presentation and the server is the authority.
+- **The administrator flag** comes from `ADMIN_USERS` or from redeeming `ADMIN_PROMO_CODE`. There is no self-service path to it beyond the code, which is why the code is treated as a credential.
+- **Grants** (`POST /admin/grant`) are explicit, logged, and per-account: `monthly` extends from today or from the remaining time, whichever is later, so granting twice never shortens a subscription; `forever` sets lifetime; `trial` hands back an unstarted trial; `revoke` clears paid, lifetime and any unstarted trial together. Nothing runs on a timer and nothing infers a payment. Specifying `order_id` also marks that invoice released, and only when it belongs to the account being granted.
+- **No horizontal scale assumption**: grants are transactional and advisory-locked per account, so two administrators acting at once cannot interleave.
 
 ## Crypto: operator wallets in the environment
 

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0a0b">
+<title>VORTEX // Access Control</title>
+<link rel="icon" href="/ui/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/ui/fonts.css">
+<link rel="stylesheet" href="/ui/experience.css"><script src="/ui/particles.js" defer></script>
+<script src="/ui/auth.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <aside class="side">
+    <div class="brand"><b>VORTEX</b><span id="build">—</span></div>
+    <div class="side-scroll">
+      <h2>Workspace</h2>
+      <nav class="menu" id="nav"></nav>
+    </div>
+    <div class="side-foot">
+      <a class="btn sm ghost" href="/">◂ landing page</a>
+      <div class="runline" id="sideRun"><i class="dot"></i><span>idle</span></div>
+    </div>
+  </aside>
+
+  <main>
+    <div class="topbar">
+      <h1 id="vTitle">Access</h1>
+      <div class="sep"></div>
+      <span class="sub">entitlements are granted by hand, never by a timer</span>
+      <div class="right"><span class="note" id="adminWho"></span></div>
+    </div>
+
+    <div class="grid two">
+      <div class="card">
+        <header><h3>Grant access</h3><div class="sep"></div>
+          <span class="note">any account, including yours</span></header>
+        <div class="body">
+          <div class="row">
+            <label class="f" style="margin:0;flex:1"><span>username</span>
+              <input type="text" id="grantName" placeholder="username" maxlength="40" spellcheck="false" autocomplete="off"></label>
+            <button class="btn sm ghost" id="grantMe" type="button">me</button>
+          </div>
+          <div class="row" style="margin-top:12px;flex-wrap:wrap;gap:8px">
+            <button class="btn" data-grant="monthly">+ 1 month</button>
+            <button class="btn primary" data-grant="forever">forever</button>
+            <button class="btn" data-grant="trial">fresh trial</button>
+            <button class="btn danger" data-grant="revoke">revoke</button>
+          </div>
+          <p class="note" style="margin-top:12px">Monthly extends from today or from whatever is left, whichever is
+            later — granting twice never shortens anything. Revoke clears paid, lifetime and any unstarted trial in
+            one step. A fresh trial stays unstarted until that account's first run.</p>
+          <p class="form-error" id="grantError" role="alert"></p>
+        </div>
+      </div>
+
+      <div class="card">
+        <header><h3>Pending invoices</h3><div class="sep"></div>
+          <span class="note" id="awaitingNote">—</span>
+          <div class="right"><button class="btn sm ghost" id="ordersReload">reload</button></div></header>
+        <div class="body"><div id="orderList"><p class="note">Loading…</p></div></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>Accounts</h3><div class="sep"></div>
+        <span class="note" id="userCount">—</span>
+        <div class="right">
+          <input type="text" id="userQuery" placeholder="search username prefix" style="max-width:220px" maxlength="40" spellcheck="false" autocomplete="off">
+          <button class="btn sm" id="userSearch">search</button>
+        </div></header>
+      <div class="body">
+        <div class="tablewrap"><table><thead><tr><th>account</th><th>plan</th><th>ends</th><th>admin</th><th></th></tr></thead><tbody id="userRows"></tbody></table></div>
+      </div>
+    </div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+<script src="/ui/components/core.js"></script>
+<script src="/app.js"></script>
+<script src="/ui/admin.js"></script>
+<script>
+"use strict";
+window.PAGE = { name: "admin", title: "Access", init() { Admin.init(); } };
+const $ = (id) => document.getElementById(id);
+App.boot();
+</script>
+</body>
+</html>

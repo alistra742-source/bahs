@@ -403,6 +403,13 @@ def page_docs() -> FileResponse:
     return _page("docs.html")
 
 
+@app.get("/admin", include_in_schema=False)
+def page_admin() -> FileResponse:
+    # The shell is served to anyone; the middleware sends a session that is not an
+    # administrator to /buy, and every endpoint this page calls re-checks the flag.
+    return _page("admin.html")
+
+
 # The landing page's furniture: section styles, one file per component, and the
 # platform marks. A single mount, because there is a file per component and a
 # route each would be a dozen lines of nothing. `app.css`/`app.js` stay explicit

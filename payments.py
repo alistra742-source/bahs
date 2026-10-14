@@ -11,6 +11,7 @@ import calendar
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
@@ -18,10 +19,12 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 import accounts
 import wallets
+
+log = logging.getLogger("bahs.payments")
 
 PLANS = {"monthly": "8.99", "forever": "45.99"}
 # Network is explicit; never silently replace Solana USDT with ERC-20 USDT.
@@ -40,14 +43,30 @@ TERMINAL = {"finished", "failed", "refunded"}
 router = APIRouter()
 
 
-def configured():
+def processor_ready():
     # Explicit opt-in: this paid processor does not meet a free-unlimited-RPC
     # constraint. Never enable real-money invoices merely because keys exist.
     return bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET"))
 
 
+def ready():
+    """Whether a checkout can start at all: is there a wallet to pay into?
+
+    Where the money lands is required either way -- the processor forwards to it,
+    or it is the deposit address on a self-custody invoice. What the processor
+    changes is only who confirms the chain, so a deployment with wallets and no
+    processor is live, not disabled.
+    """
+    return bool(wallets.available())
+
+
+def configured():
+    """Alias kept for the callers that only mean "the processor"."""
+    return processor_ready()
+
+
 async def provider(method, path, **kwargs):
-    if not configured():
+    if not processor_ready():
         raise HTTPException(503, "Crypto checkout is not configured yet. No wallet or invoice has been generated.")
     async with httpx.AsyncClient(timeout=20) as client:
         try:
@@ -72,6 +91,10 @@ def public_order(order):
         "expired": now >= order["expires"],
         "late_watch": order["expires"] <= now < order["watch_until"] and not order["granted"],
         "renewal": "manual" if order["plan"] == "monthly" else "none",
+        # No provider id means this invoice pays straight into the operator's
+        # wallet and is released by hand. The UI has to say so rather than imply
+        # a chain watcher that does not exist here.
+        "self_custody": not order["provider_id"],
     }
 
 
@@ -131,9 +154,115 @@ def reconcile(payload):
     return True
 
 
+def issue_self_custody(uid: str, plan: str, currency: str) -> dict:
+    """An invoice paid straight to the operator's own wallet.
+
+    Nothing here watches a chain, so nothing here may claim a payment. The order
+    opens against the address from the coin's environment variable and stays open
+    until an administrator releases it -- which is the honest shape of a
+    single-wallet setup. The alternative, flipping it to paid on a timer, would
+    hand out access for money that never moved.
+    """
+    address = wallets.address(currency)
+    now, oid = time.time(), uuid.uuid4().hex
+    with accounts.store.transaction() as db:
+        db.lock("checkout:" + uid)
+        existing = db.one("SELECT * FROM orders WHERE user_id=? AND expires>? AND status NOT IN ('failed','refunded','finished') ORDER BY created DESC LIMIT 1", (uid, now))
+        if existing:
+            if existing["plan"] != plan or existing["currency"] != currency:
+                raise HTTPException(409, "An invoice is already open. Complete it or wait for its payment window to expire.")
+            return public_order(existing)
+        db.execute(
+            "INSERT INTO orders(id,user_id,plan,currency,price,created,expires,watch_until,address,amount,status)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (oid, uid, plan, currency, PLANS[plan], now, now + 3600, now + 10800, address, PLANS[plan], "awaiting_transfer"),
+        )
+    return public_order(get_order(oid))
+
+
 class Checkout(BaseModel):
     plan: str
     currency: str
+
+
+# --- administration -------------------------------------------------------
+# Releasing an entitlement is a deliberate, logged, human act. Nothing here runs
+# on a timer and nothing here infers a payment.
+class Grant(BaseModel):
+    username: str = Field(min_length=1, max_length=40)
+    plan: str = Field(pattern="^(monthly|forever|trial|revoke)$")
+    order_id: str = Field(default="", max_length=64)
+
+
+def _target(username: str):
+    return username.strip().lower().lstrip("@")
+
+
+@router.get("/admin/users")
+def admin_users(q: str = Query("", max_length=40), limit: int = Query(25, ge=1, le=100)):
+    """Accounts by prefix, newest first, each with the plan it currently holds."""
+    accounts.require_admin()
+    with accounts.store.transaction() as db:
+        rows = db.all(
+            "SELECT * FROM users WHERE username LIKE ? ORDER BY created DESC LIMIT ?",
+            (_target(q) + "%", limit),
+        )
+    return {"users": [{**accounts.public_user(row), "created": row["created"]} for row in rows]}
+
+
+@router.post("/admin/grant")
+async def admin_grant(body: Grant) -> dict:
+    """Give an account a plan: monthly, forever, a fresh trial, or nothing at all.
+
+    Monthly extends from today or from what is left, whichever is later, so
+    granting twice never shortens a subscription. Revoking clears every route in
+    at once -- paid, lifetime and unstarted trial -- because "revoke" that leaves
+    a trial behind is not a revoke.
+    """
+    admin = accounts.require_admin()
+    now = time.time()
+
+    def apply():
+        name = _target(body.username)
+        with accounts.store.transaction() as db:
+            db.lock("entitlement:" + name)
+            row = db.one("SELECT * FROM users WHERE username=?", (name,))
+            if not row:
+                return None
+            if body.plan == "monthly":
+                db.execute("UPDATE users SET paid_until=? WHERE id=?", (next_month(max(now, row["paid_until"])), row["id"]))
+            elif body.plan == "forever":
+                db.execute("UPDATE users SET lifetime=1 WHERE id=?", (row["id"],))
+            elif body.plan == "trial":
+                # Unstarted on purpose: the window is spent snipe-ing, as with any
+                # other trial, so this does not hand out an expiring-by-the-clock plan.
+                db.execute("UPDATE users SET trial_available=1,trial_started=0,trial_until=0 WHERE id=?", (row["id"],))
+            else:
+                db.execute("UPDATE users SET paid_until=0,lifetime=0,trial_available=0,trial_started=?,trial_until=0 WHERE id=?", (now, row["id"]))
+            if body.order_id:
+                # Only the order belonging to this account, and only once.
+                db.execute("UPDATE orders SET granted=1,status='finished' WHERE id=? AND user_id=?", (body.order_id, row["id"]))
+            updated = db.one("SELECT * FROM users WHERE id=?", (row["id"],))
+        log.info("grant: %s -> %s (%s)", admin["username"], name, body.plan)
+        return accounts.public_user(updated)
+
+    result = await asyncio.to_thread(apply)
+    if result is None:
+        raise HTTPException(404, "No account with that username")
+    return {"user": result}
+
+
+@router.get("/admin/orders")
+def admin_orders(limit: int = Query(25, ge=1, le=100)) -> dict:
+    """Recent invoices with their account, so a manual release starts from one screen."""
+    accounts.require_admin()
+    with accounts.store.transaction() as db:
+        rows = db.all(
+            "SELECT o.*, u.username FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.created DESC LIMIT ?",
+            (limit,),
+        )
+    orders = [{**public_order(row), "username": row["username"]} for row in rows]
+    return {"orders": orders, "awaiting": sum(1 for row in orders if row["status"] == "awaiting_transfer" and not row["granted"])}
 
 
 @router.get("/billing/plans")
@@ -144,10 +273,12 @@ async def plans():
     pure Python, so a cold first call goes to a worker thread rather than stalling
     the event loop. Results are cached per coin, so only that first call pays it.
     """
-    ready = set(await asyncio.to_thread(wallets.available)) if configured() else set()
+    ready = set(await asyncio.to_thread(wallets.available))
     return {"plans": PLANS,
             "coins": [{"symbol": c, "network": v[1], "ready": c in ready} for c, v in COINS.items()],
-            "ready": configured(), "monthly_renewal": "manual", "window_minutes": 60, "late_watch_minutes": 120}
+            "ready": bool(ready), "processor": processor_ready(),
+            "settlement": "provider" if processor_ready() else "manual",
+            "monthly_renewal": "manual", "window_minutes": 60, "late_watch_minutes": 120}
 
 
 @router.post("/billing/checkout")
@@ -155,13 +286,15 @@ async def checkout(body: Checkout):
     uid = accounts.owner_id()
     if body.plan not in PLANS or body.currency not in COINS:
         raise HTTPException(400, "Unknown plan or currency")
-    if not configured():
+    if not ready():
         raise HTTPException(503, "Checkout setup is pending. No funds can be accepted yet.")
     await asyncio.to_thread(accounts.rate_limit, "checkout:" + uid, 6, 3600)
     coin, network = COINS[body.currency]
     # Resolved before any provider call: an invoice for a coin with no wallet is
     # an invoice nobody can settle, and it must fail before money can move.
     payout = await asyncio.to_thread(wallets.address, body.currency)
+    if not processor_ready():
+        return await asyncio.to_thread(issue_self_custody, uid, body.plan, body.currency)
     currencies = await provider("GET", "/currencies")
     if coin not in currencies.get("currencies", []):
         raise HTTPException(503, "This currency/network is not currently available")
@@ -259,7 +392,7 @@ async def webhook(request: Request):
 async def monitor():
     """Restart-safe polling, including invoices hidden after their first hour."""
     while True:
-        if configured():
+        if processor_ready():
             with accounts.store.transaction() as db:
                 rows = db.all("SELECT * FROM orders WHERE provider_id IS NOT NULL AND granted=0 AND status NOT IN ('failed','refunded','review') AND (watch_until>? OR id IN (SELECT order_id FROM payment_receipts WHERE first_seen<=orders.watch_until)) AND poll_after<? ORDER BY poll_after LIMIT 20", (time.time(), time.time()))
             for row in rows:

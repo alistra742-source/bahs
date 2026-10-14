@@ -212,6 +212,11 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code,200,response.text)
         other=TestClient(server.app, client=('127.0.0.1', 50000))
         second=self.signup("seconduser",other)
+        # The second account has no trial left (the first claimed the IP/device),
+        # so give it one: what is under test here is isolation between two
+        # *entitled* accounts. The paywall itself has its own test below.
+        with self.store.transaction() as db:
+            db.execute("UPDATE users SET trial_available=1,trial_started=0,trial_until=0 WHERE id=?", (second["user"]["id"],))
         self.assertEqual(other.get("/runs").json()["runs"],[])
         self.assertEqual(other.get("/runs/"+run.id).status_code,404)
         self.assertEqual(other.get("/runs/"+run.id+"/stream").status_code,404)
@@ -304,11 +309,143 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(row['status'],'review')
             self.assertEqual(len(db.all('SELECT * FROM issued_addresses')),1)
 
-    def test_payments_fail_closed_without_explicit_opt_in(self):
-        data=self.signup()
-        with patch.dict(os.environ,{'NOWPAYMENTS_ENABLED':'0'}):
-            r=self.client.post('/billing/checkout',headers=self.csrf(data),json={'plan':'monthly','currency':'SOL'})
-        self.assertEqual(r.status_code,503)
+    def test_payments_fail_closed_with_neither_wallet_nor_processor(self):
+        data = self.signup()
+        blank = {coin: "" for coin in wallets.ENV}
+        with patch.dict(os.environ, {"NOWPAYMENTS_ENABLED": "0", **blank}):
+            wallets._cache.clear()
+            r = self.client.post("/billing/checkout", headers=self.csrf(data), json={"plan": "monthly", "currency": "SOL"})
+            plans = self.client.get("/billing/plans").json()
+        wallets._cache.clear()
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(plans["ready"], "nothing to pay into, so the buy page must say so")
+        self.assertFalse(any(c["ready"] for c in plans["coins"]))
+
+    def test_self_custody_invoice_works_without_the_processor(self):
+        """Wallets alone are enough: the invoice pays into the operator's address."""
+        data = self.signup()
+        with patch.dict(os.environ, {"NOWPAYMENTS_ENABLED": "0", "NOWPAYMENTS_API_KEY": "", "NOWPAYMENTS_IPN_SECRET": ""}):
+            wallets._cache.clear()
+            r = self.client.post("/billing/checkout", headers=self.csrf(data), json={"plan": "monthly", "currency": "BTC"})
+            listed = self.client.get("/billing/plans").json()
+        wallets._cache.clear()
+        self.assertEqual(r.status_code, 200, r.text)
+        order = r.json()
+        self.assertTrue(order["self_custody"])
+        self.assertEqual(order["address"], "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
+        self.assertEqual(order["status"], "awaiting_transfer")
+        self.assertEqual(order["price"], "8.99")
+        self.assertFalse(order["granted"], "no chain watcher runs here, so nothing is granted on a timer")
+        self.assertTrue(listed["ready"])
+        self.assertEqual(listed["settlement"], "manual")
+        # Reopening returns the same invoice rather than minting a second one.
+        with patch.dict(os.environ, {"NOWPAYMENTS_ENABLED": "0"}):
+            again = self.client.post("/billing/checkout", headers=self.csrf(data), json={"plan": "monthly", "currency": "BTC"})
+            self.assertEqual(again.json().get("id"), order["id"], again.text)
+
+    def test_paywall_closes_the_app_pages_and_their_endpoints(self):
+        data = self.signup()
+        with self.store.transaction() as db:
+            # Expire it the way the clock does: started, then elapsed.
+            db.execute("UPDATE users SET trial_available=0,trial_started=?,trial_until=? WHERE id=?",
+                       (time.time() - accounts.TRIAL_SECONDS, time.time() - 1, data["user"]["id"]))
+        for path in ("/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/"):
+            page = self.client.get(path)
+            self.assertEqual(page.status_code, 200, path)
+            self.assertEqual(page.url.path, "/buy", path + " must land on the buy page")
+        for path in ("/runs", "/hits", "/proxies", "/settings", "/claim?platform=discord&username=x"):
+            self.assertEqual(self.client.get(path).status_code, 402, path)
+        # What can fix it stays open, along with /docs: a paywall with no way
+        # through is a dead end.
+        for path in ("/buy", "/account", "/docs", "/auth/status", "/billing/plans"):
+            self.assertEqual(self.client.get(path).status_code, 200, path)
+        # No session at all is the same door, not a page that 402s everywhere.
+        anon = TestClient(server.app, client=("127.0.0.1", 50000))
+        self.assertEqual(anon.get("/console").url.path, "/buy")
+        self.assertEqual(anon.get("/admin").url.path, "/buy")
+        anon.close()
+
+    def test_the_administrator_page_needs_the_flag(self):
+        data = self.signup()
+        self.assertEqual(self.client.get("/admin").url.path, "/buy")
+        self.client.post("/promo/redeem", headers=self.csrf(data), json={"code": accounts.promo_code()})
+        self.assertEqual(self.client.get("/admin").status_code, 200)
+
+    def test_the_administrator_code_is_never_shipped_to_the_browser(self):
+        code = accounts.promo_code()
+        self.assertTrue(code)
+        for path in ("/app.js", "/ui/auth.js", "/ui/billing.js", "/ui/admin.js", "/buy", "/docs", "/console"):
+            r = self.client.get(path)
+            if r.status_code == 200:
+                self.assertNotIn(code, r.text, path)
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+        for base, _dirs, files in os.walk(root):
+            if "fonts" in base:
+                continue
+            for name in files:
+                if not name.endswith((".js", ".html", ".css", ".json")):
+                    continue
+                with open(os.path.join(base, name), encoding="utf-8", errors="ignore") as handle:
+                    self.assertNotIn(code, handle.read(), os.path.join(base, name))
+
+    def test_only_an_administrator_can_grant_or_redeem(self):
+        data = self.signup()  # ADMIN_USERS is "operator", so this is not an admin
+        uid = data["user"]["id"]
+        self.assertFalse(data["user"]["admin"])
+        self.assertEqual(self.client.get("/admin/users").status_code, 403)
+        self.assertEqual(self.client.post("/admin/grant", headers=self.csrf(data), json={"username": "firstuser", "plan": "forever"}).status_code, 403)
+        self.assertEqual(self.client.get("/admin/orders").status_code, 403)
+        self.assertEqual(self.client.post("/promo/redeem", headers=self.csrf(data), json={"code": "wrong-code"}).status_code, 400)
+        with self.store.transaction() as db:
+            self.assertEqual(db.one("SELECT admin FROM users WHERE id=?", (uid,))["admin"], 0)
+
+    def test_promo_code_grants_the_administrator_flag(self):
+        data = self.signup()
+        r = self.client.post("/promo/redeem", headers=self.csrf(data), json={"code": accounts.promo_code()})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["user"]["admin"])
+        self.assertTrue(self.client.get("/auth/status").json()["user"]["admin"])
+        # Same account, same session: the panel and its endpoints are open now.
+        self.assertEqual(self.client.get("/admin/users").status_code, 200)
+        self.assertEqual(self.client.post("/admin/grant", headers=self.csrf(data), json={"username": "firstuser", "plan": "forever"}).status_code, 200)
+        me = self.client.get("/auth/status").json()["user"]
+        self.assertEqual(me["plan"], "forever")
+        self.assertTrue(me["access"])
+
+    def test_administrator_grants_plans_to_another_account(self):
+        boss = self.signup("boss", client=self.client)
+        self.client.post("/promo/redeem", headers=self.csrf(boss), json={"code": accounts.promo_code()})
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO users(id,username,password_hash,created,trial_until) VALUES('member','member','h',0,0)")
+        monthly = self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "member", "plan": "monthly"})
+        self.assertEqual(monthly.status_code, 200, monthly.text)
+        self.assertEqual(monthly.json()["user"]["plan"], "monthly")
+        with self.store.transaction() as db:
+            first = db.one("SELECT paid_until FROM users WHERE id='member'")["paid_until"]
+        # Granting again extends, never shortens.
+        self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "member", "plan": "monthly"})
+        with self.store.transaction() as db:
+            second = db.one("SELECT paid_until FROM users WHERE id='member'")["paid_until"]
+            self.assertGreater(second, first)
+        self.assertEqual(self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "member", "plan": "forever"}).json()["user"]["plan"], "forever")
+        self.assertEqual(self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "member", "plan": "revoke"}).json()["user"]["plan"], "expired")
+        self.assertEqual(self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "ghost", "plan": "monthly"}).status_code, 404)
+
+    def test_releasing_a_self_custody_invoice_marks_it_granted(self):
+        boss = self.signup("boss")
+        self.client.post("/promo/redeem", headers=self.csrf(boss), json={"code": accounts.promo_code()})
+        with patch.dict(os.environ, {"NOWPAYMENTS_ENABLED": "0"}):
+            order = self.client.post("/billing/checkout", headers=self.csrf(boss), json={"plan": "forever", "currency": "ETH"}).json()
+        self.assertTrue(order.get("self_custody"), order)
+        pending = self.client.get("/admin/orders").json()
+        self.assertEqual(pending["awaiting"], 1)
+        self.assertEqual(pending["orders"][0]["username"], "boss")
+        released = self.client.post("/admin/grant", headers=self.csrf(boss), json={"username": "boss", "plan": "forever", "order_id": order["id"]})
+        self.assertEqual(released.status_code, 200, released.text)
+        with self.store.transaction() as db:
+            row = db.one("SELECT granted,status FROM orders WHERE id=?", (order["id"],))
+        self.assertEqual((row["granted"], row["status"]), (1, "finished"))
+        self.assertEqual(self.client.get("/admin/orders").json()["awaiting"], 0)
 
 
 class MigrationTests(unittest.TestCase):
