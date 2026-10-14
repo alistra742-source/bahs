@@ -50,6 +50,24 @@ class TransportErrorTests(unittest.TestCase):
         self.assertIn("connection refused", result.cause)
         self.assertEqual(result.fault, sniper.FAULT_PROXY)
 
+    def test_an_empty_timeout_message_still_reads_as_a_sentence(self):
+        # httpcore raises ConnectTimeout('') whenever the tunnel never landed,
+        # so the line a real run produced read "ConnectTimeout: " and named
+        # nothing -- which is how a run of 128 failures said nothing at all.
+        request = httpx.Request("POST", "https://discord.com/api/v9/x")
+        result = sniper.transport_error(
+            "brew", "discord", httpx.ConnectTimeout("", request=request)
+        )
+        self.assertEqual(result.detail, "ConnectTimeout")
+        self.assertIn("ConnectTimeout: no answer within the timeout", result.cause)
+        self.assertIn("asking discord.com", result.cause)
+        self.assertFalse(result.cause.endswith(": "))
+        self.assertEqual(result.fault, sniper.FAULT_PROXY)
+
+    def test_a_timeout_with_no_request_still_names_something(self):
+        result = sniper.transport_error("brew", "github", httpx.ReadTimeout(""))
+        self.assertIn("ReadTimeout: no answer within the timeout", result.cause)
+
     def test_the_cause_is_never_sent_to_a_client(self):
         result = sniper.transport_error(
             "brew", "github", httpx.ConnectError("connection refused")

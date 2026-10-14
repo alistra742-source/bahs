@@ -576,8 +576,9 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 
 At the default `LOG_LEVEL=info` a run writes one line per check that did **not**
 produce a verdict — the platform, the name, the outcome and the exact reason
-(a transport error keeps the exception's own message, so `ProxyError` is not
-all you get), plus the exit it went through and how long it took. Alongside
+(a transport error keeps the exception's own message — and an empty one, like
+httpcore's `ConnectTimeout('')`, is given a real sentence plus the target host it
+was asking about), plus the exit it went through and how long it took. Alongside
 those: every free name found, every proxy retired (with the attempts, failures
 and refusals it was judged on), every platform paused, each stop request, and a
 `starting` / `done` pair per run carrying the settings it began with and the

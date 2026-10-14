@@ -549,11 +549,43 @@ def mask_proxy(proxy: str) -> str:
     return f"{scheme}{sep}***@{host}" if sep else f"***@{host}"
 
 
+# What a timeout that arrived with no message is called in the log. httpcore
+# raises `ConnectTimeout("")` for a CONNECT that simply never landed, so the
+# line read "ConnectTimeout: " and named nothing at all -- the empty half of the
+# failure is the half worth explaining.
+TIMEOUT_NOTE = "no answer within the timeout"
+
+
+def describe_transport_error(exc: BaseException) -> str:
+    """The exception as a readable sentence, for the log only.
+
+    Two things the exception itself does not say are added. An empty message
+    gets a real one -- ``ConnectTimeout`` carries no text whatever happened, so
+    a bare class name is all it would contribute. And the *target host* the
+    request was asking about is named from the request httpx attaches, because
+    which side went quiet is the question a failure line exists to answer:
+    failing to tunnel out to discord.com through an exit, and failing to reach
+    the exit itself, are the same exception and different problems.
+    """
+    message = str(exc).strip()
+    if not message:
+        message = TIMEOUT_NOTE if isinstance(exc, httpx.TimeoutException) else "failed"
+    # `getattr` is not enough here: httpx *raises* from the property when no
+    # request was attached -- which is exactly the case for a socksio handshake
+    # failure, the one place the proxy library's own exception is what arrives.
+    try:
+        host = exc.request.url.host  # type: ignore[attr-defined]
+    except Exception:
+        host = ""
+    asking = f", asking {host}" if host else ""
+    return f"{type(exc).__name__}: {message}{asking}"
+
+
 def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeResult":
     """The request did not reach a verdict -- say who that implicates.
 
     The exception's *message* is kept alongside its class name: the name is
-    what a row shows (``ProxyError``) and the message is what says why
+    what a row shows (``ProxyError``) and the sentence is what says why
     (``Tunnel connection failed: 403 Forbidden``). Only the log reads the
     latter -- the row has no room for it -- so a run can be diagnosed from
     the platform log without being reproduced.
@@ -565,7 +597,7 @@ def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeR
         "error",
         type(exc).__name__,
         fault=fault,
-        cause=f"{type(exc).__name__}: {exc}",
+        cause=describe_transport_error(exc),
     )
 
 
