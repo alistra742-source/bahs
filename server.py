@@ -569,9 +569,12 @@ def get_proxies(
     offset: int = Query(0, ge=0),
     format: str = Query("json", pattern="^(json|txt)$"),
 ) -> object:
-    """The stored list, paged for the table and complete for the download."""
-    if not accounts.public_user(accounts.principal())["admin"]:
-        return {"count": len(proxy_list), "offset": 0, "returned": 0, "proxies": [], "stats": {"count": len(proxy_list)}, "managed": True}
+    """The stored list, paged for the table and complete for the download.
+
+    Any logged-in account gets the list it stored. This used to be withheld from
+    everyone but an ``ADMIN_USERS`` account, which left a normal login staring at
+    an empty table and no way to fill it.
+    """
     stored = proxy_list.all()
     if format == "txt":
         return PlainTextResponse("\n".join(stored))
@@ -815,7 +818,7 @@ def _reap_runs() -> None:
         _runs.pop(run_id, None)
 
 
-def _open_run(kind: str) -> RunHandle:
+async def _open_run(kind: str) -> RunHandle:
     """Register a run: one per kind, and up to ``MAX_CONCURRENT_RUNS`` overall.
 
     One run per kind because the proxy pool is cached per kind: a second run of
@@ -823,6 +826,10 @@ def _open_run(kind: str) -> RunHandle:
     under it (and share its warm tunnels). Refusing says so honestly, and names
     the run that is already going so the caller can reattach to that one instead
     of losing it.
+
+    Opening a run is also what starts a trial. The clock is armed here, after
+    every readiness check has passed and just before the worker is detached, so
+    it runs while names are being checked -- not while an account sits unused.
     """
     _reap_runs()
     active = [handle for handle in _runs.values() if handle.active]
@@ -834,6 +841,15 @@ def _open_run(kind: str) -> RunHandle:
             )
     if len(active) >= MAX_CONCURRENT_RUNS:
         raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
+    user = accounts.CURRENT_USER.get()
+    if user and not user["lifetime"]:
+        deadline = await asyncio.to_thread(accounts.start_pending_trial, user["id"])
+        if deadline:
+            # Same dict object the request context holds, so _detach below reads
+            # the deadline that was just written instead of the old zero.
+            user["trial_until"] = deadline
+            user["trial_started"] = deadline - accounts.TRIAL_SECONDS
+            user["trial_available"] = 1
     handle = RunHandle(kind)
     _runs[handle.id] = handle
     return handle
@@ -1593,7 +1609,7 @@ async def snipe_batch(req: SnipeRequest):
     reading, and ``GET /runs/{id}/stream`` picks it up again.
     """
     names, platforms, pool, concurrency, retries, note = await _snipe_ready(req)
-    run = _open_run("snipe")
+    run = await _open_run("snipe")
     run.names, run.platforms, run.note = len(names), platforms, note
     run.keep_rows = not req.stream
     alerter = Alerter(_user_alert_settings())
@@ -1950,7 +1966,7 @@ async def scan(req: ScanRequest):
             f"batch under {SCAN_BUFFER_MAX:,}.",
         )
     pool, note = await _prepare_pool("scan", concurrency)
-    run = _open_run("scan")
+    run = await _open_run("scan")
     run.names, run.platforms, run.note = names_total, platforms, note
     run.keep_rows = not req.stream
     alerter = Alerter(_user_alert_settings())

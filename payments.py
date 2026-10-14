@@ -1,5 +1,9 @@
-"""Crypto invoice orchestration. Wallet custody and forwarding belong to the
-processor, NOT this web server. No seed/private-key environment variables are read.
+"""Crypto invoice orchestration. Invoice generation and on-chain reconciliation
+belong to the processor; the destination a settled payment is forwarded to is the
+operator's own, from the ``SOL``/``LTC``/``BTC``/``ETH``/``USDT``/``USDC`` Railway
+variables (see :mod:`wallets`). No private key is loaded and nothing is ever
+signed here -- those variables hold a public address or a recovery phrase used
+only to derive one.
 A USD monthly pass is a one-month purchase, not an automatic crypto debit.
 """
 import asyncio
@@ -17,16 +21,20 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 import accounts
+import wallets
 
 PLANS = {"monthly": "8.99", "forever": "45.99"}
 # Network is explicit; never silently replace Solana USDT with ERC-20 USDT.
+# The payout destination is not here: it is read per checkout from the coin's
+# own environment variable, so rotating a wallet is a variable change and never
+# a code change.
 COINS = {
-    "SOL": ("sol", "Solana", "7MppVDey86D7L5exPKUwgc5n9PKd711pYLGM9Y7uNkhn"),
-    "LTC": ("ltc", "Litecoin", "LYpscJxcbnrSSTDRGo3jmKi6LeCEagoyMD"),
-    "ETH": ("eth", "Ethereum", "0xBcc3B15153dBf4C6972b7cCc3509c3FDB978e39d"),
-    "BTC": ("btc", "Bitcoin", "bc1q7pvq56tppgzqx89xdvgxsyw6d23h5feuss7tey"),
-    "USDT": ("usdtsol", "Solana · SPL", "7MppVDey86D7L5exPKUwgc5n9PKd711pYLGM9Y7uNkhn"),
-    "USDC": ("usdc", "Ethereum · ERC-20", "0xBcc3B15153dBf4C6972b7cCc3509c3FDB978e39d"),
+    "SOL": ("sol", "Solana"),
+    "LTC": ("ltc", "Litecoin"),
+    "ETH": ("eth", "Ethereum"),
+    "BTC": ("btc", "Bitcoin"),
+    "USDT": ("usdtsol", "Solana · SPL"),
+    "USDC": ("usdc", "Ethereum · ERC-20"),
 }
 TERMINAL = {"finished", "failed", "refunded"}
 router = APIRouter()
@@ -129,8 +137,16 @@ class Checkout(BaseModel):
 
 
 @router.get("/billing/plans")
-def plans():
-    return {"plans": PLANS, "coins": [{"symbol": c, "network": v[1]} for c, v in COINS.items()],
+async def plans():
+    """Every coin stays listed; ``ready`` says which ones have a wallet to pay to.
+
+    Deriving an address from a recovery phrase is a few tens of milliseconds of
+    pure Python, so a cold first call goes to a worker thread rather than stalling
+    the event loop. Results are cached per coin, so only that first call pays it.
+    """
+    ready = set(await asyncio.to_thread(wallets.available)) if configured() else set()
+    return {"plans": PLANS,
+            "coins": [{"symbol": c, "network": v[1], "ready": c in ready} for c, v in COINS.items()],
             "ready": configured(), "monthly_renewal": "manual", "window_minutes": 60, "late_watch_minutes": 120}
 
 
@@ -142,7 +158,10 @@ async def checkout(body: Checkout):
     if not configured():
         raise HTTPException(503, "Checkout setup is pending. No funds can be accepted yet.")
     await asyncio.to_thread(accounts.rate_limit, "checkout:" + uid, 6, 3600)
-    coin, network, payout = COINS[body.currency]
+    coin, network = COINS[body.currency]
+    # Resolved before any provider call: an invoice for a coin with no wallet is
+    # an invoice nobody can settle, and it must fail before money can move.
+    payout = await asyncio.to_thread(wallets.address, body.currency)
     currencies = await provider("GET", "/currencies")
     if coin not in currencies.get("currencies", []):
         raise HTTPException(503, "This currency/network is not currently available")

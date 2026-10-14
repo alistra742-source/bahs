@@ -33,9 +33,14 @@
   
   function updateCountdown() {
     const u = state.user;
-    const seconds = u ? Math.max(0, Math.ceil(Math.max(u.trial_until, u.paid_until) - Date.now()/1000)) : 0;
-    const text = !u ? 'SIGN IN TO START' : u.lifetime ? 'FOREVER ACCESS' : u.paid_until > Date.now()/1000 ? 'MONTHLY ACCESS' : seconds > 0 ? `TRIAL · ${String(seconds).padStart(2,'0')}s` : 'TRIAL ENDED · CHOOSE A PLAN';
-    document.querySelectorAll('[data-access-clock]').forEach(el => { el.textContent = text; el.classList.toggle('expired', !!u && !u.lifetime && seconds <= 0); });
+    const now = Date.now()/1000;
+    // An unstarted trial has no deadline yet -- the clock starts on the first
+    // run -- so it reads as its full window until then.
+    const full = Number(u && u.trial_seconds) || 60;
+    const seconds = !u ? 0 : u.trial_pending ? full : Math.max(0, Math.ceil(Math.max(u.trial_until, u.paid_until) - now));
+    const clock = String(seconds).padStart(2,'0') + 's';
+    const text = !u ? 'SIGN IN TO START' : u.lifetime ? 'FOREVER ACCESS' : u.paid_until > now ? 'MONTHLY ACCESS' : u.trial_pending ? `TRIAL READY · ${clock}` : seconds > 0 ? `TRIAL · ${clock}` : 'TRIAL ENDED · CHOOSE A PLAN';
+    document.querySelectorAll('[data-access-clock]').forEach(el => { el.textContent = text; el.classList.toggle('expired', !!u && !u.lifetime && !u.trial_pending && seconds <= 0); });
   }
   
   async function refresh() {

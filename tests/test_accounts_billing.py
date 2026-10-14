@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 import accounts
 import payments
 import server
+import wallets
 
 ORIGIN = "http://testserver"
 
@@ -25,7 +27,17 @@ class SecurityTests(unittest.TestCase):
             "ACCOUNT_DB_PATH": self.tmp.name + "/accounts.db", "ADMIN_USERS": "operator",
             "NOWPAYMENTS_API_KEY": "test-key", "NOWPAYMENTS_IPN_SECRET": "test-ipn-key",
             "NOWPAYMENTS_ENABLED": "1", "TRUSTED_PROXY_CIDRS": "", "APP_ENV": "test",
+            # One payout wallet per coin, exactly as the Railway variables would
+            # supply them. Literal addresses here; the recovery-phrase path has
+            # its own test below.
+            "BTC": "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+            "LTC": "ltc1quxjdrku0dg9mrm96rczdh55cdltf5z2psa79cp",
+            "ETH": "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+            "USDC": "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+            "SOL": "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk",
+            "USDT": "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk",
         })
+        wallets._cache.clear()
         self.env.start()
         self.store = accounts.Store(os.getenv("TEST_DATABASE_URL", ""))
         self.saved = accounts.store
@@ -99,17 +111,89 @@ class SecurityTests(unittest.TestCase):
         self.client.cookies.clear()
         fourth = self.signup("fourthuser")
         self.assertFalse(fourth["user"]["access"])
-        self.assertGreater(first["user"]["trial_until"], 0)
+        # The first account holds its trial, unstarted: nothing has run yet.
+        self.assertTrue(first["user"]["trial_pending"])
+        self.assertEqual(first["user"]["trial_until"], 0)
+
+    def test_trial_starts_on_the_first_run_not_at_signup(self):
+        data = self.signup()
+        uid = data["user"]["id"]
+        self.assertTrue(data["user"]["access"], "an unstarted trial still gets in")
+        self.assertTrue(data["user"]["trial_pending"])
+        self.assertEqual(data["user"]["plan"], "trial")
+        self.assertEqual(data["user"]["remaining_seconds"], accounts.TRIAL_SECONDS)
+        with self.store.transaction() as db:
+            row = db.one("SELECT trial_until,trial_started,trial_available FROM users WHERE id=?", (uid,))
+        self.assertEqual((row["trial_until"], row["trial_started"]), (0.0, 0.0))
+
+        user = accounts.authenticate(self.client.cookies.get(accounts.COOKIE))
+        token = accounts.CURRENT_USER.set(user)
+        try:
+            asyncio.run(server._open_run("scan"))
+        finally:
+            accounts.CURRENT_USER.reset(token)
+        with self.store.transaction() as db:
+            started = db.one("SELECT trial_until,trial_started,trial_available FROM users WHERE id=?", (uid,))
+        self.assertGreater(started["trial_started"], 0, "the first run starts the clock")
+        self.assertAlmostEqual(started["trial_until"] - started["trial_started"], accounts.TRIAL_SECONDS, places=2)
+
+        # A second run reuses the running clock instead of extending it.
+        token = accounts.CURRENT_USER.set(accounts.authenticate(self.client.cookies.get(accounts.COOKIE)))
+        try:
+            asyncio.run(server._open_run("snipe"))
+        finally:
+            accounts.CURRENT_USER.reset(token)
+        with self.store.transaction() as db:
+            again = db.one("SELECT trial_until,trial_started FROM users WHERE id=?", (uid,))
+        self.assertEqual(again["trial_started"], started["trial_started"])
+        self.assertEqual(again["trial_until"], started["trial_until"])
+        server._runs.clear()
+
+    def test_checkout_pays_out_to_the_wallet_in_the_environment(self):
+        phrase = " ".join(["abandon"] * 11 + ["about"])
+        captured = {}
+        data = self.signup()
+        with patch.dict(os.environ, {"BTC": phrase}):
+            wallets._cache.clear()
+            async def fake(method, path, **kwargs):
+                if path == "/currencies": return {"currencies": ["btc"]}
+                if path == "/min-amount": return {"min_amount": "0.01"}
+                if path == "/estimate": return {"estimated_amount": "9"}
+                captured.update(kwargs.get("json", {}))
+                return {"payment_id": "p1", "pay_address": "bc1qdepositaddress", "pay_amount": "9"}
+            with patch("payments.provider", new=fake):
+                r = self.client.post("/billing/checkout", headers=self.csrf(data), json={"plan": "monthly", "currency": "BTC"})
+            self.assertEqual(r.status_code, 200, r.text)
+            listed = {c["symbol"]: c["ready"] for c in self.client.get("/billing/plans").json()["coins"]}
+        wallets._cache.clear()
+        # The recovery phrase became the address the provider forwards to.
+        self.assertEqual(captured["payout_address"], "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu")
+        self.assertEqual(captured["pay_currency"], "btc")
+        self.assertEqual(listed, {"SOL": True, "LTC": True, "ETH": True, "BTC": True, "USDT": True, "USDC": True})
+
+    def test_checkout_without_a_wallet_names_the_missing_variable(self):
+        data = self.signup()
+        with patch.dict(os.environ, {"SOL": ""}):
+            wallets._cache.clear()
+            r = self.client.post("/billing/checkout", headers=self.csrf(data), json={"plan": "monthly", "currency": "SOL"})
+        wallets._cache.clear()
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("SOL", r.json()["detail"])
 
     def test_expiry_csrf_origin_and_operator_boundary(self):
         data=self.signup()
         self.assertEqual(self.client.post("/hits", json={}).status_code, 403)
         self.assertEqual(self.client.delete("/hits", headers={"Origin":"https://foreign.example", "X-CSRF-Token":data["csrf"]}).status_code, 403)
         self.assertEqual(self.client.delete("/hits", headers=self.headers).status_code, 403)
-        self.assertEqual(self.client.post("/proxies/clear", headers=self.csrf(data)).status_code, 403)
+        # Managing the stored proxy list is ordinary use of a paid tool, not an
+        # operator-only action -- but a write still needs the CSRF token.
+        self.assertEqual(self.client.post("/proxies/clear", headers=self.headers).status_code, 403)
+        self.assertEqual(self.client.post("/proxies/clear", headers=self.csrf(data)).status_code, 200)
         self.assertEqual(self.client.get("/proxies").json()["proxies"], [])
         with self.store.transaction() as db:
-            db.execute("UPDATE users SET trial_until=0 WHERE id=?", (data["user"]["id"],))
+            # Expire the trial the way the clock does: started, then elapsed.
+            db.execute("UPDATE users SET trial_available=0,trial_started=?,trial_until=? WHERE id=?",
+                       (time.time() - accounts.TRIAL_SECONDS, time.time() - 1, data["user"]["id"]))
         self.assertEqual(self.client.post("/scan", headers=self.csrf(data), json={}).status_code, 402)
         self.assertEqual(self.client.get("/snipe?username=foo").status_code, 402)
         self.assertEqual(self.client.get("/auth/me").json()["user"]["plan"], "expired")
@@ -225,6 +309,41 @@ class SecurityTests(unittest.TestCase):
         with patch.dict(os.environ,{'NOWPAYMENTS_ENABLED':'0'}):
             r=self.client.post('/billing/checkout',headers=self.csrf(data),json={'plan':'monthly','currency':'SOL'})
         self.assertEqual(r.status_code,503)
+
+
+class MigrationTests(unittest.TestCase):
+    """A database created before the trial columns existed must still upgrade.
+
+    The Railway deployment already has the old ``users`` table; CREATE TABLE IF
+    NOT EXISTS never touches it, so this is the path every real upgrade takes.
+    """
+
+    def test_initialize_adds_the_trial_columns_to_an_existing_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = tmp + "/old.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,"
+                " password_hash TEXT NOT NULL, created DOUBLE PRECISION NOT NULL,"
+                " trial_until DOUBLE PRECISION NOT NULL, paid_until DOUBLE PRECISION NOT NULL DEFAULT 0,"
+                " lifetime INTEGER NOT NULL DEFAULT 0, settings TEXT NOT NULL DEFAULT '{}')"
+            )
+            conn.commit()
+            conn.close()
+            with patch.dict(os.environ, {"ACCOUNT_DB_PATH": path, "APP_ENV": "test"}):
+                store = accounts.Store("")
+                with store.transaction() as db:
+                    self.assertEqual(accounts.store_columns(db, "users") & {"trial_available", "trial_started"}, set())
+                store.initialize()
+                store.initialize()  # a restart must not be an error
+                with store.transaction() as db:
+                    columns = accounts.store_columns(db, "users")
+                    self.assertLessEqual({"trial_available", "trial_started"}, columns)
+                    # Old rows default to no trial rather than to a free window.
+                    db.execute("INSERT INTO users(id,username,password_hash,created,trial_until) VALUES('x','legacy','h',0,0)")
+                    row = db.one("SELECT trial_available,trial_started FROM users WHERE id='x'")
+                self.assertEqual((row["trial_available"], row["trial_started"]), (0, 0.0))
+                self.assertFalse(accounts.trial_pending(row))
 
 
 class CaptchaTests(unittest.IsolatedAsyncioTestCase):

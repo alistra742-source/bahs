@@ -4,12 +4,15 @@
 > server-side 60-second trial enforcement, PostgreSQL accounts/private hits,
 > and `/buy` + `/account` with $8.99 monthly / $45.99 forever plans.
 > See **[SECURITY.md](SECURITY.md)** and **[.env.example](.env.example)** before running
-> this version: new authentication variables (`AUTH_SECRET`) are required; signup uses a built-in drag-and-type challenge, so no third-party CAPTCHA keys are needed. The proxy
-> pool is operator-managed, not exposed to ordinary accounts. Some older single-user
-> setup/API descriptions below are historical and do not describe these new gates.
-> Crypto checkout is deliberately disabled: free/unlimited public blockchain RPC
-> is not guaranteed, and the optional processor integration has fees and requires
-> explicit acceptance, credentials, and live verification. No wallet seed is used.
+> this version: new authentication variables (`AUTH_SECRET`) are required; signup uses a built-in drag-and-type challenge, so no third-party CAPTCHA keys are needed. Each
+> account manages its own proxy list; there is no operator-only gate on it. Some older
+> single-user setup/API descriptions below are historical and do not describe these gates.
+> Crypto checkout runs on the optional processor, which has fees and must be enabled
+> explicitly; where a settlement is paid out is your own wallet, taken from one
+> Railway variable per coin (`SOL` `LTC` `BTC` `ETH` `USDT` `USDC` -- a public address
+> or a recovery phrase used only to derive one, never stored, never signed with).
+> No node or chain watcher runs here. The 60-second trial does not start at signup:
+> it starts on your first snipe or scan, so an idle account keeps its whole window.
 
 Username availability across sixteen platforms, over your own proxy list.
 

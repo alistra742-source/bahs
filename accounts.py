@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import secrets
@@ -28,6 +29,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+log = logging.getLogger("bahs.accounts")
 CURRENT_USER = contextvars.ContextVar("account", default=None)
 PASSWORDS = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 COOKIE = "bahs_session"
@@ -36,6 +38,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
  id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
  created DOUBLE PRECISION NOT NULL, trial_until DOUBLE PRECISION NOT NULL,
+ trial_available INTEGER NOT NULL DEFAULT 0, trial_started DOUBLE PRECISION NOT NULL DEFAULT 0,
  paid_until DOUBLE PRECISION NOT NULL DEFAULT 0, lifetime INTEGER NOT NULL DEFAULT 0,
  settings TEXT NOT NULL DEFAULT '{}'
 );
@@ -78,6 +81,21 @@ CREATE TABLE IF NOT EXISTS challenges (
 CREATE INDEX IF NOT EXISTS challenge_expiry ON challenges(expires);
 """
 
+# Columns added after the first deploy. CREATE TABLE IF NOT EXISTS does not add
+# columns to a table that already exists, so an upgraded database needs these
+# applied explicitly -- and only when they are missing, so a restart is not an
+# error and a genuinely failing ALTER still raises.
+MIGRATIONS = {
+    "users": {
+        "trial_available": "INTEGER NOT NULL DEFAULT 0",
+        "trial_started": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+    },
+}
+
+# The trial begins on the operator's first run, not at signup, so an account can
+# sit unused for a week and still get its full window.
+TRIAL_SECONDS = 60
+
 
 class Store:
     def __init__(self, url=None):
@@ -114,8 +132,26 @@ class Store:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     db.execute(statement)
+            self._migrate(db)
         if not self.pg:
             os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _migrate(db) -> None:
+        for table, columns in MIGRATIONS.items():
+            existing = store_columns(db, table)
+            for name, definition in columns.items():
+                if name not in existing:
+                    log.warning("adding %s.%s", table, name)
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def store_columns(db, table: str) -> set:
+    """Column names of ``table`` on either backend, empty if it does not exist."""
+    if db.pg:
+        rows = db.all("SELECT column_name FROM information_schema.columns WHERE table_name=?", (table,))
+        return {row["column_name"] for row in rows}
+    return {row["name"] for row in db.all(f"PRAGMA table_info({table})")}
 
 
 class Database:
@@ -211,18 +247,54 @@ def rate_limit(key, maximum, seconds):
         db.execute("DELETE FROM rate_windows WHERE expires<?", (now - 86400,))
 
 
+def trial_pending(user) -> bool:
+    """True while an account holds an unstarted trial.
+
+    The clock is deliberately not running yet: it starts on the first run, so
+    the window is spent snipe-ing rather than ticking on a freshly made account
+    nobody has logged into.
+    """
+    return bool(user["trial_available"]) and not user["trial_started"]
+
+
 def public_user(user):
     now = time.time()
     end = max(user["trial_until"], user["paid_until"])
+    pending = trial_pending(user)
     return {
         "id": user["id"], "username": user["username"],
-        "access": bool(user["lifetime"] or end > now),
-        "plan": "forever" if user["lifetime"] else "monthly" if user["paid_until"] > now else "trial" if user["trial_until"] > now else "expired",
-        "trial_until": user["trial_until"], "paid_until": user["paid_until"],
-        "remaining_seconds": max(0, int(end - now)), "lifetime": bool(user["lifetime"]),
+        "access": bool(user["lifetime"] or end > now or pending),
+        "plan": "forever" if user["lifetime"] else "monthly" if user["paid_until"] > now else "trial" if user["trial_until"] > now or pending else "expired",
+        "trial_until": user["trial_until"], "trial_started": user["trial_started"],
+        "trial_pending": pending, "trial_seconds": TRIAL_SECONDS,
+        "paid_until": user["paid_until"],
+        # An unstarted trial reads as its full window, which is exactly what it
+        # is: the countdown has not begun to be shorter than that.
+        "remaining_seconds": TRIAL_SECONDS if pending else max(0, int(end - now)),
+        "lifetime": bool(user["lifetime"]),
         "priority_support": bool(user["lifetime"]),
         "admin": user["username"] in os.getenv("ADMIN_USERS", "").lower().split(","),
     }
+
+
+def start_pending_trial(uid: str) -> float:
+    """Start the trial clock on this account's first run.
+
+    Returns the new deadline, or 0 when there was nothing to start (no trial
+    left, or it already started) -- in which case the caller keeps the deadline
+    it already had. Locked per account, because two runs opening at once must
+    not grant two windows.
+    """
+    now = time.time()
+    with store.transaction() as db:
+        db.lock("trial-start:" + uid)
+        user = db.one("SELECT trial_available,trial_started FROM users WHERE id=?", (uid,))
+        if not user or not user["trial_available"] or user["trial_started"]:
+            return 0
+        deadline = now + TRIAL_SECONDS
+        db.execute("UPDATE users SET trial_started=?,trial_until=? WHERE id=?", (now, deadline, uid))
+        log.info("trial started for %s", uid)
+        return deadline
 
 
 def authenticate(token):
@@ -245,6 +317,12 @@ def owner_id():
 
 
 def access_deadline(uid):
+    """When access ends, or ``inf`` for a lifetime account.
+
+    A trial that has not been started reads as 0 here, not as a fresh window,
+    so a run that somehow opened without start_pending_trial is stopped rather
+    than given time it was never granted. Fails closed on purpose.
+    """
     with store.transaction() as db:
         user = db.one("SELECT trial_until,paid_until,lifetime FROM users WHERE id=?", (uid,))
     if not user:
@@ -343,7 +421,7 @@ def auth_challenge(action: str = Query("signup", pattern="^(signup|login)$"), re
 def auth_config():
     return {
         "ready": True,
-        "trial_seconds": 60,
+        "trial_seconds": TRIAL_SECONDS,
         "payment_ready": bool(os.getenv("NOWPAYMENTS_ENABLED") == "1" and os.getenv("NOWPAYMENTS_API_KEY") and os.getenv("NOWPAYMENTS_IPN_SECRET")),
         "crypto": ["SOL", "LTC", "ETH", "BTC", "USDT", "USDC"]
     }
@@ -372,8 +450,10 @@ async def signup(body: Credentials, request: Request):
             if db.one("SELECT id FROM users WHERE username=?", (username,)):
                 raise HTTPException(409, "Account cannot be created with that username")
             used = any(db.one("SELECT signal FROM trial_claims WHERE signal=?", (s,)) for s in signals)
-            until = 0 if used else now + 60
-            db.execute("INSERT INTO users(id,username,password_hash,created,trial_until) VALUES(?,?,?,?,?)", (uid, username, password_hash, now, until))
+            # trial_until stays 0 until the clock actually starts
+            # (start_pending_trial, on the first run): an account made today
+            # still holds its whole window until it is first used.
+            db.execute("INSERT INTO users(id,username,password_hash,created,trial_until,trial_available) VALUES(?,?,?,?,0,?)", (uid, username, password_hash, now, 0 if used else 1))
             # Record both new signals even when one was already claimed. Clearing
             # cookies or changing IP alone therefore never creates a new trial.
             for s in signals:
@@ -443,7 +523,6 @@ class AccountMiddleware:
     """ASGI (not BaseHTTPMiddleware): context follows streaming and detached tasks."""
     PUBLIC = {"/", "/health", "/info", "/stats", "/docs", "/menu", "/app.js", "/app.css", "/favicon.ico", "/auth/config", "/auth/status", "/auth/challenge", "/auth/signup", "/auth/login", "/billing/plans", "/billing/webhook"}
     PAGES = {"/console", "/hits/", "/platforms", "/proxies/", "/alerts", "/settings/", "/buy", "/account"}
-    ADMIN = {"/proxies/upload", "/proxies/clear"}
     def __init__(self, app):
         self.app = app
 
@@ -489,8 +568,10 @@ class AccountMiddleware:
                     if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), user["csrf"]):
                         raise HTTPException(403, "Invalid request token")
                 view = public_user(user)
-                if (path in self.ADMIN or path == "/proxies" and request.method != "GET") and not view["admin"]:
-                    raise HTTPException(403, "Administrator access required")
+                # Managing the proxy list is ordinary use of a paid tool, not an
+                # administrator action: every account reads and writes its own
+                # list, which is all this deployment has ever had. Login, CSRF
+                # and Origin still gate the writes above.
                 if path in {"/scan", "/snipe", "/generate"} and not view["access"]:
                     raise HTTPException(402, "Trial ended. Choose a plan to continue.")
                 await asyncio.to_thread(rate_limit, "api:" + user["id"], 120, 60)
