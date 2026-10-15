@@ -55,6 +55,32 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _ports(name: str, default: str) -> tuple[int, ...]:
+    """A list of TCP ports from one variable, e.g. ``"9050,9150"``.
+
+    A typo must not take the service down: an unreadable token is dropped and
+    an entry that is not a port at all is ignored, which leaves the fallback
+    short one exit rather than answering every request with a stack trace. If
+    *nothing* in the variable is readable the default is used, because an empty
+    list here means "look for Tor nowhere" -- the one reading nobody asks for.
+    """
+    raw = _str(name, default)
+    ports: list[int] = []
+    for token in raw.replace(";", ",").replace(" ", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            port = int(token)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    if ports:
+        return tuple(ports)
+    return tuple(int(p) for p in default.split(",") if p.strip().isdigit())
+
+
 # --- Service ---------------------------------------------------------------
 # The user agent every checker sends unless a platform needs its own.
 #
@@ -87,6 +113,114 @@ MAX_PROXIES: int = _int("MAX_PROXIES", 100000)
 # Ceiling on how much of the stored list one run holds at once. Defaults to all
 # of it; lower it only to bound memory, since a run rotates the whole list.
 SNIPE_POOL: int = _int("SNIPE_POOL", 100000)
+
+# --- Checking the list -----------------------------------------------------
+# What a proxy is asked for when the list itself is tested (POST /proxies/check).
+#
+# Without this the first honest answer about a proxy came from a run: a name
+# spent, an error row, and -- if every exit failed -- a sweep that stopped with
+# "the list is dead". Finding out whether a list worked before spending names on
+# it meant curling from a shell on the host, which is not something the person
+# paying for the tool should have to do.
+#
+# The default target answers with the IP the site sees, so one request proves the
+# tunnel carries traffic *and* names the exit -- which is how you find out that a
+# "rotating" endpoint is handing out one address. Point it at http:// instead of
+# https:// if a list is HTTP-CONNECT only.
+PROXY_CHECK_URL: str = _str("PROXY_CHECK_URL", "https://api.ipify.org?format=json")
+# Checks in flight at once. Each one is a single request through a single proxy,
+# so this is bounded by the list as much as by the network. The whole list is
+# swept, so a 500-line list at this width finishes in the time a run would spend
+# on a handful of names.
+PROXY_CHECK_CONCURRENCY: int = _int("PROXY_CHECK_CONCURRENCY", 32)
+# Connect and read ceiling for one check. More generous than a run's, because a
+# check is a diagnostic: an exit that answers in five seconds is a usable exit
+# that a three-second ceiling would have called dead.
+PROXY_CHECK_TIMEOUT: float = _float("PROXY_CHECK_TIMEOUT", 6.0)
+# Ceiling on how many entries one check sweeps, and therefore on how long the
+# request can run. A list (or paste) larger than this is checked from the top and
+# the response says how many were left out rather than truncating silently.
+PROXY_CHECK_MAX: int = _int("PROXY_CHECK_MAX", 2000)
+
+# --- Tor (the pool when there is no list) ----------------------------------
+# An empty proxy list used to end at a 503, which is a dead end for the people
+# the tool is for: paste nothing, get nothing. Tor is the one pool that exists
+# without anyone pasting it, so when the stored list is empty the run falls back
+# to the Tor exits reachable from this host -- and says in the run itself that
+# that is what it is doing.
+#
+# It is a fallback and not a replacement, and the copy is careful about it: a
+# Tor exit is shared by thousands of users and platforms rate-limit or refuse
+# those addresses, so a Tor run answers less than a good private list does. It
+# is the difference between a tool that does something on the first click and
+# one that asks for homework first. A stored list always wins over Tor.
+TOR_ENABLED: bool = _bool("TOR_ENABLED", True)
+# Where a Tor SOCKS listener may already be found: 9050 is the tor daemon's
+# default and 9150 is Tor Browser's. Both are only ever *looked at*; nothing here
+# touches a user's browser or its profile.
+TOR_PORTS: tuple[int, ...] = _ports("TOR_PORTS", "9050,9150")
+# Loopback only, deliberately. A remote SOCKS port would be an exit we do not
+# control and cannot vouch for, and "Tor" would stop being a fact about the
+# process and become a claim about somebody else's server.
+TOR_HOST: str = _str("TOR_HOST", "127.0.0.1")
+# The SocksPorts an instance started by this service listens on. Several ports
+# rather than one because tor keeps the streams of different SocksPorts on
+# different circuits by default, which is the only way to get more than one exit
+# (and therefore more than one shared address to be refused) out of one Tor.
+# 9051 is skipped: that is the conventional control port and this service never
+# opens one.
+TOR_MANAGED_PORTS: tuple[int, ...] = _ports("TOR_MANAGED_PORTS", "9050,9052,9054,9056")
+# Start our own tor when nothing is listening. It binds 127.0.0.1 only, opens no
+# control port, and relays nothing (ClientOnly): a private outbound client, not
+# a proxy service. Off leaves the fallback to a Tor the operator runs.
+# Check your hosting provider's terms before leaving this on -- the traffic it
+# carries is yours, but "anonymisation" in an AUP is a word worth reading twice.
+TOR_AUTO_START: bool = _bool("TOR_AUTO_START", True)
+TOR_BINARY: str = _str("TOR_BINARY", "tor")
+# Where the torrc, its data directory and its log go. Must be writable.
+TOR_DATA_DIR: str = _str("TOR_DATA_DIR", "data/tor")
+# A first start with a cold data directory takes ~50s to bootstrap and can take
+# longer on a bad day, so a run that needs Tor waits this long for it. The boot
+# warmup means it is normally already up by then.
+TOR_START_TIMEOUT: float = _float("TOR_START_TIMEOUT", 75.0)
+# Local SOCKS5 handshake, used to tell "a SOCKS5 listener is here" from "nothing
+# is on that port". Loopback, so this is a connect timeout and not a network wait.
+TOR_PROBE_TIMEOUT: float = _float("TOR_PROBE_TIMEOUT", 2.0)
+# After a start, how long to wait for a SocksPort to actually accept a
+# connection before concluding the instance is not usable. Tor opens its
+# listeners before it announces 100%, so this is normally instant -- and without
+# it the fallback answered "no SOCKS5 listener" a millisecond after starting one.
+TOR_BIND_WAIT: float = _float("TOR_BIND_WAIT", 10.0)
+# How long an *empty* answer is cached, as opposed to a confirmed set of exits.
+# A tor that is still coming up must be noticed in seconds rather than after the
+# full TOR_VERIFY_TTL, or the page tells the user there is no fallback while one
+# is bootstrapping behind it.
+TOR_RETRY_AFTER: float = _float("TOR_RETRY_AFTER", 15.0)
+# Tor's own "am I using Tor" answer. One request per exit through the exit, and
+# the only evidence this service accepts before it calls an exit Tor: a SOCKS5
+# listener on port 9050 could equally be something else, and a page that says
+# "Tor" about it would be guessing.
+TOR_CHECK_URL: str = _str("TOR_CHECK_URL", "https://check.torproject.org/api/ip")
+# Slow on purpose -- three relays in three countries. A verification that
+# arrives inside this is an exit that works.
+TOR_VERIFY_TIMEOUT: float = _float("TOR_VERIFY_TIMEOUT", 25.0)
+# How long a verification is trusted. Tor's own answer does not change minute to
+# minute, and re-verifying on every page load would be a request per exit per
+# refresh for the same sentence.
+TOR_VERIFY_TTL: float = _float("TOR_VERIFY_TTL", 600.0)
+# Verifications in flight at once. Four exits is the default, and there is no
+# reason to ask check.torproject.org for more at once than that.
+TOR_VERIFY_CONCURRENCY: int = _int("TOR_VERIFY_CONCURRENCY", 4)
+# Checks in flight through Tor, for both a run and POST /proxies/check. Small on
+# purpose: one client's circuits are the bottleneck long before the socket count
+# is, and Tor's own documentation makes a throughput promise to nobody. A run
+# over Tor is slower than the same run over a private list, and saying so is
+# better than opening 64 circuits at the check target and calling it speed.
+TOR_CONCURRENCY: int = _int("TOR_CONCURRENCY", 8)
+# How many requests one Tor exit is asked to carry at once.
+TOR_PER_PROXY: int = _int("TOR_PER_PROXY", 2)
+# Connect and read ceiling for one request through Tor, in a run and in a check.
+TOR_TIMEOUT: float = _float("TOR_TIMEOUT", 20.0)
 
 # --- Timeouts (seconds) ----------------------------------------------------
 # Short on purpose. A dead proxy costs its connect timeout and pasted lists are

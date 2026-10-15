@@ -152,6 +152,10 @@ tr:hover td{background:#181a1d}
   padding:3px 6px;color:var(--dim);margin-left:6px}
 .tag.ok{border-color:#4a3a24;color:var(--free);background:var(--free-soft)}
 .tag.bad{border-color:#4a2b2b;color:#e79a9a}
+/* Not a failure and not an answer: the target refusing this exit, or an answer
+   that arrived too late to use. It has to read differently from both, because
+   the repair is different: replace the exit, or replace nothing at all. */
+.tag.warn{border-color:#4a402b;color:var(--warn)}
 .chips{display:flex;gap:5px;flex-wrap:wrap}
 .chips button{background:#131518;border:1px solid var(--line);border-radius:6px;padding:4px 10px;
   cursor:pointer;font:11px/1 var(--sans);color:var(--dim)}

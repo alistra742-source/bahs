@@ -35,32 +35,66 @@
     <div class="grid two">
       <div class="card">
         <header><h3>Add</h3><div class="sep"></div>
-          <span class="note">nothing is validated on paste — what you paste is what a run uses</span></header>
+          <span class="note">nothing is saved until you press a button</span></header>
         <div class="body">
           <label class="f"><span>one per line</span>
             <textarea id="pText" placeholder="host:port:user:pass&#10;socks5://user:pass@host:1080&#10;http://host:8080&#10;1.2.3.4:8080"></textarea></label>
           <div class="row">
             <button class="btn primary" id="pAdd">Append</button>
             <button class="btn" id="pReplace">Replace list</button>
+            <button class="btn" id="pTestPaste">Test paste</button>
             <label class="btn" style="display:inline-block;cursor:pointer">Upload file
               <input type="file" id="pFile" accept=".txt,.csv,text/plain" hidden></label>
           </div>
-          <div class="note" id="pReport" style="margin-top:12px"></div>
+          <div class="note" id="pReport" style="margin-top:12px">Test paste asks every line whether it can
+            carry a request — through the same code a run uses, without spending a single username on the
+            question. Nothing is stored by testing.</div>
         </div>
       </div>
       <div class="card">
         <header><h3>Stored</h3><div class="sep"></div><span class="note" id="pStat"></span></header>
         <div class="body">
           <div class="kv" id="pStats"></div>
+          <div class="row" style="margin-top:12px">
+            <button class="btn sm" id="pTest">Test every proxy</button>
+            <button class="btn sm ghost" id="pStop" hidden>stop</button>
+            <button class="btn sm danger" id="pPrune" hidden>remove dead</button>
+          </div>
+          <div class="note" id="pCheckNote" style="margin-top:10px">a run finds out which exits are dead one
+            name at a time — this asks the list first</div>
           <div class="scroll" style="margin-top:12px;max-height:380px"><table>
-            <thead><tr><th>proxy</th><th></th></tr></thead>
-            <tbody id="pTable"><tr><td colspan="2" class="empty">none stored</td></tr></tbody>
+            <thead><tr><th>proxy</th><th>status</th><th></th></tr></thead>
+            <tbody id="pTable"><tr><td colspan="3" class="empty">none stored</td></tr></tbody>
           </table></div>
           <p class="note" style="margin-top:12px">A run rotates the whole list. A proxy a platform refuses is rested and counted
             apart from one that fails at the transport level: a blanket refusal is not a dead list. Retirement is decided by a
             <b>rate</b>, so a working endpoint is never retired off a handful of refusals — and the last live proxy is never retired,
             because retiring the only one ends the run instead of replacing it.</p>
         </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <header><h3>Tor</h3><div class="sep"></div>
+        <span class="tag" id="torTag">—</span>
+        <span class="note" id="torState" style="margin-left:8px"></span></header>
+      <div class="body">
+        <p class="note">With <b>no list saved</b>, a run goes out over these exits instead of answering
+          nothing at all. A stored list always wins — this is only what happens when there is none. An
+          exit is called Tor only after Tor's own checker says so for a request made <i>through</i> it:
+          a SOCKS5 listener on port 9050 is not evidence, and a page that said "Tor" about one would be
+          guessing.</p>
+        <div class="kv" id="torInfo"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn sm" id="torTest" hidden>Test Tor exits</button>
+          <button class="btn sm" id="torStart" hidden>Start Tor</button>
+          <button class="btn sm ghost" id="torRefresh">Re-check</button>
+        </div>
+        <div class="note" id="torMsg" style="margin-top:10px"></div>
+        <div class="scroll" style="margin-top:12px;max-height:220px"><table>
+          <thead><tr><th>exit</th><th>asked</th><th>Tor's verdict</th></tr></thead>
+          <tbody id="torTable"><tr><td colspan="3" class="empty">not read yet</td></tr></tbody>
+        </table></div>
       </div>
     </div>
   </main>
@@ -76,11 +110,42 @@
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+/* What the last check found, keyed by the proxy string, held apart for a stored
+   list and a paste. This is page state on purpose: a report is about the list as
+   it was when it ran, and the server never stores a verdict about somebody's
+   proxy that would outlive the reason for it. The two are kept apart because
+   testing a paste must not retract the offer to clean up the stored list -- the
+   same line can be in both, and only one of them is the list on screen. */
+const C = { found: { stored: new Map(), paste: new Map(), tor: new Map() },
+            dead: { stored: [], paste: [], tor: [] },
+            rows: new Map(), torRows: new Map(), busy: false, ctrl: null };
+/* Which tag colour a status wears. The statuses and their wording come from the
+   server (proxycheck.STATUS_LABEL) -- only the colour is decided here, so the
+   page cannot invent a verdict the check did not produce. */
+const TONE = { alive: "ok", auth: "bad", refused: "bad", no_answer: "bad",
+               blocked: "warn", slow: "warn", unknown: "warn" };
+
 window.PAGE = {
   name: "proxies", title: "Proxies",
   init() {
     $("pAdd").onclick = () => save("append");
     $("pReplace").onclick = () => save("replace");
+    $("pTestPaste").onclick = () => check($("pText").value, "paste");
+    $("pTest").onclick = () => check("", "stored");
+    $("pStop").onclick = () => { if (C.ctrl) C.ctrl.abort(); };
+    $("torTest").onclick = () => check("", "tor");
+    $("torRefresh").onclick = () => torLoad(true);
+    $("torStart").onclick = async () => {
+      $("torStart").disabled = true;
+      $("torMsg").textContent = "starting tor — a cold start bootstraps for about a minute…";
+      try { renderTor(await App.api("/proxies/tor/start", { method: "POST" }));
+        App.toast("tor: " + $("torTag").textContent, "ok");
+      } catch (e) {
+        $("torMsg").textContent = "start failed: " + e.message;
+        App.toast("start failed: " + e.message, "bad");
+      } finally { $("torStart").disabled = false; }
+    };
+    $("pPrune").onclick = prune;
     $("pClear").onclick = async () => {
       if (!confirm("Empty the stored proxy list?")) return;
       const r = await App.api("/proxies/clear", { method: "POST" });
@@ -98,9 +163,9 @@ window.PAGE = {
       } catch (e) { App.toast(f.name + ": " + e.message, "bad"); }
       load();
     };
-    load();
+    load(); torLoad();
   },
-  onProxies() { load(); },
+  onProxies() { load(); torLoad(); },
 };
 async function save(mode) {
   const text = $("pText").value;
@@ -117,6 +182,198 @@ async function save(mode) {
     $("pText").value = ""; load();
   } catch (e) { App.toast("save failed: " + e.message, "bad"); }
 }
+
+/* --- the check ---------------------------------------------------------- */
+/* One status cell. The label is the server's sentence for the status, and the
+   number beside it is the only thing the check adds to it: how long the exit
+   took, and which address the target saw. */
+function statusCell(result) {
+  if (!result) return '<span class="note">not checked</span>';
+  const bits = [];
+  if (result.exit_ip) bits.push(result.exit_ip);
+  if (result.ms != null) bits.push(result.ms + " ms");
+  const tone = TONE[result.status] ? " " + TONE[result.status] : "";
+  return `<span class="tag${tone}">${App.esc(result.label)}</span>`
+    + (bits.length ? `<span class="note"> ${App.esc(bits.join(" · "))}</span>` : "");
+}
+
+async function check(text, source) {
+  if (C.busy) return App.toast("a check is already running", "bad");
+  const note = source === "paste" ? $("pReport") : source === "tor" ? $("torMsg") : $("pCheckNote");
+  const before = source === "paste" ? note.textContent : "";
+  const found = C.found[source], dead = C.dead[source];
+  C.busy = true; found.clear(); dead.length = 0; C.ctrl = new AbortController();
+  if (source === "stored") $("pPrune").hidden = true;
+  $("pStop").hidden = false;
+  const buttons = ["pTest", "pTestPaste", "torTest", "torStart", "torRefresh", "pAdd", "pReplace", "pClear"].map($);
+  buttons.forEach((b) => { if (b) b.disabled = true; });
+  // The stored column is cleared before the sweep, so an old answer cannot be
+  // read as this one's. A paste has no column to clear.
+  if (source === "stored") {
+    C.rows.forEach((tr) => { const td = tr.querySelector("td.st"); if (td) td.innerHTML = statusCell(null); });
+  }
+  note.textContent = "asking every proxy…";
+  let total = 0, summary = null;
+  try {
+    const r = await fetch("/proxies/check", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: source === "paste" ? text : "", source }),
+      signal: C.ctrl.signal,
+    });
+    if (!r.ok) {
+      let msg = "HTTP " + r.status;
+      try { const d = await r.json(); if (d && d.detail) msg = d.detail; } catch (e) {}
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const raw = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!raw.trim()) continue;
+        let ev; try { ev = JSON.parse(raw); } catch (e) { continue; }
+        if (ev.type === "start") {
+          total = ev.total;
+          const left = ev.skipped ? ` (${App.fmt(ev.skipped)} beyond the cap were not asked)` : "";
+          note.textContent = `asking ${App.fmt(total)} ${total === 1 ? "proxy" : "proxies"} for ${ev.target}${left}…`;
+        } else if (ev.type === "result") {
+          found.set(ev.proxy, ev);
+          if (!ev.ok) dead.push(ev.proxy);
+          const row = source === "tor" ? C.torRows.get(ev.proxy) : C.rows.get(ev.proxy);
+          const td = source === "paste" || !row ? null : row.querySelector("td.st");
+          if (td) td.innerHTML = statusCell(ev);
+          note.textContent = `${App.fmt(ev.checked)} of ${App.fmt(ev.total)} asked · ${App.fmt(found.size - dead.length)} answered · ${App.fmt(dead.length)} dead`;
+        } else if (ev.type === "done") summary = ev;
+      }
+    }
+    if (!summary) throw new Error("the check ended without a summary");
+    report(summary, source, note);
+  } catch (e) {
+    if (e.name === "AbortError") {
+      note.textContent = "stopped — the answers already in are shown";
+    } else {
+      // A refused check names itself: 402 on an expired trial, 409 while another
+      // one runs, 503 when the check target itself cannot be reached from here.
+      note.textContent = "check failed: " + e.message;
+      App.toast("check failed: " + e.message, "bad");
+    }
+  } finally {
+    C.busy = false; C.ctrl = null;
+    buttons.forEach((b) => { if (b) b.disabled = false; });
+    $("pStop").hidden = true;
+    if (source === "paste" && !summary && !C.dead.paste.length) note.textContent = before || note.textContent;
+  }
+}
+
+/* The one line a check is worth: how many answered, out of how many, and what
+   the rest said. A failure the user cannot act on is not written here -- each
+   row carries its own reason. */
+function summaryLine(summary) {
+  const labels = summary.labels || {};
+  const parts = Object.entries(summary.counts || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([status, count]) => `${App.fmt(count)} ${labels[status] || status}`);
+  return `${App.fmt(summary.alive)} of ${App.fmt(summary.total)} answered in ${App.clock(summary.elapsed_s)}`
+    + (parts.length ? ` — ${parts.join(", ")}` : "");
+}
+
+function report(summary, source, note) {
+  const line = summaryLine(summary);
+  const dead = C.dead[source];
+  if (source === "tor") {
+    // No rows to highlight: the exits are already listed, and each one's own
+    // verdict line is the answer. What a check adds is whether the tunnel
+    // carried a request at all, which the summary says in one sentence.
+    $("torMsg").textContent = line + " — this asked the exit, not the platforms: an exit can "
+      + "answer here and still be refused by a platform.";
+    App.toast(`${App.fmt(summary.alive)} of ${App.fmt(summary.total)} Tor exits answered`,
+              summary.alive ? "ok" : "bad");
+    return;
+  }
+  if (source === "stored") {
+    $("pCheckNote").textContent = line;
+    $("pPrune").hidden = !dead.length;
+    $("pPrune").textContent = `remove ${App.fmt(dead.length)} dead`;
+    App.toast(`${App.fmt(summary.alive)} of ${App.fmt(summary.total)} proxies answered`,
+              summary.alive ? "ok" : "bad");
+    return;
+  }
+  // A paste is not in the table yet, so the dead half is named here -- that is
+  // the whole point of testing before saving.
+  const shown = dead.slice(0, 25).map((p) => App.esc(mask(p))).join("<br>");
+  const more = dead.length > 25 ? `<br>… and ${App.fmt(dead.length - 25)} more` : "";
+  note.innerHTML = App.esc(line)
+    + (dead.length ? `<div style="margin-top:8px">could not carry a request:<br>${shown}${more}</div>` : "");
+  App.toast(`${App.fmt(summary.alive)} of ${App.fmt(summary.total)} pasted proxies answered`,
+            summary.alive ? "ok" : "bad");
+}
+
+async function prune() {
+  const dead = C.dead.stored;
+  if (!dead.length) return;
+  if (!confirm(`Remove ${dead.length} proxies that could not carry a request?`)) return;
+  try {
+    const r = await App.api("/proxies/prune", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ proxies: dead }) });
+    App.toast(`removed ${r.count} dead ${r.count === 1 ? "proxy" : "proxies"}`, "ok");
+    dead.length = 0; $("pPrune").hidden = true;
+    load();
+  } catch (e) { App.toast("prune failed: " + e.message, "bad"); }
+}
+
+/* --- the Tor fallback --------------------------------------------------- */
+/* The card is the server's picture, rendered. Every word about a state comes
+   from /proxies/tor, so the page cannot decide on its own that something is
+   Tor -- the only thing decided here is the colour of the tag. */
+const TOR_TONE = { ready: "ok", unconfirmed: "warn", starting: "warn", none: "bad", off: "" };
+
+async function torLoad(refresh) {
+  if (refresh) $("torMsg").textContent = "re-checking the exits…";
+  try {
+    renderTor(await App.api("/proxies/tor" + (refresh ? "?refresh=1" : "")));
+    if (refresh) $("torMsg").textContent = "re-checked just now";
+  } catch (e) {
+    $("torMsg").textContent = "could not read the Tor fallback: " + e.message;
+  }
+}
+
+function renderTor(d) {
+  const tone = TOR_TONE[d.state] || "";
+  $("torTag").className = "tag" + (tone ? " " + tone : "");
+  $("torTag").textContent = d.state_label || d.state;
+  $("torState").textContent = d.reason || "";
+  const exits = d.exits || [];
+  $("torInfo").innerHTML = [
+    ["size", d.usable + " exits" + (d.confirmed ? ", " + App.fmt(d.confirmed) + " confirmed Tor" : "")],
+    ["looked at", d.host + " " + (d.looked_at || d.ports || []).map((p) => ":" + p).join(" ")],
+    ["run by", d.managed ? "this service, in this container" : d.usable ? "already running on this host" : "—"],
+    ["tor binary", d.installed ? "found" : "not on PATH"],
+    ["throughput", d.concurrency + " at once · " + d.per_proxy + " per exit · " + d.timeout + "s"],
+    ["confirmed with", d.check_url],
+  ].map(([k, v]) => `<span>${k}</span><b style="font-weight:400">${App.esc(String(v))}</b>`).join("");
+  $("torTest").hidden = !d.usable;
+  $("torStart").hidden = !(d.enabled && !d.usable);
+  $("torState").title = d.note || "";
+  const body = $("torTable");
+  C.torRows = new Map();
+  if (!exits.length) {
+    body.innerHTML = '<tr><td colspan="3" class="empty">'
+      + (d.enabled ? "none found" : "Tor is off (TOR_ENABLED=0)") + "</td></tr>";
+    return;
+  }
+  body.innerHTML = exits.map((e) =>
+    `<tr data-p="${App.esc(e.url)}"><td style="font:11.5px/1 var(--mono)">${App.esc(e.host || "")}${App.esc(":" + e.port)}</td>`
+    + `<td class="st">${statusCell(C.found.tor.get(e.url))}</td>`
+    + `<td><span class="tag${e.is_tor ? " ok" : " warn"}">${App.esc(e.label)}</span>`
+    + `<span class="note"> ${App.esc(e.exit_ip || e.detail || "")}</span></td></tr>`).join("");
+  body.querySelectorAll("tr[data-p]").forEach((tr) => C.torRows.set(tr.dataset.p, tr));
+}
+
 async function load() {
   const d = await App.api("/proxies?limit=2000");
   App.S.proxies = d;
@@ -130,10 +387,20 @@ async function load() {
     ["updated", s.updated ? new Date(s.updated * 1000).toLocaleString("en-GB") : "never"],
   ].map(([k, v]) => `<span>${k}</span><b style="font-weight:400">${App.esc(v)}</b>`).join("");
   const body = $("pTable");
-  body.innerHTML = d.proxies.length ? d.proxies.map((p) =>
-    `<tr><td style="font:11.5px/1 var(--mono)">${App.esc(mask(p))}</td>
-      <td class="num"><button class="btn sm ghost" data-p="${App.esc(p)}">remove</button></td></tr>`).join("")
-    : '<tr><td colspan="2" class="empty">none stored</td></tr>';
+  C.rows = new Map();
+  if (!d.proxies.length) {
+    body.innerHTML = '<tr><td colspan="3" class="empty">none stored</td></tr>';
+  } else {
+    // Each row is rebuilt from the same map the check writes into, so a reload
+    // keeps the report instead of silently resetting every row to unchecked.
+    body.innerHTML = d.proxies.map((p) =>
+      `<tr data-p="${App.esc(p)}"><td style="font:11.5px/1 var(--mono)">${App.esc(mask(p))}</td>`
+      + `<td class="st">${statusCell(C.found.stored.get(p))}</td>`
+      + `<td class="num"><button class="btn sm ghost" data-p="${App.esc(p)}">remove</button></td></tr>`).join("");
+    // The attribute is read back the way the click handler reads it: dataset
+    // decodes the entity that esc() wrote, so the key is the stored proxy.
+    body.querySelectorAll("tr[data-p]").forEach((tr) => C.rows.set(tr.dataset.p, tr));
+  }
   body.onclick = async (e) => {
     const b = e.target.closest("button[data-p]"); if (!b) return;
     await App.api("/proxies?proxy=" + encodeURIComponent(b.dataset.p), { method: "DELETE" });

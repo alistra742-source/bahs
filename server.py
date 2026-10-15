@@ -30,11 +30,17 @@ import accounts
 import payments
 import generator
 import proxies as proxy_list_module
+import proxycheck
 import sniper
+import tor as tor_module
 from config import (
     LOG_LEVEL,
     SHUFFLE_NAMES,
     MAX_CONCURRENT_RUNS,
+    PROXY_CHECK_CONCURRENCY,
+    PROXY_CHECK_MAX,
+    PROXY_CHECK_TIMEOUT,
+    PROXY_CHECK_URL,
     MAX_ENUMERATION,
     SELECTION_BUILD_MAX,
     MIN_POOL_WARN,
@@ -57,6 +63,10 @@ from config import (
     SNIPE_RETRIES,
     STATS_PATH,
     STORE_PATH,
+    TOR_CHECK_URL,
+    TOR_CONCURRENCY,
+    TOR_ENABLED,
+    TOR_TIMEOUT,
 )
 
 logging.basicConfig(
@@ -342,6 +352,11 @@ async def lifespan(app: FastAPI):
     proxy_list.load()
     alert_settings.load()
     daily_stats.load()
+    # The Tor fallback comes up on its own clock: a cold tor can take a minute
+    # to bootstrap, and nothing -- not the healthcheck, not the first page --
+    # should wait for it. Started here so that a run with an empty list finds it
+    # already up instead of paying for it on the first click.
+    tor_task = asyncio.create_task(tor_module.warmup())
     log.info(
         "bahs up on :%d, %d stored proxies, nofile=%s",
         PORT,
@@ -360,6 +375,12 @@ async def lifespan(app: FastAPI):
                 handle.task.cancel()
         payment_monitor.cancel()
         await asyncio.gather(payment_monitor, return_exceptions=True)
+        # Stop the tor this service started (a listener that was already in the
+        # environment is left alone) before the loop goes away.
+        if not tor_task.done():
+            tor_task.cancel()
+        await asyncio.gather(tor_task, return_exceptions=True)
+        await tor_module.aclose()
         await _close_pools()
         proxy_list.save()
 
@@ -514,8 +535,17 @@ def info() -> dict:
                 "TIKTOK_SESSION_ID is set, in which case TikTok's own validator settles it and "
                 "the hit is confirmed"
             ),
+            "fallback": (
+                "an empty proxy list falls back to the Tor exits this host can reach; a stored "
+                "list always wins over it, and an exit is only called Tor once Tor's own check "
+                "says so"
+            ),
         },
         "alerts_enabled": False,
+        # The pool that exists when the user has pasted nothing. Same numbers the
+        # Proxies page shows, so the two can never disagree about whether a run
+        # with an empty list is going out over Tor.
+        "tor": tor_module.snapshot(),
         # Whether a free TikTok read can be settled by TikTok's own validator.
         # The UI says which of the two honest answers it will get.
         "tiktok_validator": bool(sniper.TIKTOK_SESSION_ID.strip()),
@@ -549,6 +579,10 @@ def info() -> dict:
             "POST /proxies/upload": "the same, with the list as a raw text request body",
             "DELETE /proxies": "remove one proxy by ?proxy=",
             "POST /proxies/clear": "empty the list",
+            "POST /proxies/check": "test every proxy end to end and stream one answer per line",
+            "POST /proxies/prune": "remove several proxies at once - {proxies: [...]}",
+            "GET /proxies/tor": "the Tor fallback: which exits answer, and which are confirmed as Tor",
+            "POST /proxies/tor/start": "start the Tor this service runs (loopback only, no control port)",
             "POST /snipe": "check usernames on every platform (JSON, or NDJSON with stream=true)",
             "GET /snipe": "the same for one ?username=",
             "POST /snipe/stop": "stop every in-flight /snipe batch",
@@ -599,10 +633,20 @@ def stats() -> dict:
 @app.get("/health")
 def health() -> dict:
     runs = _runs_status()
+    tor_state = tor_module.snapshot()
     return {
         "status": "ok",
         "build": BUILD,
         "proxies": {"count": len(proxy_list)},
+        # No I/O at all: whether a run with an empty list would go out over Tor
+        # is state this process is already holding, so a healthcheck never waits
+        # for a bootstrap and never triggers one.
+        "tor": {
+            "enabled": tor_state["enabled"],
+            "state": tor_state["state"],
+            "exits": tor_state["usable"],
+            "confirmed": tor_state["confirmed"],
+        },
         "runs": {"active": sum(1 for r in runs if r["active"]), "tracked": len(runs)},
         "platforms": list(sniper.PLATFORMS),
     }
@@ -711,6 +755,195 @@ def clear_proxies() -> dict:
     removed = proxy_list.clear()
     proxy_list.save()
     return {"removed": removed, "stored": proxy_list.stats()}
+
+
+# --- checking the list ----------------------------------------------------
+# One check per account at a time. A check sweeps the whole list in parallel, so
+# two of them are twice the outbound sockets for the same answer -- and the entry
+# is cleared by the stream's own teardown, so a closed tab does not hold the
+# lock. The age is only there for the case where teardown never ran at all: a
+# stuck entry must not lock somebody out of the page that fixes their list.
+_checks_in_flight: dict[str, float] = {}
+CHECK_STALE_AFTER = 3600.0
+
+
+class ProxyCheck(BaseModel):
+    """Which set of exits to test, and how much of it.
+
+    ``text`` checks a paste *before* it is stored, which is the moment a bad list
+    is cheapest to catch: nothing has been saved and nothing has to be undone.
+    An empty ``source`` infers: a paste when there is text, the stored list
+    otherwise. ``source="tor"`` tests the fallback exits a run would use with an
+    empty list -- the one set of exits that is never in the table above it, and
+    therefore the one nobody can check from the list's own button.
+    ``limit`` 0 is the whole list, capped by ``PROXY_CHECK_MAX``.
+    """
+
+    text: str = ""
+    limit: int = Field(0, ge=0, le=PROXY_CHECK_MAX)
+    source: str = Field("", pattern="^(|stored|paste|tor)$")
+
+
+@app.post("/proxies/check")
+async def check_proxies(body: ProxyCheck) -> StreamingResponse:
+    """Ask every proxy to carry one request, and report each as it settles.
+
+    A check never edits the list; it reports. Dropping what came back dead is a
+    separate request (``POST /proxies/prune``) and the user's decision rather
+    than this endpoint's.
+
+    The target is asked first with no proxy in the way. If this host cannot see
+    it, the check refuses with that sentence instead of reporting every line
+    dead -- which would be the wrong answer, and a completely plausible one, so
+    the user would replace a working list.
+
+    That gate is deliberately skipped for ``source="tor"``: those requests do not
+    leave from this host's address at all, so a host that cannot reach the target
+    directly is exactly the host the fallback is for. An exit the target refuses
+    comes back as ``blocked``, which is not a dead exit and is not offered for
+    removal either.
+    """
+    owner = accounts.owner_id()
+    started = _checks_in_flight.get(owner)
+    if started and time.time() - started < CHECK_STALE_AFTER:
+        raise HTTPException(409, "a proxy check is already running; wait for it to finish")
+
+    wanted = body.source or ("paste" if body.text.strip() else "stored")
+    rejected = 0
+    if wanted == "tor":
+        # Tor's own checker, so one request per exit answers both questions at
+        # once: does the tunnel carry a request, and which address did the far
+        # side see.
+        candidates = tor_module.usable_urls(await tor_module.exits())
+        if not candidates:
+            raise HTTPException(
+                503, "no Tor exits to test: " + tor_module.snapshot()["reason"]
+            )
+        source, target, concurrency, timeout = (
+            "tor", TOR_CHECK_URL, TOR_CONCURRENCY, TOR_TIMEOUT,
+        )
+        note = f"asked through the Tor fallback ({len(candidates)} exits)"
+    elif wanted == "paste":
+        report = proxy_list_module.parse_many(body.text)
+        candidates, rejected = report.accepted, report.rejected_total
+        source, target, concurrency, timeout = (
+            "paste", PROXY_CHECK_URL, PROXY_CHECK_CONCURRENCY, PROXY_CHECK_TIMEOUT,
+        )
+    else:
+        candidates = proxy_list.all()
+        source, target, concurrency, timeout = (
+            "stored", PROXY_CHECK_URL, PROXY_CHECK_CONCURRENCY, PROXY_CHECK_TIMEOUT,
+        )
+    if not candidates:
+        raise HTTPException(
+            503 if source == "stored" else 400,
+            "no proxies saved yet -- paste or upload a list first"
+            if source == "stored"
+            else "no usable proxies in that input",
+        )
+    window = candidates if body.limit <= 0 else candidates[: body.limit]
+
+    if source != "tor":
+        reachable, note = await proxycheck.target_reachable()
+        if not reachable:
+            raise HTTPException(
+                503,
+                f"the check target {PROXY_CHECK_URL} is not answering from this host "
+                f"({note}). Your proxies were not tested and nothing is wrong with them; "
+                "point PROXY_CHECK_URL at a URL this service can reach to check them.",
+            )
+
+    _checks_in_flight[owner] = time.time()
+
+    async def stream() -> AsyncIterator[str]:
+        probes: list[proxycheck.Probe] = []
+        began = time.time()
+        try:
+            yield json.dumps({
+                "type": "start", "source": source, "total": len(window),
+                "skipped": len(candidates) - len(window), "rejected": rejected,
+                "target": target, "target_note": note,
+                "concurrency": concurrency,
+            }) + "\n"
+            async for result in proxycheck.check_many(
+                window, concurrency=concurrency, url=target, timeout=timeout
+            ):
+                # A failure is the line that matters, so it lands in the platform
+                # log; an answer sits at debug. The credentials are masked by the
+                # logger, not here.
+                proxycheck.log_result(result)
+                probes.append(result)
+                yield json.dumps({
+                    "type": "result", "checked": len(probes),
+                    "total": len(window), **result.as_dict(),
+                }) + "\n"
+            summary = proxycheck.summarise(probes, time.time() - began)
+            log.info("proxy check for %s: %s", owner, proxycheck.describe(probes))
+            yield json.dumps({"type": "done", **summary}) + "\n"
+        finally:
+            _checks_in_flight.pop(owner, None)
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson", headers=NDJSON_HEADERS)
+
+
+class ProxyPrune(BaseModel):
+    """The entries to drop, exactly as a check returned them."""
+
+    proxies: list[str] = Field(default_factory=list)
+
+
+@app.post("/proxies/prune")
+def prune_proxies(body: ProxyPrune) -> dict:
+    """Remove several proxies in one request.
+
+    The bulk form of ``DELETE /proxies``: after a check, dropping the dead part
+    of a 500-line paste is one action, and 500 separate DELETE requests is not.
+    Only entries actually in the list are removed, so a stale page cannot empty
+    a list it never saw.
+    """
+    removed: list[str] = []
+    for proxy in dict.fromkeys(body.proxies):
+        if proxy_list.remove(proxy):
+            removed.append(proxy)
+    if removed:
+        proxy_list.save()
+    return {"removed": removed, "count": len(removed), "stored": proxy_list.stats()}
+
+
+# --- Tor, the fallback pool -----------------------------------------------
+@app.get("/proxies/tor")
+async def tor_status(refresh: bool = Query(False)) -> dict:
+    """What the Tor fallback is, right now.
+
+    Nothing here reads or writes the user's proxy list: this is the pool that
+    exists when there is no list, and the answer is what a run would go out on.
+
+    A first read may start a tor, which is what ``TOR_AUTO_START`` means -- the
+    whole point is that an empty list is not a dead end for someone who has not
+    read the docs. ``refresh=1`` re-discovers and re-verifies instead of using
+    the cached picture; the default reuses it, because the expensive half of this
+    is one request per exit to a free service run by the Tor Project, and a page
+    that re-ran it on every load would be a small denial of service aimed at
+    them. The verdict itself does not change minute to minute.
+    """
+    if TOR_ENABLED:
+        await tor_module.exits(force=refresh)
+    return tor_module.snapshot()
+
+
+@app.post("/proxies/tor/start")
+async def tor_start() -> dict:
+    """Start the Tor this service runs, because somebody asked it to.
+
+    Deliberately not gated on ``TOR_AUTO_START``: that flag decides whether a
+    tor comes up *by itself*, and this is a person pressing a button. What still
+    refuses is ``TOR_ENABLED=0`` -- the service saying it wants no part of Tor,
+    which is not a preference to be overridden by a click.
+    """
+    if not TOR_ENABLED:
+        raise HTTPException(409, "Tor is off for this service (TOR_ENABLED=0)")
+    await tor_module.start_now()
+    return tor_module.snapshot()
 
 
 # --- run control ----------------------------------------------------------
@@ -1085,65 +1318,102 @@ async def run_stream(run_id: str, since: int = Query(-1, ge=-1)) -> StreamingRes
 # tighter timeouts and wider per-proxy concurrency, so a scan never
 # reconfigures the pool a single check is using.
 _pool_state: dict[str, dict[str, object]] = {
-    "snipe": {"pool": None, "built": 0.0, "version": -1},
-    "scan": {"pool": None, "built": 0.0, "version": -1},
+    "snipe": {"pool": None, "built": 0.0, "version": -1, "source": "", "tor_version": -1},
+    "scan": {"pool": None, "built": 0.0, "version": -1, "source": "", "tor_version": -1},
 }
 _pool_lock = asyncio.Lock()
 
 
-def _build_pool(scan: bool, concurrency: int) -> sniper.ProxyPool:
-    """Pool the stored proxies with a connection budget that can carry it.
+def _pool_kwargs(scan: bool, concurrency: int, proxies: list[str], source: str) -> dict:
+    """How to build one pool: the list's formula, or Tor's own numbers.
 
-    The per-proxy connection count is derived from ``concurrency / len(list)``
-    rather than fixed, because a fixed one is a hard throughput ceiling for a
-    short list: with one rotating endpoint, asking for 256 concurrent checks
-    still got however many connections the fixed number allowed. A long list
-    still works out to the floor, so this only ever helps.
+    Two pools of the same length are not the same pool. A pasted list is
+    replenished by editing it, so a bad entry can be retired and another one
+    tried; the Tor fallback has nothing to replace an exit *with*, its per-exit
+    connection count is set by Tor's circuits rather than by a throughput
+    measurement, and a request through it costs three relays -- so all of that
+    comes from ``tor.pool_kwargs`` instead of from the formula below.
     """
-    stored = proxy_list.all()[:SNIPE_POOL]
+    if source == "tor":
+        return tor_module.pool_kwargs()
     floor = SCAN_PER_PROXY if scan else SNIPE_PER_PROXY
     per_proxy = sniper.per_proxy_connections(
-        len(stored), concurrency, floor, SNIPE_PER_PROXY_MAX
+        len(proxies), concurrency, floor, SNIPE_PER_PROXY_MAX
     )
     if not scan:
-        return sniper.ProxyPool(stored, cooldown=SNIPE_PROXY_COOLDOWN, per_proxy=per_proxy)
-    timeout = httpx.Timeout(
-        connect=SCAN_CONNECT_TIMEOUT,
-        read=SCAN_READ_TIMEOUT,
-        write=SCAN_READ_TIMEOUT,
-        pool=SCAN_READ_TIMEOUT,
-    )
-    return sniper.ProxyPool(stored, per_proxy=per_proxy, timeout=timeout)
+        return {"cooldown": SNIPE_PROXY_COOLDOWN, "per_proxy": per_proxy}
+    return {
+        "per_proxy": per_proxy,
+        "timeout": httpx.Timeout(
+            connect=SCAN_CONNECT_TIMEOUT,
+            read=SCAN_READ_TIMEOUT,
+            write=SCAN_READ_TIMEOUT,
+            pool=SCAN_READ_TIMEOUT,
+        ),
+    }
 
 
-async def _pool(mode: str, concurrency: int) -> sniper.ProxyPool:
+async def _pool(mode: str, concurrency: int) -> tuple[sniper.ProxyPool, str]:
+    """The pool a run will use, and where its exits came from.
+
+    A stored list always wins: it is the thing the user chose, and Tor is only
+    what happens when there is nothing to choose. So this reads the list first
+    and only consults the fallback when it is empty.
+
+    The fallback is resolved *before* the lock is taken. A cold tor can spend up
+    to ``TOR_START_TIMEOUT`` bootstrapping, and holding this lock across that
+    would stall every other pool request in the process -- the console, a check,
+    a scan -- for as long as it took. The list is re-read afterwards too, so a
+    list pasted while Tor was coming up is used instead of the fallback.
+    """
     scan = mode == "scan"
-    floor = SCAN_PER_PROXY if scan else SNIPE_PER_PROXY
+    source = "list"
+    stored = proxy_list.all()[:SNIPE_POOL]
+    if not stored:
+        fallback = tor_module.usable_urls(await tor_module.exits())
+        # Re-read first, and only then decide: the wait above can be a minute of
+        # bootstrap, and a list pasted during it is the newer answer. The
+        # fallback is what happens when there is *still* nothing to choose.
+        stored = proxy_list.all()[:SNIPE_POOL]
+        if stored:
+            source = "list"
+        elif fallback:
+            stored, source = fallback, "tor"
+    version = proxy_list.version
+    kwargs = _pool_kwargs(scan, concurrency, stored, source)
     async with _pool_lock:
         state = _pool_state[mode]
         pool = state["pool"]
         age = time.time() - float(state["built"])  # type: ignore[arg-type]
-        fresh_list = state["version"] == proxy_list.version
+        fresh = (
+            state["version"] == version
+            and state["source"] == source
+            # Tor's exits can change under a live pool -- an instance that came
+            # up, or one that dropped out -- and a pool built over a set that no
+            # longer exists is a run with no way out of the process.
+            and (source != "tor" or state["tor_version"] == tor_module.version)
+        )
         # Reuse only when this pool's connection budget is already the one this
         # concurrency needs. Rebuilding on every request would throw away the
         # warm tunnels that make a batch fast.
         if (
             isinstance(pool, sniper.ProxyPool)
             and len(pool)
-            and fresh_list
+            and fresh
             and age < SNIPE_POOL_TTL
-            and pool.per_proxy
-            == sniper.per_proxy_connections(len(pool), concurrency, floor, SNIPE_PER_PROXY_MAX)
+            and pool.per_proxy == kwargs["per_proxy"]
         ):
-            return pool
-        new_pool = _build_pool(scan, concurrency)
+            return pool, str(state["source"] or source)
+        new_pool = sniper.ProxyPool(stored, **kwargs)
         if isinstance(pool, sniper.ProxyPool) and pool is not new_pool:
             # Retire the old connections in the background; nobody waits on it.
             asyncio.create_task(pool.aclose())
         state["pool"] = new_pool
         state["built"] = time.time()
-        state["version"] = proxy_list.version
-        return new_pool
+        state["version"] = version
+        state["source"] = source
+        state["tor_version"] = tor_module.version
+        return new_pool, source
 
 
 async def _close_pools() -> None:
@@ -1154,21 +1424,65 @@ async def _close_pools() -> None:
         state["pool"] = None
 
 
+def _no_pool_reason() -> str:
+    """Why a run has nothing to go out on -- every reason, and the fix for each.
+
+    This used to be one sentence about pasting a list, which was correct and no
+    longer complete: with an empty list there is a second thing that can be
+    wrong (the fallback), and a message that names only the first sends the user
+    to fix the wrong half.
+    """
+    base = "no proxies saved yet -- paste or upload a list first"
+    if not TOR_ENABLED:
+        return base
+    return f"{base}. The Tor fallback is not available either: {tor_module.snapshot()['reason']}"
+
+
+def _tor_note(pool: sniper.ProxyPool, concurrency: int) -> str:
+    """What a run over the fallback is, said before it spends a single name."""
+    state = tor_module.snapshot()
+    exits = len(pool)
+    confirmed = sum(1 for e in state["exits"] if e.get("is_tor"))
+    if confirmed:
+        proof = f"{confirmed} of {exits} confirmed as Tor by {state['check_url']}"
+    elif state["managed"]:
+        proof = "started by this service, not yet confirmed as Tor"
+    else:
+        proof = "none confirmed as Tor"
+    capacity = exits * pool.per_proxy
+    return (
+        f"no list stored, so this run goes out over the Tor fallback: {exits} "
+        f"exit(s) at {pool.per_proxy} connection(s) each (about {capacity} checks at "
+        f"once; {concurrency} asked for). {proof}. Tor exits are shared by thousands "
+        "of users and platforms refuse them far more often than a private list, so "
+        "expect more blocked checks and fewer verdicts -- a pasted list takes over the "
+        "moment you save one."
+    )
+
+
 async def _prepare_pool(mode: str, concurrency: int) -> tuple[sniper.ProxyPool, str]:
     """The pool for a run, plus a note when the list is too thin to be useful.
 
     With an empty list every check comes back an error and the caller just sees
     a table of nothing, so that is a 503 with the reason rather than a run that
-    quietly fails. A short list still runs, but says so up front.
+    quietly fails. An empty list is not a dead end any more: it falls back to
+    Tor, and the run says so in its first line. A short list still runs, but says
+    so up front.
     """
-    pool = await _pool(mode, concurrency)
+    pool, source = await _pool(mode, concurrency)
     # A fresh run gets fresh verdicts. The pool object is cached (and its warm
     # tunnels with it), but the previous run's retirements and strikes must not
     # decide this one -- otherwise a list that recovered still reads "the list
     # is dead" until the cache expires.
     pool.begin_run()
     if len(pool) == 0:
-        raise HTTPException(503, "no proxies saved yet -- paste or upload a list first")
+        raise HTTPException(503, _no_pool_reason())
+    if source == "tor":
+        # The generic warnings below are about the *list* -- one that is too
+        # short, or a concurrency it cannot carry. Over Tor both are known up
+        # front and neither is fixable by editing anything, so they are replaced
+        # by one sentence that says what this run actually is.
+        return pool, _tor_note(pool, concurrency)
     if len(pool) < MIN_POOL_WARN:
         return pool, (
             f"only {len(pool)} proxies in the list -- a run this narrow will be slow "

@@ -8,6 +8,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# tor: the fallback pool for an account that has pasted no proxies (see tor.py
+# and the Tor section of README.md). A client only -- the service writes its own
+# torrc with ClientOnly, no control port, and every SocksPort bound to loopback.
+# `--no-install-recommends` keeps it to what the binary actually needs.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tor \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY . .
 
 # Railway injects PORT; default matches Railway's own fallback for local runs.

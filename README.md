@@ -29,8 +29,13 @@ A run is not tied to the tab. Close the page, lose signal, put the phone down �
 the sweep keeps going, and coming back reattaches to the same run, buffer and
 all, until you press **Stop** or the pool genuinely dies.
 
-Nothing is scraped. Nothing is validated ahead of time. The list you paste is
-exactly what a run rotates over.
+Nothing is scraped, and nothing changes the list behind your back: what you
+paste is exactly what a run rotates over. It can be *tested* before a run spends
+a name finding out — see [asking the list whether it
+works](#asking-the-list-whether-it-works-without-spending-a-name).
+
+**And if you have no list at all, a run goes out over Tor** rather than answering
+nothing — see [the fallback](#no-list-tor-is-the-fallback).
 
 ## Run it
 
@@ -462,6 +467,108 @@ The `done` summary carries `proxy_attempts` and `proxy_failures`, and the
 dashboard turns them into one line: a high transport-failure share is the list,
 not the names.
 
+## No list? Tor is the fallback
+
+An empty proxy list used to be the end of the road: every run answered
+`no proxies saved yet` and nothing happened until a list arrived. That is a dead
+end for the first click, and it is the one thing a run needs that this service
+can supply itself. So an empty list now falls back to the Tor exits this host can
+reach, and the run **says so in its own first line** rather than looking like a
+list that is mysteriously failing.
+
+Three rules, because the alternative to each is quietly lying to you:
+
+- **A stored list always wins.** Tor is what happens when there is *nothing* to
+  choose. The moment you save a list, runs use it — a paste during a Tor
+  bootstrap even wins over the fallback the run was already waiting on.
+- **A port is not a Tor.** Something listening on `127.0.0.1:9050` is a SOCKS5
+  proxy and nothing more. An exit is called `Tor exit` only after Tor's own
+  checker answers `IsTor: true` for a request made *through* that port. A
+  listener that will not confirm is still used, and is reported as
+  `SOCKS5, unconfirmed` — never as Tor. Nothing here guesses.
+- **Loopback only.** Discovery looks at `127.0.0.1`; an instance this service
+  starts binds `127.0.0.1` on every port, opens **no control port** (so there is
+  no cookie or password to leak and nothing else can signal it), and sets
+  `ClientOnly` — a private outbound client, never a proxy for anybody else.
+
+A cold `tor` takes about a minute to bootstrap, so it is started **at boot**
+rather than on your first click, and a status read never waits on it. From the
+`Proxies` page's Tor card you can see which exits answered, what address each one
+is, whether each is *confirmed* Tor, start one by hand, and **test the exits** —
+the same sweep the check runs, pointed at the fallback instead of at a list.
+
+It is a fallback and not a replacement, and the copy says so everywhere rather
+than only in the docs:
+
+| what | a private list | Tor |
+|---|---|---|
+| who shares the exit | you | thousands of users |
+| platforms refusing it | occasionally | often — expect more `blocked` checks |
+| throughput | measured hundreds/s | tens/s at best, and it varies |
+| what it costs to set up | a paste | nothing |
+
+So a Tor run that answers few names is behaving normally, and the run note, the
+card and `/health` all say that up front rather than letting a small number look
+like a bug. What it buys is the difference between a tool that does something on
+the first click and one that asks for homework first.
+
+Two details that follow from *no replacement exists*: a Tor pool is built with
+Tor's own timeouts (three relays per request, so a 3-second connect ceiling would
+report healthy exits as dead) and **never retires an exit** — there is no list to
+delete a bad one from, so it is rested instead of written off, because retiring
+the last way out ends the run instead of replacing it.
+
+If `tor` is not installed and nothing is listening, that is a sentence, not a
+crash: the 503 names both halves — paste a list, or make the fallback available:
+
+```
+no proxies saved yet -- paste or upload a list first. The Tor fallback is not
+available either: no SOCKS5 listener answered on 127.0.0.1, ports 9050, 9150:
+tor is not installed here (looked for 'tor' on PATH).
+```
+
+## Asking the list whether it works, without spending a name
+
+The first honest answer about a proxy used to come from a run: one name, one
+`error` row, and — if every exit failed — a sweep that stopped with "the list is
+dead, replace it". Finding out beforehand meant a `curl -x` from a shell on the
+host, which is not something the person paying for the tool should have to do.
+
+`POST /proxies/check` asks every proxy in the stored list — or a paste that has
+not been saved yet — to carry one request to `PROXY_CHECK_URL`. The default
+target answers with the address the site saw, so a single request proves the
+tunnel carries traffic *and* names the exit, which is how a "rotating" endpoint
+that hands out one IP gets caught. It runs over the same client, the same proxy
+schemes, the same shared TLS context and the same `sniper.proxy_fault` judgement
+a run uses, because a check that measures something other than what the run does
+is a promise the run cannot keep. It streams NDJSON: a `start` line, one `result`
+per proxy as it settles, then a `done` summary.
+
+| status | what it means | the repair |
+|---|---|---|
+| `alive` | an answer came back | — |
+| `auth` | the exit answered 407 | add or fix `user:pass` on that line |
+| `refused` | the exit refused to open the tunnel | replace the exit |
+| `no_answer` | nothing answered the CONNECT | replace the exit |
+| `blocked` | the tunnel worked and the *target* refused this exit | nothing — the proxy is fine |
+| `slow` | tunnel up, answer late | nothing — that is the target, and a run reads it the same way |
+| `unknown` | something arrived that is not readable as any of these | look at the detail |
+
+The target is asked first with no proxy in the way. If this host cannot see it,
+the check refuses with that sentence rather than reporting every proxy dead — the
+wrong answer, and a completely plausible one, so the user would replace a working
+list. One check runs per account at a time (`409` while one is going), and a check changes
+nothing: the list is edited only by you. `POST /proxies/prune` removes
+the entries you name, which is what the page's **remove dead** button does with
+what a check called dead — a target that blocked every exit is counted apart from
+that, because deleting a working list for the target's opinion is the mistake
+this report exists to prevent.
+
+`done` carries `total`, `alive`, `dead`, `counts`, `labels` and `elapsed_s`;
+`dead` counts only the exits that could not carry a request themselves. Every
+failed probe is also one line in the platform log, with the credentials masked,
+so a check can be diagnosed from Railway's log viewer instead of a shell.
+
 **Errors and unanswered checks are different things.** A transport failure is
 the tunnel's fault. A challenge page, a status we do not read, or a 200 missing
 the field we look at is the *platform's* answer, reported separately as
@@ -498,6 +605,7 @@ registered it. Confirm the name is still free, then claim it yourself.
 | `GET /info`, `GET /health` | platforms, generation, counters, and the commit this process is running (`build`) |
 | `GET /menu` | every bucket with its real size |
 | `GET /proxies` `POST` `DELETE` `POST /proxies/clear` `POST /proxies/upload` | the list |
+| `POST /proxies/check` `POST /proxies/prune` | test every proxy end to end (NDJSON), and remove the ones that failed |
 | `POST /scan` | `{buckets:[{kind,length}], platforms, stream}` — the whole selection is swept |
 | `POST /snipe` | the same for explicit `usernames` |
 | `GET /snipe?username=` | one name |
@@ -529,6 +637,26 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 |---|---|---|
 | `PORT` | `8080` | |
 | `STORE_PATH` | `data/proxies.json` | local cache — the database copy is the store |
+| `PROXY_CHECK_URL` | `https://api.ipify.org?format=json` | what a check asks a proxy for — must answer 2xx, and `http://` works if the list is CONNECT-only on 80 |
+| `PROXY_CHECK_CONCURRENCY` | `32` | probes in flight at once |
+| `PROXY_CHECK_TIMEOUT` | `6.0` | connect/read ceiling for one probe, seconds |
+| `PROXY_CHECK_MAX` | `2000` | entries one check may sweep |
+| `TOR_ENABLED` | `true` | use Tor when the stored list is empty |
+| `TOR_PORTS` | `9050,9150` | where a Tor SOCKS listener may already be (daemon, Tor Browser); discovery also looks at `TOR_MANAGED_PORTS`, which is how the instance this service starts is found |
+| `TOR_HOST` | `127.0.0.1` | where those ports are looked for; loopback, deliberately |
+| `TOR_AUTO_START` | `true` | start our own `tor` when nothing is listening |
+| `TOR_MANAGED_PORTS` | `9050,9052,9054,9056` | the SocksPorts that instance listens on; several ports because Tor keeps their streams on separate circuits, which is the only way to get more than one exit out of one Tor |
+| `TOR_BINARY` | `tor` | looked up on `PATH`; never assumed |
+| `TOR_DATA_DIR` | `data/tor` | torrc, data directory and log |
+| `TOR_START_TIMEOUT` | `75` | seconds a first start may take to bootstrap |
+| `TOR_BIND_WAIT` | `10` | after a start, seconds to wait for a SocksPort to accept a connection |
+| `TOR_RETRY_AFTER` | `15` | how long an *empty* answer is cached, so a tor that is still coming up is noticed in seconds |
+| `TOR_CHECK_URL` | `https://check.torproject.org/api/ip` | Tor's own "am I Tor" answer — the only evidence accepted before an exit is called Tor |
+| `TOR_VERIFY_TIMEOUT` / `TOR_VERIFY_TTL` | `25` / `600` | per-exit ceiling, and how long a verdict is trusted |
+| `TOR_VERIFY_CONCURRENCY` | `4` | confirmations in flight at once |
+| `TOR_CONCURRENCY` | `8` | checks in flight through Tor, for a run and for a check |
+| `TOR_PER_PROXY` | `2` | requests one Tor exit carries at once |
+| `TOR_TIMEOUT` | `20` | connect/read ceiling for one request through Tor |
 | `SETTINGS_PATH` | `data/settings.json` | alert settings |
 | `STATS_PATH` | `data/stats.json` | today's totals, for the landing page |
 | `TIKTOK_SESSION_ID` | — | TikTok `sessionid` cookie, optional: settles a free TikTok name with TikTok's own validator. A credential for a real account — see below |

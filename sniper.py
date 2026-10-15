@@ -679,8 +679,17 @@ class ProxyPool:
         block_limit: int = SNIPE_PROXY_BLOCK_LIMIT,
         block_memory: float = SNIPE_BLOCK_MEMORY,
         max_clients: int = SNIPE_MAX_CLIENTS,
+        retire: bool = True,
     ) -> None:
         self._all = list(dict.fromkeys(proxies))
+        # Some pools cannot be replenished, and the fallback pool is the case
+        # that matters: there is no list to delete a bad Tor exit *from*, so
+        # retiring one is not a repair, it is one fewer way out -- and retiring
+        # the last one ends a run that would otherwise keep resolving names
+        # through it. A non-retirable pool rests an entry instead, which moves
+        # load onto the exits that are working and leaves this one available
+        # again once the cooldown lapses.
+        self._retirable = bool(retire)
         self._cooldown = max(0.0, cooldown)
         self._block_cooldown = max(0.0, block_cooldown)
         self._per_proxy = max(1, per_proxy)
@@ -762,9 +771,22 @@ class ProxyPool:
     def __len__(self) -> int:
         return len(self._all)
 
+    def all(self) -> list[str]:
+        """Every entry the pool was built with, in rotation order.
+
+        Not on any hot path and not a copy the pool keeps: this is for the
+        report a caller writes about the pool it just built.
+        """
+        return list(self._all)
+
     @property
     def per_proxy(self) -> int:
         return self._per_proxy
+
+    @property
+    def retirable(self) -> bool:
+        """May this pool write an entry off, or is it all there is?"""
+        return self._retirable
 
     def begin_run(self) -> None:
         """Reset per-run bookkeeping, keeping the warm tunnels.
@@ -887,6 +909,25 @@ class ProxyPool:
         # but the log line is not: retiring twice should not read as two
         # different endpoints, or as a list that is dying faster than it is.
         if proxy in self._retired:
+            return
+        if not self._retirable:
+            # Nothing can replace this entry, so the pool does not get to
+            # delete it. Resting it is the only lever left that still moves
+            # load toward whatever else there is, and the entry comes back on
+            # its own when the cooldown lapses. Its failure counts are left
+            # alone: they are what the run summary reports, and rewriting them
+            # here would be the pool editing its own evidence.
+            rest = max(self._cooldown, self._block_cooldown)
+            if rest > 0:
+                self._resting[proxy] = time.time() + rest
+            log.debug(
+                "proxy %s is not retirable (the pool has no replacement): "
+                "resting %.0fs after %d failures of %d attempts",
+                mask_proxy(proxy),
+                rest,
+                self._failed.get(proxy, 0),
+                self._attempts.get(proxy, 0),
+            )
             return
         self._retired.add(proxy)
         self._resting.pop(proxy, None)

@@ -80,6 +80,25 @@
     </div>
 
     <div class="card" style="margin-top:16px">
+      <header><h3>No list? Tor is the fallback</h3><div class="sep"></div>
+        <span class="note" id="torState">—</span></header>
+      <div class="body">
+        <p class="note">An empty proxy list used to end at <code>no proxies saved yet</code>. It now falls
+          back to the Tor exits this host can reach, and the run says so in its own first line. A saved
+          list always wins. An exit is called Tor only after Tor's own checker says so for a request made
+          <i>through</i> it — an open port is not evidence. The instance this service starts binds
+          loopback only, opens no control port and relays nothing, so it is a client and never a proxy
+          for anyone else.</p>
+        <div class="kv" style="margin-top:12px" id="torDocs"></div>
+        <p class="note" style="margin-top:12px">Tor exits are shared by thousands of users, so platforms
+          refuse them far more often than a private list: expect more <code>blocked</code> checks and
+          fewer verdicts, and read a low number as the route rather than as a bug. There is no
+          replacement for a Tor exit that goes bad, so a fallback pool rests one instead of retiring it —
+          retiring the last way out would end the run rather than fix it.</p>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
       <header><h3>The site and the tool</h3><div class="sep"></div>
         <span class="note">one front door, one console</span></header>
       <div class="body">
@@ -124,6 +143,19 @@ window.PAGE = {
   init() {
     const i = App.S.info;
     $("dBuild").textContent = "build " + i.build + " · " + i.platforms.length + " snipers";
+    // The state, the reason and the numbers all come from /info, which reads the
+    // same module the pools do -- so this page cannot claim Tor is ready while a
+    // run is answering "no proxies saved yet".
+    const t = i.tor || {};
+    $("torState").textContent = (t.state_label || "—") + (t.reason ? " · " + t.reason : "");
+    $("torDocs").innerHTML = [
+      ["right now", (t.usable || 0) + " exit(s), " + (t.confirmed || 0) + " confirmed as Tor"],
+      ["looked at", App.esc((t.host || "") + " " + (t.looked_at || t.ports || []).map((p) => ":" + p).join(" "))],
+      ["run by", t.managed ? "this service, in this container" : t.usable ? "already running on this host" : "—"],
+      ["throughput", App.esc((t.concurrency || "—") + " at once · " + t.per_proxy + " per exit · " + t.timeout + "s")],
+      ["confirmed with", App.esc(t.check_url || "—")],
+      ["precedence", "a saved list is always used instead"],
+    ].map(([k, v]) => `<span>${k}</span><b style="font-weight:400">${v}</b>`).join("");
     $("howto").innerHTML = (i.checks || []).map((c) =>
       `<span>${App.esc(c.platform)}</span><b style="font-weight:400">${App.esc(c.how)}</b>`).join("");
     $("eps").innerHTML = Object.entries(i.endpoints || {}).map(([k, v]) =>

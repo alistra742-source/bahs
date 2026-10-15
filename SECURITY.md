@@ -32,7 +32,7 @@ There is no password recovery, email verification, MFA, or user account-deletion
 Access is one question: does this account hold a plan, or a trial that has not run out. An administrator holds access implicitly -- granting from a panel you cannot open would be a trap.
 
 - **Pages**: `/console`, `/hits/`, `/platforms`, `/proxies/`, `/alerts` and `/settings/` redirect (302) to `/buy` for a session without access, and for no session at all. `/buy`, `/account`, `/docs`, `/` and the whole `/auth`, `/billing` and `/promo` surface stay open, because a paywall with no way through is a dead end. The sidebar mirrors the same rule, and re-renders when the session changes.
-- **Endpoints**: `/runs`, `/hits`, `/proxies`, `/settings`, `/claim` and `/scan`, `/snipe`, `/generate` answer 402 without access. The rule lives in `AccountMiddleware`, next to login, CSRF and Origin, so hiding a tab is presentation and the server is the authority.
+- **Endpoints**: `/runs`, `/hits`, `/proxies` (including `/proxies/check` and `/proxies/prune`), `/settings`, `/claim` and `/scan`, `/snipe`, `/generate` answer 402 without access. The rule lives in `AccountMiddleware`, next to login, CSRF and Origin, so hiding a tab is presentation and the server is the authority.
 - **The administrator flag** comes from `ADMIN_USERS` or from redeeming `ADMIN_PROMO_CODE`. There is no self-service path to it beyond the code, which is why the code is treated as a credential.
 - **Grants** (`POST /admin/grant`) are explicit, logged, and per-account: `monthly` extends from today or from the remaining time, whichever is later, so granting twice never shortens a subscription; `forever` sets lifetime; `trial` hands back an unstarted trial; `revoke` clears paid, lifetime and any unstarted trial together. Nothing runs on a timer and nothing infers a payment. Specifying `order_id` also marks that invoice released, and only when it belongs to the account being granted.
 - **No horizontal scale assumption**: grants are transactional and advisory-locked per account, so two administrators acting at once cannot interleave.
@@ -57,9 +57,51 @@ An optional NOWPayments adapter implements processor-issued invoices and provide
 - Confirming/confirmed/partial payments do not grant access. Sufficient `actually_paid`, matching order ID/currency/network/address/USD price, and terminal `finished` are required. Grant happens once in a transaction, even for duplicate callbacks. Payments first observed outside the three-hour window are review-only; payments detected inside it continue polling while awaiting confirmations, even after the window ends. Live webhook canonicalization and processor finished/fees semantics require a sandbox/low-value production acceptance test before enabling real money.
 - Forwarding is provider-managed, not web-server signing. Network fees/dust/minimums mean 'every cent' cannot be delivered net. No tested wallet sweep or withdrawal automation is claimed.
 
+`POST /proxies/check` is the one endpoint that makes a request somewhere the user chose: it asks each stored proxy (or a paste that was never stored) to fetch `PROXY_CHECK_URL`, which defaults to `api.ipify.org` — an address that answers with the exit IP and sees nothing but that request. It is owner-scoped, capped by `PROXY_CHECK_MAX`, limited to one check per account at a time, and it reports an answer without changing the list. Nothing about a proxy is stored: results live in the page that asked for them. Do not point `PROXY_CHECK_URL` at an endpoint that treats repeated anonymous requests as abuse, and treat the target as public — it will see every exit in the list.
+
+### Tor: the fallback for an account with no proxy list
+
+When the stored list is empty, a run goes out over Tor instead of stopping at
+`no proxies saved yet`. That is a whole category of traffic leaving this process
+by a different route, so what it does and does not do is stated here rather than
+left to be discovered.
+
+- **A port is not a Tor.** Something listening on `127.0.0.1:9050` is read as a
+  SOCKS5 proxy, not as evidence. An exit is labelled `Tor exit` only after Tor's
+  own checker answers `IsTor: true` for a request made *through* that port;
+  anything that will not confirm is reported as `SOCKS5, unconfirmed`, and one
+  that confirms it is *not* Tor is reported as exactly that. No exit is ever
+  called Tor on the strength of its port number.
+- **Loopback only, client only, no control port.** Discovery looks at
+  `TOR_HOST` (loopback by default). The instance this service starts writes its
+  own torrc: one `SocksPort 127.0.0.1:<port>` per listener (loopback spelled out,
+  never a wildcard), `ClientOnly 1` so it never relays, and `ControlPort 0` so
+  there is no control socket and therefore no cookie or password to leak and
+  nothing else on the host can signal it. A tor that was already running in the
+  environment is used and **never stopped** by this service; only a process this
+  service started is terminated on shutdown.
+- **What the network sees.** Every request a fallback run makes goes to three
+  volunteer relays and leaves from a shared exit address, so the *target* sees an
+  address that thousands of other Tor users also use — that is the point of it,
+  and it is also why platforms refuse Tor exits far more often. DNS for those
+  requests is resolved at the exit (`socks5h`), so the names being checked are not
+  handed to this host's resolver. Everything else about a run is unchanged: the
+  same platforms, the same names, the same logs.
+- **What it is not.** It is not anonymity for the account using it, not a proxy
+  service for others, and not a substitute for a private list. Do not describe it
+  as either. A pasted list always takes precedence, and `TOR_ENABLED=0` removes
+  the fallback entirely. Running a Tor *client* is also a deployment choice worth
+  reading your provider's terms over: Railway's AUP forbids operating
+  proxy/anonymisation *services*, which this is not, but ask them before relying
+  on that reading.
+- **Credentials and files.** The torrc, the data directory and tor's own log live
+  under `TOR_DATA_DIR` and are written by this service. No proxy credentials, no
+  Tor control-password and no cookie are handled here, and the log tail exposed
+  to the page is bounded and never contains a secret.
+
 ## Verification
 
-`python -m unittest discover -s tests -v` runs account/trial/CSRF/ownership/body-size/rate-limit/payment/address-ledger and wallet-derivation regression tests. Set `TEST_DATABASE_URL` to a **dedicated empty test database** to run them on PostgreSQL; tests clear their own tables. Do not point it at production. CAPTCHA/provider results are simulated in tests; no test bypass is shipped to the server.
+`python -m unittest discover -s tests -v` runs account/trial/CSRF/ownership/body-size/rate-limit/payment/address-ledger, wallet-derivation and proxy-check regression tests. Set `TEST_DATABASE_URL` to a **dedicated empty test database** to run them on PostgreSQL; tests clear their own tables. Do not point it at production. CAPTCHA/provider results are simulated in tests; no test bypass is shipped to the server.
 
 Local setup without external credentials displays explicit setup notices; signup/login and buy remain disabled. Interactive browser sign-off of the drag/word challenge on real phones and desktops, live blockchain confirmation, fees/merchant forwarding, IPv4/IPv6 ingress attribution and priority support handling require operator setup/user acceptance tests.
 
