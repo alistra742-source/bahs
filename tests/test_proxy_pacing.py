@@ -39,6 +39,7 @@ was asked at. The socket-level truth is tested where a socket can show it:
 import asyncio
 import json
 import unittest
+from collections import Counter
 
 import httpx
 
@@ -468,6 +469,40 @@ class SaturatedRunTests(unittest.TestCase):
         statuses = [r.status for r in results]
         self.assertEqual(statuses.count("available"), 0)
         self.assertLess(len(results), 200, "the run stops rather than filing an error per name")
+
+    def test_a_dead_transport_gives_up_in_a_bounded_number_of_names(self):
+        # The same dead endpoint at the settings a deployment actually ships
+        # (SNIPE_PER_PROXY_MAX=128, SCAN_CONCURRENCY=256, SCAN_RETRIES=1), because
+        # the descent cost is a function of the width it starts at and the test
+        # above starts twenty times narrower. Measured on the reported run this
+        # is 259 names: the pool walks 128 -> 64 -> ... -> 1, and the endpoint is
+        # retired once a single tunnel still gets nothing. The bound is what
+        # matters -- a run that stopped admitting it would walk a 456,976-name
+        # sweep, which is indistinguishable to the user from a hung one.
+        results, widths, pool = self.run_it(
+            names=2000, capacity=0, concurrency=256, per_proxy=128, retries=1
+        )
+        # A name burned is an attempt that errored, so the bound is over
+        # *attempts*, not over rows. The run also ends with one `waiting` line --
+        # the scheduler saying it has nothing left to dispatch while it winds
+        # down -- and counting that as a lost name would make the bound drift
+        # with a scheduling detail instead of with work lost.
+        statuses = Counter(r.status for r in results)
+        attempts = statuses["error"]
+        self.assertEqual(statuses.get("available", 0), 0)
+        self.assertEqual(statuses.get("taken", 0), 0)
+        self.assertEqual(statuses.get("unanswered", 0), 0,
+                         "a transport timeout is never filed as a missing answer")
+        self.assertEqual(sum(statuses.values()) - attempts,
+                         statuses.get("waiting", 0) + statuses.get("heartbeat", 0),
+                         "every row that is not a waiting/heartbeat line is a failure")
+        self.assertEqual(sorted(set(widths)), [1, 2, 4, 8, 16, 32, 64, 128])
+        self.assertEqual(pool.retired(), 1)
+        self.assertEqual(pool.alive(), 0)
+        self.assertLess(attempts, 400, f"{attempts} names burned before giving up")
+        # And it says which lever to move, rather than "the list is dead".
+        self.assertIn("connections timed out", pool.stop_reason)
+        self.assertIn("raise the connect timeout", pool.stop_reason)
 
     def test_an_endpoint_that_can_take_the_load_is_never_touched(self):
         # The whole fix has to be invisible when the endpoint is fine: no
