@@ -19,7 +19,7 @@ const S = {
   info: null, menu: [], kinds: {}, plats: new Set(), spaces: new Set(),
   tune: { snd: false, notif: false, follow: true, keep: true },
   run: null, status: null, watching: false, lastRun: null,
-  cursor: 0, feed: [], hits: [], filter: "all", proxies: null,
+  cursor: 0, feed: [], errors: [], hits: [], filter: "all", proxies: null,
 };
 const SHOW = 400, HOLD = 6000;
 const $ = (id) => document.getElementById(id);
@@ -321,7 +321,10 @@ function renderPaced(by, paused) {
 }
 
 function feedLine(ev) {
-  if (!isVerdict(ev.status)) return;         // results are verdicts, nothing else
+  // Results are verdicts; anything else goes to the errors list, not silently
+  // away. Dropping a failing row outright is what left a run reading "128
+  // checks" with a results list that explained none of them.
+  if (!isVerdict(ev.status)) { errorLine(ev); return; }
   const t = new Date().toLocaleTimeString("en-GB");
   S.feed.unshift({ t, u: ev.username, p: ev.platform, s: ev.status, c: ev.confirmed });
   if (S.feed.length > SHOW) S.feed.pop();
@@ -345,6 +348,31 @@ function renderFeed() {
   })) || []);
 }
 
+/* A request that never reached a verdict. Kept in its own list, shown in its own
+   section: a name whose check errored has not been checked, and letting the row
+   sit in the verdicts stream would say the opposite. */
+function errorLine(ev) {
+  if (ev.status !== "error") return;       // unanswered/blocked are not errors
+  const t = new Date().toLocaleTimeString("en-GB");
+  S.errors.unshift({
+    t, username: ev.username, platform: ev.platform,
+    e: ev.detail || "error", ms: ev.latency_ms,
+  });
+  if (S.errors.length > SHOW) S.errors.pop();
+  renderErrors();
+}
+
+function renderErrors() {
+  const el = $("errFeed");
+  if (el) el.innerHTML = UI.errorFeed(S.errors);
+  const note = $("errNote");
+  if (note) {
+    note.textContent = S.errors.length
+      ? `${fmt(S.errors.length)} never arrived — not checks of a name`
+      : "no failures yet";
+  }
+}
+
 function beep() {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -363,6 +391,7 @@ async function startSweep() {
   const body = { buckets: buckets(), platforms: [...S.plats], stream: true };
   if ($("limit") && Number($("limit").value) > 0) body.limit = Number($("limit").value);
   S.feed = []; renderFeed();
+  S.errors = []; renderErrors();
   await runStream("/scan", body);
 }
 
@@ -527,8 +556,8 @@ async function boot() {
 
 window.App = {
   S, $, api, toast, fmt, esc, pct, clock, boot, renderPlats, renderSpaces, summarise,
-  applyProgress, renderPaced, renderFeed, feedLine, startSweep, startSingle, follow,
-  selectionSize, summarise, paintPlatSum,
+  applyProgress, renderPaced, renderFeed, renderErrors, feedLine, errorLine,
+  startSweep, startSingle, follow, selectionSize, summarise, paintPlatSum,
   pumpRun, stopRun, renderNav, persist, isVerdict, runStream, navAllowed,
 };
 

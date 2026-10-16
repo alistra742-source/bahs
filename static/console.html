@@ -82,10 +82,15 @@
       </div>
     </div>
 
+    <!-- Two sections, and they never mix. A verdict is an answer about a name;
+         an error is a request that never came back with one. Shown as one list
+         they read as the same thing, which is how a run that resolved nothing
+         came to look like a run that resolved thousands of names and found no
+         hits. -->
     <div class="grid two" style="margin-top:16px">
       <div class="card">
         <header><h3>Verdicts</h3><div class="sep"></div>
-          <span class="note">free and taken only — a refusal is not a verdict</span>
+          <span class="note">free and taken only — a name actually resolved</span>
           <div class="right">
             <div class="chips" id="filters">
               <button data-f="all" class="on">all</button>
@@ -97,6 +102,22 @@
         <div class="body"><div class="feed" id="feed"></div></div>
       </div>
 
+      <div class="card">
+        <header><h3>Errors</h3><div class="sep"></div>
+          <span class="note" id="errNote">no failures yet</span>
+          <div class="right"><button class="btn sm ghost" id="errClear">clear</button></div></header>
+        <div class="body">
+          <div class="feed errors" id="errFeed"></div>
+          <p class="note" style="margin-top:12px">A row here is a request that never came back with an
+            answer about the name. It is <b>not</b> a check of the name: nothing in it says whether the
+            handle is free or held, and it is not counted among the verdicts beside it. The class on
+            each row is what failed — a tunnel that never opened is the proxy's, a read that never
+            landed is the target's.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:16px">
       <div class="card">
         <header><h3>Run health</h3><div class="sep"></div>
           <span class="note">what is not a verdict</span></header>
@@ -118,6 +139,7 @@
 <script src="/ui/components/kpi.js"></script>
 <script src="/ui/components/sniper-cell.js"></script>
 <script src="/ui/components/verdict-feed.js"></script>
+<script src="/ui/components/error-feed.js"></script>
 <script src="/ui/components/health-panel.js"></script>
 <script src="/app.js"></script>
 <script>
@@ -126,7 +148,7 @@ window.PAGE = {
   name: "console", title: "Console",
   init() {
     const A = App, S = A.S;
-    A.renderSpaces(); A.renderFeed();
+    A.renderSpaces(); A.renderFeed(); A.renderErrors();
     if ($("startBtn")) $("startBtn").onclick = () => A.startSweep();
     if ($("limit")) $("limit").oninput = () => A.summarise();
     if ($("quickBtn")) $("quickBtn").onclick = () => A.startSingle(($("quickName").value || "").trim());
@@ -135,6 +157,7 @@ window.PAGE = {
     if ($("platNone")) $("platNone").onclick = () => { S.plats = new Set(); A.persist(); A.renderPlats(); };
     if ($("spaceClear")) $("spaceClear").onclick = () => { S.spaces = new Set(); A.persist(); A.renderSpaces(); };
     if ($("feedClear")) $("feedClear").onclick = () => { S.feed = []; A.renderFeed(); };
+    if ($("errClear")) $("errClear").onclick = () => { S.errors = []; A.renderErrors(); };
     if ($("resumeBtn")) $("resumeBtn").onclick = () => { if (S.run) A.follow(S.run); };
     if ($("filters")) $("filters").onclick = (e) => {
       const b = e.target.closest("button"); if (!b) return;

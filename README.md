@@ -616,6 +616,53 @@ the field we look at is the *platform's* answer, reported separately as
 list is what made a run against a challenged site report "your list is dead"
 about a list that was working.
 
+## Asking whether a *checker* still works, without guessing
+
+A proxy list and a checker fail in the same shape and for opposite reasons: a
+run where every name comes back "available" looks identical whether the list is
+dead, the platform is refusing this host, or the page the checker reads has been
+redesigned. Only the last one produces a *wrong* answer rather than no answer — a
+name that cannot be registered, reported as claimable — so it is the one worth
+testing for directly.
+
+```bash
+python verify.py                                  # every platform, direct
+python verify.py --platform github --held github=torvalds
+python verify.py --proxy http://user:pass@host:8080   # as a run would
+```
+
+Each checker is asked two handles whose truth is known independently of it: a
+**held** control, which certainly exists on that platform and must read
+taken/banned, and a random **free** probe, which has never existed and must read
+available. Both go through `sniper.CHECKERS`, the same code path a run uses.
+
+The verdicts are about the checker, never about the names: `ok`, `false-free`
+(a handle that exists read as free — the failure that matters), `false-taken`,
+`blocked`, `failed`, `unreadable`, and `unverified` when no held control was
+supplied for that platform. `--held platform=handle` replaces any built-in
+control, and `--json` is there for a check that must not be read by eye.
+
+The exit code is `0` only when every selected platform produced verdicts, so it
+works as a build check as well as a report. Run direct and a `BLOCKED` line is a
+fact about that host, not a broken checker: re-run with `--proxy` against the
+list you actually snipe with.
+
+**On "getting past Cloudflare".** The usual advice is a TLS-impersonation client
+(`curl_cffi`) that presents Chrome's JA3/HTTP2 fingerprint instead of httpx's,
+on the theory that the challenge was triggered by the fingerprint. It was
+measured here rather than assumed, against every endpoint this build actually
+requests — guns.lol, TikTok, YouTube, X, Telegram, Facebook with the preview
+agent it sends, the GitHub API, Mojang's lookup, Roblox's validator — from the
+same host, one request each, same headers. Impersonating Chrome changed the
+answer on none of them. The one difference a first pass appeared to show
+(Facebook answering 400 to httpx and 200 to Chrome's fingerprint) was the
+User-Agent's doing, not the TLS handshake: with `PREVIEW_UA`, which is the agent
+the checker really sends, both clients got the identical 200. So no
+impersonation dependency was added. When one of these hosts does challenge, what
+it is saying is that the **exit IP** was asked to wait — which is the proxy
+list's problem, not the client's — and telling that apart from a checker that has
+rotted is what `verify.py` is for.
+
 ## Alerts
 
 Set a Discord webhook on the **Alerts** tab (or `ALERT_WEBHOOK`) and free names

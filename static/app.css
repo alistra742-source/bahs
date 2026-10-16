@@ -144,6 +144,12 @@ tr:hover td{background:#181a1d}
 .feed .p{color:var(--dim2);margin-left:auto}
 .feed .available .u{color:var(--free);font-weight:600}
 .feed .taken .u{color:var(--taken)}
+/* An errored check: never a verdict, so it is never coloured like one. It gets
+   the bad tone and its failure class in its own column, because the row has to
+   say *what* failed without being read as an answer about the name. */
+.feed .error{border-left:2px solid var(--bad);padding-left:7px}
+.feed .error .u{color:var(--dim)}
+.feed .error .e{color:var(--bad)}
 .v{display:inline-flex;align-items:center;gap:6px;font:11px/1 var(--mono)}
 .v::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
 .v.available{color:var(--free)} .v.taken{color:var(--taken)} .v.blocked{color:var(--warn)}
