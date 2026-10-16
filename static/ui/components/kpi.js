@@ -34,7 +34,11 @@
       q.pool_size == null
         ? { label: "proxy pool", value: "—", sub: "no run to report on" }
         : { label: "proxy pool", value: `${UI.fmt(q.pool_alive)}<span class="m">/${UI.fmt(q.pool_size)}</span>`,
-            sub: `${UI.fmt(q.pool_resting)} resting · ${UI.fmt(q.pool_retired)} retired` },
+            // "paced" only appears when an endpoint has been asked to open
+            // fewer tunnels at once -- a number the reader has to be able to
+            // explain, and cannot from "resting" or "retired" alone.
+            sub: `${UI.fmt(q.pool_resting)} resting · ${UI.fmt(q.pool_retired)} retired`
+              + (q.proxies_paced ? ` · ${UI.fmt(q.proxies_paced)} paced` : "") },
     ];
   };
 

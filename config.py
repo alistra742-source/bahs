@@ -377,6 +377,57 @@ SNIPE_PROXY_FAIL_LIMIT: int = _int("SNIPE_PROXY_FAIL_LIMIT", 6)
 # stops using it -- stopping a sweep is worse than reporting an error rate, and
 # a host still answering two requests in five is still producing answers.
 SNIPE_PROXY_FAIL_RATE: float = _float("SNIPE_PROXY_FAIL_RATE", 0.75)
+# --- Endpoint pacing -------------------------------------------------------
+# An endpoint asked for more simultaneous tunnels than it will accept does not
+# refuse them -- it answers nothing at all, and a CONNECT that never lands is
+# the same exception a dead host raises. One request cannot tell those apart; a
+# *burst* can, and the only lever that separates them is how many tunnels the
+# endpoint is being asked to open at once. So the pool paces the proxy the same
+# way it paces a platform: cut the width hard when the CONNECTs start timing
+# out, grow it back one at a time when they stop.
+#
+# Measured live on one rotating endpoint asked for 128 tunnels at once: 128
+# checks, 128 ConnectTimeouts at the scan's 2s ceiling, a settled sample of 16
+# of them retired the only entry in the list, and the run ended at name 128 of
+# 456,976 saying the list was dead. It was not dead -- it was saturated.
+# Connect timeouts one endpoint is judged on before its width is adjusted.
+SNIPE_PROXY_PACE_WINDOW: int = _int("SNIPE_PROXY_PACE_WINDOW", 16)
+# The share of that window that has to be connect timeouts before the width is
+# halved. A saturated endpoint reads near 100%; half its tunnels timing out is
+# still worth halving.
+SNIPE_PROXY_PACE_RATE: float = _float("SNIPE_PROXY_PACE_RATE", 0.5)
+# Between the two shares above, one tunnel comes off the width: a window with
+# tunnels timing out in it is the endpoint saying it is at its ceiling, and
+# halving for that would throw away half a working width. A window at or under
+# this share counts as clean.
+#
+# The three thresholds are not a guess. Modelled over an endpoint that accepts
+# K simultaneous tunnels and answers the rest with silence, this rule holds
+# 91-102% of K and loses 0.4-2.5% of checks to the probe that finds it. Halving
+# only on a majority and growing on any quiet window instead sat at 125-142% of
+# K and lost 23-33% of checks; backing off on *any* timeout collapsed a healthy
+# endpoint with 2% loss to a single tunnel.
+SNIPE_PROXY_PACE_RECOVER: float = _float("SNIPE_PROXY_PACE_RECOVER", 0.1)
+# Tunnels refused in a row, at the width being offered right now, that mean the
+# endpoint cannot take that width at all -- as opposed to the one unlucky
+# request the window exists to average out. It cuts the width there and then:
+# those checks are *names*, so being sure before acting costs real ones.
+# Measured against an endpoint that accepts 4 of the 16 it is first offered:
+# acting only at the window boundary burned 48 of 200 names finding the width,
+# and acting on four refusals in a row burns about a quarter of that. A healthy
+# endpoint at 2% loss never trips it -- four in a row is a 1-in-6-million run.
+SNIPE_PROXY_PACE_CONFIRM: int = _int("SNIPE_PROXY_PACE_CONFIRM", 4)
+# Clean windows in a row before the width grows by one. A width that was just
+# cut is not grown back immediately -- it is the width that was just shown to be
+# too wide -- and every probe that fails doubles this, so an endpoint that keeps
+# refusing the extra tunnel is not asked for it again every few seconds.
+SNIPE_PROXY_PACE_GROW_AFTER: int = _int("SNIPE_PROXY_PACE_GROW_AFTER", 3)
+# The longest that pause grows to, in clean windows.
+SNIPE_PROXY_PACE_GROW_MAX: int = _int("SNIPE_PROXY_PACE_GROW_MAX", 16)
+# The floor the width can be cut to. At one tunnel and still no answer, the
+# timeouts are evidence about the *endpoint* rather than about the width, and
+# the ordinary failure rules take over and can retire it.
+SNIPE_PROXY_MIN_PARALLEL: int = _int("SNIPE_PROXY_MIN_PARALLEL", 1)
 # Seconds the warm pool is reused across requests before it is rebuilt, so
 # consecutive batches skip their handshakes.
 SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)

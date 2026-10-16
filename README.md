@@ -463,9 +463,49 @@ rate is now decided on at least sixteen settled attempts (or twice
 retired in about twenty attempts and the run stops with "the list is dead,
 replace it". A proxy answering a third of its requests still never trips it.
 
+**And an endpoint is not dead because it was asked for too much at once.** A
+rotating endpoint accepts so many simultaneous tunnels and answers the rest with
+silence, and silence is the *same* exception a dead host raises -- one request
+cannot tell them apart. The reported run is what that costs:
+
+    scan run starting: 456976 names x 1 platform(s) [guns.lol],
+      concurrency 256, retries 1, pool 1 of 1 usable at 128 connection(s) each
+    check guns.lol/vlej -> error (ConnectTimeout: no answer within the timeout)
+    proxy http://***@global.nullproxies.com:8080 retired for this run:
+      16 attempts, 16 transport failures, 0 platform refusals; 0 of 1 proxies left
+
+128 checks went out at once, all 128 timed out opening their tunnel at the
+scan's 2 s ceiling, a settled sample of 16 retired the only entry in the list,
+and the run ended at name 128 of 456,976 saying the list was dead. So the pool
+now paces the *endpoint* the way it already paced a *platform*: the width it is
+asked for is cut when its CONNECTs start timing out, and grown back one tunnel
+at a time when they stop. A run of refusals cuts it immediately -- the window
+exists to average out bad luck, and four tunnels that never opened in a row is
+not bad luck. A cut never goes below the highest width that has completed a
+clean window, and the tunnels already in flight at the old width do not count
+against the new one: they were doomed when the cut was decided, and counting
+them drove the width down again and again on stale news.
+
+The window is counted in tunnels *offered* and judged on how many of those came
+back refused, which is what keeps it honest in both directions: counting
+completed checks weights the window by how long each kind takes, and judging on
+offers alone reads low because the newest offers have not been refused yet.
+Retries are not counted at all -- a retry is a second arrival caused by the
+first attempt failing, not new demand, and counting it settled an endpoint that
+accepts four tunnels at exactly two.
+
+A timeout therefore no longer counts toward retirement while the width is above
+the floor. At the floor, with one tunnel at a time and still nothing back, the
+endpoint *is* the problem and the ordinary failure rules take over; the stop
+reason then says which it was, and what to change -- concurrency, connect
+timeout, or a second endpoint -- instead of "the list is dead, replace it".
+
 The `done` summary carries `proxy_attempts` and `proxy_failures`, and the
 dashboard turns them into one line: a high transport-failure share is the list,
-not the names.
+not the names. `proxy_timeouts` counts the tunnels that never opened,
+`proxies_paced` and `proxy_capacity` say how much of the pool is being asked for
+less than the run wanted, and `proxy_pace_adjustments` lists the width changes
+without ever naming an endpoint.
 
 ## No list? Tor is the fallback
 
@@ -694,6 +734,13 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `SNIPE_PROXY_BLOCK_RATE` | `0.8` | share of a proxy's answers that must be refusals to retire it |
 | `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired, on a settled sample |
 | `SNIPE_PROXY_FAIL_RATE` | `0.75` | share of failures that writes a proxy off |
+| `SNIPE_PROXY_PACE_WINDOW` | `16` | tunnels offered at one width before it is judged |
+| `SNIPE_PROXY_PACE_RATE` | `0.5` | share of those that never opened, which halves the width |
+| `SNIPE_PROXY_PACE_RECOVER` | `0.1` | share at or under which the window counts as clean |
+| `SNIPE_PROXY_PACE_CONFIRM` | `4` | refusals in a row that cut the width immediately |
+| `SNIPE_PROXY_PACE_GROW_AFTER` | `3` | clean windows before the width grows by one |
+| `SNIPE_PROXY_PACE_GROW_MAX` | `16` | the longest that pause grows to |
+| `SNIPE_PROXY_MIN_PARALLEL` | `1` | floor the width can be cut to |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
 | `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |

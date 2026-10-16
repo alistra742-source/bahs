@@ -1724,6 +1724,16 @@ class _Tally:
             "pool_blocked": self.pool.blocked(),
             "proxy_attempts": self.pool.attempts(),
             "proxy_failures": self.pool.failures(),
+            # How much of the pool is being asked for fewer tunnels at once,
+            # and the connect timeouts that caused it. An endpoint that answers
+            # a burst of CONNECTs with silence is paced rather than retired, and
+            # that decision has to be visible while it is happening -- the run
+            # would otherwise look like it was merely running slowly, and the
+            # retired count is the one an operator reads as "my list is dead".
+            "proxy_timeouts": self.pool.timed_out(),
+            "proxies_paced": self.pool.paced_endpoints(),
+            "proxy_capacity": self.pool.capacity(),
+            "per_proxy_connections": self.pool.per_proxy,
             "confirmed_count": self.confirmed,
             "corrected_count": self.corrected,
             **_verdict_report(self.answered, self.checked),
@@ -1792,6 +1802,14 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         "pool_retired": pool.retired(),
         "pool_blocked": pool.blocked(),
         "per_proxy_connections": pool.per_proxy,
+        # How many tunnels the pool will open right now, and how many endpoints
+        # the width pacer has cut to get there. An endpoint asked for more
+        # simultaneous tunnels than it accepts answers with silence, so the run
+        # narrows it instead of writing it off -- and this is where that shows.
+        "proxy_capacity": pool.capacity(),
+        "proxies_paced": pool.paced_endpoints(),
+        "proxy_timeouts": pool.timed_out(),
+        "proxy_pace_adjustments": pool.recent_endpoint_pace(),
         # Requests the proxies carried and how many failed at the transport
         # level. This is what tells "your list is bad" apart from "the names are
         # taken" -- the errors column alone cannot, which is how a run that was

@@ -19,6 +19,16 @@
       ["refused by a platform", UI.fmt(q.pool_blocked || 0)],
       ["requests carried", UI.fmt(q.proxy_attempts || 0)],
       ["failed at the transport", UI.fmt(q.proxy_failures || 0)],
+      // An endpoint that answers a burst of tunnels with silence is asked for
+      // fewer of them rather than retired: the two lines below are that
+      // decision, and "of N" is the width it was cut from.
+      ...(q.proxy_timeouts ? [["tunnels timed out", UI.fmt(q.proxy_timeouts)]] : []),
+      ...(q.proxies_paced ? [[
+        "endpoints paced",
+        `${UI.fmt(q.proxies_paced)} of ${UI.fmt(q.pool_alive)} · `
+          + `${UI.fmt(q.proxy_capacity)} tunnel(s) at once of `
+          + `${UI.fmt((q.pool_alive || 0) * (q.per_proxy_connections || 0))}`,
+      ]] : []),
       // A run that ended because of the pool rather than because it ran out of
       // names. "every platform throttled the whole list" and "the list is dead"
       // look identical in the error column; this is the line that separates them.

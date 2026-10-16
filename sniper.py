@@ -124,6 +124,13 @@ from config import (
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
     SNIPE_PROXY_FAIL_RATE,
+    SNIPE_PROXY_MIN_PARALLEL,
+    SNIPE_PROXY_PACE_CONFIRM,
+    SNIPE_PROXY_PACE_GROW_AFTER,
+    SNIPE_PROXY_PACE_GROW_MAX,
+    SNIPE_PROXY_PACE_RATE,
+    SNIPE_PROXY_PACE_RECOVER,
+    SNIPE_PROXY_PACE_WINDOW,
     SNIPE_SIGNAL_GUARD_AFTER,
     SNIPE_SIGNAL_GUARD_TTL,
     SSL_CONTEXT,
@@ -598,6 +605,11 @@ def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeR
         type(exc).__name__,
         fault=fault,
         cause=describe_transport_error(exc),
+        # Nothing answered inside the timeout, as opposed to something
+        # refusing. Which of the two it was is what the pool paces on: a refusal
+        # is the endpoint talking, and silence at the ceiling is what being
+        # asked for more tunnels than it accepts looks like.
+        timed_out=isinstance(exc, httpx.TimeoutException),
     )
 
 
@@ -648,6 +660,13 @@ class SnipeResult:
     # client and never shown in a row -- it exists so the log line for a failed
     # check says what actually went wrong instead of only naming the exception.
     cause: str = ""
+    # The transport ran out of time -- nothing answered the CONNECT -- rather
+    # than being refused. A refusal is the endpoint (or the host) saying no;
+    # silence at the ceiling is also what an endpoint asked for more simultaneous
+    # tunnels than it accepts looks like from a single request. So the pool reads
+    # a *burst* of these as evidence about the width it was asking for before it
+    # reads one as evidence about the endpoint.
+    timed_out: bool = False
 
     @property
     def is_available(self) -> bool:
@@ -716,6 +735,59 @@ class ProxyPool:
         self._blocks: dict[str, int] = {}
         # A proxy retired mid-run is never handed out again.
         self._retired: set[str] = set()
+        # Simultaneous tunnels each endpoint is allowed *right now*, when that is
+        # below the run's width. Only endpoints that timed out under load get an
+        # entry, so an ordinary list keeps the flat ``alive() * per_proxy``
+        # arithmetic it had before.
+        self._width: dict[str, int] = {}
+        # The window a width is judged on: tunnels offered since the last
+        # judgement, how many of those came back at all, and how many of *those*
+        # never opened -- plus the tunnel failures the endpoint has had
+        # altogether (the summary and the stop reason read the total).
+        #
+        # The window closes on offers, and the share is over what came back.
+        # Closing it on completed checks instead weights the window by how long
+        # each kind takes -- a refused tunnel that hangs for the whole connect
+        # timeout is one outcome where a check that answers in a fraction of the
+        # read timeout is another -- and the width drifts above what the
+        # endpoint will take. Judging on offers alone lags: the newest offers of
+        # the window have not been refused yet, so the share reads low.
+        self._pace_offered: dict[str, int] = {}
+        self._pace_resolved: dict[str, int] = {}
+        self._pace_refused: dict[str, int] = {}
+        self._timeouts: dict[str, int] = {}
+        # Clean windows in a row towards the next growth, and how many are
+        # needed right now -- doubled every time a probe finds the endpoint
+        # still will not take another tunnel.
+        self._grow_streak: dict[str, int] = {}
+        self._grow_after: dict[str, int] = {}
+        # Requests handed out before the last width change, still in flight. A
+        # tunnel opened at the width that was just abandoned was already doomed
+        # when the cut was decided, so its failure is evidence about the old
+        # width and not about the new one -- without this, the whole burst from
+        # the old width reports after the cut and drives the width down again
+        # and again, which is a descent measured entirely on stale news.
+        self._drain: dict[str, int] = {}
+        # The highest width this endpoint has completed a clean window at. A cut
+        # never goes below it: that width is known to work, so abandoning it is
+        # not a response to anything the endpoint said.
+        self._clean_width: dict[str, int] = {}
+        # Attempts and failures *at the width being offered now*. The retirement
+        # decision reads these rather than the run's totals, because evidence
+        # gathered while the endpoint was being asked for 128 tunnels says
+        # nothing about whether it can carry one.
+        self._width_attempts: dict[str, int] = {}
+        self._width_failed: dict[str, int] = {}
+        # (was, now, when) per width change, for the report. Never the endpoint:
+        # nothing a browser receives names a proxy.
+        self.endpoint_adjustments: deque[tuple[int, int, float]] = deque(maxlen=64)
+        self._pace_window = max(4, SNIPE_PROXY_PACE_WINDOW)
+        self._pace_rate = min(1.0, max(0.0, SNIPE_PROXY_PACE_RATE))
+        self._pace_recover = min(1.0, max(0.0, SNIPE_PROXY_PACE_RECOVER))
+        self._pace_min = max(1, SNIPE_PROXY_MIN_PARALLEL)
+        self._pace_confirm = max(1, SNIPE_PROXY_PACE_CONFIRM)
+        self._grow_after_base = max(1, SNIPE_PROXY_PACE_GROW_AFTER)
+        self._grow_after_max = max(self._grow_after_base, SNIPE_PROXY_PACE_GROW_MAX)
         self._fail_limit = max(1, fail_limit)
         # Attempts before the failure *rate* alone is allowed to write a host
         # off. Six is enough to see that a host is gone; it is not enough to
@@ -788,6 +860,167 @@ class ProxyPool:
         """May this pool write an entry off, or is it all there is?"""
         return self._retirable
 
+    # --- endpoint width ----------------------------------------------------
+    # A platform is paced on its refusals; an endpoint is paced on its silence.
+    # The two are the same problem from opposite sides: too much at once, and
+    # the only way to tell a saturated endpoint from a dead one is the rate it
+    # is happening at -- and to do something about the width, rather than
+    # writing the endpoint off over a load the run chose.
+
+    def width(self, proxy: str) -> int:
+        """How many tunnels this endpoint may have open at once, right now."""
+        return self._width.get(proxy, self._per_proxy)
+
+    def capacity(self) -> int:
+        """Simultaneous tunnels the pool will open right now.
+
+        ``alive() * per_proxy`` less whatever the pacer has taken off individual
+        endpoints. O(1) when nothing has been paced and O(paced) otherwise --
+        only endpoints that timed out under load hold an override. The scheduler
+        asks this once per dispatch iteration, so walking the whole list here
+        would put the pool's size back on that path, which is exactly what
+        ``alive()`` exists to avoid.
+        """
+        cut = sum(self._per_proxy - width for width in self._width.values())
+        return max(0, self.alive() * self._per_proxy - cut)
+
+    def paced_endpoints(self) -> int:
+        """Endpoints being asked for fewer tunnels than the run's width."""
+        return sum(
+            1
+            for proxy, width in self._width.items()
+            if width < self._per_proxy and proxy not in self._retired
+        )
+
+    def recent_endpoint_pace(self, limit: int = 6) -> list[dict]:
+        """The last few width changes, newest last. Never names the endpoint."""
+        now = time.monotonic()
+        return [
+            {"was": was, "now": width, "seconds_ago": round(now - when, 1)}
+            for was, width, when in list(self.endpoint_adjustments)[-limit:]
+        ]
+
+    def _pace_endpoint(self, proxy: str, timed_out: bool, retry: bool = False) -> None:
+        """Judge one endpoint's width on the tunnels it just opened, or did not.
+
+        A rotating endpoint accepts so many simultaneous CONNECTs and answers the
+        next one with silence, and silence at the ceiling is the *same* exception
+        a dead host raises -- measured live: 128 tunnels asked of one endpoint at
+        once, 128 ConnectTimeouts at the scan's 2s ceiling, and nothing in the
+        run that could tell those apart from a corpse. What can is the rate, and
+        the only lever is the width:
+
+        * every tunnel offered so far refused -> halve it at once: a run of
+          refusals is the endpoint refusing the width itself, not one unlucky
+          request, and the window would otherwise spend more names confirming
+          it;
+        * most of the window timing out -> halve it, the width is wrong by a
+          factor rather than by one;
+        * a few of them -> take one tunnel off, because a window with timeouts
+          in it is the endpoint saying it is at its ceiling and halving would
+          throw away half a width that mostly works;
+        * a window that comes back clean -> count it, and grow by one once
+          enough have, so the width can follow an endpoint that recovers. Each
+          failed probe doubles how long the next one waits: the width that was
+          just refused is not asked for again a few seconds later.
+
+        Modelled over an endpoint that accepts K tunnels at once, this holds
+        91-102% of K and loses 0.4-2.5% of checks finding it; halving only on a
+        majority sat at 125-142% of K and lost 23-33% of them.
+        """
+        if proxy in self._retired:
+            # It is out of the run. Requests already in flight still report,
+            # and a width written for a retired endpoint would sit in the
+            # override map forever -- `capacity()` would go on subtracting a cut
+            # belonging to something that is no longer in the rotation.
+            return
+        if retry:
+            # A retry is a second arrival *caused by* the first attempt failing,
+            # not new demand on the endpoint. Counting it halves the width for
+            # the run's own retry rather than for anything the endpoint said --
+            # measured against an endpoint that accepts 4 tunnels at once, the
+            # retries made it settle at 2, half of what it will actually carry.
+            return
+        self._pace_resolved[proxy] = self._pace_resolved.get(proxy, 0) + 1
+        if timed_out:
+            self._pace_refused[proxy] = self._pace_refused.get(proxy, 0) + 1
+        offered = self._pace_offered.get(proxy, 0)
+        resolved = self._pace_resolved.get(proxy, 0)
+        refused = self._pace_refused.get(proxy, 0)
+        # Everything offered at this width that has come back was refused, and
+        # enough of them to rule out bad luck: the endpoint is not being asked
+        # for one tunnel too many, it is being asked for a width it will not
+        # take at all. Judge it now rather than at the end of the window --
+        # these are names, and waiting for a dozen more offers to confirm what
+        # four in a row already said spends them for nothing.
+        tripped = resolved >= self._pace_confirm and refused >= resolved
+        if not tripped and offered < self._pace_window:
+            return
+        share = refused / max(1, resolved)
+        width = self.width(proxy)
+        proven = self._clean_width.get(proxy, 0)
+        if proven and width <= proven:
+            # The width that used to work is being refused now, so its capacity
+            # has moved. The memory of it must not become a floor the endpoint
+            # is stuck on -- forgetting it is how the width keeps responding.
+            self._clean_width.pop(proxy, None)
+            proven = 0
+        if share >= self._pace_rate and width > self._pace_min:
+            new = max(self._pace_min, width // 2)
+            if proven:
+                # Never below a width that has completed a clean window.
+                new = max(new, proven)
+            self._grow_streak[proxy] = 0
+            self._grow_after[proxy] = self._grow_after_base
+        elif share > self._pace_recover and width > self._pace_min:
+            new = width - 1
+            self._grow_streak[proxy] = 0
+            self._grow_after[proxy] = min(
+                self._grow_after_max, self._grow_after.get(proxy, self._grow_after_base) * 2
+            )
+        elif share > self._pace_recover:
+            # At the floor and still being refused: there is no tunnel to take
+            # off, and this window is certainly not one to grow on.
+            new = width
+            self._grow_streak[proxy] = 0
+        elif width >= self._per_proxy:
+            new = width
+        else:
+            if not proven:
+                # A window this clean is the endpoint saying what it can carry.
+                self._clean_width[proxy] = width
+            streak = self._grow_streak.get(proxy, 0) + 1
+            if streak >= self._grow_after.get(proxy, self._grow_after_base):
+                new, streak = min(self._per_proxy, width + 1), 0
+            else:
+                new = width
+            self._grow_streak[proxy] = streak
+        self._pace_offered[proxy] = 0
+        self._pace_resolved[proxy] = 0
+        self._pace_refused[proxy] = 0
+        if new == width:
+            return
+        self._width[proxy] = new
+        if new < width:
+            # The tunnels already open at the old width are still in flight and
+            # will still report. They were dispatched before this decision, so
+            # they are not counted against the new width -- only the drain tells
+            # them apart from the requests that follow.
+            self._drain[proxy] = self._inflight.get(proxy, 0)
+            self._pace_offered[proxy] = 0
+            self._pace_resolved[proxy] = 0
+            self._pace_refused[proxy] = 0
+            # Evidence is judged against the width it was gathered at: attempts
+            # made while this endpoint was being asked for more tunnels than it
+            # will take are not answers to the question "can it carry one?".
+            self._width_attempts[proxy] = 0
+            self._width_failed[proxy] = 0
+        self.endpoint_adjustments.append((width, new, time.monotonic()))
+        log.info(
+            "pacing %s: %d -> %d simultaneous tunnel(s) (%d%% connect timeouts of the last %d)",
+            mask_proxy(proxy), width, new, round(share * 100), self._pace_window,
+        )
+
     def begin_run(self) -> None:
         """Reset per-run bookkeeping, keeping the warm tunnels.
 
@@ -816,6 +1049,18 @@ class ProxyPool:
         self._platform_ok.clear()
         self._seen.clear()
         self._retired.clear()
+        self._width.clear()
+        self._pace_offered.clear()
+        self._pace_resolved.clear()
+        self._pace_refused.clear()
+        self._timeouts.clear()
+        self._grow_streak.clear()
+        self._grow_after.clear()
+        self._drain.clear()
+        self._clean_width.clear()
+        self._width_attempts.clear()
+        self._width_failed.clear()
+        self.endpoint_adjustments.clear()
         self._paused.clear()
         self.paused_reason.clear()
         self._cursor = 0
@@ -847,17 +1092,37 @@ class ProxyPool:
                 continue
             if self._resting.get(proxy, 0.0) > now:
                 continue
+            # Every tunnel this endpoint is allowed right now is already open,
+            # which only ever happens to one the pacer cut: the next check goes
+            # to an endpoint that will still take it. The fallback below still
+            # hands this one out when it is the only way out of the process, so
+            # a single-endpoint pool behaves exactly as it did.
+            if self._inflight.get(proxy, 0) >= self.width(proxy):
+                continue
             self._cursor = idx + 1
             return self._hand_out(proxy)
         usable = [p for p in self._all if p not in self._retired]
         if not usable:
             return None
-        # Every live proxy is resting: use whichever comes back first.
-        return self._hand_out(min(usable, key=lambda p: self._resting.get(p, 0.0)))
+        # Nothing live would take it on the walk: every one is resting, or every
+        # one is already carrying the width the pacer allows it. Hand the check
+        # to whichever is carrying the least and comes back first -- a run that
+        # stalls is worse than one that asks an endpoint for one more tunnel
+        # than it was paced to, and the scheduler's own window is what normally
+        # stops that from happening.
+        return self._hand_out(
+            min(usable, key=lambda p: (self._inflight.get(p, 0), self._resting.get(p, 0.0)))
+        )
 
     def _hand_out(self, proxy: str) -> str:
-        """Mark a proxy as carrying a request that has not reported yet."""
+        """Mark a proxy as carrying a request that has not reported yet.
+
+        The offer is counted here as well as in flight: the width is judged on
+        how many tunnels were *asked for* and how many of them never opened, so
+        the count has to start where the asking does.
+        """
         self._inflight[proxy] = self._inflight.get(proxy, 0) + 1
+        self._pace_offered[proxy] = self._pace_offered.get(proxy, 0) + 1
         return proxy
 
     def abandon(self, proxy: str) -> None:
@@ -930,6 +1195,9 @@ class ProxyPool:
             )
             return
         self._retired.add(proxy)
+        # Its override has to go with it, or `capacity()` would subtract a cut
+        # belonging to an endpoint that no longer contributes a full width.
+        self._width.pop(proxy, None)
         self._resting.pop(proxy, None)
         client = self._clients.pop(proxy, None)
         if client is not None:
@@ -956,6 +1224,8 @@ class ProxyPool:
         outcome: str,
         platform: str = "",
         retry_after: float | None = None,
+        timed_out: bool = False,
+        retry: bool = False,
     ) -> None:
         """Remember how a proxy behaved, so retries avoid a bad one.
 
@@ -976,6 +1246,12 @@ class ProxyPool:
         # come back to zero and could never be retired at all.
         if self._inflight.get(proxy):
             self._inflight[proxy] -= 1
+        # Was this request dispatched before the last width change? If so it was
+        # sent at the width that has since been abandoned, and its outcome says
+        # nothing about the width being offered now.
+        stale = self._drain.get(proxy, 0) > 0
+        if stale:
+            self._drain[proxy] -= 1
 
         if retry_after and (self.retry_after is None or retry_after > self.retry_after):
             self.retry_after = retry_after
@@ -993,6 +1269,12 @@ class ProxyPool:
             # exactly as it was: no cooldown, no strike, no attempt counted.
             return
 
+        # Anything the endpoint said about its own tunnels feeds the width: an
+        # answer, however unwelcome, is a tunnel that opened, and a timeout is
+        # one that never did. This is what tells a saturated endpoint apart from
+        # a dead one, over a window rather than one request.
+        self._pace_endpoint(proxy, timed_out, retry or stale)
+
         if outcome == OUTCOME_TIMEOUT:
             # The tunnel carried this request and the answer never came. The
             # proxy's panel shows the request -- it is not dead -- so this never
@@ -1008,6 +1290,11 @@ class ProxyPool:
         # and that is `blocked`'s own record.
         if outcome != OUTCOME_BLOCKED:
             self._attempts[proxy] = self._attempts.get(proxy, 0) + 1
+            # ...and the same count for the width being offered right now, which
+            # is the sample a retirement is allowed to be decided on. A request
+            # from the old width is not part of that sample.
+            if not stale:
+                self._width_attempts[proxy] = self._width_attempts.get(proxy, 0) + 1
 
         if outcome == OUTCOME_OK:
             if platform:
@@ -1059,8 +1346,22 @@ class ProxyPool:
             return
 
         self._failed[proxy] = self._failed.get(proxy, 0) + 1
-        attempts = self._attempts.get(proxy, 0)
-        failed = self._failed[proxy]
+        if not stale:
+            self._width_failed[proxy] = self._width_failed.get(proxy, 0) + 1
+        attempts = self._width_attempts.get(proxy, 0)
+        failed = self._width_failed[proxy]
+        if timed_out:
+            self._timeouts[proxy] = self._timeouts.get(proxy, 0) + 1
+            if self.width(proxy) > self._pace_min:
+                # Paced, not judged. The endpoint is being asked for more
+                # tunnels at once than it will accept, and the width is the
+                # thing to change -- a pool that retired its only entry for a
+                # request it should not have made ended a 456,976-name sweep at
+                # name 128 and called the list dead. While the width is above the
+                # floor every one of the strikes below is withheld; at the floor,
+                # with a single tunnel open and still nothing back, the timeouts
+                # are evidence about the *endpoint* and it is judged as usual.
+                return
         # Two ways off the list, and both are about the *rate* rather than a
         # streak, because a streak is wiped by any answer and a host that answers
         # one request in three never built one -- the run limped through the
@@ -1116,6 +1417,17 @@ class ProxyPool:
 
     def failures(self) -> int:
         return sum(self._failed.values())
+
+    def timed_out(self) -> int:
+        """Tunnel failures where nothing answered inside the timeout.
+
+        Kept apart from ``failures()`` because the two need different sentences.
+        A refusal is the list (or the platform) saying no; silence at the
+        ceiling is an endpoint that could not take the load it was given, or one
+        that is unreachable, and the advice that follows is not "replace the
+        list".
+        """
+        return sum(self._timeouts.values())
 
     def alive(self) -> int:
         """Proxies not written off for the rest of the run.
@@ -1354,6 +1666,17 @@ class ProxyPool:
                     f"every one of the {total} proxies was rate-limited {self._block_limit} "
                     "times and retired for this run -- the list is being throttled, not "
                     "merely exhausted; check the proxies and try again later"
+                )
+            timeouts = sum(self._timeouts.values())
+            if self.failures() and timeouts >= self.failures() * 0.5:
+                return (
+                    f"every one of the {total} proxies in the list was retired after its "
+                    f"connections timed out ({timeouts} of {self.failures()} failures): nothing "
+                    "ever answered the CONNECT, and the run paced it down to one tunnel at a "
+                    "time before giving up on it. That is what an endpoint looks like when it "
+                    "is asked for more simultaneous tunnels than it accepts, or when it is "
+                    "unreachable -- lower the concurrency, raise the connect timeout, or use "
+                    "more than one endpoint, and try again"
                 )
             return (
                 f"every one of the {total} proxies in the list failed with a transport error "
@@ -2734,7 +3057,11 @@ async def confirm_available(
 
 # --- the batch ------------------------------------------------------------
 async def check_once(
-    platform: str, username: str, pool: ProxyPool, confirm: bool | None = None
+    platform: str,
+    username: str,
+    pool: ProxyPool,
+    confirm: bool | None = None,
+    retry: bool = False,
 ) -> SnipeResult:
     """One name on one platform, through the next proxy the pool hands out."""
     proxy = pool.next()
@@ -2781,7 +3108,14 @@ async def check_once(
         # Neither produced a verdict about the name. Both are retried on another
         # proxy; only the timeout additionally rests the host it came from.
         result.status = STATUS_UNANSWERED
-    pool.report(proxy, outcome, platform, result.retry_after)
+    pool.report(
+        proxy,
+        outcome,
+        platform,
+        result.retry_after,
+        timed_out=result.timed_out,
+        retry=retry,
+    )
     # One line per check, and the only place a run's traffic is legible as
     # traffic. Everything that is not a verdict -- a transport error, a
     # refusal, an answer nobody could read -- is INFO, because a failure that
@@ -2859,7 +3193,12 @@ async def iter_snipes(
     # after that came back "proxies exhausted this run". Measured on one dead
     # proxy: 192 of 256 rows were that message, and at concurrency 256 the run
     # finished the whole list without ever saying why.
-    window = max(1, min(concurrency * window_factor, max(1, pool.alive() * pool.per_proxy)))
+    full_window = max(1, min(concurrency * window_factor, max(1, pool.alive() * pool.per_proxy)))
+    # What the window is at this moment. It follows the pool's own capacity down
+    # (see the dispatch loop): an endpoint that answered a burst of CONNECTs with
+    # silence has just been paced to a narrower width, and offering it the old
+    # one would only re-create the burst that caused it.
+    window = full_window
     # Each platform answers for its own share of that window. The pool keeps the
     # pacer so a report can say which platform a run slowed down for.
     pace = PlatformPacer(platforms, max(1, concurrency))
@@ -2898,7 +3237,7 @@ async def iter_snipes(
             while True:
                 if stop is not None and stop.is_set():
                     return None
-                result = await check_once(platform, username, pool)
+                result = await check_once(platform, username, pool, retry=attempt > 0)
                 if result.detail in POOL_MISS_DETAILS:
                     # Nothing in the pool could carry this name. `next()` hands
                     # back None only once every proxy is retired, so this is the
@@ -2994,6 +3333,12 @@ async def iter_snipes(
                 if result is not None:
                     answered += 1 if result.answered else 0
                     yield result
+
+            # The width the pool will carry right now, which the pacer may have
+            # cut while this run was going. Only ever narrower: the evidence for
+            # it is CONNECTs that timed out, and nothing in flight disproves
+            # that. One subtraction when nothing has been paced.
+            window = min(full_window, max(1, pool.capacity()))
 
             # Every proxy gone means nothing else can be dispatched, so the run
             # stops and says so rather than working through the rest of the name
