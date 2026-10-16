@@ -387,7 +387,6 @@ async function startSweep() {
   if (!S.plats.size) return toast("pick at least one sniper", "bad");
   if (!spaceKeys().length) return toast("pick at least one name space", "bad");
   if (!buckets().length) return toast("that name-space selection did not parse", "bad");
-  if (!S.proxies || !S.proxies.count) return toast("no proxies stored — add some first", "bad");
   const body = { buckets: buckets(), platforms: [...S.plats], stream: true };
   if ($("limit") && Number($("limit").value) > 0) body.limit = Number($("limit").value);
   S.feed = []; renderFeed();
