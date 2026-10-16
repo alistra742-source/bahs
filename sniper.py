@@ -1190,6 +1190,10 @@ class ProxyPool:
         """
         if proxy in self._ceiling_raised:
             return False
+        if self._base_ceiling <= 0.0:
+            # No connect ceiling was configured, so there is none to raise:
+            # inventing a 1s one here would be a regression, not a retry.
+            return False
         # Evidence first. A pool whose width starts at the floor -- Tor's does --
         # would otherwise escalate on its very first hiccup, and one timeout is
         # a blip, not a diagnosis. The same sample size the failure rules use is

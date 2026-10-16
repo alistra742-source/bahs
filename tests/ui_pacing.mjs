@@ -42,6 +42,15 @@ const paced = rows.find(([k]) => k === 'endpoints paced');
 assert.ok(paced, rows);
 assert.equal(paced[1], '1 of 1 · 4 tunnel(s) at once of 128', paced[1]);
 assert.deepEqual(rows.find(([k]) => k === 'tunnels timed out'), ['tunnels timed out', '20']);
+
+// An endpoint that needed a longer connect clock than the run configured. Shown
+// because it changes what the rest of the run means, and absent when nobody
+// needed one -- a healthy pool must not carry a line about a ceiling it kept.
+const raised = UI.poolRows({ ...pool, proxies_ceiling_raised: 1 })
+assert.deepEqual(raised.find(([k]) => k === 'endpoints given longer to connect'),
+  ['endpoints given longer to connect', '1 of 1'], raised);
+assert.equal(rows.some(([k]) => k === 'endpoints given longer to connect'), false,
+  'a pool that never raised a ceiling says nothing about raising one');
 assert.equal(UI.poolRows(healthy).some(([k]) => k === 'endpoints paced'), false,
   'a healthy pool says nothing about pacing');
 
