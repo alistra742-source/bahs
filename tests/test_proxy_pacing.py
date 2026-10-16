@@ -504,6 +504,67 @@ class SaturatedRunTests(unittest.TestCase):
         self.assertIn("connections timed out", pool.stop_reason)
         self.assertIn("raise the connect timeout", pool.stop_reason)
 
+    def test_an_endpoint_that_needs_longer_to_open_is_not_called_dead(self):
+        # The reported failure: every tunnel timed out at the scan's tight connect
+        # ceiling, at every width down to a single one, and the run concluded the
+        # endpoint was dead and spent names proving it. If completing the tunnel
+        # simply needs longer than the ceiling allows, that conclusion is wrong --
+        # and the only way to tell is to ask once with more room.
+        seen: list[float] = []
+
+        async def check(client, username):
+            ceiling = client.timeout.connect
+            seen.append(ceiling)
+            if ceiling < 4.0:
+                await asyncio.sleep(0.01)
+                return sniper.transport_error(
+                    username, "lab",
+                    httpx.ConnectTimeout(
+                        "", request=httpx.Request("GET", "https://guns.lol/" + username)
+                    ),
+                )
+            return sniper.SnipeResult(username, "lab", "available", "free")
+
+        sniper.CHECKERS["lab"] = check
+        # Width at the floor from the start, so the only lever left is the clock.
+        pool = sniper.ProxyPool(
+            [PROXY], per_proxy=1,
+            timeout=httpx.Timeout(connect=1.0, read=2.0, write=2.0, pool=2.0),
+        )
+
+        async def go():
+            out = []
+            async for result in sniper.iter_snipes(
+                [f"name{index}" for index in range(40)], ["lab"], pool,
+                concurrency=4, retries=0,
+            ):
+                out.append(result.status)
+            return out
+
+        statuses = asyncio.run(go())
+        asyncio.run(pool.aclose())
+        self.assertEqual(pool.retired(), 0, "a slow tunnel is not a dead endpoint")
+        self.assertEqual(pool.raised_ceilings(), 1, "exactly one retry was spent")
+        self.assertGreaterEqual(pool.connect_ceiling(PROXY), 4.0)
+        self.assertEqual(seen[0], 1.0, "the tight ceiling is tried first, not skipped")
+        self.assertGreater(max(seen), 1.0, "and then a longer one is actually used")
+        self.assertGreater(statuses.count("available"), 30, statuses)
+
+    def test_a_dead_endpoint_pays_one_retry_for_the_ceiling_verdict(self):
+        # The other half: when the endpoint is genuinely unreachable the retry must
+        # not become an open-ended one. One escalation, then the verdict -- and the
+        # stop reason has to say the ceiling was already ruled out, because telling
+        # somebody to raise a timeout the run has already raised is worse than
+        # saying nothing.
+        _results, _widths, pool = self.run_it(
+            names=2000, capacity=0, concurrency=256, per_proxy=128, retries=1
+        )
+        self.assertEqual(pool.raised_ceilings(), 1)
+        self.assertEqual(pool.retired(), 1)
+        self.assertEqual(pool.alive(), 0)
+        self.assertIn("connect ceiling was already raised", pool.stop_reason)
+        self.assertIn("cannot carry a request to this target", pool.stop_reason)
+
     def test_an_endpoint_that_can_take_the_load_is_never_touched(self):
         # The whole fix has to be invisible when the endpoint is fine: no
         # adjustments, no errors, and the width the run asked for.

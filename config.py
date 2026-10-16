@@ -428,6 +428,23 @@ SNIPE_PROXY_PACE_GROW_MAX: int = _int("SNIPE_PROXY_PACE_GROW_MAX", 16)
 # timeouts are evidence about the *endpoint* rather than about the width, and
 # the ordinary failure rules take over and can retire it.
 SNIPE_PROXY_MIN_PARALLEL: int = _int("SNIPE_PROXY_MIN_PARALLEL", 1)
+# The connect ceiling an endpoint is given for one retry, at the floor, before
+# the timeouts are read as its verdict. The tight scan ceiling exists because a
+# dead exit is lost time -- and it is kept, as the *first* ceiling. But "no
+# answer inside 2s" and "no answer at all" raise the same exception, and the
+# only thing that tells them apart is asking once with more room.
+#
+# Measured on a live deployment: 192 checks, 192 ConnectTimeouts, at every width
+# down to a single tunnel. That is the shape of an endpoint whose tunnel takes
+# longer to complete than the run will wait -- the TLS handshake through the
+# CONNECT is on the *connect* clock -- and the run had no way to find that out,
+# so it called a working endpoint dead and spent 192 names proving it.
+#
+# Multiplied by the ceiling in force, then capped. 2s becomes 10s; Tor's own 20s
+# stays 20s. Once per endpoint per run, so an endpoint that is genuinely gone
+# pays one window for the answer.
+SNIPE_PROXY_CEILING_STEP: float = _float("SNIPE_PROXY_CEILING_STEP", 5.0)
+SNIPE_PROXY_CEILING_MAX: float = _float("SNIPE_PROXY_CEILING_MAX", 30.0)
 # Seconds the warm pool is reused across requests before it is rebuilt, so
 # consecutive batches skip their handshakes.
 SNIPE_POOL_TTL: int = _int("SNIPE_POOL_TTL", 300)

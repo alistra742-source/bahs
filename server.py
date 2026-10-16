@@ -1820,6 +1820,12 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         # because it ran out of names -- "the platform throttled every proxy" is
         # a completely different message from "your list is dead".
         "stop_reason": pool.stop_reason,
+        # Endpoints the pool had to give a longer *connect* clock than the run
+        # configured, because every tunnel timed out at one at a time. A number
+        # and not a flag: it says how much of the list needed it, and it is the
+        # line that separates "this exit range is slow to open tunnels" from
+        # "this exit range cannot carry a request".
+        "proxies_ceiling_raised": pool.raised_ceilings(),
         # Platforms sat out because they refused the whole list, so a throttle is
         # visible per platform instead of hidden in the blocked count.
         "platforms_paused": pool.paused(),

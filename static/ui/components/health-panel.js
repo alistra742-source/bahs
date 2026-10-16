@@ -29,6 +29,14 @@
           + `${UI.fmt(q.proxy_capacity)} tunnel(s) at once of `
           + `${UI.fmt((q.pool_alive || 0) * (q.per_proxy_connections || 0))}`,
       ]] : []),
+      // An endpoint whose every tunnel timed out at one at a time is given a
+      // longer connect clock rather than called dead. Shown because it changes
+      // what the rest of the run means: a slow opening stretch here is the pool
+      // finding that ceiling, not a list that is failing.
+      ...(q.proxies_ceiling_raised ? [[
+        "endpoints given longer to connect",
+        `${UI.fmt(q.proxies_ceiling_raised)} of ${UI.fmt(q.pool_alive)}`,
+      ]] : []),
       // A run that ended because of the pool rather than because it ran out of
       // names. "every platform throttled the whole list" and "the list is dead"
       // look identical in the error column; this is the line that separates them.

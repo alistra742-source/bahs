@@ -124,6 +124,8 @@ from config import (
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
     SNIPE_PROXY_FAIL_RATE,
+    SNIPE_PROXY_CEILING_MAX,
+    SNIPE_PROXY_CEILING_STEP,
     SNIPE_PROXY_MIN_PARALLEL,
     SNIPE_PROXY_PACE_CONFIRM,
     SNIPE_PROXY_PACE_GROW_AFTER,
@@ -713,6 +715,18 @@ class ProxyPool:
         self._block_cooldown = max(0.0, block_cooldown)
         self._per_proxy = max(1, per_proxy)
         self._timeout = timeout or default_timeout()
+        # The ceiling the run was configured with, kept per pool because an
+        # endpoint may be given a longer *connect* clock than that without
+        # disturbing the read clock: a target slow to answer and an endpoint
+        # slow to open a tunnel are different problems, fixed by different
+        # numbers.
+        self._base_ceiling = float(self._timeout.connect or 0.0)
+        self._ceiling_step = max(1.0, SNIPE_PROXY_CEILING_STEP)
+        self._ceiling_max = max(self._ceiling_step, SNIPE_PROXY_CEILING_MAX)
+        # Endpoints that needed a longer tunnel handshake, and the ones already
+        # given their one retry at it.
+        self._ceilings: dict[str, float] = {}
+        self._ceiling_raised: set[str] = set()
         self._max_clients = max(1, max_clients)
         self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
         self._resting: dict[str, float] = {}
@@ -1050,6 +1064,8 @@ class ProxyPool:
         self._seen.clear()
         self._retired.clear()
         self._width.clear()
+        self._ceilings.clear()
+        self._ceiling_raised.clear()
         self._pace_offered.clear()
         self._pace_resolved.clear()
         self._pace_refused.clear()
@@ -1130,6 +1146,77 @@ class ProxyPool:
         if self._inflight.get(proxy):
             self._inflight[proxy] -= 1
 
+    def connect_ceiling(self, proxy: str) -> float:
+        """The *connect* ceiling this endpoint is on right now.
+
+        The run's configured ceiling unless this endpoint has been given its one
+        retry with more room (see ``_raise_ceiling``). Only the connect phase
+        moves: a target slow to answer is bounded by the read clock, which is a
+        different question and keeps its own answer.
+        """
+        return self._ceilings.get(proxy, self._base_ceiling)
+
+    def _timeout_for(self, proxy: str) -> httpx.Timeout:
+        """The timeout a client for this endpoint is built with."""
+        ceiling = self.connect_ceiling(proxy)
+        if ceiling == self._base_ceiling:
+            return self._timeout
+        base = self._timeout
+        return httpx.Timeout(
+            connect=ceiling, read=base.read, write=base.write, pool=base.pool
+        )
+
+    def raised_ceilings(self) -> int:
+        """How many endpoints were given a longer connect clock than configured."""
+        return len(self._ceilings)
+
+    def _raise_ceiling(self, proxy: str) -> bool:
+        """One more try with a longer tunnel handshake before judging the endpoint.
+
+        Called only when the width is already at its floor and the endpoint is
+        still producing nothing but connect timeouts -- so the width is not the
+        explanation and something else has to be. The candidate a run cannot
+        otherwise see is that completing the tunnel simply takes longer than the
+        run will wait: the TLS handshake through the CONNECT is on the *connect*
+        clock, and the scan's is a tight one.
+
+        So it is asked once with more room. If that answers, the endpoint was
+        never dead and the run keeps the longer ceiling for it; if it does not,
+        the ordinary rules retire it a window later and the stop reason says the
+        ceiling was ruled out rather than leaving the user to guess at it.
+
+        Once per endpoint per run, so an endpoint that is genuinely unreachable
+        pays one window for the answer instead of the whole sweep.
+        """
+        if proxy in self._ceiling_raised:
+            return False
+        # Evidence first. A pool whose width starts at the floor -- Tor's does --
+        # would otherwise escalate on its very first hiccup, and one timeout is
+        # a blip, not a diagnosis. The same sample size the failure rules use is
+        # the right bar for spending a retry on it.
+        if self._timeouts.get(proxy, 0) < self._fail_limit:
+            return False
+        current = self.connect_ceiling(proxy)
+        raised = min(self._ceiling_max, max(current * self._ceiling_step, current + 1.0))
+        if raised <= current:
+            return False
+        self._ceiling_raised.add(proxy)
+        self._ceilings[proxy] = raised
+        # The kept-alive client carries the old ceiling, so it is dropped and
+        # rebuilt on the next request rather than silently continuing on it.
+        stale = self._clients.pop(proxy, None)
+        if stale is not None:
+            self._close_later(stale)
+        log.warning(
+            "endpoint %s: every tunnel timed out at one at a time, so its connect "
+            "ceiling is raised from %.0fs to %.0fs for one retry -- if the endpoint "
+            "is merely slow to open a tunnel, this is where verdicts resume",
+            mask_proxy(proxy),
+            current,
+            raised,
+        )
+        return True
+
     def client(self, proxy: str) -> httpx.AsyncClient:
         """The kept-alive client for one proxy, created on first use.
 
@@ -1147,7 +1234,7 @@ class ProxyPool:
             self._close_later(stale)
         client = httpx.AsyncClient(
             proxy=proxy,
-            timeout=self._timeout,
+            timeout=self._timeout_for(proxy),
             follow_redirects=True,
             limits=httpx.Limits(
                 max_connections=self._per_proxy,
@@ -1352,6 +1439,12 @@ class ProxyPool:
         failed = self._width_failed[proxy]
         if timed_out:
             self._timeouts[proxy] = self._timeouts.get(proxy, 0) + 1
+            # Before the strikes below, and only at the floor: a longer
+            # connect clock has to be ruled out before "the endpoint is dead"
+            # is the answer, or a run reports a working endpoint as a corpse
+            # on the strength of a number it chose for itself.
+            if self.width(proxy) <= self._pace_min and self._raise_ceiling(proxy):
+                return
             if self.width(proxy) > self._pace_min:
                 # Paced, not judged. The endpoint is being asked for more
                 # tunnels at once than it will accept, and the width is the
@@ -1655,6 +1748,25 @@ class ProxyPool:
                 return False
             await asyncio.sleep(min(0.25, remaining))
 
+    def _ceiling_note(self) -> str:
+        """What the retry at a longer connect ceiling did, when one was made.
+
+        Without it the stop reason lists raising the timeout as the thing to try,
+        which is wrong advice after the run has already tried it -- and the gap
+        between "raise the connect timeout" and "the ceiling was ruled out" is the
+        gap between a deployment somebody can fix and an endpoint that is simply
+        not a way into this target.
+        """
+        if not self._ceilings:
+            return ""
+        reached = max(self._ceilings.values())
+        return (
+            f" The connect ceiling was already raised to {reached:.0f}s for one retry "
+            f"before that verdict (from {self._base_ceiling:.0f}s), and it timed out "
+            "too -- so the ceiling is not the problem. This endpoint cannot carry a "
+            "request to this target; a different exit range is what is needed."
+        )
+
     def exhausted_reason(self) -> str:
         """Why a run stopped with nothing left to dispatch through."""
         total = len(self._all)
@@ -1677,7 +1789,7 @@ class ProxyPool:
                     "is asked for more simultaneous tunnels than it accepts, or when it is "
                     "unreachable -- lower the concurrency, raise the connect timeout, or use "
                     "more than one endpoint, and try again"
-                )
+                ) + self._ceiling_note()
             return (
                 f"every one of the {total} proxies in the list failed with a transport error "
                 "and was retired for this run -- the list is dead, replace it"
