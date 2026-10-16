@@ -57,8 +57,8 @@
             <a class="btn" href="/proxies/">Manage proxies</a>
             <a class="btn" href="/alerts">Webhook alerts</a>
           </div>
-          <p class="note" style="margin-top:14px">The proxy list and the alert settings live in the database, so they survive
-            a redeploy; <code>data/proxies.json</code> and <code>data/settings.json</code> are local caches next to the
+          <p class="note" style="margin-top:14px">The proxy list starts empty on every redeploy and must be pasted again; alert
+            settings live in the database and survive a redeploy. <code>data/proxies.json</code> and <code>data/settings.json</code> are local files next to the
             app and are rebuilt from it. Today's totals and nothing else are file-only — mount a volume at
             <code>/app/data</code> if you want those to survive too.</p>
         </div>

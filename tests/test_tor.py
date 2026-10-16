@@ -542,8 +542,7 @@ class PoolFallbackTests(unittest.IsolatedAsyncioTestCase):
         tor.reset()
         self.saved = server.proxy_list
         self.tmp = tempfile.TemporaryDirectory()
-        server.proxy_list = server.proxy_list_module.ProxyList(
-            self.tmp.name + "/proxies.json", mirror=None)
+        server.proxy_list = server.proxy_list_module.ProxyList(self.tmp.name + "/proxies.json")
         for state in server._pool_state.values():
             state["pool"] = None
             state["source"] = ""
@@ -710,8 +709,7 @@ class TorEndpointTests(unittest.TestCase):
         accounts.store = accounts.Store("")
         accounts.store.initialize()
         self.saved_list = server.proxy_list
-        server.proxy_list = server.proxy_list_module.ProxyList(
-            self.tmp.name + "/proxies.json", mirror=server.proxy_list_module.StoreMirror())
+        server.proxy_list = server.proxy_list_module.ProxyList(self.tmp.name + "/proxies.json")
         self.saved_tor = tor._state.exits
         tor.reset()
         server._checks_in_flight.clear()

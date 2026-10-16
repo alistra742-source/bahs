@@ -177,60 +177,6 @@ def parse_many(text: str) -> ParseReport:
     return report
 
 
-class StoreMirror:
-    """The durable copy of the proxy list, in the accounts database.
-
-    A container filesystem is rebuilt from the image on every deploy, so
-    ``data/proxies.json`` does not survive one and the next run answers "no
-    proxies saved yet" -- which reads as a broken run rather than a lost file.
-    The database does survive a deploy, so it is the real store and the file
-    stays a local cache for a single-process start.
-
-    Every method here is best-effort: if the database is unreachable the list
-    keeps working from the file, because a missing mirror must never stop a run.
-    """
-
-    ROW = "default"
-
-    @staticmethod
-    def _database():
-        import accounts  # late: the server imports both, neither imports the other
-        return accounts.store
-
-    def load(self) -> tuple[list[str], float]:
-        try:
-            with self._database().transaction() as db:
-                row = db.one("SELECT payload,updated FROM proxy_store WHERE id=?", (self.ROW,))
-        except Exception as exc:  # pragma: no cover - a database that has not been migrated
-            log.warning("could not read the stored proxy list (%s)", exc)
-            return [], 0.0
-        if not row:
-            return [], 0.0
-        try:
-            data = json.loads(row["payload"])
-        except ValueError:
-            log.warning("the stored proxy list is not valid JSON; ignoring it")
-            return [], 0.0
-        raw = data.get("proxies") if isinstance(data, dict) else data
-        if not isinstance(raw, list):
-            return [], 0.0
-        updated = float(row["updated"] or 0.0)
-        return [str(entry) for entry in raw], updated
-
-    def save(self, proxies: list[str], updated: float) -> None:
-        payload = json.dumps({"updated": updated, "proxies": proxies})
-        try:
-            with self._database().transaction() as db:
-                db.lock("proxy-store")
-                db.execute(
-                    "INSERT INTO proxy_store(id,payload,updated) VALUES(?,?,?)"
-                    " ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated=excluded.updated",
-                    (self.ROW, payload, updated),
-                )
-        except Exception as exc:  # pragma: no cover
-            log.warning("could not mirror the proxy list to the database (%s)", exc)
-
-
 @dataclass
 class _State:
     proxies: list[str] = field(default_factory=list)
@@ -244,61 +190,27 @@ class ProxyList:
     list changed and rebuild its pool instead of running the previous set.
     """
 
-    def __init__(self, path: str = STORE_PATH, mirror: "StoreMirror | None" = None) -> None:
+    def __init__(self, path: str = STORE_PATH) -> None:
         self.path = path
-        self.mirror = mirror
         self._state = _State()
         self.version = 0
 
     # --- persistence ------------------------------------------------------
-    def _from_file(self) -> tuple[list[str], float]:
-        try:
-            with open(self.path, encoding="utf-8") as handle:
-                data = json.load(handle)
-        except FileNotFoundError:
-            log.info("no proxy list at %s yet", self.path)
-            return [], 0.0
-        except (ValueError, OSError) as exc:
-            log.warning("could not read %s (%s); starting empty", self.path, exc)
-            return [], 0.0
-        raw = data.get("proxies") if isinstance(data, dict) else data
-        if not isinstance(raw, list):
-            log.warning("%s does not hold a proxy list; starting empty", self.path)
-            return [], 0.0
-        updated = float(data.get("updated") or 0.0) if isinstance(data, dict) else 0.0
-        return [str(x) for x in raw], updated
-
     def load(self) -> int:
-        """The newest list this process can see: the file, or the database.
+        """Start empty. Every process boot begins with no proxies.
 
-        Whichever was written last wins. After a deploy the file is gone and the
-        database still holds the list; on a fresh database the file is what
-        there is. Neither is assumed to exist.
+        The list is never restored from disk or a database: a redeploy or restart
+        must not bring back a list someone pasted earlier. The user pastes the
+        list again, and that paste is what the run uses.
         """
-        from_file, file_updated = self._from_file()
-        stored, stored_updated = self.mirror.load() if self.mirror else ([], 0.0)
-        if stored_updated > file_updated:
-            raw, source = stored, "the database"
-        else:
-            raw, source = from_file, self.path
-        kept = [p for p in dict.fromkeys(raw) if normalize(p) == p]
-        self._state = _State(proxies=kept[:MAX_PROXIES], updated=max(file_updated, stored_updated))
+        self._state = _State()
         self.version += 1
-        log.info("loaded %d stored proxies from %s", len(kept), source)
-        return len(kept)
+        log.info("proxy list starts empty on every boot; paste the list again")
+        return 0
 
     def save(self) -> None:
         self._state.updated = time.time()
         payload = {"updated": self._state.updated, "proxies": self._state.proxies}
-        # The database first: it is the copy that survives a redeploy, so it must
-        # not be lost to a full or read-only volume. Guarded anyway -- the file is
-        # still a usable store, and a mirror that fails must not cost the user the
-        # list they just pasted.
-        if self.mirror:
-            try:
-                self.mirror.save(self._state.proxies, self._state.updated)
-            except Exception as exc:
-                log.warning("proxy list mirror failed (%s); the file copy is current", exc)
         directory = os.path.dirname(os.path.abspath(self.path))
         try:
             os.makedirs(directory, exist_ok=True)
@@ -308,8 +220,8 @@ class ProxyList:
             with open(temp, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle)
             os.replace(temp, self.path)
-        except OSError as exc:  # a read-only volume is survivable, the database is the store
-            log.warning("could not write %s (%s); the database copy is current", self.path, exc)
+        except OSError as exc:  # a read-only volume is survivable: the list is in memory
+            log.warning("could not write %s (%s)", self.path, exc)
 
     # --- contents ---------------------------------------------------------
     def all(self) -> list[str]:

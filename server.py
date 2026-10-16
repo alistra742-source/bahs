@@ -335,7 +335,7 @@ def _build_id() -> str:
 
 BUILD = _build_id()
 
-proxy_list = proxy_list_module.ProxyList(STORE_PATH, mirror=proxy_list_module.StoreMirror())
+proxy_list = proxy_list_module.ProxyList(STORE_PATH)
 
 # Today's totals, for the landing page's stats strip.
 daily_stats = DailyStats(STATS_PATH)

@@ -285,8 +285,7 @@ class EndpointTests(unittest.TestCase):
         accounts.store = accounts.Store("")
         accounts.store.initialize()
         self.saved_list = server.proxy_list
-        server.proxy_list = server.proxy_list_module.ProxyList(
-            self.tmp.name + "/proxies.json", mirror=server.proxy_list_module.StoreMirror())
+        server.proxy_list = server.proxy_list_module.ProxyList(self.tmp.name + "/proxies.json")
         server._runs.clear()
         server._checks_in_flight.clear()
         self.client = TestClient(server.app, client=("127.0.0.1", 50000))

@@ -450,11 +450,10 @@ class SecurityTests(unittest.TestCase):
 
 
 class ProxyPersistenceTests(unittest.TestCase):
-    """The proxy list has to outlive a deploy, and a deploy wipes data/.
+    """The proxy list is never restored at boot: every start begins empty.
 
-    Railway rebuilds the container filesystem from the image, so the JSON file
-    is gone on the next boot while the database is not. Losing the list is what
-    turns a working setup into "no proxies saved yet" on every run.
+    A redeploy or restart must not bring back a list pasted earlier, so there is
+    no database copy and loading ignores any file left on disk.
     """
 
     def setUp(self):
@@ -473,39 +472,23 @@ class ProxyPersistenceTests(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def test_the_database_copy_survives_a_lost_file(self):
-        first = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
+    def test_a_restart_starts_empty_even_with_a_file_on_disk(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"updated": time.time(), "proxies": ["http://192.0.2.99:8080"]}, handle)
+        listing = proxies_module.ProxyList(self.path)
+        self.assertEqual(listing.load(), 0)
+        self.assertEqual(listing.all(), [])
+
+    def test_a_pasted_list_does_not_survive_a_redeploy(self):
+        first = proxies_module.ProxyList(self.path)
         self.assertEqual(first.replace(["http://192.0.2.10:8080", "socks5://192.0.2.11:1080"]), 2)
         first.save()
-        self.assertTrue(os.path.exists(self.path))
-        os.remove(self.path)  # the next deploy starts from an empty filesystem
-        second = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
-        self.assertEqual(second.load(), 2)
-        self.assertEqual(second.all(), ["http://192.0.2.10:8080", "socks5://192.0.2.11:1080"])
+        second = proxies_module.ProxyList(self.path)
+        self.assertEqual(second.load(), 0)
+        self.assertEqual(second.all(), [])
 
-    def test_the_newest_copy_wins(self):
-        mirror = proxies_module.StoreMirror()
-        newer = proxies_module.ProxyList(self.path, mirror=mirror)
-        newer.replace(["http://192.0.2.20:8080"])
-        newer.save()
-        # A stale file left behind by an older process must not beat the database.
-        with open(self.path, "w", encoding="utf-8") as handle:
-            json.dump({"updated": newer.updated - 60, "proxies": ["http://192.0.2.99:8080"]}, handle)
-        reader = proxies_module.ProxyList(self.path, mirror=proxies_module.StoreMirror())
-        self.assertEqual(reader.load(), 1)
-        self.assertEqual(reader.all(), ["http://192.0.2.20:8080"])
-
-    def test_a_mirror_that_cannot_write_still_keeps_the_file_working(self):
-        class Broken:
-            def load(self):
-                return [], 0.0
-            def save(self, proxies, updated):
-                raise RuntimeError("database gone")
-        listing = proxies_module.ProxyList(self.path, mirror=Broken())
-        listing.replace(["http://192.0.2.30:8080"])
-        listing.save()  # must not raise: the file is still a usable store
-        again = proxies_module.ProxyList(self.path)
-        self.assertEqual(again.load(), 1)
+    def test_the_database_holds_no_proxy_list(self):
+        self.assertFalse(hasattr(proxies_module, "StoreMirror"))
 
 
 class MigrationTests(unittest.TestCase):

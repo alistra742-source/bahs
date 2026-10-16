@@ -45,8 +45,8 @@ uvicorn server:app --host 0.0.0.0 --port 8080
 ```
 
 Open `http://localhost:8080`. On Railway, `PORT` is injected. The proxy list is
-kept in the database as well as in `data/proxies.json`, so it survives a deploy
-without a volume; `STORE_PATH` only decides where the local cache sits.
+held in memory and starts empty on every boot, so a redeploy never restores an
+old list; paste it again. `STORE_PATH` only decides where the local snapshot sits.
 
 The dashboard's Live card prints the commit it is running (`build 9597c9d`), from
 `RAILWAY_GIT_COMMIT_SHA` or the checkout's `HEAD`, and `/health` and `/info`
@@ -723,7 +723,7 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | variable | default | |
 |---|---|---|
 | `PORT` | `8080` | |
-| `STORE_PATH` | `data/proxies.json` | local cache — the database copy is the store |
+| `STORE_PATH` | `data/proxies.json` | local snapshot; never read back at boot |
 | `PROXY_CHECK_URL` | `https://api.ipify.org?format=json` | what a check asks a proxy for — must answer 2xx, and `http://` works if the list is CONNECT-only on 80 |
 | `PROXY_CHECK_CONCURRENCY` | `32` | probes in flight at once |
 | `PROXY_CHECK_TIMEOUT` | `6.0` | connect/read ceiling for one probe, seconds |
