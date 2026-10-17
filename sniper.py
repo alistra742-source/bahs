@@ -3240,13 +3240,22 @@ async def check_once(
     # it did. Verdicts are DEBUG: a sweep of millions of names must not bury
     # those failures under its own success.
     level = logging.DEBUG if result.status in FINAL_STATUSES else logging.INFO
+    # A connect timeout means the tunnel never opened inside the connect ceiling.
+    # Say what that ceiling and the endpoint's width were, so the line shows why.
+    why = ""
+    if (result.cause or result.detail or "").startswith("ConnectTimeout") and result.proxy:
+        why = (
+            f"; connect ceiling {pool.connect_ceiling(proxy):.1f}s, "
+            f"{pool.width(proxy)} tunnel(s) open to this endpoint"
+        )
     log.log(
         level,
-        "check %s/%s -> %s (%s) via %s in %.0f ms",
+        "check %s/%s -> %s (%s%s) via %s in %.0f ms",
         platform,
         username,
         result.status,
         result.cause or result.detail or "-",
+        why,
         mask_proxy(result.proxy or "direct"),
         result.latency_ms or 0.0,
     )
