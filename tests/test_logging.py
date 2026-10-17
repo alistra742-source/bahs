@@ -123,6 +123,15 @@ class CheckLineLoggingTests(_CheckOnceLogging):
             self.assertIn(expected, line)
         self.assertNotIn("hunter2", line)
 
+    def test_a_connect_timeout_says_which_ceiling_it_hit(self):
+        result = sniper.transport_error("brew", self.platform, httpx.ConnectTimeout(""))
+        with self.assertLogs("bahs.sniper", level="INFO") as captured:
+            self.run_check(result)
+        line = captured.output[0]
+        self.assertIn("ConnectTimeout: no answer within the timeout", line)
+        self.assertIn("connect ceiling", line)
+        self.assertIn("tunnel(s) open to this endpoint", line)
+
     def test_a_verdict_is_logged_but_not_at_info(self):
         result = sniper.SnipeResult("brew", self.platform, "taken")
         with self.assertLogs("bahs.sniper", level="DEBUG") as captured:
