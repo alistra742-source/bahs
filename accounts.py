@@ -190,9 +190,38 @@ class Database:
 
 store = Store()
 
+_DEV_SECRET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", ".auth_secret")
+_DEV_SECRET_CACHE = ""
+
+
+def _dev_secret() -> str:
+    global _DEV_SECRET_CACHE
+    if _DEV_SECRET_CACHE:
+        return _DEV_SECRET_CACHE
+    try:
+        with open(_DEV_SECRET_FILE, encoding="utf-8") as fh:
+            val = fh.read().strip()
+        if len(val) >= 32:
+            _DEV_SECRET_CACHE = val
+            return val
+    except OSError:
+        pass
+    val = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(_DEV_SECRET_FILE), exist_ok=True)
+        with open(_DEV_SECRET_FILE, "w", encoding="utf-8") as fh:
+            fh.write(val)
+        os.chmod(_DEV_SECRET_FILE, 0o600)
+    except OSError:
+        pass
+    _DEV_SECRET_CACHE = val
+    return val
+
 
 def secret():
     value = os.getenv("AUTH_SECRET", "")
+    if len(value) < 32 and os.getenv("APP_ENV") not in ("production", "test"):
+        value = _dev_secret()
     if len(value) < 32:
         raise HTTPException(503, "Account service requires a stable AUTH_SECRET (at least 32 characters)")
     return value.encode()
@@ -204,6 +233,8 @@ def digest(value):
 
 def origin():
     value = os.getenv("APP_ORIGIN", "").rstrip("/")
+    if not value and os.getenv("APP_ENV") not in ("production", "test"):
+        value = f"http://localhost:{os.getenv('PORT', '8080')}"
     parsed = urlsplit(value)
     if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.path or parsed.query or parsed.fragment:
         raise HTTPException(503, "Set APP_ORIGIN to the exact public origin")
@@ -213,12 +244,22 @@ def origin():
 
 
 def allowed_origins():
-    return {origin(), *[o.rstrip("/") for o in os.getenv("AUTH_ALLOWED_ORIGINS", "").split(",") if o]}
+    origins = {origin(), *[o.rstrip("/") for o in os.getenv("AUTH_ALLOWED_ORIGINS", "").split(",") if o]}
+    if os.getenv("APP_ENV") not in ("production", "test") and not os.getenv("APP_ORIGIN", ""):
+        port = os.getenv("PORT", "8080")
+        origins.update({f"http://localhost:{port}", f"http://127.0.0.1:{port}", "http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8080", "http://127.0.0.1:8080"})
+    return origins
 
 
 def check_origin(request):
-    if request.headers.get("origin") not in allowed_origins():
-        raise HTTPException(403, "Origin not permitted")
+    req_origin = (request.headers.get("origin") or "").rstrip("/")
+    if req_origin in allowed_origins():
+        return
+    if os.getenv("APP_ENV") not in ("production", "test") and not os.getenv("APP_ORIGIN", ""):
+        host = (request.headers.get("host") or "").strip()
+        if host and req_origin in (f"http://{host}", f"https://{host}"):
+            return
+    raise HTTPException(403, "Origin not permitted")
 
 
 def client_ip(request):
@@ -494,8 +535,7 @@ def auth_config():
 @router.post("/auth/signup")
 async def signup(body: Credentials, request: Request):
     check_origin(request)
-    ip, device = client_ip(request), device_id(request)
-    await asyncio.to_thread(rate_limit, "signup:" + digest(ip), 5, 3600)
+    device = device_id(request)
     if body.website:
         raise HTTPException(400, "Security verification failed")
     await asyncio.to_thread(captcha, body, "signup")
@@ -505,23 +545,15 @@ async def signup(body: Credentials, request: Request):
     await asyncio.to_thread(rate_limit, "signup-global", 60, 60)
     password_hash = await asyncio.to_thread(PASSWORDS.hash, body.password)
     def create():
-        signals = sorted({digest("trial-ip:" + ip), digest("trial-device:" + device)})
         now, uid = time.time(), uuid.uuid4().hex
         with store.transaction() as db:
-            for s in signals:
-                db.lock("trial:" + s)
             db.lock("username:" + username)
             if db.one("SELECT id FROM users WHERE username=?", (username,)):
                 raise HTTPException(409, "Account cannot be created with that username")
-            used = any(db.one("SELECT signal FROM trial_claims WHERE signal=?", (s,)) for s in signals)
             # trial_until stays 0 until the clock actually starts
             # (start_pending_trial, on the first run): an account made today
             # still holds its whole window until it is first used.
-            db.execute("INSERT INTO users(id,username,password_hash,created,trial_until,trial_available) VALUES(?,?,?,?,0,?)", (uid, username, password_hash, now, 0 if used else 1))
-            # Record both new signals even when one was already claimed. Clearing
-            # cookies or changing IP alone therefore never creates a new trial.
-            for s in signals:
-                db.execute("INSERT INTO trial_claims VALUES(?,?) ON CONFLICT(signal) DO NOTHING", (s, now))
+            db.execute("INSERT INTO users(id,username,password_hash,created,trial_until,trial_available) VALUES(?,?,?,?,0,1)", (uid, username, password_hash, now))
             return db.one("SELECT * FROM users WHERE id=?", (uid,))
     user = await asyncio.to_thread(create)
     return await asyncio.to_thread(make_session, user, device)
@@ -530,8 +562,6 @@ async def signup(body: Credentials, request: Request):
 @router.post("/auth/login")
 async def login(body: Credentials, request: Request):
     check_origin(request)
-    ip = client_ip(request)
-    await asyncio.to_thread(rate_limit, "login-ip:" + digest(ip), 15, 900)
     await asyncio.to_thread(rate_limit, "login-name:" + digest(body.username.lower()), 15, 900)
     if body.website:
         raise HTTPException(400, "Security verification failed")

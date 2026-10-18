@@ -165,9 +165,16 @@ window.PAGE = {
       for (const x of $("filters").querySelectorAll("button")) x.classList.toggle("on", x === b);
       A.renderFeed();
     };
-    A.applyProgress((S.status && S.status.progress) || {});
+    const p0 = (S.status && S.status.progress) || {};
+    if (p0.pool_size == null && S.proxies && S.proxies.count != null) {
+      p0.pool_size = S.proxies.count;
+      p0.pool_alive = S.proxies.count;
+      p0.pool_resting = 0;
+      p0.pool_retired = 0;
+    }
+    A.applyProgress(p0);
   },
-  onReattach(st) { App.applyProgress(st.progress || {}); if (App.S.tuneFollow !== false) App.follow(st.id); },
+  onReattach(st) { App.applyProgress(st.progress || {}); if (App.S.tune.follow !== false) App.follow(st.id); },
   onStatus(st) { App.applyProgress(st.progress || {}); },
   onResult(ev) { /* the tick already carries every counter this page shows */ },
 };

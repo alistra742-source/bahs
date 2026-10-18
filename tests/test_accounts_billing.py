@@ -100,21 +100,14 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(good.status_code, 200)
         self.assertEqual(good.json()["user"]["trial_until"], user["trial_until"])
 
-    def test_same_ip_and_rotated_ip_device_cannot_reset_trial(self):
-        first = self.signup()
-        second = self.signup("seconduser")
-        self.assertFalse(second["user"]["access"])
-        # Change IP alone: device is signed and still consumed.
-        with patch("accounts.client_ip", return_value="198.51.100.99"):
-            third = self.signup("thirduser")
-        self.assertFalse(third["user"]["access"])
-        # Clear device cookie but reuse original IP: still consumed.
-        self.client.cookies.clear()
-        fourth = self.signup("fourthuser")
-        self.assertFalse(fourth["user"]["access"])
-        # The first account holds its trial, unstarted: nothing has run yet.
-        self.assertTrue(first["user"]["trial_pending"])
-        self.assertEqual(first["user"]["trial_until"], 0)
+    def test_multiple_accounts_same_ip_and_device_all_get_trial(self):
+        # Multiple accounts from the same IP and device can be created without
+        # per-IP rate-limit lockouts, and each receives its own unstarted trial.
+        for idx in range(7):
+            account = self.signup(f"multiuser_{idx}")
+            self.assertTrue(account["user"]["access"])
+            self.assertTrue(account["user"]["trial_pending"])
+            self.assertEqual(account["user"]["trial_until"], 0)
 
     def test_trial_starts_on_the_first_run_not_at_signup(self):
         data = self.signup()

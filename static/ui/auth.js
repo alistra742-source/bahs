@@ -160,7 +160,7 @@
         <button class="btn primary big auth-submit" disabled>${signup ? 'Create account →' : 'Log in →'}</button>
       </form>
       <p class="auth-switch">${signup ? 'Already have an account? <button type="button" data-mode="login">Log in</button>' : 'New here? <button type="button" data-mode="signup">Create account</button>'}</p>
-      <p class="auth-legal">${signup ? 'One trial per eligible IP/device. 60 seconds of full speed sweeps.' : 'Passwords hashed with Argon2id. Every login needs the same human check.'}</p>`;
+      <p class="auth-legal">${signup ? 'Each new account starts with a 60-second trial of full-speed sweeps.' : 'Passwords hashed with Argon2id. Every login needs the same human check.'}</p>`;
     
     state.dialog.querySelector('.modal-close').onclick = () => state.dialog.close();
     state.dialog.querySelector('[data-mode]').onclick = e => { state.mode = e.target.dataset.mode; form(); };

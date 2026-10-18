@@ -90,6 +90,7 @@ import logging
 import random
 import re
 import time
+import traceback
 from collections import OrderedDict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
@@ -541,6 +542,36 @@ def proxy_fault(exc: BaseException) -> bool:
     for cls in type(exc).__mro__:
         if cls.__name__ in ("ProxyError", "GeneralProxyError"):
             return True
+    return _in_tunnel_setup(exc)
+
+
+def _in_tunnel_setup(exc: BaseException) -> bool:
+    """Did this exception happen while opening the proxy tunnel itself?
+
+    httpcore sends the proxy ``CONNECT`` request as an ordinary HTTP/1.1 request
+    to the proxy socket, so a dead HTTP proxy that accepts the TCP socket and
+    then hangs or closes without answering raises ``ReadTimeout``,
+    ``RemoteProtocolError`` or ``ReadError`` from inside ``AsyncTunnelHTTPConnection``
+    before the tunnel is ever established; ``AsyncSocks5Connection`` does the
+    same inside ``_init_socks5_connection``. Without checking the call stack,
+    those look like target read failures and are reported as ``unanswered``
+    instead of retiring the dead proxy.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        tb = cur.__traceback__
+        if tb is not None:
+            for frame in traceback.extract_tb(tb):
+                line = (frame.line or "").strip()
+                if (
+                    "connect_response =" in line
+                    or "_init_socks5_connection" in line
+                    or "_init_socks4_connection" in line
+                ):
+                    return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
     return False
 
 
@@ -1550,6 +1581,9 @@ class ProxyPool:
     def retired(self) -> int:
         return len(self._retired)
 
+    def is_retired(self, proxy: str | None) -> bool:
+        return bool(proxy and proxy in self._retired)
+
     def _refused_now(self, platform: str) -> set[str]:
         """Proxies this platform has refused *within the memory window*.
 
@@ -1901,8 +1935,9 @@ def _guns_verdict(username: str, body: bytes) -> SnipeResult | None:
     if GUNS_ACCOUNT_MARKER in body:
         return SnipeResult(username, "guns.lol", "taken", "registered account (no public profile)")
     # Free: the page is offering to claim *this* name. That offer is the signal,
-    # not the title it shares with a banned profile's page.
-    if GUNS_CLAIM + username.encode() in body:
+    # not the title it shares with a banned profile's page. Match
+    # case-insensitively because guns.lol normalizes the claim parameter.
+    if (GUNS_CLAIM + username.lower().encode()) in body.lower():
         return SnipeResult(username, "guns.lol", "available", "claimable")
     if b"</title>" not in body:
         return None
@@ -1954,6 +1989,12 @@ async def check_guns(client: httpx.AsyncClient, username: str) -> SnipeResult:
         return SnipeResult(username, "guns.lol", "invalid", "reserved or unserved route")
     if resp.status_code != 200:
         return SnipeResult(username, "guns.lol", "error", f"status {resp.status_code}")
+
+    # App routes such as /pricing redirect to /premium (or another site route)
+    # and cannot be claimed as usernames.
+    final_path = resp.url.path.strip("/").lower()
+    if final_path != username.strip("/").lower():
+        return SnipeResult(username, "guns.lol", "invalid", "reserved or unserved route")
 
     # The clearance page served under load, with a 200 on it. It is not a profile
     # and it is certainly not a free name, so it is refused rather than read.
@@ -2264,11 +2305,14 @@ async def check_tiktok(client: httpx.AsyncClient, username: str) -> SnipeResult:
     if result is not None:
         return result
     if TIKTOK_PAGE_FIRST:
-        # The page was asked first and had nothing to say -- it served the shell
-        # or an interstitial. A 400 from the embed is not evidence about the
-        # name, so this is unanswered rather than available, and the pool
-        # retries it.
-        return SnipeResult(username, "tiktok", "error", "oembed 400, page had no verdict")
+        # The page was asked first and had nothing to say -- it served the shell,
+        # an interstitial, or failed on the wire. If the page failed at the
+        # transport layer, preserve that transport error so the proxy pool sees
+        # the real fault; otherwise report why the page had no verdict.
+        if page.fault:
+            return page
+        detail = f"oembed 400, page: {page.detail}" if page.detail else "oembed 400, page had no verdict"
+        return SnipeResult(username, "tiktok", "error", detail)
     tail = await _tiktok_profile(client, handle)
     if tail.status == "available":
         return await _tiktok_settle(client, username, handle, tail)
@@ -3143,9 +3187,20 @@ async def confirm_available(
         pool.abandon(second_proxy)
         raise
     except Exception:
+        pool.abandon(second_proxy)
         first.detail = (first.detail + "; unconfirmed, second read failed").strip("; ")
         return first
     second.proxy = second_proxy
+    if (
+        second.status == "error"
+        and second.fault == ""
+        and second.detail.startswith("status 407")
+    ):
+        second.fault = FAULT_PROXY
+    second_outcome = outcome_for(second)
+    if second_outcome in (OUTCOME_UNKNOWN, OUTCOME_TIMEOUT):
+        second.status = STATUS_UNANSWERED
+    pool.report(second_proxy, second_outcome, platform, second.retry_after)
     if second.status == "available":
         if second.confirmed:
             # The second read settled the name with the platform's own validator
@@ -3359,9 +3414,14 @@ async def iter_snipes(
             # The last real attempt at this name, kept so a pool that dies
             # between two retries does not erase a failure that really happened.
             tried: SnipeResult | None = None
+            retried_retired = 0
             while True:
                 if stop is not None and stop.is_set():
                     return None
+                if pool.alive() == 0:
+                    if tried is None:
+                        pool.misses += 1
+                    return tried
                 result = await check_once(platform, username, pool, retry=attempt > 0)
                 if result.detail in POOL_MISS_DETAILS:
                     # Nothing in the pool could carry this name. `next()` hands
@@ -3377,6 +3437,20 @@ async def iter_snipes(
                     return tried
                 if result.status not in ("blocked", "error", STATUS_UNANSWERED):
                     return result
+                # If the proxy was retired while this request was in flight (or
+                # retired on this failure), and every proxy is now gone, do not
+                # file the remaining in-flight failures as extra error rows once
+                # the pool has already reached its retirement threshold. And if
+                # live proxies remain in the pool, hand this name to one of them
+                # without charging the dead proxy against the name's retry budget.
+                if result.status == "error" and pool.is_retired(result.proxy):
+                    if pool.alive() == 0:
+                        if tried is None:
+                            pool.misses += 1
+                        return tried
+                    if retried_retired < max(2, len(pool)):
+                        retried_retired += 1
+                        continue
                 tried = result
                 if result.status == "blocked" and result.retry_after:
                     # The platform named the wait, and it is measured in minutes:
@@ -3469,7 +3543,7 @@ async def iter_snipes(
             # stops and says so rather than working through the rest of the name
             # list against a pool that is not there. Checked only once a pool
             # miss has been seen, because alive() walks the whole list.
-            if pool.misses and pool.alive() == 0:
+            if pool.alive() == 0:
                 stopping(pool.exhausted_reason())
                 break
 
@@ -3609,7 +3683,7 @@ async def iter_snipes(
                 if result is not None:
                     answered += 1 if result.answered else 0
                     yield result
-            if pool.misses and pool.alive() == 0:
+            if pool.alive() == 0:
                 stopping(pool.exhausted_reason())
                 break
             # Any platform that has now refused the whole pool is sat out with

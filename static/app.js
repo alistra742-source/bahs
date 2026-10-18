@@ -412,6 +412,13 @@ async function runStream(path, body) {
     if (!r.ok) {
       const txt = await r.text();
       let d = null; try { d = JSON.parse(txt); } catch (e) {}
+      if (r.status === 409) {
+        const rid = r.headers.get("x-run-id") || (d && d.detail && (d.detail.match(/run ([a-f0-9]+)/i) || [])[1]);
+        toast("a run is already in flight — reattaching to live stream", "ok");
+        if (rid) { S.run = rid; S.watching = true; await follow(rid); return; }
+        await pumpRun();
+        if (S.run) { await follow(S.run); return; }
+      }
       throw new Error((d && d.detail) || ("HTTP " + r.status));
     }
     const reader = r.body.getReader();
@@ -441,8 +448,11 @@ function handleEvent(ev) {
   if (ev.type === "start") {
     S.run = ev.run_id; S.watching = true;
     if ($("runNote")) $("runNote").textContent = `${fmt(ev.names)} names × ${ev.platforms.length} snipers`;
+    if ($("poolNote")) $("poolNote").textContent = ev.pool_note || "";
+    const pSize = (S.proxies && S.proxies.count) || undefined;
     applyProgress({ progress: 0, checked: 0, total_checks: ev.names * ev.platforms.length,
-                    available_count: 0, checks_per_second: 0, verdicts_per_second: 0 });
+                    available_count: 0, checks_per_second: 0, verdicts_per_second: 0,
+                    pool_size: pSize, pool_alive: pSize, pool_resting: 0, pool_retired: 0 });
     return;
   }
   if (ev.type === "result" || ev.status) {
@@ -452,6 +462,7 @@ function handleEvent(ev) {
     return;
   }
   if (ev.type === "progress" || ev.type === "waiting" || ev.type === "heartbeat") {
+    if (ev.type === "waiting" && ev.detail && $("runNote")) $("runNote").textContent = ev.detail;
     applyProgress(ev);
     return;
   }

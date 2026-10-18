@@ -1116,7 +1116,8 @@ async def _open_run(kind: str) -> RunHandle:
         if handle.kind == kind:
             raise HTTPException(
                 409,
-                f"A {kind} run is already in flight. Retry when the worker is free.",
+                f"A {kind} run is already in flight (run {handle.id}). Retry when the worker is free.",
+                headers={"X-Run-Id": handle.id},
             )
     if len(active) >= MAX_CONCURRENT_RUNS:
         raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
@@ -1469,6 +1470,17 @@ async def _prepare_pool(mode: str, concurrency: int) -> tuple[sniper.ProxyPool, 
     Tor, and the run says so in its first line. A short list still runs, but says
     so up front.
     """
+    _reap_runs()
+    active = [handle for handle in _runs.values() if handle.active]
+    for handle in active:
+        if handle.kind == mode:
+            raise HTTPException(
+                409,
+                f"A {mode} run is already in flight (run {handle.id}). Retry when the worker is free.",
+                headers={"X-Run-Id": handle.id},
+            )
+    if len(active) >= MAX_CONCURRENT_RUNS:
+        raise HTTPException(429, f"too many runs in flight (max {MAX_CONCURRENT_RUNS})")
     pool, source = await _pool(mode, concurrency)
     # A fresh run gets fresh verdicts. The pool object is cached (and its warm
     # tunnels with it), but the previous run's retirements and strikes must not
@@ -1734,6 +1746,7 @@ class _Tally:
             "proxies_paced": self.pool.paced_endpoints(),
             "proxy_capacity": self.pool.capacity(),
             "per_proxy_connections": self.pool.per_proxy,
+            "skipped": self.pool.skipped,
             "confirmed_count": self.confirmed,
             "corrected_count": self.corrected,
             **_verdict_report(self.answered, self.checked),
@@ -1761,6 +1774,7 @@ class _Tally:
             "rate_limits": self.rate_limits,
             "proxy_misses": self.proxy_misses,
             "unattempted": self.unattempted,
+            "skipped": self.pool.skipped if self.pool is not None else 0,
             "current_target": self.current,
             "elapsed_s": round(self.elapsed, 2),
             "checks_per_second": round(self.meter.average, 1),
@@ -2000,6 +2014,17 @@ async def _snipe_ndjson(
     run_id = run.id if run else ""
     tally.run_id = run_id
     last_report = 0.0
+    yield json.dumps(
+        {
+            "type": "start",
+            "run_id": run_id,
+            "names": len(names),
+            "truncated": False,
+            "platforms": platforms,
+            "pool_note": note,
+            "concurrency": concurrency,
+        }
+    ) + "\n"
     if note:
         yield json.dumps(
             {"type": "note", "run_id": run_id, "pool_note": note, "pool_size": len(pool)}
@@ -2037,6 +2062,24 @@ async def _snipe_ndjson(
                 last_report = now
                 yield json.dumps({"type": "progress", **tally.progress()}) + "\n"
                 await _flush_alerts(alerter)
+    except Exception as exc:  # pragma: no cover - a stream must terminate cleanly
+        log.exception("snipe run failed mid-stream")
+        _log_run_end("snipe", run_id, tally, pool)
+        yield json.dumps({
+            "type": "done",
+            "run_id": run_id,
+            "stopped": False,
+            "names": len(names),
+            "platforms": platforms,
+            "pool_note": note,
+            "duration_ms": round(tally.elapsed * 1000, 1),
+            "per_second": round(tally.meter.average, 1),
+            "alerts": _alert_report(alerter),
+            **_pool_report(pool),
+            "stop_reason": f"the run ended on an internal error: {type(exc).__name__}",
+            **tally.summary(),
+        }) + "\n"
+        return
     finally:
         if run:
             run.finish()
