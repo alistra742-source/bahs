@@ -101,7 +101,7 @@ class ProxyRetirementTests(unittest.TestCase):
             s3 = await asyncio.start_server(socks_stall_handler, "127.0.0.1", 0)
             p3 = s3.sockets[0].getsockname()[1]
 
-            # Case 4: HTTP proxy completes CONNECT, then HTTP target stalls on response
+            # Case 4: HTTP proxy forwards HTTP, then target stalls on response
             async def target_stall_handler(r, w):
                 await r.read(256)
                 await asyncio.sleep(2.0)
@@ -110,12 +110,26 @@ class ProxyRetirementTests(unittest.TestCase):
             s4 = await asyncio.start_server(target_stall_handler, "127.0.0.1", 0)
             p4 = s4.sockets[0].getsockname()[1]
 
+            # Case 5: CONNECT succeeded, but the remote TLS handshake never answers.
+            async def target_tls_stall_handler(r, w):
+                await r.readline()
+                while await r.readline() not in (b"\r\n", b"\n", b""):
+                    pass
+                w.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await w.drain()
+                await asyncio.sleep(2.0)
+                w.close()
+
+            s5 = await asyncio.start_server(target_tls_stall_handler, "127.0.0.1", 0)
+            p5 = s5.sockets[0].getsockname()[1]
+
             t = httpx.Timeout(0.15)
             for name, url, target_url in [
                 ("http_connect_timeout", f"http://127.0.0.1:{p1}", "https://example.com/"),
                 ("http_connect_drop", f"http://127.0.0.1:{p2}", "https://example.com/"),
                 ("socks5_connect_timeout", f"socks5://127.0.0.1:{p3}", "https://example.com/"),
                 ("target_stall_after_connect", f"http://127.0.0.1:{p4}", "http://example.com/"),
+                ("target_tls_stall_after_connect", f"http://127.0.0.1:{p5}", "https://example.com/"),
             ]:
                 async with httpx.AsyncClient(proxy=url, timeout=t) as c:
                     try:
@@ -123,16 +137,19 @@ class ProxyRetirementTests(unittest.TestCase):
                     except Exception as exc:
                         results[name] = sniper.proxy_fault(exc)
 
-            for s in (s1, s2, s3, s4):
+            for s in (s1, s2, s3, s4, s5):
                 s.close()
+            await asyncio.gather(*(s.wait_closed() for s in (s1, s2, s3, s4, s5)))
             return results
 
         outcomes = asyncio.run(run_cases())
         self.assertTrue(outcomes["http_connect_timeout"])
         self.assertTrue(outcomes["http_connect_drop"])
         self.assertTrue(outcomes["socks5_connect_timeout"])
-        # Target stalling after tunnel was established is not a proxy fault
+        # Target stalling after the tunnel was established is not a proxy fault,
+        # including when the target TLS handshake consumes the connect timeout.
         self.assertFalse(outcomes["target_stall_after_connect"])
+        self.assertFalse(outcomes["target_tls_stall_after_connect"])
 
     def test_dead_pool_stops_without_spraying_inflight_errors(self):
         import asyncio

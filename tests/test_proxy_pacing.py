@@ -34,6 +34,10 @@ endpoint being saturated. The real run through a real endpoint produced
 ``ConnectTimeout``, so that is what the model raises, at exactly the width it
 was asked at. The socket-level truth is tested where a socket can show it:
 ``RealConnectTimeoutTests`` gets one out of the IP stack.
+
+The scan connect default is deliberately longer than the old 2s deadline: the
+reported failures all landed at exactly that cutoff, and a proxy tunnel includes
+the HTTPS handshake before the target request can proceed.
 """
 
 import asyncio
@@ -59,6 +63,15 @@ class RealConnectTimeoutTests(unittest.TestCase):
     classification everything else in this file keys on, checked against
     something no mock is involved in.
     """
+
+    def test_scan_timeout_defaults_leave_time_for_a_slow_proxy_handshake(self):
+        # Scan defaults must not expire before proxy handshake latency routinely
+        # seen on global/rotating endpoints; per-scan overrides remain possible.
+        self.assertEqual(server.SCAN_CONNECT_TIMEOUT, 10.0)
+        self.assertEqual(server.SCAN_READ_TIMEOUT, 8.0)
+        scan_pool = server._pool_kwargs(True, 32, [PROXY], "list")
+        self.assertEqual(scan_pool["timeout"].connect, 10.0)
+        self.assertEqual(scan_pool["timeout"].read, 8.0)
 
     def test_a_blackholed_endpoint_is_a_proxy_fault_and_a_timeout(self):
         async def go():
@@ -124,6 +137,14 @@ class EndpointPacingTests(unittest.TestCase):
         self.assertEqual(pool.width(PROXY), 64, "the width is the thing that gives")
         self.assertEqual(pool.paced_endpoints(), 1)
         self.assertEqual(pool.capacity(), 64)
+
+    def test_target_timeouts_do_not_reduce_the_proxy_tunnel_width(self):
+        pool = self.pool(per_proxy=16)
+        self.probes(pool, 32, outcome=sniper.OUTCOME_TIMEOUT, timed_out=True)
+        self.assertEqual(pool.width(PROXY), 16)
+        self.assertEqual(pool.timed_out(), 0)
+        self.assertEqual(pool.failures(), 0)
+        self.assertEqual(pool.retired(), 0)
 
     def test_the_same_failures_that_were_refusals_still_retire_it(self):
         # The counterfactual, and the old behaviour: a proxy that *refused*
@@ -505,11 +526,9 @@ class SaturatedRunTests(unittest.TestCase):
         self.assertIn("raise the connect timeout", pool.stop_reason)
 
     def test_an_endpoint_that_needs_longer_to_open_is_not_called_dead(self):
-        # The reported failure: every tunnel timed out at the scan's tight connect
-        # ceiling, at every width down to a single one, and the run concluded the
-        # endpoint was dead and spent names proving it. If completing the tunnel
-        # simply needs longer than the ceiling allows, that conclusion is wrong --
-        # and the only way to tell is to ask once with more room.
+        # Every tunnel timed out at the configured connect ceiling, even at one
+        # tunnel at a time. A tunnel that needs more time is not a dead endpoint;
+        # the pool should retry once with a longer ceiling before deciding.
         seen: list[float] = []
 
         async def check(client, username):

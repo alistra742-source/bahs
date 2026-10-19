@@ -466,10 +466,11 @@ SCAN_BUFFER_MAX: int = _int("SCAN_BUFFER_MAX", 50000)
 # throttle never gets retried because it pauses the platform first (see
 # SNIPE_PLATFORM_BLOCK_RATE). Set 0 for pure throughput on a very wide run.
 SCAN_RETRIES: int = _int("SCAN_RETRIES", 1)
-# Tighter than the check above, because in a scan a dead proxy is pure lost
-# time.
-SCAN_CONNECT_TIMEOUT: float = _float("SCAN_CONNECT_TIMEOUT", 2.0)
-SCAN_READ_TIMEOUT: float = _float("SCAN_READ_TIMEOUT", 6.0)
+# Two seconds was too tight for HTTPS CONNECT plus TLS on a global endpoint:
+# failures landed at exactly 2,000 ms even though the same exit reached Roblox.
+# Allow slower handshakes; the pool pacer separately reduces excessive tunnels.
+SCAN_CONNECT_TIMEOUT: float = _float("SCAN_CONNECT_TIMEOUT", 10.0)
+SCAN_READ_TIMEOUT: float = _float("SCAN_READ_TIMEOUT", 8.0)
 # Floor for the per-proxy connection pool during a scan; the real number is
 # ceil(concurrency / pool size), as above.
 SCAN_PER_PROXY: int = _int("SCAN_PER_PROXY", 6)

@@ -513,16 +513,18 @@ def proxy_fault(exc: BaseException) -> bool:
     classic false report: "the list is dead" about a list that was working and
     visibly receiving traffic.
 
-    Only the connect phase and the proxy library's own errors are the proxy's.
+    ``ConnectTimeout`` is ambiguous for HTTPS: httpx uses its connect clock for
+    the proxy TCP/CONNECT steps *and* the target TLS handshake inside an already
+    established tunnel. The latter is target-side latency, not a dead proxy.
 
     * yes -- ``ProxyError`` (the tunnel refused), ``ConnectError`` (nothing
-      answered the CONNECT), ``ConnectTimeout`` (the CONNECT never landed),
-      ``UnsupportedProtocol``, and the SOCKS handshake errors those are raised
-      from.
-    * no  -- ``ReadTimeout`` / ``ReadError`` / ``WriteError`` /
-      ``RemoteProtocolError``: bytes went out and the answer was late or
-      malformed. The connect succeeded, so the exit IP is not what failed.
+      answered the CONNECT), ``ConnectTimeout`` before target TLS, and SOCKS
+      handshake errors.
+    * no  -- timeouts during target TLS, plus ``ReadTimeout`` / ``ReadError`` /
+      ``WriteError`` / ``RemoteProtocolError`` after the tunnel was established.
     """
+    if isinstance(exc, httpx.ConnectTimeout) and _in_target_tls_handshake(exc):
+        return False
     if isinstance(
         exc,
         (
@@ -543,6 +545,36 @@ def proxy_fault(exc: BaseException) -> bool:
         if cls.__name__ in ("ProxyError", "GeneralProxyError"):
             return True
     return _in_tunnel_setup(exc)
+
+
+def _in_target_tls_handshake(exc: BaseException) -> bool:
+    """Whether a CONNECT succeeded and the subsequent target TLS handshake timed out.
+
+    httpcore runs ``start_tls`` from its HTTP tunnel connection only after a
+    successful CONNECT response. In this phase a ``ConnectTimeout`` belongs to
+    the requested destination, not to the proxy endpoint's ability to open a
+    tunnel. Match both frames so an initial proxy TCP/CONNECT timeout remains a
+    proxy fault.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        tb = cur.__traceback__
+        frames = traceback.extract_tb(tb) if tb is not None else ()
+        through_http_tunnel = any(
+            frame.filename.replace("\\", "/").endswith("/httpcore/_async/http_proxy.py")
+            and frame.name == "handle_async_request"
+            for frame in frames
+        )
+        in_tls_handshake = any(
+            frame.name == "start_tls" or "stream.start_tls(" in (frame.line or "")
+            for frame in frames
+        )
+        if through_http_tunnel and in_tls_handshake:
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    return False
 
 
 def _in_tunnel_setup(exc: BaseException) -> bool:
@@ -637,7 +669,11 @@ def transport_error(username: str, platform: str, exc: BaseException) -> "SnipeR
         "error",
         type(exc).__name__,
         fault=fault,
-        cause=describe_transport_error(exc),
+        cause=(
+            describe_transport_error(exc) + " (target TLS handshake)"
+            if _in_target_tls_handshake(exc)
+            else describe_transport_error(exc)
+        ),
         # Nothing answered inside the timeout, as opposed to something
         # refusing. Which of the two it was is what the pool paces on: a refusal
         # is the endpoint talking, and silence at the ceiling is what being
@@ -1391,11 +1427,12 @@ class ProxyPool:
             # exactly as it was: no cooldown, no strike, no attempt counted.
             return
 
-        # Anything the endpoint said about its own tunnels feeds the width: an
-        # answer, however unwelcome, is a tunnel that opened, and a timeout is
-        # one that never did. This is what tells a saturated endpoint apart from
-        # a dead one, over a window rather than one request.
-        self._pace_endpoint(proxy, timed_out, retry or stale)
+        # Only a proxy-side timeout means a tunnel failed to open. A target read
+        # or TLS timeout has already established the tunnel and must not shrink
+        # the endpoint's width; otherwise a slow Discord handshake would make
+        # every other destination run slower too.
+        endpoint_timeout = timed_out and outcome == OUTCOME_FAILED
+        self._pace_endpoint(proxy, endpoint_timeout, retry or stale)
 
         if outcome == OUTCOME_TIMEOUT:
             # The tunnel carried this request and the answer never came. The
@@ -1472,7 +1509,7 @@ class ProxyPool:
             self._width_failed[proxy] = self._width_failed.get(proxy, 0) + 1
         attempts = self._width_attempts.get(proxy, 0)
         failed = self._width_failed[proxy]
-        if timed_out:
+        if endpoint_timeout:
             self._timeouts[proxy] = self._timeouts.get(proxy, 0) + 1
             # Before the strikes below, and only at the floor: a longer
             # connect clock has to be ruled out before "the endpoint is dead"
@@ -3306,10 +3343,13 @@ async def check_once(
     # Say what that ceiling and the endpoint's width were, so the line shows why.
     why = ""
     if (result.cause or result.detail or "").startswith("ConnectTimeout") and result.proxy:
-        why = (
-            f"; connect ceiling {pool.connect_ceiling(proxy):.1f}s, "
-            f"{pool.width(proxy)} tunnel(s) open to this endpoint"
-        )
+        if "(target TLS handshake)" in (result.cause or ""):
+            why = f"; target TLS handshake exceeded the {pool.connect_ceiling(proxy):.1f}s connect ceiling"
+        else:
+            why = (
+                f"; connect ceiling {pool.connect_ceiling(proxy):.1f}s, "
+                f"{pool.width(proxy)} tunnel(s) open to this endpoint"
+            )
     log.log(
         level,
         "check %s/%s -> %s (%s%s) via %s in %.0f ms",

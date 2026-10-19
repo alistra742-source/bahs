@@ -789,7 +789,7 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `SNIPE_PROXY_PACE_GROW_MAX` | `16` | the longest that pause grows to |
 | `SNIPE_PROXY_MIN_PARALLEL` | `1` | floor the width can be cut to |
 | `CONNECT_TIMEOUT` / `READ_TIMEOUT` | `3` / `8` | seconds |
-| `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `2` / `6` | tighter in a scan |
+| `SCAN_CONNECT_TIMEOUT` / `SCAN_READ_TIMEOUT` | `10` / `8` | connect includes the proxy's HTTPS tunnel/TLS handshake; scan pool still paces tunnel concurrency |
 | `MAX_CONCURRENT_RUNS` | `8` | 429 past it |
 | `OG_WORDS_FILE` / `OG_WORDS` | — | extra wordlists for `og` |
 | `LOG_LEVEL` | `info` | `debug` logs every verdict and the HTTP wire itself |
