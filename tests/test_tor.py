@@ -886,7 +886,11 @@ class TorEndpointTests(unittest.TestCase):
         second = TestClient(server.app, client=("127.0.0.1", 50005))
         try:
             session = self.signup("torless", second)
-            self.assertFalse(session["user"]["access"])
+            with accounts.store.transaction() as db:
+                db.execute(
+                    "UPDATE users SET trial_available=0,trial_started=?,trial_until=? WHERE id=?",
+                    (time.time() - accounts.TRIAL_SECONDS, time.time() - 1, session["user"]["id"]),
+                )
             self.assertEqual(second.get("/proxies/tor").status_code, 402)
             self.assertEqual(
                 second.post("/proxies/tor/start", headers=self.csrf(session)).status_code, 402)

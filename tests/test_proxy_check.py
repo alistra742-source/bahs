@@ -357,7 +357,11 @@ class EndpointTests(unittest.TestCase):
         second = TestClient(server.app, client=("127.0.0.1", 50001))
         try:
             session = self.signup("nobody", second)
-            self.assertFalse(session["user"]["access"])
+            with accounts.store.transaction() as db:
+                db.execute(
+                    "UPDATE users SET trial_available=0,trial_started=?,trial_until=? WHERE id=?",
+                    (time.time() - accounts.TRIAL_SECONDS, time.time() - 1, session["user"]["id"]),
+                )
             r = second.post("/proxies/check", headers=self.csrf(session), json={})
             self.assertEqual(r.status_code, 402, r.text)
             self.assertEqual(r.json()["detail"], "Trial ended. Choose a plan to continue.")

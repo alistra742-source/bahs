@@ -3200,7 +3200,14 @@ async def confirm_available(
     second_outcome = outcome_for(second)
     if second_outcome in (OUTCOME_UNKNOWN, OUTCOME_TIMEOUT):
         second.status = STATUS_UNANSWERED
-    pool.report(second_proxy, second_outcome, platform, second.retry_after)
+    pool.report(
+        second_proxy,
+        second_outcome,
+        platform,
+        second.retry_after,
+        timed_out=second.timed_out,
+        retry=True,
+    )
     if second.status == "available":
         if second.confirmed:
             # The second read settled the name with the platform's own validator
