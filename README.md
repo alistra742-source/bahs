@@ -507,6 +507,38 @@ not the names. `proxy_timeouts` counts the tunnels that never opened,
 less than the run wanted, and `proxy_pace_adjustments` lists the width changes
 without ever naming an endpoint.
 
+### A host the exits cannot reach is not a reason to slow every other one
+
+`ConnectTimeout` is the same exception whether the endpoint is saturated or has
+no route to the host. The first is fixed by asking for fewer tunnels; the second
+is not fixed by the width at all -- and treating it as the first is what made a
+multi-platform run crawl. One endpoint that carries roblox but times out on
+discord was paced down to a single tunnel, and *roblox* then ran at one check
+per connect timeout as well.
+
+The pool now counts connect timeouts per `(endpoint, platform)` and compares
+them with what the endpoint has actually carried. Four timeouts on one host,
+with no answer on that host, are ruled out as a route **only when there is
+contrast**: the same endpoint answered another platform, or another endpoint
+answered this one. The pair is then not offered again, the endpoint keeps its
+whole width for the platforms it does carry, and a platform no live exit can
+reach is reported in `platforms_unreachable` and skipped instead of spending the
+rest of the names on ten-second CONNECTs.
+
+Without that contrast four timeouts are exactly what saturation looks like, so
+the width pacer still owns the decision (and the one retry at a longer connect
+ceiling still happens at the floor). The new number is
+`SNIPE_DEST_FAIL_LIMIT` (4); the routing evidence is per run, so a new batch
+tries the pair again.
+
+What this does **not** do is make an unreachable host reachable. If the exits
+have no route to `discord.com` or `guns.lol`, no client-side tuning creates one:
+the run now says so in `stop_reason` instead of returning a wall of
+`ConnectTimeout` rows, and the fix is a list whose exits reach that platform.
+Throughput for the platforms that *do* answer is `width / latency` -- 64 warm
+tunnels at 300 ms is over 200 checks/s, and 32 at 800 ms is 40/s -- which is why
+protecting the width matters more than adding concurrency.
+
 ## No list? Tor is the fallback
 
 An empty proxy list used to be the end of the road: every run answered
@@ -781,6 +813,7 @@ socket is only a reader. `GET /runs` lists what is going and what just finished,
 | `SNIPE_PROXY_BLOCK_RATE` | `0.8` | share of a proxy's answers that must be refusals to retire it |
 | `SNIPE_PROXY_FAIL_LIMIT` | `6` | attempts before a proxy that failed every one is retired, on a settled sample |
 | `SNIPE_PROXY_FAIL_RATE` | `0.75` | share of failures that writes a proxy off |
+| `SNIPE_DEST_FAIL_LIMIT` | `4` | connect timeouts on one host through one exit before that pair is ruled out |
 | `SNIPE_PROXY_PACE_WINDOW` | `16` | tunnels offered at one width before it is judged |
 | `SNIPE_PROXY_PACE_RATE` | `0.5` | share of those that never opened, which halves the width |
 | `SNIPE_PROXY_PACE_RECOVER` | `0.1` | share at or under which the window counts as clean |

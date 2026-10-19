@@ -377,6 +377,23 @@ SNIPE_PROXY_FAIL_LIMIT: int = _int("SNIPE_PROXY_FAIL_LIMIT", 6)
 # stops using it -- stopping a sweep is worse than reporting an error rate, and
 # a host still answering two requests in five is still producing answers.
 SNIPE_PROXY_FAIL_RATE: float = _float("SNIPE_PROXY_FAIL_RATE", 0.75)
+# Connect timeouts on *one platform* through *one endpoint* before that pair is
+# treated as a route the endpoint does not have, rather than as load on it.
+#
+# `ConnectTimeout` says the CONNECT never landed. That is the same exception a
+# saturated endpoint raises, but the two want opposite responses: saturation is
+# fixed by asking for fewer tunnels, an unreachable host is not fixed by the
+# width at all. Only the run can tell them apart, and the evidence is where the
+# answers are: an endpoint that carries roblox but times out on discord for
+# every tunnel is not over-loaded, it has no route to discord. Counting timeouts
+# per (endpoint, platform) and comparing them with what the endpoint *has*
+# carried on other platforms isolates the second case -- which then stops the
+# pair and, crucially, does not shrink the width every other platform is using.
+# Without it one unreachable host paces a whole endpoint down to a single tunnel
+# and every other platform on it runs at 1/s. Four is enough to rule out a blip:
+# at the widths involved, four simultaneous tunnels to the same host failing
+# while another host answers is not bad luck.
+SNIPE_DEST_FAIL_LIMIT: int = _int("SNIPE_DEST_FAIL_LIMIT", 4)
 # --- Endpoint pacing -------------------------------------------------------
 # An endpoint asked for more simultaneous tunnels than it will accept does not
 # refuse them -- it answers nothing at all, and a CONNECT that never lands is

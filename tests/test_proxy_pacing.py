@@ -44,6 +44,7 @@ import asyncio
 import json
 import unittest
 from collections import Counter
+from unittest import mock
 
 import httpx
 
@@ -318,6 +319,133 @@ class EndpointPacingTests(unittest.TestCase):
         self.assertEqual(pool.alive(), 1)
         self.assertEqual(pool.width(PROXY), 1)
         self.assertEqual(pool.paced_endpoints(), 1)
+
+    def dest(self, pool, platform, outcome=sniper.OUTCOME_FAILED, timed_out=True, proxy=PROXY):
+        """One check on one platform through a named endpoint, offered then reported."""
+        pool._hand_out(proxy)
+        pool.report(proxy, outcome, platform, timed_out=timed_out)
+
+    def test_a_host_the_endpoint_cannot_reach_does_not_narrow_the_width(self):
+        # The report this is for: discord (or guns.lol) times out through an
+        # endpoint that is plainly carrying roblox. Four timeouts are not the
+        # endpoint's ceiling -- the endpoint just answered another host -- so
+        # taking tunnels off it is what turned one unreachable platform into a
+        # one-tunnel run for every platform.
+        pool = self.pool(per_proxy=64)
+        self.dest(pool, "roblox", outcome=sniper.OUTCOME_OK, timed_out=False)
+        for _ in range(4):
+            self.dest(pool, "discord")
+        self.assertEqual(pool.width(PROXY), 64)
+        self.assertEqual(pool.paced_endpoints(), 0)
+        self.assertEqual(pool.retired(), 0)
+        self.assertTrue(pool.destination_dead(PROXY, "discord"))
+        self.assertTrue(pool.unreachable("discord"))
+        self.assertIsNone(pool.next("discord"), "the pair is not offered again")
+        self.assertEqual(pool.next("roblox"), PROXY, "the platform that works keeps the width")
+
+    def test_another_endpoint_answering_is_the_same_proof(self):
+        # The host is reachable from the pool, just not from this endpoint.
+        pool = self.pool(per_proxy=16, proxies=(PROXY, OTHER))
+        self.dest(pool, "discord", outcome=sniper.OUTCOME_OK, timed_out=False, proxy=OTHER)
+        for _ in range(4):
+            self.dest(pool, "discord", proxy=PROXY)
+        self.assertEqual(pool.width(PROXY), 16)
+        self.assertTrue(pool.destination_dead(PROXY, "discord"))
+        self.assertFalse(pool.unreachable("discord"), "OTHER still reaches it")
+        self.assertEqual(pool.next("discord"), OTHER)
+
+    def test_without_contrast_silence_is_still_read_as_load(self):
+        # A single endpoint and a single platform with no answer is not proof of
+        # a missing route -- it is exactly what saturation looks like, and the
+        # existing width pacer is still the thing that decides it.
+        pool = self.pool(per_proxy=64)
+        for _ in range(4):
+            self.dest(pool, "guns.lol")
+        self.assertEqual(pool.width(PROXY), 32)
+        self.assertFalse(pool.destination_dead(PROXY, "guns.lol"))
+        self.assertFalse(pool.unreachable("guns.lol"))
+
+    def test_a_pair_that_answers_again_is_offered_again(self):
+        # An in-flight request answering after the pair was ruled out is the one
+        # piece of evidence that can overrule the decision.
+        pool = self.pool(per_proxy=64)
+        self.dest(pool, "roblox", outcome=sniper.OUTCOME_OK, timed_out=False)
+        for _ in range(4):
+            self.dest(pool, "discord")
+        self.assertTrue(pool.destination_dead(PROXY, "discord"))
+        self.dest(pool, "discord", outcome=sniper.OUTCOME_BLOCKED, timed_out=False)
+        self.assertFalse(pool.destination_dead(PROXY, "discord"))
+        self.assertFalse(pool.unreachable("discord"))
+        self.assertEqual(pool.next("discord"), PROXY)
+
+    def test_the_run_report_names_the_unreachable_platform_not_the_endpoint(self):
+        pool = self.pool()
+        self.dest(pool, "roblox", outcome=sniper.OUTCOME_OK, timed_out=False)
+        for _ in range(4):
+            self.dest(pool, "discord")
+        report = server._pool_report(pool)
+        self.assertEqual(report["platforms_unreachable"], ["discord"])
+        blob = json.dumps(report)
+        self.assertNotIn("10.255.255.2", blob)
+        self.assertNotIn("discord.com", blob)
+
+    def test_the_scheduler_drops_the_unreachable_platform_and_keeps_the_other(self):
+        # The whole point: the names on the platform that works still get
+        # checked, at the configured width, instead of every one of them queuing
+        # behind a 10-second CONNECT that will never land.
+        pool = self.pool(per_proxy=8)
+        pool._carried_mask[PROXY] = sniper.PLATFORM_BITS["roblox"]
+        pool._platform_carried.add("roblox")
+        pool._dest_dead.add((PROXY, "discord"))
+        pool._refresh_unreachable("discord")
+
+        async def taken(client, username):
+            return sniper.SnipeResult(username, "roblox", "taken", "held")
+
+        async def never(client, username):
+            raise AssertionError("discord was asked despite having no route")
+
+        async def go():
+            with mock.patch.dict(
+                sniper.CHECKERS, {"roblox": taken, "discord": never}
+            ):
+                results = [
+                    result
+                    async for result in sniper.iter_snipes(
+                        ["abc"], ["roblox", "discord"], pool, concurrency=2, retries=0
+                    )
+                ]
+            await pool.aclose()
+            return results
+
+        results = asyncio.run(go())
+        self.assertEqual([r.platform for r in results if r.answered], ["roblox"])
+        self.assertEqual(pool.skipped, 1, "the discord job is dropped, not filed as an error")
+        self.assertFalse(pool.stop_reason, "the run finished on the platform that answers")
+
+    def test_a_run_with_only_the_unreachable_platform_stops_and_says_why(self):
+        pool = self.pool()
+        pool._dest_dead.add((PROXY, "discord"))
+        pool._refresh_unreachable("discord")
+
+        async def never(client, username):
+            raise AssertionError("a name was spent on a host with no route")
+
+        async def go():
+            with mock.patch.dict(sniper.CHECKERS, {"discord": never}):
+                results = [
+                    result
+                    async for result in sniper.iter_snipes(
+                        ["abc", "def"], ["discord"], pool, concurrency=2, retries=0
+                    )
+                ]
+            await pool.aclose()
+            return results
+
+        results = asyncio.run(go())
+        self.assertEqual(results, [])
+        self.assertIn("does not route to it", pool.stop_reason)
+        self.assertIn("discord", pool.stop_reason)
 
 
 class RunReportTests(unittest.TestCase):

@@ -20,6 +20,12 @@ target rate-limits or blocks by IP. Four things make a batch of names fast:
   framework payload; the marker the check turns on is inside the first few KB.
   Note that this saves decompression and parsing, not transfer -- the server
   sends the whole body either way -- so it is a cheap saving, not a large one.
+* **A host one exit cannot reach is not load on that exit.** ``ConnectTimeout``
+  is the same exception for a saturated endpoint and for one with no route to a
+  target. Pacing the width on the second is what turned one unreachable platform
+  into a one-tunnel run for every platform; the pool now separates them by what
+  the endpoint *has* carried, stops offering the pair, and keeps the width for
+  the platforms that answer.
 
 The four endpoints, and what each answer means, were read off the live sites
 rather than assumed:
@@ -121,6 +127,7 @@ from config import (
     SNIPE_PLATFORM_WAIT,
     SNIPE_PROXY_BLOCK_LIMIT,
     SNIPE_CONFIRM_FREE,
+    SNIPE_DEST_FAIL_LIMIT,
     SNIPE_PROXY_BLOCK_RATE,
     SNIPE_PROXY_COOLDOWN,
     SNIPE_PROXY_FAIL_LIMIT,
@@ -362,6 +369,13 @@ PLATFORMS = (
     "guns.lol",
     "huggingface",
 )
+
+# One bit per platform, so what an endpoint has answered is a single int per
+# endpoint instead of a set of (endpoint, platform) pairs. A 100k-line list at
+# four platforms is 400k pairs -- tens of MB for a fact that only has to answer
+# "did this endpoint carry this platform, or another one?". One int per endpoint
+# that answered anything is the same question in a few hundred KB.
+PLATFORM_BITS: dict[str, int] = {name: 1 << index for index, name in enumerate(PLATFORMS)}
 
 # A name held by an account the platform has banned. Its own verdict rather than
 # `taken`, because the two want different things from the user: a taken name is
@@ -894,6 +908,40 @@ class ProxyPool:
         # Total answers each proxy gave (any outcome). The denominator for the
         # refusal *rate* that decides block-retirement.
         self._seen: dict[str, int] = {}
+        # What each endpoint has actually *carried*, as a platform bitmask, and
+        # the platforms some endpoint has carried at all. Together these are what
+        # tells "this endpoint is overloaded" apart from "this endpoint has no
+        # route to this host": an endpoint that carries roblox but times out on
+        # discord for every tunnel is not being asked for too much, it is being
+        # asked for a host it cannot reach.
+        self._carried_mask: dict[str, int] = {}
+        self._platform_carried: set[str] = set()
+        # The known platforms' bits, plus one assigned on first sight for any
+        # name a caller uses that is not in PLATFORMS (a test model, or a
+        # platform added ahead of the tuple). Sharing a single "unknown" bit
+        # would make two such names look like the same one.
+        self._platform_bits: dict[str, int] = dict(PLATFORM_BITS)
+        # Connect timeouts on one (endpoint, platform) that have not answered
+        # yet. Only pairs with outstanding silence are held, so this is empty on
+        # a healthy run and bounded by the failures on a bad one -- not by
+        # len(proxies) * len(platforms).
+        self._dest_timeouts: dict[tuple[str, str], int] = {}
+        # Pairs proved to be a route the endpoint does not have. A pair that
+        # answers again is taken off this set: a tunnel that opened disproves
+        # the only claim the set makes.
+        self._dest_dead: set[tuple[str, str]] = set()
+        # Platforms with no live endpoint left that can tunnel to them. A dict
+        # because a missing key means "not computed since the last change": the
+        # dispatch loop asks once per pass, and walking a 100k-line list on every
+        # dead pair would be quadratic. Every transition clears the entry instead.
+        self._unreachable: dict[str, bool] = {}
+        # Live endpoints that still have a route to each platform, maintained
+        # incrementally so asking whether a platform is dead never walks a
+        # 100k-line list. Computed once on first ask; then only a dead pair, a
+        # recovered pair or a retirement moves it.
+        self._dest_live: dict[str, int] = {}
+        self._warned_unreachable: set[str] = set()
+        self._dest_fail_limit = max(1, SNIPE_DEST_FAIL_LIMIT)
         self._cursor = 0
         # platform -> {proxy: monotonic time of its last refusal}. A proxy
         # blocked by discord is still a perfectly good proxy for tiktok, and
@@ -940,6 +988,17 @@ class ProxyPool:
     def retirable(self) -> bool:
         """May this pool write an entry off, or is it all there is?"""
         return self._retirable
+
+    @property
+    def timeouts(self) -> tuple[float, float]:
+        """The configured (connect, read) clocks, for the run's own record.
+
+        A deployment can override `SCAN_CONNECT_TIMEOUT` in its environment and
+        the source default says nothing about what is actually in force. A run
+        that reports the ceilings it used is the difference between diagnosing a
+        timeout and guessing at one.
+        """
+        return (float(self._base_ceiling), float(self._timeout.read or 0.0))
 
     # --- endpoint width ----------------------------------------------------
     # A platform is paced on its refusals; an endpoint is paced on its silence.
@@ -1129,6 +1188,13 @@ class ProxyPool:
         self._platform_seen.clear()
         self._platform_ok.clear()
         self._seen.clear()
+        self._carried_mask.clear()
+        self._platform_carried.clear()
+        self._dest_timeouts.clear()
+        self._dest_dead.clear()
+        self._unreachable.clear()
+        self._dest_live.clear()
+        self._warned_unreachable.clear()
         self._retired.clear()
         self._width.clear()
         self._ceilings.clear()
@@ -1152,7 +1218,7 @@ class ProxyPool:
         self.stop_reason = ""
         self.retry_after = None
 
-    def next(self) -> str | None:
+    def next(self, platform: str = "") -> str | None:
         """The next proxy to use, walking the rotation from a cursor.
 
         The cursor skips resting and retired entries in place. Rebuilding a
@@ -1160,6 +1226,12 @@ class ProxyPool:
         millions of operations over a wide run -- so this walks instead, which
         is O(resting) in the common case and only reaches O(n) when nearly
         everything is resting, which is itself the signal that the pool is dead.
+
+        ``platform`` narrows the walk to endpoints that can still tunnel to it.
+        A pair the run has proved cannot be reached is not offered again: the
+        proof is connect timeouts on that host while the same exit (or another
+        one) answered, and re-offering it only spends another name on the same
+        silence.
         """
         now = time.time()
         n = len(self._all)
@@ -1173,6 +1245,8 @@ class ProxyPool:
             proxy = self._all[idx]
             if proxy in self._retired:
                 continue
+            if platform and (proxy, platform) in self._dest_dead:
+                continue
             if self._resting.get(proxy, 0.0) > now:
                 continue
             # Every tunnel this endpoint is allowed right now is already open,
@@ -1184,7 +1258,12 @@ class ProxyPool:
                 continue
             self._cursor = idx + 1
             return self._hand_out(proxy)
-        usable = [p for p in self._all if p not in self._retired]
+        usable = [
+            p
+            for p in self._all
+            if p not in self._retired
+            and not (platform and (p, platform) in self._dest_dead)
+        ]
         if not usable:
             return None
         # Nothing live would take it on the walk: every one is resting, or every
@@ -1195,6 +1274,150 @@ class ProxyPool:
         # stops that from happening.
         return self._hand_out(
             min(usable, key=lambda p: (self._inflight.get(p, 0), self._resting.get(p, 0.0)))
+        )
+
+    # --- destination health ------------------------------------------------
+    # A platform that one endpoint cannot reach is not a fact about the width.
+    # These methods keep the two apart, so a run keeps its throughput on the
+    # platforms that work instead of narrowing every tunnel to the slowest host.
+
+    def destination_dead(self, proxy: str, platform: str) -> bool:
+        """Has this exact (endpoint, platform) pair been ruled out this run?"""
+        return bool(platform) and (proxy, platform) in self._dest_dead
+
+    def _live_for(self, platform: str) -> int:
+        """Live endpoints that still have a route to this platform."""
+        count = self._dest_live.get(platform)
+        if count is None:
+            count = sum(
+                1
+                for p in self._all
+                if p not in self._retired and (p, platform) not in self._dest_dead
+            )
+            self._dest_live[platform] = count
+        return count
+
+    def unreachable(self, platform: str) -> bool:
+        """Can no live endpoint open a tunnel to this platform?
+
+        Answered from a counter maintained on each transition, so the dispatch
+        loop can ask this once per pass without walking the pool. The first ask
+        for a platform costs one walk; every ask after it is a dict lookup.
+        """
+        if not platform:
+            return False
+        cached = self._unreachable.get(platform)
+        if cached is not None:
+            return cached
+        answer = self.alive() > 0 and self._live_for(platform) == 0
+        self._unreachable[platform] = answer
+        if answer and platform not in self._warned_unreachable:
+            self._warned_unreachable.add(platform)
+            log.warning(
+                "no live proxy can open a tunnel to %s: %d endpoint(s) timed "
+                "out on that host while answering others -- skipping the "
+                "platform instead of spending the rest of the names on it",
+                platform,
+                self.alive(),
+            )
+        return answer
+
+    def unreachable_platforms(self) -> list[str]:
+        """Platforms no live endpoint could tunnel to, for the run report."""
+        names = {name for _, name in self._dest_dead}
+        return sorted(name for name in names if self.unreachable(name))
+
+    def _bit(self, platform: str) -> int:
+        """The bit for a platform, assigning one for a name we have not seen."""
+        bit = self._platform_bits.get(platform)
+        if bit is None:
+            bit = 1 << len(self._platform_bits)
+            self._platform_bits[platform] = bit
+        return bit
+
+    def _carried(self, proxy: str, platform: str) -> bool:
+        """Did this endpoint actually carry this platform this run?"""
+        return bool(self._carried_mask.get(proxy, 0) & self._bit(platform))
+
+    def _dest_answered(self, proxy: str, platform: str) -> None:
+        """The tunnel to this platform opened -- whatever the answer was.
+
+        Called for every outcome except a transport failure. A reached target is
+        proof the endpoint has a route to it, so a pair that was written off is
+        restored: an in-flight request that answers after the decision is the
+        one piece of evidence that can overrule it.
+        """
+        if not platform:
+            return
+        self._platform_carried.add(platform)
+        bit = self._bit(platform)
+        self._carried_mask[proxy] = self._carried_mask.get(proxy, 0) | bit
+        pair = (proxy, platform)
+        self._dest_timeouts.pop(pair, None)
+        if pair in self._dest_dead:
+            self._dest_dead.discard(pair)
+            if proxy not in self._retired and platform in self._dest_live:
+                self._dest_live[platform] += 1
+            self._refresh_unreachable(platform)
+
+    def _dest_isolated(self, proxy: str, platform: str) -> bool:
+        """Is this silence about the route rather than about the width?
+
+        Only when the run has contrast: this endpoint carried *another* platform
+        (so it is open for business), or another endpoint carried *this* one (so
+        the host is reachable from the pool). With neither, four timeouts could
+        be saturation or a dead exit, and the existing pacer and retirement rules
+        are the ones that should decide -- they have the width and the strikes.
+        """
+        if not platform or self._carried(proxy, platform):
+            return False
+        bit = self._bit(platform)
+        other_platform = bool(self._carried_mask.get(proxy, 0) & ~bit)
+        return other_platform or platform in self._platform_carried
+
+    def _dest_timeout(self, proxy: str, platform: str) -> None:
+        """Count a CONNECT that never landed, and rule the pair out when proved."""
+        if not platform or self._carried(proxy, platform):
+            return
+        pair = (proxy, platform)
+        count = self._dest_timeouts.get(pair, 0) + 1
+        self._dest_timeouts[pair] = count
+        if count < self._dest_fail_limit or not self._dest_isolated(proxy, platform):
+            return
+        if pair in self._dest_dead:
+            return
+        self._dest_dead.add(pair)
+        if proxy not in self._retired and platform in self._dest_live:
+            self._dest_live[platform] = max(0, self._dest_live[platform] - 1)
+        log.warning(
+            "no tunnel to %s through %s: %d connect timeouts with no answer on "
+            "that host, while %s -- that pair is not offered again this run",
+            platform,
+            mask_proxy(proxy),
+            count,
+            "the same endpoint answered another platform"
+            if self._carried_mask.get(proxy, 0) & ~self._bit(platform)
+            else "another endpoint answered the platform",
+        )
+        self._refresh_unreachable(platform)
+
+    def _refresh_unreachable(self, platform: str) -> None:
+        """Forget the cached answer; the next ask recomputes it from the pairs."""
+        self._unreachable.pop(platform, None)
+
+    def unreachable_reason(self, platforms: Iterable[str]) -> str:
+        """Why a run cannot make progress: a route, not a width or a throttle."""
+        names = [p for p in platforms if self.unreachable(p)]
+        if not names:
+            return self.blocked_reason()
+        listed = ", ".join(names)
+        return (
+            f"no live proxy could open a tunnel to {listed} "
+            f"({self._dest_fail_limit} connect timeouts each with no answer on "
+            "that host) while the same exits were answering other platforms -- "
+            "the proxy range does not route to it. That is a property of the "
+            "exits, not of the names: use a list whose exits reach that "
+            "platform, or check the platform from a network that can."
         )
 
     def _hand_out(self, proxy: str) -> str:
@@ -1375,6 +1598,14 @@ class ProxyPool:
             self.alive(),
             len(self._all),
         )
+        # Retiring the last endpoint that could reach a platform makes that
+        # platform as unreachable as a missing route does; the cached answer has
+        # to follow the retirement, or the scheduler keeps dispatching names into
+        # a pool that will hand them nothing.
+        for platform in {name for _, name in self._dest_dead}:
+            if (proxy, platform) not in self._dest_dead and platform in self._dest_live:
+                self._dest_live[platform] = max(0, self._dest_live[platform] - 1)
+            self._refresh_unreachable(platform)
 
     def report(
         self,
@@ -1421,6 +1652,13 @@ class ProxyPool:
             self._platform_seen[platform] = self._platform_seen.get(platform, 0) + 1
         self._seen[proxy] = self._seen.get(proxy, 0) + 1
 
+        if outcome != OUTCOME_FAILED:
+            # Every other outcome -- a verdict, a refusal, a slow target, even an
+            # unreadable answer -- means the tunnel carried the request. That is
+            # the evidence that tells a missing route apart from a width the
+            # endpoint will not take, so it is recorded before the early returns.
+            self._dest_answered(proxy, platform)
+
         if outcome == OUTCOME_UNKNOWN:
             # The request arrived and the answer was unusable. Not the tunnel's
             # fault, and not a refusal either, so the proxy's record is left
@@ -1432,7 +1670,17 @@ class ProxyPool:
         # the endpoint's width; otherwise a slow Discord handshake would make
         # every other destination run slower too.
         endpoint_timeout = timed_out and outcome == OUTCOME_FAILED
-        self._pace_endpoint(proxy, endpoint_timeout, retry or stale)
+        # ...and a connect timeout on a host this pair has no route to is not
+        # about the width at all. Pacing on it is what took a whole endpoint down
+        # to one tunnel because *one* platform could not be reached, which made
+        # every other platform on that endpoint run at one check per timeout.
+        route = endpoint_timeout and (
+            self._dest_isolated(proxy, platform)
+            or self.destination_dead(proxy, platform)
+        )
+        if endpoint_timeout:
+            self._dest_timeout(proxy, platform)
+        self._pace_endpoint(proxy, endpoint_timeout and not route, retry or stale)
 
         if outcome == OUTCOME_TIMEOUT:
             # The tunnel carried this request and the answer never came. The
@@ -1511,6 +1759,11 @@ class ProxyPool:
         failed = self._width_failed[proxy]
         if endpoint_timeout:
             self._timeouts[proxy] = self._timeouts.get(proxy, 0) + 1
+            if route:
+                # The width is not what these were lost to, and the pair is out
+                # of the rotation. The endpoint keeps its width for the platforms
+                # it can carry, rather than being retired for a route it lacks.
+                return
             # Before the strikes below, and only at the floor: a longer
             # connect clock has to be ruled out before "the endpoint is dead"
             # is the answer, or a run reports a working endpoint as a corpse
@@ -3214,7 +3467,7 @@ async def confirm_available(
     * the second read cannot answer -> the free verdict stands, but it is left
       unconfirmed, and the site shows it as unconfirmed rather than as sure.
     """
-    second_proxy = pool.next()
+    second_proxy = pool.next(platform)
     if second_proxy is None:
         first.detail = (first.detail + "; unconfirmed, no second exit").strip("; ")
         return first
@@ -3279,7 +3532,7 @@ async def check_once(
     retry: bool = False,
 ) -> SnipeResult:
     """One name on one platform, through the next proxy the pool hands out."""
-    proxy = pool.next()
+    proxy = pool.next(platform)
     if proxy is None:
         detail = POOL_MISS_DETAILS[0] if len(pool) else POOL_MISS_DETAILS[1]
         # Dropped by the run rather than filed as a row, so it is only ever a
@@ -3469,6 +3722,10 @@ async def iter_snipes(
                     if tried is None:
                         pool.misses += 1
                     return tried
+                if pool.unreachable(platform):
+                    # The platform was ruled out while this name was waiting its
+                    # turn. There is nothing to ask, and no failure to report.
+                    return tried
                 result = await check_once(platform, username, pool, retry=attempt > 0)
                 if result.detail in POOL_MISS_DETAILS:
                     # Nothing in the pool could carry this name. `next()` hands
@@ -3598,13 +3855,19 @@ async def iter_snipes(
             # the reason the platform gave. The run continues on the platforms
             # that are still answering instead of stopping on the worst one.
             pool.pause_blocked(platforms)
-            if platforms and all(pool.is_paused(p) for p in platforms):
+            if platforms and all(pool.unreachable(p) or pool.is_paused(p) for p in platforms):
                 # Every platform is sitting out at once -- a datacenter list
                 # refused by every target is the usual cause, and ending the run
                 # here is what reported "17,303 checks were never made": every
                 # name not yet asked about was thrown away. Sit out for the
                 # shortest pause and resume instead, bounded so a pool that can
                 # never answer still ends honestly.
+                if all(pool.unreachable(p) for p in platforms):
+                    # No pause will fix this: the exits have no route to the
+                    # host. Say that, rather than sitting out a throttle that
+                    # is not happening.
+                    stopping(pool.unreachable_reason(platforms))
+                    break
                 remaining = pool.shortest_pause()
                 now_m = time.monotonic()
                 if pause_since == 0.0:
@@ -3669,6 +3932,15 @@ async def iter_snipes(
                 if pool.is_paused(platform):
                     # No proxy and no network is spent on a platform that has
                     # refused the whole list; the jobs are dropped, not answered.
+                    skipped += 1
+                    pool.skipped = skipped
+                    continue
+                if pool.unreachable(platform):
+                    # Every live endpoint has timed out opening a tunnel to this
+                    # host while answering others, so the exits do not route to
+                    # it. That is not a result about the name and not a request
+                    # worth spending: drop the job and let the platforms that do
+                    # answer keep the run's whole width.
                     skipped += 1
                     pool.skipped = skipped
                     continue
@@ -3737,13 +4009,19 @@ async def iter_snipes(
             # the reason the platform gave. The run continues on the platforms
             # that are still answering instead of stopping on the worst one.
             pool.pause_blocked(platforms)
-            if platforms and all(pool.is_paused(p) for p in platforms):
+            if platforms and all(pool.unreachable(p) or pool.is_paused(p) for p in platforms):
                 # Every platform is sitting out at once -- a datacenter list
                 # refused by every target is the usual cause, and ending the run
                 # here is what reported "17,303 checks were never made": every
                 # name not yet asked about was thrown away. Sit out for the
                 # shortest pause and resume instead, bounded so a pool that can
                 # never answer still ends honestly.
+                if all(pool.unreachable(p) for p in platforms):
+                    # No pause will fix this: the exits have no route to the
+                    # host. Say that, rather than sitting out a throttle that
+                    # is not happening.
+                    stopping(pool.unreachable_reason(platforms))
+                    break
                 remaining = pool.shortest_pause()
                 now_m = time.monotonic()
                 if pause_since == 0.0:

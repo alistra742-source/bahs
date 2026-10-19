@@ -1824,6 +1824,11 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         "proxies_paced": pool.paced_endpoints(),
         "proxy_timeouts": pool.timed_out(),
         "proxy_pace_adjustments": pool.recent_endpoint_pace(),
+        # The clocks the run actually used. An environment override is invisible
+        # in a source default, and "was the timeout still 2s?" is the first
+        # question a ConnectTimeout report raises.
+        "connect_timeout": pool.timeouts[0],
+        "read_timeout": pool.timeouts[1],
         # Requests the proxies carried and how many failed at the transport
         # level. This is what tells "your list is bad" apart from "the names are
         # taken" -- the errors column alone cannot, which is how a run that was
@@ -1843,6 +1848,10 @@ def _pool_report(pool: sniper.ProxyPool) -> dict:
         # Platforms sat out because they refused the whole list, so a throttle is
         # visible per platform instead of hidden in the blocked count.
         "platforms_paused": pool.paused(),
+        # Platforms no live exit could open a tunnel to. This is a different
+        # failure from a throttle -- the exit range has no route to that host --
+        # and it is reported separately so it is not mistaken for one.
+        "platforms_unreachable": pool.unreachable_platforms(),
         # Platforms the run is deliberately asking *slower*, with the numbers
         # behind the decision. That is what a throttle looks like when it is
         # being handled rather than merely survived: the platform keeps producing
@@ -1870,9 +1879,11 @@ def _log_run_start(
     which a streaming client sends once and nobody ever reads back. This is
     the line an operator can find again after a sweep behaved oddly.
     """
+    connect, read = pool.timeouts
     log.info(
         "%s run %s starting: %d names x %d platform(s) [%s], concurrency %d, "
-        "retries %d, pool %d of %d usable at %d connection(s) each, note: %s",
+        "retries %d, connect %.1fs / read %.1fs, pool %d of %d usable at %d "
+        "connection(s) each, note: %s",
         kind,
         run_id,
         names,
@@ -1880,6 +1891,8 @@ def _log_run_start(
         ", ".join(platforms),
         concurrency,
         retries,
+        connect,
+        read,
         pool.alive(),
         len(pool),
         pool.per_proxy,
